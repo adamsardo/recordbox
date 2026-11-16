@@ -63,7 +63,7 @@ pub fn track_attrs(t: &Track) -> Vec<(&'static str, String)> {
         ("Rating", rating.to_string()),
         ("Location", location(&t.path)),
         ("Remixer", t.remixer.clone()),
-        ("Tonality", key_name(t.key, false)),
+        ("Tonality", t.key_label(false)),
         ("Label", t.label.clone()),
         ("Mix", t.mix_name.clone()),
         // Track colour, as rekordbox writes it (0xRRGGBB of its eight track colours).

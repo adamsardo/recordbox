@@ -415,6 +415,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
             file_type: ext,
             bpm: n("BPM") as f64 / 100.0,
             key: parse_key(&lookup(&keys, r.get("KeyID"))),
+            key_text: lookup(&keys, r.get("KeyID")).trim().to_string(),
             rating: n("Rating").clamp(0, 5) as u8,
             color: n("ColorID").clamp(0, 8) as u8,
             date_added: g("StockDate"),
@@ -517,6 +518,9 @@ mod tests {
             println!("{t}: {n}");
         }
         let lib = read_library(&c, &src.join("share")).unwrap();
+        for t in lib.tracks.iter().take(6) {
+            println!("key {:?} -> {} :: {}", t.xt.track.key_text, t.xt.track.key, t.xt.track.title);
+        }
         let with_grid = lib.tracks.iter().filter(|t| t.xt.grid.is_some()).count();
         let hot = lib.tracks.iter().map(|t| t.xt.cues.iter().filter(|c| c.kind == CueKind::Hot).count()).sum::<usize>();
         println!("local tracks {}, not local {}, with grid {}, hot cues {}, playlists {}, smart {}, tag categories {}", lib.tracks.len(), lib.not_local, with_grid, hot, lib.playlists.len(), lib.smart_lists, lib.tag_categories.len());

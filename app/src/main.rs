@@ -135,10 +135,13 @@ impl eframe::App for Gui {
                 let _ = buf.save(&path);
                 std::process::exit(0);
             }
-            if frames == 120 {
+            // Taken once the launch-time rekordbox sync has finished, so the picture shows the
+            // synced library (up to ~20 s).
+            static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if frames >= 120 && (app.rb_job.is_none() || frames >= 1200) && !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
-            if frames > 400 {
+            if frames > 1500 {
                 std::process::exit(1);
             }
             app.screenshot = Some((path, frames + 1));

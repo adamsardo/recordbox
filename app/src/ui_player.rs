@@ -185,7 +185,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         app.prefs.time_remain = !app.prefs.time_remain;
     }
     if let Some(t) = &track {
-        p.text(pos2((x_key + x_bpm) / 2.0, hy), Align2::CENTER_CENTER, key_name(t.key, app.prefs.key_alnum), FontId::proportional(13.0), WHITE);
+        p.text(pos2((x_key + x_bpm) / 2.0, hy), Align2::CENTER_CENTER, t.key_label(app.prefs.key_alnum), FontId::proportional(13.0), WHITE);
     }
     if loaded {
         let b = app.current_bpm();

@@ -213,9 +213,27 @@ pub struct Track {
     /// The user chose this key: analysis never replaces it (Analyze Key does, when asked).
     #[serde(default)]
     pub key_manual: bool,
+    /// The key as the imported library or file spelled it ("7A", "Fm"), shown as is, as the
+    /// original does, until analysis or the user sets the key.
+    #[serde(default)]
+    pub key_text: String,
 }
 
 impl Track {
+    /// The key as shown: the imported spelling when there is one, else in the chosen notation.
+    pub fn key_label(&self, alnum: bool) -> String {
+        if self.key_text.trim().is_empty() {
+            key_name(self.key, alnum)
+        } else {
+            self.key_text.clone()
+        }
+    }
+    /// Set the key from analysis or the user (drops the imported spelling).
+    pub fn set_key(&mut self, k: i32) {
+        self.key = k;
+        self.key_text.clear();
+    }
+
     pub fn file_name(&self) -> String {
         std::path::Path::new(&self.path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
     }
@@ -454,6 +472,16 @@ pub struct MyTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imported_key_spelling_is_shown_until_the_key_changes() {
+        let mut t = Track { key: parse_key("7A"), key_text: "7A".into(), ..Default::default() };
+        // Shown as imported whatever the notation preference (as rekordbox lists "7A" beside "Fm").
+        assert_eq!(t.key_label(false), "7A");
+        assert_eq!(t.key_label(true), "7A");
+        t.set_key(parse_key("Fm"));
+        assert_eq!((t.key_label(false), t.key_label(true)), ("Fm".to_string(), "4A".to_string()));
+    }
+
     #[test]
     fn keys() {
         assert_eq!(parse_key("Am"), 7);

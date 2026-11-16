@@ -177,9 +177,10 @@ pub fn split_panes(p: &Painter, r: Rect, c: Color32) {
     p.rect_filled(Rect::from_min_max(b.min, pos2(b.center().x - 1.0, b.max.y)), 0.0, c);
 }
 pub fn window_icon(p: &Painter, r: Rect, c: Color32) {
-    let b = Rect::from_center_size(r.center(), vec2(r.width() * 0.6, r.height() * 0.5));
-    p.rect_stroke(b, 1.0, s(c, 1.3), egui::StrokeKind::Inside);
-    p.rect_filled(Rect::from_min_max(b.min, pos2(b.max.x, b.min.y + 3.0)), 0.0, c);
+    // Reference 04: a 12 × 10 pt window with a 4 pt title bar and a 1.5 pt frame (in an 18 × 16 rect).
+    let b = Rect::from_center_size(r.center(), vec2(r.width() * 0.667, r.height() * 0.625));
+    p.rect_stroke(b, 1.0, s(c, 1.5), egui::StrokeKind::Inside);
+    p.rect_filled(Rect::from_min_max(b.min, pos2(b.max.x, b.min.y + 4.0)), 0.0, c);
 }
 pub fn view_art_list(p: &Painter, r: Rect, c: Color32) {
     let b = Rect::from_center_size(r.center(), vec2(r.width() * 0.6, r.height() * 0.6));

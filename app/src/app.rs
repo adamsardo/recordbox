@@ -923,6 +923,9 @@ pub struct App {
     pub ctx: egui::Context,
     pub screenshot: Option<(String, u32)>,
     pub scroll_to_selected: bool,
+    /// The track list's vertical scroll position set by dragging its scroll bar (applied on the
+    /// next frame).
+    pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
 }
@@ -1023,6 +1026,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             screenshot: screenshot.map(|s| (s, 0)),
             scroll_to_selected: false,
+            list_scroll_to: None,
             menu: None,
         };
         app.menu = crate::menus::build();
@@ -1621,7 +1625,7 @@ impl App {
                         t.comment,
                         t.composer,
                         t.mix_name,
-                        key_name(t.key, self.prefs.key_alnum),
+                        format!("{} {}", t.key_label(self.prefs.key_alnum), key_name(t.key, self.prefs.key_alnum)),
                         self.tag_text(t.id)
                     )),
                     };
@@ -1860,7 +1864,7 @@ impl App {
         for (id, key) in results {
             if key >= 0 && self.track(id).map(|t| t.key != key || t.key_manual).unwrap_or(false) {
                 if let Some(t) = self.track_mut(id) {
-                    t.key = key;
+                    t.set_key(key);
                     t.key_manual = false;
                 }
                 self.save_track(id);
@@ -2326,6 +2330,18 @@ impl App {
             let known = seen.contains_key(&rt.rb_id);
             let changed = known && seen.get(&rt.rb_id) != Some(&rt.fingerprint);
             let existing = self.db.track_by_path(&rt.xt.track.path);
+            // Libraries synced before the key's spelling was kept: fill it in once, where the
+            // stored key is still rekordbox's own (not analysed over or chosen by the user).
+            if let Some(mut t) = existing.and_then(|id| self.db.track(id)) {
+                let rb = &rt.xt.track;
+                if t.key_text.is_empty() && !rb.key_text.is_empty() && !t.key_manual && t.key == rb.key {
+                    t.key_text = rb.key_text.clone();
+                    let _ = self.db.update_track(&t);
+                    if let Some(m) = self.track_mut(t.id) {
+                        m.key_text = t.key_text.clone();
+                    }
+                }
+            }
             let (id, fresh) = match existing {
                 None => {
                     let mut t = rt.xt.track.clone();
@@ -2686,7 +2702,7 @@ impl App {
                 // track had no key, or on its first analysis when the key came from tags.
                 if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid)))) {
                     // Analyze Key asked for it explicitly: replaces even a chosen key.
-                    t.key = res.key;
+                    t.set_key(res.key);
                     if key_requested {
                         t.key_manual = false;
                     }
@@ -3572,10 +3588,12 @@ impl App {
             fresh.key_manual = t.key_manual;
             if t.key_manual {
                 fresh.key = t.key;
+                fresh.key_text = t.key_text.clone();
             }
             if t.analyzed == 1 {
                 fresh.bpm = t.bpm;
                 fresh.key = t.key;
+                fresh.key_text = t.key_text.clone();
                 fresh.duration = t.duration;
             }
             if let Some(slot) = self.track_mut(*id) {

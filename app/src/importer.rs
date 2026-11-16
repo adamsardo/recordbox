@@ -65,6 +65,7 @@ pub fn read_track(path: &Path) -> Track {
         let key = g(ItemKey::InitialKey);
         if !key.is_empty() {
             t.key = parse_key(&key);
+            t.key_text = key.trim().to_string();
         }
         if let Some(pic) = tag.pictures().first() {
             let data = pic.data();
@@ -359,6 +360,7 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                     },
                     remixer: get("Remixer"),
                     key: parse_key(&get("Tonality")),
+                    key_text: get("Tonality").trim().to_string(),
                     label: get("Label"),
                     mix_name: get("Mix"),
                     autoload_hotcue: true,

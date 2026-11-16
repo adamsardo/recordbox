@@ -704,7 +704,7 @@ fn info_window(app: &mut App, ctx: &Context) {
             }
             take!(title, artist, album, album_artist, genre, label, remixer, original_artist, composer, lyricist, mix_name, grouping, comment, message, release_date, year, track_no, disc_no, rating, color);
             if t.key != orig.key {
-                cur.key = t.key;
+                cur.set_key(t.key);
                 cur.key_manual = t.key >= 0;
             }
         }

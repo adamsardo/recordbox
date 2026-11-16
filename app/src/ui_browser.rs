@@ -368,7 +368,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
     p.rect_filled(right_strip, 0.0, BG2);
     // Top row of the tree area: collapse chevron and sub-window icon.
     crate::icons::chevron_right(&p, Rect::from_center_size(pos2(full.min.x + 13.6, full.min.y + 12.0), vec2(14.0, 14.0)), OFF);
-    crate::icons::window_icon(&p, Rect::from_center_size(pos2(full.min.x + 57.5, full.min.y + 12.0), vec2(18.0, 16.0)), WHITE);
+    crate::icons::window_icon(&p, Rect::from_center_size(pos2(full.min.x + 58.0, full.min.y + 13.0), vec2(18.0, 16.0)), WHITE);
     p.line_segment([pos2(full.min.x, full.min.y + 22.0), pos2(tree.max.x, full.min.y + 22.0)], Stroke::new(1.0, BG));
 
     icon_strip(app, ui, strip);
@@ -459,26 +459,22 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
         (crate::icons::record, None, "Recordings (not available in this app)"),
     ];
     for (i, (draw, mode, name)) in items.iter().enumerate() {
-        let c = pos2(r.min.x + 16.0, r.min.y + 37.6 + i as f32 * 19.9);
-        let rr = Rect::from_center_size(c, vec2(16.5, 16.5));
+        // Reference 04: 18 pt tiles on a 20 pt pitch, centred at x 15.75 pt; a 1 pt #646464
+        // rounded border and a white glyph; the selected one blue with a white inner border.
+        let c = pos2(r.min.x + 15.75, r.min.y + 36.85 + i as f32 * 20.0);
+        let rr = Rect::from_center_size(c, vec2(18.0, 18.0));
         let on = mode.map(|m| app.side == m).unwrap_or(false);
-        let resp = ui.interact(rr.expand(1.5), ui.id().with(("side", i)), Sense::click());
+        let resp = ui.interact(rr.expand(1.0), ui.id().with(("side", i)), Sense::click());
         let p = ui.painter();
         if on {
-            p.rect_filled(rr, 2.0, BLUE);
+            p.rect_filled(rr, 3.0, BLUE);
+            p.rect_stroke(rr.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
         } else {
-            p.rect_stroke(rr, 2.0, Stroke::new(1.0, if mode.is_some() { DIM } else { hex(0x4A4A4A) }), egui::StrokeKind::Inside);
+            let edge = if mode.is_none() { hex(0x3A3A3A) } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) };
+            p.rect_stroke(rr, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         }
-        let col = if on {
-            WHITE
-        } else if mode.is_none() {
-            hex(0x4A4A4A)
-        } else if resp.hovered() {
-            WHITE
-        } else {
-            DIM2
-        };
-        draw(p, rr.shrink(1.0), col);
+        let col = if mode.is_none() { hex(0x4A4A4A) } else { WHITE };
+        draw(p, rr.expand(0.5), col);
         let resp = if app.prefs.tooltips { resp.on_hover_text(*name) } else { resp };
         if let (true, Some(m)) = (resp.clicked(), mode) {
             app.side = *m;
@@ -524,12 +520,15 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
             _ => false,
         };
         let resp = ui.interact(rr, ui.id().with(("ricon", i)), Sense::click());
+        // Same tiles as the left strip (reference 04).
         if on {
-            ui.painter().rect_filled(rr, 2.0, BLUE);
+            ui.painter().rect_filled(rr, 3.0, BLUE);
+            ui.painter().rect_stroke(rr.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
         } else {
-            ui.painter().rect_stroke(rr, 2.0, Stroke::new(1.0, if enabled { DIM } else { hex(0x4A4A4A) }), egui::StrokeKind::Inside);
+            let edge = if !enabled { hex(0x3A3A3A) } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) };
+            ui.painter().rect_stroke(rr, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         }
-        draw(ui.painter(), rr.shrink(1.5), if !enabled { hex(0x4A4A4A) } else if on || resp.hovered() { WHITE } else { TEXT });
+        draw(ui.painter(), rr.shrink(1.0), if !enabled { hex(0x4A4A4A) } else { WHITE });
         let resp = if app.prefs.tooltips { resp.on_hover_text(*tipt) } else { resp };
         if resp.clicked() {
             match i {
@@ -666,16 +665,19 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
         }
         SideMode::Playlists => {
             // Tree View / Column View segmented toggle at 27..48 pt.
-            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 25.0), Sense::hover());
-            crate::icons::magnifier(ui.painter(), Rect::from_center_size(pos2(row.min.x + 11.0, row.center().y), vec2(16.0, 16.0)), DIM2, 0);
-            let tv = Rect::from_min_max(pos2(row.min.x + 26.0, row.min.y + 2.0), pos2(row.min.x + 124.0, row.max.y - 2.0));
+            // Reference 04: the search glyph sits in an 18 pt bordered tile; the tree's first row
+            // starts 24 pt below the top.
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+            let st = Rect::from_center_size(pos2(row.min.x + 11.0, row.min.y + 12.5), vec2(18.0, 18.0));
+            ui.painter().rect_stroke(st, 3.0, Stroke::new(1.0, hex(0x646464)), egui::StrokeKind::Inside);
+            crate::icons::magnifier(ui.painter(), st.shrink(2.0), DIM2, 0);
+            let tv = Rect::from_min_max(pos2(row.min.x + 26.0, row.min.y + 2.0), pos2(row.min.x + 124.0, row.min.y + 23.0));
             ui.painter().rect_filled(tv, 0.0, BLUE);
             ui.painter().text(tv.center(), Align2::CENTER_CENTER, "Tree View", FontId::proportional(12.5), WHITE);
             let cv = Rect::from_min_max(pos2(tv.max.x + 4.0, tv.min.y), pos2(row.max.x, tv.max.y));
             ui.painter().rect_filled(cv, 0.0, hex(0x323232));
             crate::icons::lock(ui.painter(), Rect::from_center_size(pos2(cv.min.x + 9.0, cv.center().y), vec2(10.0, 10.0)), DIM);
             ui.painter().with_clip_rect(cv).text(pos2(cv.min.x + 18.0, cv.center().y), Align2::LEFT_CENTER, "Column View", FontId::proportional(12.0), DIM);
-            ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let all_sel = app.view == View::Collection;
@@ -866,9 +868,29 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
     }
     let on_root = matches!(&app.view, View::Device { root, .. } if root.is_empty());
     ui.add_space(1.0);
-    if tree_row(ui, 1, "Devices", None, on_root, TreeIcon::Open, 17.0).clicked() {
+    let dr = tree_row(ui, 1, "Devices", None, on_root, TreeIcon::Open, 17.0);
+    if dr.clicked() {
         app.set_view(View::Device { root: String::new(), node: None });
     }
+    // Reference 05 shows only the "Devices" row; Recordbox's extras live in its context menu.
+    let dr = if app.prefs.tooltips && app.devices.is_empty() { dr.on_hover_text("Connect a USB drive or SD card (FAT32, exFAT or HFS+). Right-click for more.") } else { dr };
+    dr.context_menu(|ui| {
+        if ui.button("Add a folder as a device…").on_hover_text("Export into any folder, for example to prepare a drive image or test an export.").clicked() {
+            ui.close_menu();
+            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                let s = d.to_string_lossy().to_string();
+                if !app.prefs.devices_extra.contains(&s) {
+                    app.prefs.devices_extra.push(s);
+                    app.save_prefs();
+                }
+                app.scan_devices();
+            }
+        }
+        if ui.button("Export to device…").clicked() {
+            ui.close_menu();
+            open_export(app, vec![], vec![]);
+        }
+    });
     let devs: Vec<(String, String, String, Option<Vec<crate::export::usb::DevNode>>, Option<String>, usize)> = app
         .devices
         .iter()
@@ -999,24 +1021,6 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
             }
             rows(app, ui, &root, &nodes, 0, 2);
         }
-    }
-    if app.devices.is_empty() {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Connect a USB drive or SD card (FAT32, exFAT or HFS+).").size(11.0).color(DIM));
-    }
-    ui.add_space(10.0);
-    if ui.button("Add a folder as a device…").on_hover_text("Export into any folder, for example to prepare a drive image or test an export.").clicked() {
-        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-            let s = d.to_string_lossy().to_string();
-            if !app.prefs.devices_extra.contains(&s) {
-                app.prefs.devices_extra.push(s);
-                app.save_prefs();
-            }
-            app.scan_devices();
-        }
-    }
-    if ui.button("Export to device…").clicked() {
-        open_export(app, vec![], vec![]);
     }
 }
 
@@ -1250,10 +1254,17 @@ fn history_tree(app: &mut App, ui: &mut Ui) {
 fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, history: Option<u32>) {
     if root.is_empty() {
         // The "Devices" / "Histories" item itself: an empty list, as in the original.
+        // Reference 05: the usual title bar (title, divider, the view-mode icons greyed out).
         let r = ui.max_rect();
-        let bar = Rect::from_min_size(r.min, vec2(r.width(), 24.0));
-        ui.painter().rect_filled(bar, 0.0, BG2);
-        ui.painter().text(pos2(bar.min.x + 12.0, bar.center().y), Align2::LEFT_CENTER, if history.is_some() { "Histories" } else { "Devices" }, FontId::proportional(12.5), WHITE);
+        let bar = Rect::from_min_max(pos2(r.min.x, r.min.y + 5.0), pos2(r.max.x, r.min.y + 27.0));
+        let p = ui.painter();
+        p.rect_filled(bar, 0.0, BG2);
+        p.text(pos2(bar.min.x + 10.5, bar.center().y), Align2::LEFT_CENTER, if history.is_some() { "Histories" } else { "Devices" }, FontId::proportional(11.5), WHITE);
+        p.line_segment([pos2(bar.min.x + 340.0, bar.min.y), pos2(bar.min.x + 340.0, bar.max.y)], Stroke::new(1.0, BG));
+        let icons: [(f32, IconFn); 4] = [(394.5, crate::icons::view_art_list), (356.5, crate::icons::view_list), (297.5, crate::icons::view_columns), (260.0, crate::icons::split_panes)];
+        for (dx, draw) in icons {
+            draw(p, Rect::from_center_size(pos2(bar.max.x - dx, bar.center().y), vec2(18.0, 17.0)), hex(0x4A4A4A));
+        }
         return;
     }
     let Some(dev) = app.devices.iter().find(|d| d.root == root) else {
@@ -1434,7 +1445,11 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
         te.request_focus();
     }
-    let cm = icon_button_ui(ui, Rect::from_center_size(pos2(rx - 8.0, bar.center().y), vec2(14.0, 18.0)), "colmenu", crate::icons::hamburger);
+    // Reference 01: the column menu sits in the icon strip's column, 12.75 pt from the window edge.
+    let clip = ui.clip_rect();
+    ui.set_clip_rect(ui.ctx().screen_rect());
+    let cm = icon_button_ui(ui, Rect::from_center_size(pos2(rx + 14.25, bar.center().y + 1.0), vec2(14.0, 18.0)), "colmenu", crate::icons::hamburger);
+    ui.set_clip_rect(clip);
     dropdown(ui, &cm, "cols", |ui| {
         ui.label(RichText::new("Columns").strong());
         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -1472,15 +1487,37 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         top = cr.max.y + 4.0;
     }
     let top = top.max(r.min.y + 31.0) - 4.0;
-    let area = Rect::from_min_max(pos2(r.min.x, top + 4.0), r.max);
+    // Reference 04: the list keeps an 11 pt column on the right for its vertical scroll bar
+    // (black track, 6.5 pt #323232 thumb) and a solid horizontal bar along the bottom.
+    let vbar_x = r.max.x - 11.0;
+    let area = Rect::from_min_max(pos2(r.min.x, top + 4.0), pos2(vbar_x, r.max.y));
     let mut aui = ui.new_child(egui::UiBuilder::new().max_rect(area));
     aui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    aui.spacing_mut().scroll = egui::style::ScrollStyle {
+        floating: false,
+        bar_width: 8.0,
+        bar_inner_margin: 2.0,
+        bar_outer_margin: 2.0,
+        foreground_color: false,
+        dormant_background_opacity: 1.0,
+        active_background_opacity: 1.0,
+        interact_background_opacity: 1.0,
+        dormant_handle_opacity: 1.0,
+        active_handle_opacity: 1.0,
+        interact_handle_opacity: 1.0,
+        ..egui::style::ScrollStyle::solid()
+    };
+    aui.visuals_mut().extreme_bg_color = Color32::BLACK;
+    aui.visuals_mut().widgets.inactive.bg_fill = hex(0x323232);
+    aui.visuals_mut().widgets.hovered.bg_fill = hex(0x4A4A4A);
+    aui.visuals_mut().widgets.active.bg_fill = hex(0x5A5A5A);
+    let mut vstate: Option<(Rect, f32, f32)> = None;
     let cols = app.prefs.columns.clone();
     let mut all_cols = vec![Col::Status];
     all_cols.extend(cols.iter().copied().filter(|c| *c != Col::Status));
     let total_w: f32 = all_cols.iter().map(|c| col_width(app, *c)).sum::<f32>() + 12.0;
     let manual = app.is_manual_playlist();
-    egui::ScrollArea::horizontal().id_salt("hscroll").auto_shrink([false, false]).show(&mut aui, |ui| {
+    egui::ScrollArea::horizontal().id_salt("hscroll").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(&mut aui, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         let w = total_w.max(ui.available_width());
         // header: 13.5 pt, #1E1E1E, white 11 pt labels, sort column in blue with an arrow
@@ -1585,7 +1622,10 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         }
         let n = app.list.len();
         let rh = row_height(app);
-        let mut sa = egui::ScrollArea::vertical().id_salt("vscroll").auto_shrink([false, false]);
+        let mut sa = egui::ScrollArea::vertical().id_salt("vscroll").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+        if let Some(y) = app.list_scroll_to.take() {
+            sa = sa.vertical_scroll_offset(y);
+        }
         if app.scroll_to_selected {
             if let Some(i) = app.anchor {
                 let h = ui.available_height();
@@ -1607,7 +1647,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             app.scroll_to_selected = false;
         }
         let mut drop_line: Option<usize> = None;
-        sa.show_rows(ui, rh, n, |ui, range| {
+        let vout = sa.show_rows(ui, rh, n, |ui, range| {
             for i in range {
                 let id = app.list[i];
                 let Some(t) = app.track(id).cloned() else { continue };
@@ -1691,6 +1731,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                 });
             }
         });
+        vstate = Some((vout.inner_rect, vout.state.offset.y, vout.content_size.y));
         // Reorder inside a playlist (only when sorted by #)
         if let (Some(pl), Some(to), Some(ids)) = (manual, drop_line, app.drag.clone()) {
             if ui.input(|i| i.pointer.any_released()) && app.prefs.sort_col == Col::Num && app.prefs.sort_asc && app.search.is_empty() {
@@ -1699,6 +1740,28 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+    // The fixed vertical scroll bar (stays put when the columns scroll sideways).
+    if let Some((inner, off, content_h)) = vstate {
+        let track = Rect::from_min_max(pos2(vbar_x, area.min.y + 13.5), pos2(r.max.x, inner.max.y));
+        let p = ui.painter();
+        p.rect_filled(track, 0.0, Color32::BLACK);
+        let view_h = inner.height().max(1.0);
+        if content_h > view_h + 0.5 {
+            let len = (track.height() * view_h / content_h).max(16.0).min(track.height());
+            let max_off = (content_h - view_h).max(1.0);
+            let y0 = track.min.y + (track.height() - len) * (off / max_off).clamp(0.0, 1.0);
+            let thumb = Rect::from_min_size(pos2(track.min.x + 2.0, y0), vec2(6.5, len));
+            let resp = ui.interact(track, ui.id().with("list_vbar"), Sense::click_and_drag());
+            p.rect_filled(thumb, 0.0, if resp.dragged() { hex(0x5A5A5A) } else if resp.hovered() { hex(0x4A4A4A) } else { hex(0x323232) });
+            if resp.dragged() || resp.clicked() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let f = ((pp.y - track.min.y - len / 2.0) / (track.height() - len).max(1.0)).clamp(0.0, 1.0);
+                    app.list_scroll_to = Some(f * max_off);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
     // Files dropped from Finder
     let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
     if !dropped.is_empty() {
@@ -1787,7 +1850,7 @@ fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect) {
                 ui.painter().rect_filled(rr, 0.0, BG2.gamma_multiply(0.5));
             }
             let mut x = rr.min.x + 8.0;
-            let texts = [t.display_title(), t.artist.clone(), if t.bpm > 0.0 { format!("{:.2}", t.bpm) } else { String::new() }, key_name(t.key, alnum), if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }];
+            let texts = [t.display_title(), t.artist.clone(), if t.bpm > 0.0 { format!("{:.2}", t.bpm) } else { String::new() }, t.key_label(alnum), if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }];
             for ((_, w, right), txt) in cols.iter().zip(texts) {
                 let cell = Rect::from_min_size(pos2(x, rr.min.y), vec2(*w - 6.0, rr.height()));
                 let p = ui.painter().with_clip_rect(cell);
@@ -1995,7 +2058,7 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
             }
         }
         Col::Time => txt(if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }),
-        Col::Key => txt(key_name(t.key, app.prefs.key_alnum)),
+        Col::Key => txt(t.key_label(app.prefs.key_alnum)),
         Col::DateAdded => txt(t.date_added.get(..10).unwrap_or(&t.date_added).to_string()),
         Col::Color => {
             if t.color > 0 {
