@@ -6,7 +6,7 @@ An unofficial, open-source macOS app for getting ready for a DJ set: organise yo
 
 ## Status
 
-**Studying how rekordbox behaves (no app code yet)**
+**Building**
 
 No app code has been written yet.
 
