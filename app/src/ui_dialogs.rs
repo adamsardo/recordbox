@@ -146,12 +146,9 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     ui.add_space(4.0);
                     for (i, t) in tabs.iter().enumerate() {
-                        let disabled = app.dialogs.prefs_tab == 1 && i == 1;
                         let sel = sub_tab == i;
-                        let b = egui::Button::new(RichText::new(*t).size(14.0).color(if sel { WHITE } else if disabled { OFF } else { DIM2 })).fill(if sel { BLUE } else { BG2 }).corner_radius(0.0).min_size(vec2(0.0, 30.0));
-                        let r = ui.add(b);
-                        let r = if disabled { r.on_hover_text("Automatic cue analysis is not part of this app.") } else { r };
-                        if r.clicked() && !disabled {
+                        let b = egui::Button::new(RichText::new(*t).size(14.0).color(if sel { WHITE } else { DIM2 })).fill(if sel { BLUE } else { BG2 }).corner_radius(0.0).min_size(vec2(0.0, 30.0));
+                        if ui.add(b).clicked() {
                             sub_tab = i;
                         }
                     }
@@ -239,6 +236,12 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             card(ui, "Vocal", |ui| {
                                 toggle(ui, &mut app.prefs.show_vocal, "Show vocal positions above the overview waveform");
                                 ui.label(RichText::new("From rekordbox's vocal detection, for tracks it analysed.").size(11.0).color(DIM));
+                            });
+                        }
+                        (1, 1) => {
+                            card(ui, "CUE Analysis", |ui| {
+                                toggle(ui, &mut app.prefs.auto_first_downbeat_cue, "Set Hot Cue A on the first downbeat (\"1.1Bars\") when a track is analysed");
+                                ui.label(RichText::new("As rekordbox does on first analysis. Only for tracks that have no cues yet; tracks from your rekordbox library keep their own cues.").size(11.0).color(DIM));
                             });
                         }
                         (1, _) => {

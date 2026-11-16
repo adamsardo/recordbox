@@ -72,7 +72,8 @@ pub fn open_snapshot(db: &Path) -> Result<rusqlite::Connection> {
         return Err(anyhow!("the rekordbox library is empty or unreadable"));
     }
     // A copy taken while rekordbox was writing could be inconsistent: check it first.
-    let check: String = c.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_default();
+    // Full integrity check (also verifies index contents, unlike quick_check).
+    let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap_or_default();
     if check != "ok" {
         return Err(anyhow!("the copy of the rekordbox library failed its integrity check ({check}); try again with rekordbox closed"));
     }
@@ -637,5 +638,24 @@ mod onelibrary_probe {
             }
             Err(e) => println!("not opened: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cue_origin_probe {
+    /// When were the user's cues created relative to the track's analysis? Run with --ignored.
+    #[test]
+    #[ignore]
+    fn cue_creation_times() {
+        let Some(src) = super::library_dir() else { return };
+        let dest = std::env::temp_dir().join(format!("prepdeck_cue_origin_{}", std::process::id()));
+        let c = super::open_snapshot(&super::snapshot(&src, &dest).unwrap()).unwrap();
+        let mut st = c.prepare("SELECT k.Kind, k.Comment, k.ColorTableIndex, k.created_at, c.created_at, c.updated_at, c.AnalysisUpdated FROM djmdCue k JOIN djmdContent c ON c.ID = k.ContentID WHERE k.rb_local_deleted = 0 LIMIT 12").unwrap();
+        for r in st.query_map([], |r| Ok((0..7).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
+            println!("cue: {r}");
+        }
+        let n: i64 = c.query_row("SELECT count(DISTINCT substr(created_at,1,16)) FROM djmdCue WHERE rb_local_deleted = 0", [], |r| r.get(0)).unwrap();
+        println!("distinct creation minutes: {n}");
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

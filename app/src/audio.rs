@@ -200,6 +200,8 @@ impl Default for PlayState {
 
 pub struct Player {
     pub state: Arc<Mutex<PlayState>>,
+    /// Set by the stream when its device stops working (unplugged, switched off).
+    pub lost: Arc<std::sync::atomic::AtomicBool>,
     _stream: Option<cpal::Stream>,
     pub device_rate: u32,
     pub error: Option<String>,
@@ -213,9 +215,10 @@ impl Player {
     /// Open the named output device (None: the system's default output).
     pub fn with_device(device: Option<&str>) -> Player {
         let state = Arc::new(Mutex::new(PlayState::default()));
-        match Self::open_stream(state.clone(), device) {
-            Ok((s, rate)) => Player { state, _stream: Some(s), device_rate: rate, error: None },
-            Err(e) => Player { state, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match Self::open_stream(state.clone(), device, lost.clone()) {
+            Ok((s, rate)) => Player { state, lost, _stream: Some(s), device_rate: rate, error: None },
+            Err(e) => Player { state, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
         }
     }
 
@@ -246,14 +249,15 @@ impl Player {
 
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
-        let (s, rate) = Self::open_stream(self.state.clone(), device)?;
+        let (s, rate) = Self::open_stream(self.state.clone(), device, self.lost.clone())?;
+        self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
         self._stream = Some(s);
         self.device_rate = rate;
         self.error = None;
         Ok(())
     }
 
-    fn open_stream(state: Arc<Mutex<PlayState>>, device: Option<&str>) -> Result<(cpal::Stream, u32)> {
+    fn open_stream(state: Arc<Mutex<PlayState>>, device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
@@ -268,24 +272,40 @@ impl Player {
         let config: cpal::StreamConfig = cfg.clone().into();
         let st = state.clone();
         let stream = match cfg.sample_format() {
-            cpal::SampleFormat::F32 => dev.build_output_stream(
+            cpal::SampleFormat::F32 => {
+                let lost = lost.clone();
+                dev.build_output_stream(
                 &config,
                 move |data: &mut [f32], _| render(&st, data, channels, rate),
-                |e| eprintln!("audio error: {e}"),
+                move |e| {
+                    eprintln!("audio error: {e}");
+                    if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                        lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
                 None,
-            )?,
+            )?
+            }
             _ => {
                 let st2 = st.clone();
+                // Scratch buffer reused across callbacks (no allocation on the audio thread once
+                // it has reached the device's buffer size).
+                let mut tmp: Vec<f32> = Vec::with_capacity(8192);
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [i16], _| {
-                        let mut tmp = vec![0f32; data.len()];
+                        tmp.resize(data.len(), 0.0);
                         render(&st2, &mut tmp, channels, rate);
-                        for (d, s) in data.iter_mut().zip(tmp) {
+                        for (d, s) in data.iter_mut().zip(tmp.iter().copied()) {
                             *d = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                         }
                     },
-                    |e| eprintln!("audio error: {e}"),
+                    move |e| {
+                        eprintln!("audio error: {e}");
+                        if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                            lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    },
                     None,
                 )?
             }

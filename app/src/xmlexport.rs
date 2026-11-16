@@ -75,7 +75,41 @@ pub fn track_attrs(t: &Track) -> Vec<(&'static str, String)> {
 /// with the imported text (precision, key spelling, URL encoding, absent attributes); edited
 /// fields are written from PrepDeck's value; unknown attributes follow.
 pub fn track_line(t: &Track, extra: &crate::importer::XmlExtra) -> String {
-    let mut line = format!("    <TRACK TrackID=\"{}\"", t.id);
+    track_line_id(t, extra, &t.id.to_string())
+}
+
+/// TrackIDs for export: each imported track keeps the ID its XML gave it when no other track
+/// already has it; the rest use PrepDeck's own ID, or the next free number on a clash.
+pub fn export_ids(tracks: &[(i64, String)]) -> std::collections::HashMap<i64, String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = std::collections::HashMap::new();
+    for (id, xml) in tracks {
+        if !xml.is_empty() && used.insert(xml.clone()) {
+            out.insert(*id, xml.clone());
+        }
+    }
+    let mut next = used.iter().filter_map(|v| v.parse::<i64>().ok()).max().unwrap_or(0).max(tracks.iter().map(|t| t.0).max().unwrap_or(0)) + 1;
+    for (id, _) in tracks {
+        if out.contains_key(id) {
+            continue;
+        }
+        let own = id.to_string();
+        let v = if used.insert(own.clone()) {
+            own
+        } else {
+            while used.contains(&next.to_string()) {
+                next += 1;
+            }
+            used.insert(next.to_string());
+            next.to_string()
+        };
+        out.insert(*id, v);
+    }
+    out
+}
+
+pub fn track_line_id(t: &Track, extra: &crate::importer::XmlExtra, id: &str) -> String {
+    let mut line = format!("    <TRACK TrackID=\"{}\"", esc(id));
     for (k, v) in track_attrs(t) {
         let v = extra.orig.iter().find(|o| o.0 == k && o.2 == v).map(|o| o.1.clone()).unwrap_or(v);
         if v == ABSENT || (k == "Colour" && v.is_empty()) {
@@ -93,58 +127,34 @@ pub fn build(app: &App) -> String {
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DJ_PLAYLISTS Version=\"1.0.0\">\n");
     x.push_str("  <PRODUCT Name=\"PrepDeck\" Version=\"1.0\" Company=\"\"/>\n");
     x.push_str(&format!("  <COLLECTION Entries=\"{}\">\n", app.tracks.len()));
+    let extras: std::collections::HashMap<i64, crate::importer::XmlExtra> = app.tracks.iter().map(|t| (t.id, app.db.xml_extra(t.id))).collect();
+    let ids = export_ids(&app.tracks.iter().map(|t| (t.id, extras[&t.id].xml_id.clone())).collect::<Vec<_>>());
     for t in &app.tracks {
         // Fields PrepDeck doesn't model, and original text of unchanged fields, as imported.
-        let extra = app.db.xml_extra(t.id);
-        x.push_str(&track_line(t, &extra));
-        let (_, extra_nodes) = extra_xml(&extra, "      ");
-        if let Some(g) = app.db.grid(t.id) {
-            // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
-            let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
-            let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
-            for i in tempo_select(&recs, BRIDGE_EXPORT_BEAT_GRID) {
-                let (beat, bpm, ms) = recs[i];
-                x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", ms as f64 * 0.001, bpm as f64 * 0.01, beat));
-            }
-        }
-        for c in app.db.cues(t.id).unwrap_or_default() {
-            // rekordbox's XML writer emits numbered cues for slots A–H only (rekordbox-rea XML-003).
-            if c.kind == CueKind::Hot && !(0..8).contains(&c.slot) {
-                continue;
-            }
-            let num = if c.kind == CueKind::Hot { c.slot } else { -1 };
-            // As rekordbox's writer: Type 4 and End whenever End is non-zero (rekordbox-rea XML-003;
-            // the colour helper alone uses end > start).
-            let end_ms = c.end.map(|e| (e * 1000.0).round() as i64).unwrap_or(0);
-            let ty = if end_ms != 0 { 4 } else { 0 };
-            let end = if end_ms != 0 { format!(" End=\"{:.3}\"", c.end.unwrap()) } else { String::new() };
-            let rgb = if c.kind == CueKind::Hot {
-                let [r, g, b] = hotcue_rgb(c.color);
-                format!(" Red=\"{r}\" Green=\"{g}\" Blue=\"{b}\"")
-            } else {
-                String::new()
-            };
-            x.push_str(&format!("      <POSITION_MARK Name=\"{}\" Type=\"{}\" Start=\"{:.3}\"{} Num=\"{}\"{}/>\n", esc(&c.comment), ty, c.start, end, num, rgb));
-        }
+        let extra = &extras[&t.id];
+        x.push_str(&track_line_id(t, extra, &ids[&t.id]));
+        let (_, extra_nodes) = extra_xml(extra, "      ");
+        x.push_str(&track_children(t, extra, app.db.grid(t.id), app.db.cues(t.id).unwrap_or_default()));
         x.push_str(&extra_nodes);
         x.push_str("    </TRACK>\n");
     }
     x.push_str("  </COLLECTION>\n  <PLAYLISTS>\n");
-    fn node(app: &App, parent: i64, depth: usize, x: &mut String) {
+    fn node(app: &App, ids: &std::collections::HashMap<i64, String>, parent: i64, depth: usize, x: &mut String) {
         for n in app.nodes.iter().filter(|n| n.parent == parent) {
             let pad = "  ".repeat(depth + 3);
             match n.kind {
                 NodeKind::Folder => {
                     let count = app.nodes.iter().filter(|c| c.parent == n.id).count();
                     x.push_str(&format!("{pad}<NODE Type=\"0\" Name=\"{}\" Count=\"{}\">\n", esc(&n.name), count));
-                    node(app, n.id, depth + 1, x);
+                    node(app, ids, n.id, depth + 1, x);
                     x.push_str(&format!("{pad}</NODE>\n"));
                 }
                 _ => {
                     let tracks = if n.kind == NodeKind::Smart { n.smart.as_ref().map(|r| app.smart_tracks(r)).unwrap_or_default() } else { app.db.playlist_tracks(n.id).unwrap_or_default() };
                     x.push_str(&format!("{pad}<NODE Name=\"{}\" Type=\"1\" KeyType=\"0\" Entries=\"{}\">\n", esc(&n.name), tracks.len()));
                     for t in tracks {
-                        x.push_str(&format!("{pad}  <TRACK Key=\"{t}\"/>\n"));
+                        let key = ids.get(&t).cloned().unwrap_or_else(|| t.to_string());
+                        x.push_str(&format!("{pad}  <TRACK Key=\"{}\"/>\n", esc(&key)));
                     }
                     x.push_str(&format!("{pad}</NODE>\n"));
                 }
@@ -153,7 +163,7 @@ pub fn build(app: &App) -> String {
     }
     let top = app.nodes.iter().filter(|n| n.parent == 0).count();
     x.push_str(&format!("    <NODE Type=\"0\" Name=\"ROOT\" Count=\"{top}\">\n"));
-    node(app, 0, 0, &mut x);
+    node(app, &ids, 0, 0, &mut x);
     x.push_str("    </NODE>\n  </PLAYLISTS>\n</DJ_PLAYLISTS>\n");
     x
 }
@@ -198,6 +208,21 @@ pub fn tempo_keep(records: &[(u16, u16, u32)]) -> Vec<usize> {
         from_prev = ms as f64 + interval;
     }
     out
+}
+
+#[cfg(test)]
+mod id_tests {
+    #[test]
+    fn imported_ids_kept_without_clashes() {
+        // Track 5 was imported as 1; native track 1 must then take another number.
+        let ids = super::export_ids(&[(1, String::new()), (5, "1".into()), (6, "77".into()), (7, "77".into())]);
+        assert_eq!(ids[&5], "1");
+        assert_eq!(ids[&6], "77");
+        assert_ne!(ids[&1], "1");
+        assert_ne!(ids[&7], "77");
+        let all: std::collections::HashSet<&String> = ids.values().collect();
+        assert_eq!(all.len(), 4);
+    }
 }
 
 #[cfg(test)]
@@ -297,4 +322,55 @@ pub fn extra_xml(e: &crate::importer::XmlExtra, pad: &str) -> (String, String) {
         .map(|(tag, a)| format!("{pad}<{tag}{}/>\n", a.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect::<String>()))
         .collect();
     (attrs, nodes)
+}
+
+/// A TRACK's TEMPO and cue POSITION_MARK elements: the imported originals while the grid /
+/// cues are unchanged since an XML import, else from PrepDeck's data as rekordbox writes them.
+pub fn track_children(t: &Track, extra: &crate::importer::XmlExtra, grid: Option<BeatGrid>, cues: Vec<Cue>) -> String {
+    let mut x = String::new();
+        let raw = |attrs: &Vec<(String, String)>, tag: &str| format!("      <{tag}{}/>\n", attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect::<String>());
+        if !extra.tempo.is_empty() && crate::importer::grid_fingerprint(&grid) == extra.grid_fp {
+            // Grid unchanged since the XML import: the original TEMPO elements, as written.
+            for a in &extra.tempo {
+                x.push_str(&raw(a, "TEMPO"));
+            }
+        } else if let Some(g) = grid {
+            // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
+            let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
+            let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
+            for i in tempo_select(&recs, BRIDGE_EXPORT_BEAT_GRID) {
+                let (beat, bpm, ms) = recs[i];
+                x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", ms as f64 * 0.001, bpm as f64 * 0.01, beat));
+            }
+        }
+        let marks_unchanged = !extra.marks.is_empty() && crate::importer::cues_fingerprint(&cues) == extra.cues_fp;
+        if marks_unchanged {
+            // Cues unchanged since the XML import: the original elements, as written.
+            for a in &extra.marks {
+                x.push_str(&raw(a, "POSITION_MARK"));
+            }
+        }
+        for c in cues.into_iter().filter(|_| !marks_unchanged) {
+            // rekordbox's XML writer emits numbered cues for slots A–H only (rekordbox-rea XML-003).
+            if c.kind == CueKind::Hot && !(0..8).contains(&c.slot) {
+                continue;
+            }
+            let num = if c.kind == CueKind::Hot { c.slot } else { -1 };
+            // As rekordbox's writer: Type 4 and End whenever End is non-zero (rekordbox-rea XML-003;
+            // the colour helper alone uses end > start).
+            let end_ms = c.end.map(|e| (e * 1000.0).round() as i64).unwrap_or(0);
+            let ty = if end_ms != 0 { 4 } else { 0 };
+            let end = if end_ms != 0 { format!(" End=\"{:.3}\"", c.end.unwrap()) } else { String::new() };
+            let rgb = if c.kind == CueKind::Hot {
+                // An uncoloured hot cue gets its slot's default (loops their own), as rekordbox's
+                // writer asks its default-colour helper (rekordbox-rea native-xml-trace §1).
+                let idx = if (1..=64).contains(&c.color) { c.color } else { crate::model::hotcue_default_color(c.slot, c.is_loop()) };
+                let [r, g, b] = hotcue_rgb(idx);
+                format!(" Red=\"{r}\" Green=\"{g}\" Blue=\"{b}\"")
+            } else {
+                String::new()
+            };
+            x.push_str(&format!("      <POSITION_MARK Name=\"{}\" Type=\"{}\" Start=\"{:.3}\"{} Num=\"{}\"{}/>\n", esc(&c.comment), ty, c.start, end, num, rgb));
+        }
+    x
 }

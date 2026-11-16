@@ -90,16 +90,27 @@ impl Db {
             CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL, path TEXT NOT NULL,
                 title TEXT NOT NULL, artist TEXT NOT NULL, removed_at INTEGER NOT NULL, json TEXT NOT NULL, wave BLOB, preview BLOB);",
         )?;
-        // Columns added after the first release.
-        let has_raw: bool = conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_ok();
-        if !has_raw {
-            conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
+        // Columns added after the first release, and the version stamp, in one transaction:
+        // an interrupted upgrade leaves the library as it was (a backup was taken above).
+        conn.execute_batch("BEGIN")?;
+        let migrate = (|| -> Result<()> {
+            if conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_err() {
+                conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
+            }
+            // Set when the user chose the key; analysis then never replaces it.
+            if conn.prepare("SELECT key_manual FROM tracks LIMIT 0").is_err() {
+                conn.execute_batch("ALTER TABLE tracks ADD COLUMN key_manual INTEGER DEFAULT 0;")?;
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            Ok(())
+        })();
+        match migrate {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
-        // Set when the user chose the key; analysis then never replaces it.
-        if conn.prepare("SELECT key_manual FROM tracks LIMIT 0").is_err() {
-            conn.execute_batch("ALTER TABLE tracks ADD COLUMN key_manual INTEGER DEFAULT 0;")?;
-        }
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         let db = Db { conn };
         db.seed_mytags()?;
         Ok(db)

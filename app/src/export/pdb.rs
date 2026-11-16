@@ -444,3 +444,31 @@ mod tests {
         assert_eq!(row_string(r, 8, 0, false), "Artist 39");
     }
 }
+
+#[cfg(test)]
+mod table_census {
+    /// Rows per table type in real rekordbox exports (fixtures). Run with --ignored.
+    #[test]
+    #[ignore]
+    fn row_counts() {
+        let root = dirs::home_dir().unwrap().join("Developer/rekordbox-rea/analysis/format-oracles");
+        let mut stack = vec![root];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.file_name().map(|n| n == "export.pdb" || n == "exportExt.pdb").unwrap_or(false) {
+                    let Ok(db) = super::Database::parse(std::fs::read(&p).unwrap()) else { continue };
+                    let counts: Vec<String> = (0..30).filter_map(|t| { let n = db.rows(t).len(); (n > 0).then(|| format!("{t}:{n}")) }).collect();
+                    for (h, o) in db.rows(19) {
+                        let r = db.row_bytes(h, o);
+                        println!("  table19 head {:?}", &r[..32.min(r.len())]);
+                    }
+                    println!("{} -> {}", p.display().to_string().split("format-oracles/").nth(1).unwrap_or(""), counts.join(" "));
+                }
+            }
+        }
+    }
+}

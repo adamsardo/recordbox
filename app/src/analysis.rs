@@ -987,3 +987,34 @@ mod ground_truth {
         }
     }
 }
+
+#[cfg(test)]
+mod edge_input_tests {
+    use super::*;
+
+    fn dec(samples: Vec<f32>) -> Decoded {
+        let n = samples.len() / 2;
+        Decoded { sr: 44100, samples, raw_frames: n }
+    }
+
+    /// Silence, a single frame, an impulse and antiphase stereo analyse without panicking and
+    /// without inventing tempo, key or loudness.
+    #[test]
+    fn degenerate_inputs() {
+        let s = AnalysisSettings::default();
+        let silent = analyze_decoded(&dec(vec![0.0; 44100 * 2 * 10]), &s);
+        assert!(silent.gain_db.is_nan(), "silence has no loudness");
+        assert!(silent.key < 0, "silence has no key");
+        let one = analyze_decoded(&dec(vec![0.1, 0.1]), &s);
+        assert!(one.gain_db.is_nan() && one.duration < 0.001);
+        let mut imp = vec![0.0f32; 44100 * 2 * 5];
+        imp[44100] = 1.0;
+        imp[44101] = 1.0;
+        let r = analyze_decoded(&dec(imp), &s);
+        assert!(r.duration > 4.9);
+        // Antiphase: the mono mix cancels, but loudness (per channel) does not.
+        let anti: Vec<f32> = (0..44100 * 10).flat_map(|i| { let v = 0.1 * (i as f32 * 0.142).sin(); [v, -v] }).collect();
+        let a = analyze_decoded(&dec(anti), &s);
+        assert!(a.gain_db.is_finite());
+    }
+}

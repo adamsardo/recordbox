@@ -156,6 +156,28 @@ const KEY: [u8; 19] = [0xCB, 0xE1, 0xEE, 0xFA, 0xE5, 0xEE, 0xAD, 0xEE, 0xE9, 0xD
 
 /// XOR the data part of a PSSI section (everything after the entry count) with rekordbox 6's
 /// mask. Applying it twice restores the original.
+/// Name of a phrase kind (high-mood labels).
+pub fn kind_name(kind: u16) -> &'static str {
+    match kind {
+        INTRO => "Intro",
+        UP => "Up",
+        DOWN => "Down",
+        CHORUS => "Chorus",
+        OUTRO => "Outro",
+        _ => "Phrase",
+    }
+}
+
+/// Suggested memory cues: the start of each phrase after the first, named after the phrase
+/// it starts (provenance: phrase analysis). Times come from the grid's beats.
+pub fn cue_proposals(s: &Structure, beats: &[Beat]) -> Vec<(f64, &'static str)> {
+    s.phrases
+        .iter()
+        .filter(|p| p.beat > 1)
+        .filter_map(|p| beats.get(p.beat as usize - 1).map(|b| (b.time, kind_name(p.kind))))
+        .collect()
+}
+
 pub fn mask_section(section: &mut [u8]) {
     if section.len() < 18 || &section[..4] != b"PSSI" {
         return;
@@ -242,6 +264,69 @@ mod tests {
 
     /// Compare PrepDeck's phrases with rekordbox's for the user's library, on rekordbox's own
     /// grids. PREPDECK_ANLZ_PAIRS = tsv "audio path\trekordbox ANLZ base". Run with --ignored.
+    #[test]
+    #[ignore]
+    fn cue_proposal_benchmark() {
+        // How well phrase-start proposals match the cues the user set in rekordbox (hot and
+        // memory, read from rekordbox's own files): recall = user cues within one beat of a
+        // proposal, precision = proposals within one beat of a user cue. rekordbox's own phrase
+        // starts are scored the same way for reference.
+        // The user's cues come from a snapshot of the rekordbox library (the original is not
+        // touched); rekordbox keeps cues in master.db, not in its analysis files.
+        let dest = std::env::temp_dir().join(format!("prepdeck_cuebench_{}", std::process::id()));
+        let Ok(Some(lib)) = crate::rbimport::load_installed(&dest) else { return };
+        let rows: Vec<(String, String, Vec<f64>)> = lib
+            .tracks
+            .iter()
+            .filter_map(|t| Some((t.xt.track.path.clone(), t.anlz_base.as_ref()?.to_string_lossy().to_string(), t.xt.cues.iter().map(|c| c.start).collect::<Vec<f64>>())))
+            .filter(|r| !r.2.is_empty())
+            .collect();
+        let res = std::sync::Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            for ch in rows.chunks((rows.len() / 8).max(1)) {
+                let res = &res;
+                sc.spawn(move || {
+                    for (audio, base, user) in ch {
+                        let dat = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.DAT")));
+                        let Some(q) = dat.get("PQTZ") else { continue };
+                        let n = u32::from_be_bytes(q[20..24].try_into().unwrap()) as usize;
+                        let beats: Vec<Beat> = (0..n).map(|k| {
+                            let o = 24 + k * 8;
+                            Beat { time: u32::from_be_bytes(q[o + 4..o + 8].try_into().unwrap()) as f64 / 1000.0, bpm: u16::from_be_bytes([q[o + 2], q[o + 3]]) as f64 / 100.0, beat: u16::from_be_bytes([q[o], q[o + 1]]) as u8, index: k }
+                        }).collect();
+                        let beat_len = 60.0 / beats.first().map(|b| b.bpm).unwrap_or(120.0).max(1.0);
+                        if std::env::var("PREPDECK_CUE_DUMP2").is_ok() {
+                            let down = beats.iter().find(|b| b.beat == 1).map(|b| b.time).unwrap_or(-1.0);
+                            for u in user.iter() {
+                                eprintln!("cue2 at_first_downbeat={} at_first_beat={}", (u - down).abs() < 0.002, (u - beats[0].time).abs() < 0.002);
+                            }
+                        }
+                        if std::env::var("PREPDECK_CUE_DUMP").is_ok() {
+                            let first = beats.first().map(|b| b.time).unwrap_or(0.0);
+                            eprintln!("cues {:?} first beat {:.3}", user.iter().map(|u| format!("{:.2}s (beat {:.1})", u, (u - first) / beat_len)).collect::<Vec<_>>(), first);
+                        }
+                        let Ok(d) = crate::audio::decode_file(audio) else { continue };
+                        let Some(mine) = analyze(&d.mono(), d.sr as f64, &beats) else { continue };
+                        let ours: Vec<f64> = cue_proposals(&mine, &beats).iter().map(|p| p.0).collect();
+                        let rb_ext = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.EXT")));
+                        let theirs: Vec<f64> = rb_ext.get("PSSI").and_then(|s| parse(s)).map(|s| cue_proposals(&s, &beats).iter().map(|p| p.0).collect()).unwrap_or_default();
+                        let near = |a: &[f64], t: f64| a.iter().any(|x| (x - t).abs() <= beat_len * 1.01);
+                        let score = |props: &[f64]| (user.iter().filter(|u| near(props, **u)).count(), props.iter().filter(|p| near(&user, **p)).count(), props.len());
+                        res.lock().unwrap().push((user.len(), score(&ours), score(&theirs)));
+                    }
+                });
+            }
+        });
+        let r = res.into_inner().unwrap();
+        let users: usize = r.iter().map(|x| x.0).sum();
+        let sum = |f: &dyn Fn(&(usize, (usize, usize, usize), (usize, usize, usize))) -> (usize, usize, usize)| r.iter().map(f).fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+        let o = sum(&|x| x.1);
+        let t = sum(&|x| x.2);
+        eprintln!("{} tracks, {users} user cues", r.len());
+        eprintln!("PrepDeck phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * o.0 as f64 / users as f64, 100.0 * o.1 as f64 / o.2.max(1) as f64, o.2);
+        eprintln!("rekordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * t.0 as f64 / users as f64, 100.0 * t.1 as f64 / t.2.max(1) as f64, t.2);
+    }
+
     #[test]
     #[ignore]
     fn phrase_benchmark() {

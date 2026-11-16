@@ -450,8 +450,11 @@ pub fn save(path: &Path, s: &Stems) -> Result<()> {
     for v in &s.data {
         f.write_all(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())?;
     }
-    f.flush()?;
-    drop(f);
+    // On disk before it gets its final name, so a crash can't leave a short cache file that
+    // looks complete.
+    let file = f.into_inner().map_err(|e| anyhow!("{e}"))?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

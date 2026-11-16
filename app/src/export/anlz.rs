@@ -374,6 +374,40 @@ pub fn read_section_list(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     std::fs::read(path).map(|b| section_list(&b)).unwrap_or_default()
 }
 
+/// Sections of a file on a drive, only when its framing is valid (a damaged file's pieces are
+/// not carried into a new one).
+pub fn read_valid_section_list(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    match std::fs::read(path) {
+        Ok(b) if validate(&b).is_ok() => section_list(&b),
+        _ => vec![],
+    }
+}
+
+/// Check an ANLZ file's framing: the PMAI header (28 bytes, declared total = file length) and
+/// every section's header and total lengths lying inside the file and tiling it exactly.
+pub fn validate(b: &[u8]) -> Result<(), String> {
+    let be32 = |o: usize| -> Option<usize> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize) };
+    if b.len() < 28 || &b[..4] != b"PMAI" {
+        return Err("not an analysis file".into());
+    }
+    let (hl, total) = (be32(4).unwrap_or(0), be32(8).unwrap_or(0));
+    if hl != 28 {
+        return Err(format!("header length {hl}, expected 28"));
+    }
+    if total != b.len() {
+        return Err(format!("declares {total} bytes, file has {}", b.len()));
+    }
+    let mut i = hl;
+    while i < b.len() {
+        let (Some(shl), Some(st)) = (be32(i + 4), be32(i + 8)) else { return Err(format!("section at {i} is cut short")) };
+        if st < 12 || shl < 12 || shl > st || i + st > b.len() {
+            return Err(format!("section {} at {i} has header {shl} / total {st} outside the file", String::from_utf8_lossy(&b[i..(i + 4).min(b.len())])));
+        }
+        i += st;
+    }
+    Ok(())
+}
+
 /// Every top-level section of ANLZ file bytes, in order.
 pub fn section_list(b: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
@@ -447,7 +481,8 @@ pub fn parse_cues(ext: &[(String, Vec<u8>)], dat: &[(String, Vec<u8>)]) -> Vec<C
     if !pco2.is_empty() {
         for sec in pco2 {
             for e in entries(sec) {
-                if &e[..4] != b"PCP2" || e.len() < 44 {
+                // Only point cues (1) and loops (2) are known entry types.
+                if &e[..4] != b"PCP2" || e.len() < 44 || !matches!(e[16], 1 | 2) {
                     continue;
                 }
                 let hot = be32(&e, 12).unwrap_or(0);
@@ -462,7 +497,7 @@ pub fn parse_cues(ext: &[(String, Vec<u8>)], dat: &[(String, Vec<u8>)]) -> Vec<C
     }
     for (_, sec) in dat.iter().filter(|(t, _)| t == "PCOB") {
         for e in entries(sec) {
-            if &e[..4] != b"PCPT" || e.len() < 40 {
+            if &e[..4] != b"PCPT" || e.len() < 40 || !matches!(e[28], 1 | 2) {
                 continue;
             }
             let hot = be32(&e, 12).unwrap_or(0);
@@ -641,6 +676,17 @@ mod tests {
         let mut moved = cues.clone();
         moved[1].start = 2.6;
         assert_ne!(local_cue_fingerprint(&moved), local_cue_fingerprint(&cues));
+    }
+
+    #[test]
+    fn validates_framing() {
+        let w = Waveform { frames: vec![[10; 8]; 50] };
+        let f = build("/a.mp3", &[], &w, &[], 0, 44100);
+        assert!(validate(&f.dat).is_ok() && validate(&f.ext).is_ok() && validate(&f.ex2).is_ok());
+        assert!(validate(&f.dat[..f.dat.len() - 3]).is_err());
+        let mut bad = f.ext.clone();
+        bad[28 + 8..28 + 12].copy_from_slice(&9_999_999u32.to_be_bytes());
+        assert!(validate(&bad).is_err());
     }
 
     #[test]

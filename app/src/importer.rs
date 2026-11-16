@@ -137,11 +137,38 @@ pub struct XmlExtra {
     /// while the field is unedited.
     #[serde(default)]
     pub orig: Vec<(String, String, String)>,
+    /// The TEMPO and cue POSITION_MARK elements as imported (all attributes, in order), with
+    /// fingerprints of the grid and cues they became: while those are unchanged, export writes
+    /// the original elements (meter, precision and unknown attributes kept).
+    #[serde(default)]
+    pub tempo: Vec<Vec<(String, String)>>,
+    #[serde(default)]
+    pub marks: Vec<Vec<(String, String)>>,
+    #[serde(default)]
+    pub grid_fp: String,
+    #[serde(default)]
+    pub cues_fp: String,
+    /// The TrackID the XML gave this track (written back when free, so playlists made
+    /// elsewhere keep referring to the same IDs).
+    #[serde(default)]
+    pub xml_id: String,
+}
+
+/// Fingerprint of a beat grid for "unchanged since import".
+pub fn grid_fingerprint(g: &Option<crate::model::BeatGrid>) -> String {
+    serde_json::to_string(g).unwrap_or_default()
+}
+
+/// Fingerprint of a track's cues (ids aside) for "unchanged since import".
+pub fn cues_fingerprint(cues: &[Cue]) -> String {
+    let mut v: Vec<String> = cues.iter().map(|c| format!("{:?}|{}|{:.6}|{:?}|{}|{}", c.kind, c.slot, c.start, c.end.map(|e| (e * 1e6).round() as i64), c.color, c.comment)).collect();
+    v.sort();
+    v.join("\n")
 }
 
 impl XmlExtra {
     pub fn is_empty(&self) -> bool {
-        self.attrs.is_empty() && self.nodes.is_empty() && self.orig.is_empty()
+        self.attrs.is_empty() && self.nodes.is_empty() && self.orig.is_empty() && self.tempo.is_empty() && self.marks.is_empty() && self.xml_id.is_empty()
     }
 }
 
@@ -165,6 +192,8 @@ pub struct XmlNode {
 pub struct XmlLibrary {
     pub tracks: Vec<XmlTrack>,
     pub playlists: Vec<XmlNode>,
+    /// Problems found while reading (bad escapes, count mismatches), for the import report.
+    pub warnings: Vec<String>,
 }
 
 pub fn decode_location(loc: &str) -> String {
@@ -195,6 +224,8 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
     let mut in_collection = false;
     let mut cur: Option<XmlTrack> = None;
     let mut tempos: Vec<(f64, f64, u8)> = vec![];
+    let mut bad_attrs = 0usize;
+    let mut declared: Option<usize> = None;
     loop {
         let ev = reader.read_event()?;
         let (e, empty) = match &ev {
@@ -237,16 +268,30 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
         let Some(e) = e else { continue };
         let mut attrs = std::collections::HashMap::new();
         let mut ordered: Vec<(String, String)> = vec![];
-        for a in e.attributes().flatten() {
+        for a in e.attributes() {
+            let Ok(a) = a else {
+                bad_attrs += 1;
+                continue;
+            };
             let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
-            let v = a.unescape_value().map(|v| v.to_string()).unwrap_or_default();
+            let v = match a.unescape_value() {
+                Ok(v) => v.to_string(),
+                Err(_) => {
+                    // Kept as written rather than emptied, and reported.
+                    bad_attrs += 1;
+                    String::from_utf8_lossy(&a.value).to_string()
+                }
+            };
             ordered.push((k.clone(), v.clone()));
             attrs.insert(k, v);
         }
         let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
         let num = |k: &str| attrs.get(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         match e.name().as_ref() {
-            b"COLLECTION" => in_collection = true,
+            b"COLLECTION" => {
+                in_collection = true;
+                declared = attrs.get("Entries").and_then(|v| v.parse::<usize>().ok());
+            }
             b"TRACK" if in_collection => {
                 let loc = decode_location(&get("Location"));
                 let t = Track {
@@ -297,7 +342,7 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                     "660099" => 8,
                     _ => 0,
                 };
-                let extra = XmlExtra { attrs: ordered.iter().filter(|(k, _)| !XML_TRACK_ATTRS.contains(&k.as_str())).cloned().collect(), nodes: vec![], orig: vec![] };
+                let extra = XmlExtra { attrs: ordered.iter().filter(|(k, _)| !XML_TRACK_ATTRS.contains(&k.as_str())).cloned().collect(), nodes: vec![], orig: vec![], xml_id: get("TrackID"), ..Default::default() };
                 let mut extra = extra;
                 let track = Track { color, ..t };
                 for (k, v) in crate::xmlexport::track_attrs(&track) {
@@ -315,6 +360,9 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
             }
             b"TEMPO" => {
                 tempos.push((num("Inizio"), num("Bpm"), get("Battito").parse::<u8>().unwrap_or(1)));
+                if let Some(t) = cur.as_mut() {
+                    t.extra.tempo.push(ordered.clone());
+                }
             }
             b"POSITION_MARK" if cur.is_some() && !matches!(get("Type").trim(), "0" | "4" | "") => {
                 // Fade-in (1), fade-out (2), load (3) and unknown types: kept as written.
@@ -332,6 +380,7 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                     let kind = if n >= 0 { CueKind::Hot } else { CueKind::Memory };
                     let color = if kind == CueKind::Hot && (r, g, b) != (0, 0, 0) { nearest_hot_color([r, g, b]) } else if kind == CueKind::Hot { HOTCUE_DEFAULT } else { 0 };
                     t.cues.push(Cue { id: 0, track_id: 0, kind, slot: n, start, end, color, comment: get("Name"), active_loop: false });
+                    t.extra.marks.push(ordered.clone());
                 }
             }
             tag if cur.is_some() && in_collection && !matches!(tag, b"TEMPO" | b"POSITION_MARK" | b"TRACK") => {
@@ -366,7 +415,16 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
     }
     // The XML wraps everything in a ROOT folder node.
     let playlists = if roots.len() == 1 && roots[0].name == "ROOT" { roots.pop().unwrap().children } else { roots };
-    Ok(XmlLibrary { tracks, playlists })
+    let mut warnings = vec![];
+    if bad_attrs > 0 {
+        warnings.push(format!("{bad_attrs} attribute value(s) had invalid escapes and were kept as written"));
+    }
+    if let Some(n) = declared {
+        if n != tracks.len() {
+            warnings.push(format!("the collection declares {n} tracks but contains {}", tracks.len()));
+        }
+    }
+    Ok(XmlLibrary { tracks, playlists, warnings })
 }
 
 fn finish_grid(t: &mut XmlTrack, tempos: &[(f64, f64, u8)]) {
@@ -440,6 +498,32 @@ mod tests {
         assert_eq!(t.grid.as_ref().unwrap().anchors.len(), 1);
         assert_eq!(lib.playlists.len(), 1);
         assert_eq!(lib.playlists[0].track_keys, vec!["7"]);
+    }
+}
+
+#[cfg(test)]
+mod xml_children_tests {
+    #[test]
+    fn unchanged_tempo_and_cues_come_back_verbatim() {
+        let x = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="1">
+<TRACK TrackID="1" Name="A" Location="file://localhost/x/a.mp3" AverageBpm="128.00">
+<TEMPO Inizio="0.1204" Bpm="128.00" Metro="3/4" Battito="1"/>
+<POSITION_MARK Name="Drop" Type="0" Start="12.34567" Num="0" Red="40" Green="226" Blue="20" Future="x"/>
+</TRACK></COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"></NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
+        let lib = super::parse_rekordbox_xml(x).unwrap();
+        let xt = &lib.tracks[0];
+        let mut extra = xt.extra.clone();
+        extra.grid_fp = super::grid_fingerprint(&xt.grid);
+        extra.cues_fp = super::cues_fingerprint(&xt.cues);
+        let out = crate::xmlexport::track_children(&xt.track, &extra, xt.grid.clone(), xt.cues.clone());
+        assert!(out.contains(r#"<TEMPO Inizio="0.1204" Bpm="128.00" Metro="3/4" Battito="1"/>"#), "{out}");
+        assert!(out.contains(r#"Start="12.34567" Num="0" Red="40" Green="226" Blue="20" Future="x"/>"#), "{out}");
+        // A moved cue is written from PrepDeck's data instead (the grid still verbatim).
+        let mut moved = xt.cues.clone();
+        moved[0].start = 13.0;
+        let out2 = crate::xmlexport::track_children(&xt.track, &extra, xt.grid.clone(), moved);
+        assert!(out2.contains(r#"Start="13.000""#) && !out2.contains("Future") && out2.contains("Metro=\"3/4\""), "{out2}");
     }
 }
 

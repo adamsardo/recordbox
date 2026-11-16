@@ -212,8 +212,14 @@ pub struct Prefs {
     pub keymap: std::collections::BTreeMap<String, String>,
     /// Column browser (Genre / Artist / Album) above the track list.
     pub column_browser: bool,
+    /// CUE Analysis: hot cue A ("1.1Bars") on the first downbeat when a track is first analysed.
+    pub auto_first_downbeat_cue: bool,
     /// Stem pads: 4 (vocal, inst, bass, drums) or 3 (vocal, inst with bass, drums).
     pub stem_parts: u8,
+    /// Settings this version doesn't know (written by a newer PrepDeck), kept as they are
+    /// when the preferences are saved again.
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
     /// Audio output device by name; None follows the system's default output.
     pub audio_device: Option<String>,
     /// Sub-browser: a second track list under the main one.
@@ -357,6 +363,36 @@ impl Default for RelatedRules {
 /// Distance between two keys on the key wheel: steps around the wheel plus one when the
 /// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
 #[cfg(test)]
+mod prefs_tests {
+    #[test]
+    fn unknown_settings_survive_a_save() {
+        let json = r#"{"tooltips": false, "future_setting": {"a": 1}, "another": [1, 2]}"#;
+        let p: super::Prefs = serde_json::from_str(json).unwrap();
+        assert!(!p.tooltips);
+        let back: serde_json::Value = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back["future_setting"]["a"], 1);
+        assert_eq!(back["another"][1], 2);
+    }
+}
+
+#[cfg(test)]
+mod grid_jump_tests {
+    use crate::model::Beat;
+    #[test]
+    fn follows_tempo_changes() {
+        // 4 beats at 0.5 s, then 4 at 0.25 s.
+        let times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.25, 2.5, 2.75, 3.0];
+        let beats: Vec<Beat> = times.iter().enumerate().map(|(i, t)| Beat { time: *t, bpm: 120.0, beat: (i % 4 + 1) as u8, index: i }).collect();
+        // From halfway through the beat at 1.0 s, 4 beats on lands halfway through the one at 2.5 s.
+        assert!((super::grid_jump(&beats, 1.25, 4.0).unwrap() - 2.625).abs() < 1e-9);
+        assert!((super::grid_jump(&beats, 2.625, -4.0).unwrap() - 1.25).abs() < 1e-9);
+        // Past the end the last interval continues.
+        assert!((super::grid_jump(&beats, 2.75, 2.0).unwrap() - 3.25).abs() < 1e-9);
+        assert!(super::grid_jump(&beats, 1.0, 0.5).is_none());
+    }
+}
+
+#[cfg(test)]
 mod pvdi_tests {
     #[test]
     fn reads_vocal_levels() {
@@ -486,6 +522,8 @@ impl Default for Prefs {
             column_browser: false,
             audio_device: None,
             stem_parts: 4,
+            auto_first_downbeat_cue: true,
+            other: Default::default(),
             sub_browser: false,
             browse_font: 0,
             browse_line: 0,
@@ -773,6 +811,8 @@ pub struct App {
     /// Key analysis on the drum-free mix in the background: results (track, key) and the
     /// number of tracks asked for.
     pub key_job: Option<(Receiver<(i64, i32)>, usize, usize)>,
+    /// Last attempt to reopen a lost audio device, and whether the loss was reported.
+    pub audio_retry: Option<(Instant, bool)>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
@@ -872,6 +912,7 @@ impl App {
             edits_checked: HashSet::new(),
             key_job: None,
             vocal_failed: HashSet::new(),
+            audio_retry: None,
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
@@ -1667,6 +1708,36 @@ impl App {
         }
     }
 
+/// The audio device went away (unplugged, switched off): stop, say so once, and try to
+    /// reopen the chosen output (else the default) every two seconds until it works.
+    pub fn poll_audio_device(&mut self) {
+        if !self.player.lost.load(std::sync::atomic::Ordering::Relaxed) {
+            self.audio_retry = None;
+            return;
+        }
+        let (last, told) = self.audio_retry.unwrap_or((Instant::now() - std::time::Duration::from_secs(10), false));
+        if !told {
+            self.player.state.lock().playing = false;
+            self.toast_err("The audio output stopped working (device disconnected?). PrepDeck will reconnect when it is available.");
+        }
+        if last.elapsed() >= std::time::Duration::from_secs(2) {
+            // The system's default output: opening it needs no device search (which can block),
+            // so this never stalls the window. A chosen device is used again from the next launch
+            // or by picking it in Preferences > Audio.
+            match self.player.switch_device(None) {
+                Ok(()) => {
+                    self.audio_retry = None;
+                    self.toast("Audio output reconnected (system default output).");
+                    return;
+                }
+                Err(_) => self.audio_retry = Some((Instant::now(), true)),
+            }
+        } else {
+            self.audio_retry = Some((last, true));
+        }
+        self.ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
     pub fn poll_vocal(&mut self) {
         let Some(rx) = &self.deck.vocal_rx else { return };
         if let Ok((id, r)) = rx.try_recv() {
@@ -2308,10 +2379,21 @@ impl App {
             if let Some(g) = &xt.grid {
                 note(self.db.save_grid(id, g));
             }
-            note(self.db.set_xml_extra(id, &xt.extra));
             if !xt.cues.is_empty() {
                 note(self.db.replace_cues(id, &xt.cues));
             }
+            // What the imported TEMPO/POSITION_MARK elements became, to tell later whether they
+            // were edited.
+            let mut extra = xt.extra.clone();
+            extra.grid_fp = crate::importer::grid_fingerprint(&self.db.grid(id));
+            extra.cues_fp = crate::importer::cues_fingerprint(&self.db.cues(id).unwrap_or_default());
+            if xt.grid.is_none() {
+                extra.tempo.clear();
+            }
+            if xt.cues.is_empty() {
+                extra.marks.clear();
+            }
+            note(self.db.set_xml_extra(id, &extra));
             idmap.insert(xt.xml_id.clone(), id);
         }
         if let Some(e) = failed {
@@ -2319,22 +2401,24 @@ impl App {
             self.reload_all();
             return self.toast_err(format!("The collection could not be imported ({e}). Nothing was changed."));
         }
-        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>) {
+        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>, missing: &mut usize) {
             for n in nodes {
                 if n.folder {
                     let id = app.db.create_node(parent, &n.name, NodeKind::Folder, None).unwrap_or(0);
-                    add_nodes(app, id, &n.children, idmap);
+                    add_nodes(app, id, &n.children, idmap, missing);
                 } else {
                     let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
                     // KeyType="1" playlists refer to tracks by file location.
                     let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| if n.by_location { app.db.track_by_path(k) } else { idmap.get(k).copied() }).collect();
+                    *missing += n.track_keys.len() - tr.len();
                     let _ = app.db.set_playlist_tracks(id, &tr);
                 }
             }
         }
+        let mut missing_refs = 0usize;
         if !lib.playlists.is_empty() {
             let root = self.db.create_node(0, "Imported collection", NodeKind::Folder, None).unwrap_or(0);
-            add_nodes(self, root, &lib.playlists, &idmap);
+            add_nodes(self, root, &lib.playlists, &idmap, &mut missing_refs);
         }
         if let Err(e) = self.db.conn.execute_batch("COMMIT") {
             let _ = self.db.conn.execute_batch("ROLLBACK");
@@ -2342,7 +2426,12 @@ impl App {
             return self.toast_err(format!("The collection could not be imported ({e}). Nothing was changed."));
         }
         self.reload_all();
-        self.toast(format!("Imported {added} new track(s) with their cues, grids and playlists. Original files were not changed."));
+        let mut notes = lib.warnings.clone();
+        if missing_refs > 0 {
+            notes.push(format!("{missing_refs} playlist entr{} referred to tracks not in the collection and were left out", if missing_refs == 1 { "y" } else { "ies" }));
+        }
+        let extra = if notes.is_empty() { String::new() } else { format!(" Note: {}.", notes.join("; ")) };
+        self.toast(format!("Imported {added} new track(s) with their cues, grids and playlists. Original files were not changed.{extra}"));
         if self.prefs.auto_analysis {
             let todo: Vec<i64> = self.tracks.iter().filter(|t| t.analyzed == 0 && !t.missing).map(|t| t.id).collect();
             self.analyze(&todo, false);
@@ -2422,8 +2511,32 @@ impl App {
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
                 self.previews.insert(id, preview);
+                let new_grid = save_grid.clone();
                 if let Some(g) = save_grid {
                     let _ = self.db.save_grid(id, &g);
+                }
+                // rekordbox sets hot cue A, named "1.1Bars", on the first downbeat when it first
+                // analyses a track (seen on every analysed track of the user's library, created
+                // during analysis). Only on a fresh grid and for a track with no cues yet.
+                if self.prefs.auto_first_downbeat_cue && first_analysis {
+                    if let Some(g) = &new_grid {
+                        let dur = self.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
+                        if let Some(b) = g.beats(dur).into_iter().find(|b| b.beat == 1) {
+                            if self.db.cues(id).map(|c| c.is_empty()).unwrap_or(false) {
+                                let c = Cue { id: 0, track_id: id, kind: CueKind::Hot, slot: 0, start: b.time, end: None, color: 0, comment: "1.1Bars".into(), active_loop: false };
+                                let _ = self.db.save_cue(&c);
+                                if let Some(e) = self.cue_counts.get_mut(&id) {
+                                    e.0 += 1;
+                                } else {
+                                    self.cue_counts.insert(id, (1, 0));
+                                }
+                                self.hot_positions.entry(id).or_default().push((b.time, 0, 0));
+                                if self.deck.track == Some(id) {
+                                    self.deck.cues = self.db.cues(id).unwrap_or_default();
+                                }
+                            }
+                        }
+                    }
                 }
                 if self.deck.track == Some(id) {
                     self.deck.wave = Some(res.wave);
@@ -2855,7 +2968,8 @@ impl App {
 
     pub fn beat_jump(&mut self, beats: f64) {
         let p = self.pos();
-        let t = p + beats * self.beat_len();
+        let t = grid_jump(&self.deck.beats, p, beats).unwrap_or(p + beats * self.beat_len());
+        let t = t.clamp(0.0, self.deck.duration.max(0.0));
         self.seek(t);
         if !self.playing() {
             self.deck.cue_point = self.pos();
@@ -3578,6 +3692,31 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     } else {
         na == nb
     }
+}
+
+/// Jump a whole number of beats along the grid's own beats (so tempo changes are followed),
+/// keeping the position within the beat. None for fractional jumps or an empty grid; beyond
+/// the grid's ends the nearest beat interval is extended.
+pub fn grid_jump(beats: &[Beat], p: f64, n: f64) -> Option<f64> {
+    if beats.len() < 2 || n.fract() != 0.0 {
+        return None;
+    }
+    let len = beats.len() as i64;
+    let i = (beats.partition_point(|b| b.time <= p) as i64 - 1).clamp(0, len - 2);
+    let (a, b) = (beats[i as usize].time, beats[i as usize + 1].time);
+    let frac = (p - a) / (b - a).max(1e-9);
+    let k = i + n as i64;
+    let at = |k: i64| -> f64 {
+        if k < 0 {
+            beats[0].time + k as f64 * (beats[1].time - beats[0].time)
+        } else if k >= len - 1 {
+            let d = beats[(len - 1) as usize].time - beats[(len - 2) as usize].time;
+            beats[(len - 1) as usize].time + (k - (len - 1)) as f64 * d
+        } else {
+            beats[k as usize].time
+        }
+    };
+    Some(at(k) + frac * (at(k + 1) - at(k)))
 }
 
 /// A PVDI section: header 24 bytes (u16 discriminator at 12, hop at 14, sample rate at 16,

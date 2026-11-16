@@ -1094,7 +1094,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         if let Some(b) = anlz_base(&prev.analyze_path) {
             let b = root.join(b.trim_start_matches('/'));
             for e in ["DAT", "EXT", "2EX"] {
-                device.insert(e, anlz::read_section_list(&b.with_extension(e)));
+                device.insert(e, anlz::read_valid_section_list(&b.with_extension(e)));
             }
         }
         let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device, pvdi: et.vocal.as_deref().map(anlz::pvdi) });
@@ -1246,6 +1246,7 @@ fn merge_node(lib: &mut DeviceLibrary, parent: u32, n: &ExportNode, map: &HashMa
 
 /// Remove a playlist/folder from the device library (and optionally its tracks).
 pub fn remove_node(root: &Path, node_id: u32, delete_tracks: bool) -> Result<()> {
+    recover_device(root);
     let mut lib = read_device(root)?;
     let mut doomed = vec![node_id];
     let mut i = 0;
@@ -1256,24 +1257,34 @@ pub fn remove_node(root: &Path, node_id: u32, delete_tracks: bool) -> Result<()>
     }
     let removed_tracks: Vec<u32> = lib.nodes.iter().filter(|n| doomed.contains(&n.id)).flat_map(|n| n.entries.clone()).collect();
     lib.nodes.retain(|n| !doomed.contains(&n.id));
+    let mut gone: Vec<PathBuf> = vec![];
     if delete_tracks {
         for t in removed_tracks {
             let still = lib.nodes.iter().any(|n| n.entries.contains(&t));
             if !still {
                 if let Some(dt) = lib.tracks.remove(&t) {
-                    let _ = std::fs::remove_file(root.join(dt.file_path.trim_start_matches('/')));
+                    gone.push(root.join(dt.file_path.trim_start_matches('/')));
                     if let Some(base) = anlz_base(&dt.analyze_path) {
                         let b = root.join(base.trim_start_matches('/'));
                         for e in ["DAT", "EXT", "2EX"] {
-                            let _ = std::fs::remove_file(b.with_extension(e));
+                            gone.push(b.with_extension(e));
                         }
                     }
                 }
             }
         }
     }
+    // The databases are published (journaled) first and the files deleted only afterwards, so
+    // an interruption can at worst leave unused files (Clean Up Unused Files finds them), never
+    // a library that points at deleted ones.
+    let mut created = Created::begin(root)?;
     backup_device_db(root);
-    write_device(root, &lib)
+    write_device_journaled(root, &lib, &mut created)?;
+    created.finish();
+    for f in gone {
+        let _ = std::fs::remove_file(f);
+    }
+    Ok(())
 }
 
 /// Write via a temporary file that is flushed to the device before it replaces `path`.
@@ -1859,6 +1870,41 @@ mod tests {
             let diff: Vec<usize> = (0..0x5c).filter(|&i| i != 2 && i != 3 && !ids.iter().any(|&o| i >= o && i < o + 4) && ta.raw_head[i] != tb.raw_head[i]).collect();
             assert!(diff.is_empty(), "track {id}: header bytes {diff:x?} changed");
             assert_eq!((ta.title.clone(), ta.artist.clone(), ta.album.clone(), ta.genre.clone(), ta.bpm100, ta.key_name.clone()), (tb.title.clone(), tb.artist.clone(), tb.album.clone(), tb.genre.clone(), tb.bpm100, tb.key_name.clone()));
+        }
+    }
+
+    /// The fixed tables PrepDeck writes (colours, columns, menu, sort, table 19) match a real
+    /// rekordbox export row for row, byte for byte (rekordcrate's demo_tracks export).
+    #[test]
+    fn fixed_tables_match_a_real_rekordbox_export() {
+        let p = dirs::home_dir().unwrap().join("Developer/rekordbox-rea/analysis/format-oracles/Holzhaus__rekordcrate/data/complete_export/demo_tracks/PIONEER/rekordbox/export.pdb");
+        let Ok(bytes) = std::fs::read(&p) else { return };
+        let real = pdb::Database::parse(bytes.clone()).unwrap();
+        let ours = pdb::Database::parse(build_export_pdb(&parse_pdb(bytes).unwrap())).unwrap();
+        for t in [6u32, 16, 17, 18, 19] {
+            let a: Vec<Vec<u8>> = real.rows(t).into_iter().map(|(h, o)| real.row_bytes(h, o).to_vec()).collect();
+            let b: Vec<Vec<u8>> = ours.rows(t).into_iter().map(|(h, o)| ours.row_bytes(h, o).to_vec()).collect();
+            assert_eq!(a.len(), b.len(), "table {t} row count");
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                // Rows are compared over the shorter length (row_bytes runs to the heap's end).
+                let mut n = x.len().min(y.len());
+                if t == 19 {
+                    // The row itself (the rest of row_bytes is page padding and footer).
+                    n = n.min(32);
+                }
+                let (mut x, mut y) = (x[..n].to_vec(), y[..n].to_vec());
+                if t == 19 {
+                    // The export date (a short string at 12..23) is the day of the export, and
+                    // the u16 at 2..4 varies between real exports with no rule found yet (0,
+                    // 0x160, 0x20 for 0, 2 and 3,886 tracks).
+                    for v in [&mut x, &mut y] {
+                        v[12..23].fill(0);
+                        v[2..4].fill(0);
+                    }
+                }
+                let diff: Vec<usize> = (0..n).filter(|&k| x[k] != y[k]).collect();
+                assert!(diff.is_empty(), "table {t} row {i}: bytes {diff:?} differ (rekordbox {:?}, PrepDeck {:?})", diff.iter().map(|&k| x[k]).collect::<Vec<_>>(), diff.iter().map(|&k| y[k]).collect::<Vec<_>>());
+            }
         }
     }
 

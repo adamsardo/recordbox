@@ -348,3 +348,61 @@ fn cond_matches(c: &Condition, t: &Track, tags: &HashSet<i64>, today: i64) -> bo
 pub fn today_days() -> i64 {
     chrono::Local::now().date_naive().num_days_from_ce() as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(field: Field, op: Op, value: &str, value2: &str) -> Condition {
+        Condition { field, op, value: value.into(), value2: value2.into(), months: false }
+    }
+    fn day(s: &str) -> i64 {
+        date_days(s).unwrap()
+    }
+
+    #[test]
+    fn evaluates_each_field_type() {
+        let t = Track { title: "Café del Mar".into(), artist: "Energy 52".into(), genre: "Trance".into(), bpm: 128.0, rating: 4, color: 3, key: 7, date_added: "2026-11-10".into(), duration: 300.0, ..Default::default() };
+        let tags: HashSet<i64> = [42].into_iter().collect();
+        let today = day("2026-11-17");
+        let one = |cond: Condition| matches(&SmartRule { match_all: true, conditions: vec![cond], auto_update: true }, &t, &tags, today);
+        // Text: case- and accent-insensitive.
+        assert!(one(c(Field::Title, Op::Contains, "cafe", "")));
+        assert!(one(c(Field::Title, Op::StartsWith, "CAFÉ", "")));
+        assert!(one(c(Field::Genre, Op::Is, "trance", "")));
+        assert!(!one(c(Field::Genre, Op::IsNot, "Trance", "")));
+        assert!(one(c(Field::Artist, Op::NotContains, "techno", "")));
+        // Numbers: ranges are inclusive and either order; BPM compares to 0.01.
+        assert!(one(c(Field::Bpm, Op::InRange, "130", "126")));
+        assert!(one(c(Field::Bpm, Op::Is, "128.00", "")));
+        assert!(!one(c(Field::Bpm, Op::Is, "128.02", "")));
+        assert!(one(c(Field::Rating, Op::Greater, "3", "")));
+        assert!(one(c(Field::Time, Op::Less, "5:01", "")));
+        // Dates: in the last N days / months.
+        assert!(one(c(Field::DateAdded, Op::InLast, "7", "")));
+        assert!(!one(c(Field::DateAdded, Op::InLast, "6", "")));
+        assert!(one(c(Field::DateAdded, Op::NotInLast, "3", "")));
+        assert!(one(Condition { months: true, ..c(Field::DateAdded, Op::InLast, "1", "") }));
+        // Key, colour, My Tag.
+        assert!(one(c(Field::Key, Op::Is, &crate::model::key_name(7, false), "")));
+        assert!(one(c(Field::Color, Op::Is, "3", "")));
+        assert!(one(c(Field::MyTag, Op::Contains, "42", "")));
+        assert!(one(c(Field::MyTag, Op::NotContains, "41", "")));
+        // A track without a date never matches "in the last", always "not in the last".
+        let undated = Track { date_added: String::new(), ..t.clone() };
+        let r = |op| SmartRule { match_all: true, conditions: vec![c(Field::DateAdded, op, "7", "")], auto_update: true };
+        assert!(!matches(&r(Op::InLast), &undated, &tags, today));
+        assert!(matches(&r(Op::NotInLast), &undated, &tags, today));
+    }
+
+    #[test]
+    fn all_and_any() {
+        let t = Track { genre: "House".into(), bpm: 124.0, ..Default::default() };
+        let tags = HashSet::new();
+        let conds = vec![c(Field::Genre, Op::Is, "house", ""), c(Field::Bpm, Op::Greater, "130", "")];
+        assert!(!matches(&SmartRule { match_all: true, conditions: conds.clone(), auto_update: true }, &t, &tags, 0));
+        assert!(matches(&SmartRule { match_all: false, conditions: conds, auto_update: true }, &t, &tags, 0));
+        // No conditions match nothing.
+        assert!(!matches(&SmartRule { match_all: true, conditions: vec![], auto_update: true }, &t, &tags, 0));
+    }
+}
