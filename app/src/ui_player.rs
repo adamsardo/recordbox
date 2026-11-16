@@ -250,31 +250,48 @@ pub fn wave_bars(mode: u8, v: [u8; 4]) -> Vec<(f32, Color32)> {
 fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     let p = ui.painter().clone();
     let dur = app.deck.duration.max(0.001);
-    let mid = r.center().y + 2.0;
-    let half = r.height() / 2.0 - 2.0;
+    // Measured from the original: baseline 29 pt below the top, bars up to 24 pt tall,
+    // a double progress rule at +33/+36 pt and minute ticks under it.
+    let base = r.min.y + 29.0;
+    let full_h = 24.0;
     if let Some(w) = &app.deck.wave {
         let n = r.width().max(1.0) as usize;
         let cols = w.columns(n);
+        // the overview fills its height at the track's loudest column
+        let top = cols.iter().map(|c| { let d = Waveform::disp(c); d[0].max(d[1]) }).max().unwrap_or(255).max(1) as f32;
+        let norm = (255.0 / top).min(4.0);
         for (i, c) in cols.iter().enumerate() {
             let x = r.min.x + i as f32 + 0.5;
             let played = (i as f64 / n as f64) * dur < pos;
-            for (h, col) in wave_bars(app.prefs.wave_color, Waveform::disp(c)) {
+            let mut d = Waveform::disp(c);
+            for v in d.iter_mut() {
+                *v = (*v as f32 * norm).min(255.0) as u8;
+            }
+            let layers: Vec<(f32, Color32)> = if app.prefs.wave_color >= 2 {
+                // 3Band overview: a blue body with thin orange and white edges above it
+                let t = (d[0] as f32 / 255.0).max(d[1] as f32 / 255.0);
+                let hi = (d[3] as f32 / (d[0] as f32 + 1.0)).min(1.0);
+                vec![(t * (0.94 + 0.06 * hi), WAVE_HIGH), (t * 0.94, WAVE_MID), (t * 0.86, WAVE_LOW)]
+            } else {
+                wave_bars(app.prefs.wave_color, d)
+            };
+            for (h, col) in layers {
                 let col = if played { col.gamma_multiply(0.45) } else { col };
-                // overview is drawn from the baseline upwards like the original
-                p.line_segment([pos2(x, mid + half * 0.15), pos2(x, mid + half * 0.15 - h * half * 1.15)], Stroke::new(1.0, col));
+                p.line_segment([pos2(x, base), pos2(x, base - h.min(1.0) * full_h)], Stroke::new(1.0, col));
             }
         }
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
     }
-    // time scale ticks
-    p.line_segment([pos2(r.min.x, r.max.y - 1.0), pos2(r.max.x, r.max.y - 1.0)], Stroke::new(1.0, hex(0x3A3A3A)));
+    // progress rule and minute ticks
+    p.line_segment([pos2(r.min.x, r.min.y + 33.0), pos2(r.max.x, r.min.y + 33.0)], Stroke::new(1.0, hex(0x5A5A5A)));
+    p.line_segment([pos2(r.min.x, r.min.y + 36.0), pos2(r.max.x, r.min.y + 36.0)], Stroke::new(1.0, hex(0x3A3A3A)));
     if app.deck.track.is_some() {
         let minute = 60.0 / dur * r.width() as f64;
         let mut k = 1.0;
         while k * minute < r.width() as f64 {
             let x = r.min.x + (k * minute) as f32;
-            p.line_segment([pos2(x, r.max.y - 3.0), pos2(x, r.max.y)], Stroke::new(1.0, DIM));
+            p.line_segment([pos2(x, r.min.y + 37.0), pos2(x, r.min.y + 39.0)], Stroke::new(1.0, DIM2));
             k += 1.0;
         }
         let x_of = |t: f64| r.min.x + (t / dur) as f32 * r.width();
@@ -289,20 +306,20 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             let x = x_of(c.start);
             if c.kind == CueKind::Memory {
                 let col = if c.color > 0 { label_color(c.color) } else { BAR_RED };
-                tri_up(&p, pos2(x, r.max.y + 1.0), 5.0, col);
+                tri_up(&p, pos2(x, base + 0.5), 5.0, col);
             } else {
                 let col = hotcue_color(c.color);
-                let lr = Rect::from_min_size(pos2(x - 0.5, r.min.y), vec2(10.0, 10.0));
+                let lr = Rect::from_min_size(pos2(x - 0.5, r.min.y), vec2(11.0, 9.0));
                 p.rect_filled(lr, 0.0, col);
                 p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(8.0), WHITE);
-                p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, col));
+                p.line_segment([pos2(x, r.min.y), pos2(x, base)], Stroke::new(1.0, col));
             }
         }
         // cue point
-        tri_up(&p, pos2(x_of(app.deck.cue_point), r.max.y + 1.0), 6.0, CUE_MARK);
+        tri_up(&p, pos2(x_of(app.deck.cue_point), base + 0.5), 6.0, CUE_MARK);
         // playhead
         let px = x_of(pos);
-        p.line_segment([pos2(px, r.min.y - 2.0), pos2(px, r.max.y)], Stroke::new(1.5, WHITE));
+        p.line_segment([pos2(px, r.min.y + 2.0), pos2(px, base)], Stroke::new(1.5, WHITE));
     }
     let resp = ui.interact(r.expand2(vec2(0.0, 4.0)), ui.id().with("overview"), Sense::click_and_drag());
     if (resp.clicked() || resp.dragged()) && app.deck.audio.is_some() {
@@ -468,6 +485,8 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
 
 fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let p = ui.painter().clone();
+    // The strip behind the pads is dark grey in the original, the pads darker still.
+    p.rect_filled(Rect::from_min_max(pos2(s.min.x + 81.5, s.min.y), pos2(main.max.x, s.max.y - 2.0)), 0.0, BG2);
     // Tabs CUE/LOOP and GRID (stacked, as measured: x 83..162.5).
     let tab1 = Rect::from_min_max(pos2(s.min.x + 2.0, s.min.y), pos2(s.min.x + 81.5, s.min.y + 23.0));
     let tab2 = Rect::from_min_max(pos2(s.min.x + 2.0, s.min.y + 23.0), pos2(s.min.x + 81.5, s.max.y));
@@ -481,18 +500,22 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let x0 = sx(main, 407.9);
     let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 23.0));
     if app.deck.ctrl_tab == 0 {
-        // hot cue pads, 25 pt squares on a 32.9 pt pitch starting at x = 420.4
+        // hot cue pads: 28 pt dark squares on a 32.9 pt pitch starting at x = 420.4;
+        // a set cue shows as a 15 pt square of its colour behind the letter.
         let mut x = x0;
         for slot in 0..8 {
-            let r = Rect::from_center_size(pos2(sx(main, 420.4 + slot as f32 * 32.9), y), vec2(25.0, 25.0));
+            let r = Rect::from_center_size(pos2(sx(main, 420.4 + slot as f32 * 32.9), y), vec2(28.0, 28.0));
             let _ = x;
             let cue = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned();
-            let (fill, tc) = match &cue {
-                Some(c) => (hotcue_color(c.color), WHITE),
-                None => (BG1, OFF),
-            };
             let resp = ui.interact(r, ui.id().with(("pad", slot)), Sense::click_and_drag());
-            p.rect_filled(r, 1.0, if resp.hovered() && cue.is_none() { hex(0x1A1A1A) } else { fill });
+            p.rect_filled(r, 2.0, if resp.hovered() { hex(0x1A1A1A) } else { hex(0x121212) });
+            let tc = match &cue {
+                Some(c) => {
+                    p.rect_filled(Rect::from_center_size(r.center(), vec2(15.0, 15.0)), 0.0, hotcue_color(c.color));
+                    WHITE
+                }
+                None => hex(0x5F5F5F),
+            };
             p.text(r.center(), Align2::CENTER_CENTER, ((b'A' + slot as u8) as char).to_string(), FontId::proportional(15.0), tc);
             if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
                 if ui.input(|i| i.modifiers.shift) {
