@@ -60,7 +60,7 @@ pub fn synth(spec: &DemoSpec, sr: u32) -> Vec<f32> {
     };
     let third = if spec.minor { 3 } else { 4 };
     let chord = [0, third, 7];
-    let prog: [i32; 4] = if spec.minor { [0, 8, 3, 10] } else { [0, 5, 9, 7] };
+    let prog: [i32; 4] = if spec.minor { [0, 5, 0, 7] } else { [0, 5, 7, 0] };
     let base = 36 + spec.root as i64;
     let beats = spec.bars * 4;
     for k in 0..beats {

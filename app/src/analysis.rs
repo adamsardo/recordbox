@@ -334,7 +334,7 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
     let whole = bpm.round();
     if (whole - bpm).abs() > 1e-6 && (whole - bpm).abs() < 0.35 {
         let (_, sc) = comb_score(&env, 60.0 * fps / whole);
-        if sc >= best.2 * 0.985 {
+        if sc >= best.2 * 0.97 {
             bpm = whole;
         }
     }
@@ -377,7 +377,21 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
         t += period_s;
         k += 1;
     }
-    let down = (0..4).max_by(|a, b| sums[*a].partial_cmp(&sums[*b]).unwrap()).unwrap_or(0);
+    // Harmony tends to change at the start of a bar: add the chroma change at each beat.
+    let times: Vec<f64> = (0..k).map(|i| first + i as f64 * period_s).collect();
+    let nov = chroma_novelty(mono, sr, &times);
+    let mut hsum = [0f64; 4];
+    for (i, v) in nov.iter().enumerate() {
+        hsum[i % 4] += v;
+    }
+    let z = |a: [f64; 4]| -> [f64; 4] {
+        let m = a.iter().sum::<f64>() / 4.0;
+        let sd = (a.iter().map(|x| (x - m).powi(2)).sum::<f64>() / 4.0).sqrt().max(1e-9);
+        [(a[0] - m) / sd, (a[1] - m) / sd, (a[2] - m) / sd, (a[3] - m) / sd]
+    };
+    let (zl, zh) = (z(sums), z(hsum));
+    let score: Vec<f64> = (0..4).map(|j| zl[j] * 0.6 + zh[j]).collect();
+    let down = (0..4).max_by(|a, b| score[*a].partial_cmp(&score[*b]).unwrap()).unwrap_or(0);
     // Beat number of the first beat so that beat index `down` is a "1".
     let first_beat_no = ((4 - down) % 4) as u8 + 1;
     (bpm, Some(BeatGrid::constant(first, bpm, first_beat_no)))
@@ -428,6 +442,49 @@ fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
     first + med as f64 * ms as f64 / sr
 }
 
+/// Cosine distance between the pitch-class profile of each beat and the previous beat.
+fn chroma_novelty(mono: &[f32], sr: f64, times: &[f64]) -> Vec<f64> {
+    let nfft = 4096usize;
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(nfft);
+    let win: Vec<f32> = (0..nfft).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / nfft as f32).cos()).collect();
+    let mut buf = vec![Complex::new(0f32, 0f32); nfft];
+    let mut prev: Option<[f64; 12]> = None;
+    let mut out = Vec::with_capacity(times.len());
+    for &t in times {
+        let start = ((t + 0.03) * sr) as usize;
+        if start + nfft > mono.len() {
+            out.push(0.0);
+            continue;
+        }
+        for i in 0..nfft {
+            buf[i] = Complex::new(mono[start + i] * win[i], 0.0);
+        }
+        fft.process(&mut buf);
+        let mut c = [0f64; 12];
+        for b in 1..nfft / 2 {
+            let f = b as f64 * sr / nfft as f64;
+            if !(90.0..=2000.0).contains(&f) {
+                continue;
+            }
+            let midi = 69.0 + 12.0 * (f / 440.0).log2();
+            let pc = (midi.round() as i64).rem_euclid(12) as usize;
+            c[pc] += buf[b].norm() as f64;
+        }
+        let n = c.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-9);
+        for x in c.iter_mut() {
+            *x /= n;
+        }
+        let v = match prev {
+            Some(p) => 1.0 - (0..12).map(|i| p[i] * c[i]).sum::<f64>(),
+            None => 0.0,
+        };
+        out.push(v);
+        prev = Some(c);
+    }
+    out
+}
+
 /// Recompute a grid's BPM by tapping intervals etc. is UI work; this helper fits a constant
 /// tempo for "Analyze from current position" style edits.
 pub fn shift_grid(g: &BeatGrid, seconds: f64) -> BeatGrid {
@@ -475,7 +532,7 @@ pub fn detect_key(mono: &[f32], sr: f64) -> i32 {
         let pc = (nearest as i64).rem_euclid(12) as usize;
         let w = (1.0 - dev / 0.35) as f32;
         // Emphasise bass/mid register where harmony lives.
-        let reg = if f < 110.0 { 0.7 } else if f < 900.0 { 1.0 } else { 0.6 };
+        let reg = if f < 220.0 { 1.4 } else if f < 900.0 { 1.0 } else { 0.6 };
         map.push((b, pc, w * reg));
     }
     let mut chroma = [0f64; 12];
@@ -648,5 +705,24 @@ mod tests {
             .collect();
         let k = detect_key(&x, sr);
         assert_eq!(crate::model::key_name(k, false), "Am");
+    }
+}
+
+#[cfg(test)]
+mod real_files {
+    #[test]
+    #[ignore]
+    fn analyze_env_files() {
+        let list = std::env::var("PREPDECK_AUDIO").unwrap_or_default();
+        for p in list.split('|').filter(|s| !s.is_empty()) {
+            let t0 = std::time::Instant::now();
+            match super::analyze_file(p, &Default::default()) {
+                Ok(r) => {
+                    let g = r.grid.unwrap();
+                    eprintln!("{:.1}s bpm {:.2} first {:.3} beat {} key {} gain {:.1} dur {:.1} :: {}", t0.elapsed().as_secs_f64(), r.bpm, g.anchors[0].time, g.anchors[0].beat, crate::model::key_name(r.key, false) + "/" + &crate::model::key_alnum(r.key), r.gain_db, r.duration, p.rsplit('/').next().unwrap());
+                }
+                Err(e) => eprintln!("ERR {e} :: {p}"),
+            }
+        }
     }
 }

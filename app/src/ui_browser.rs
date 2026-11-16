@@ -44,11 +44,11 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     ui.painter().rect_filled(r, 0.0, BG1);
     ui.horizontal_centered(|ui| {
         ui.add_space(12.0);
-        let mode = ui.add(egui::Label::new(RichText::new("EXPORT  ⌄").strong().size(12.0).color(WHITE)).sense(Sense::click()));
+        let mode = ui.add(egui::Label::new(RichText::new("EXPORT  ▼").strong().size(12.0).color(WHITE)).sense(Sense::click()));
         let mode = if app.prefs.tooltips { mode.on_hover_text("This app covers EXPORT mode (library, preparation and USB export).") } else { mode };
         let _ = mode;
         ui.add_space(18.0);
-        let layout = ui.add(egui::Label::new(RichText::new(if app.prefs.browser_only { "▭ Full Browser ⌄" } else { "▭ 1 Player ⌄" }).size(11.0).color(DIM2)).sense(Sense::click()));
+        let layout = ui.add(egui::Label::new(RichText::new(if app.prefs.browser_only { "▭ Full Browser ▼" } else { "▭ 1 Player ▼" }).size(11.0).color(DIM2)).sense(Sense::click()));
         dropdown(ui, &layout, "layout", |ui| {
             if ui.selectable_label(!app.prefs.browser_only, "1 Player").clicked() {
                 app.prefs.browser_only = false;
@@ -320,7 +320,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
             let rr = Rect::from_min_size(pp + vec2(12.0, 6.0), vec2(8.0 + label.len() as f32 * 6.5, 18.0));
             lp.rect_filled(rr, 3.0, SELECT);
             lp.text(rr.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(11.0), WHITE);
-            for (r, id) in &drop_targets {
+            for (r, _id) in &drop_targets {
                 if r.contains(pp) {
                     lp.rect_stroke(*r, 2.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Inside);
                 }
@@ -442,7 +442,7 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
                 if tree_row(ui, 0, "All Tracks", Some(app.tracks.len()), all_sel, "♫", ui.id().with("alltracks")).clicked() {
                     app.set_view(View::Collection);
                 }
-                let root = tree_row(ui, 0, "Playlists", None, false, "▾", ui.id().with("plroot"));
+                let root = tree_row(ui, 0, "Playlists", None, false, "▼", ui.id().with("plroot"));
                 root.context_menu(|ui| {
                     if ui.button("Create New Playlist").clicked() {
                         app.create_node(0, NodeKind::Playlist);
@@ -470,7 +470,7 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
         let sel = app.view == View::Playlist(n.id);
         let open = app.expanded.contains(&n.id);
         let (icon, count) = match n.kind {
-            NodeKind::Folder => (if open { "▾🗀" } else { "▸🗀" }, None),
+            NodeKind::Folder => (if open { "▼🗀" } else { "▸🗀" }, None),
             NodeKind::Smart => ("⚙", n.smart.as_ref().map(|r| app.smart_tracks(r).len())),
             NodeKind::Playlist => ("☰", Some(app.node_counts.get(&n.id).copied().unwrap_or(0))),
         };
@@ -594,7 +594,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         app.scan_devices();
     }
     let sel_dev = matches!(app.view, View::Device { .. });
-    tree_row(ui, 0, "Devices", None, !sel_dev, "▾", ui.id().with("devroot"));
+    tree_row(ui, 0, "Devices", None, !sel_dev, "▼", ui.id().with("devroot"));
     let devs: Vec<(String, String, String, Option<Vec<crate::export::usb::DevNode>>, Option<String>, usize)> = app
         .devices
         .iter()

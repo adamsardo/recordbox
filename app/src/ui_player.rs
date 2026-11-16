@@ -46,13 +46,13 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // ---------------- left column: jumps, beat jump, CUE, PLAY
     let lx = left.min.x;
     let ly = left.min.y;
-    if tip(button(ui, Rect::from_min_size(pos2(lx + 8.0, ly + 28.0), vec2(30.0, 26.0)), "front", "⇤", BG2, TEXT, 15.0), app, "Jump to the front").clicked() {
+    if tip(button(ui, Rect::from_min_size(pos2(lx + 8.0, ly + 28.0), vec2(30.0, 26.0)), "front", "|◀", BG2, TEXT, 15.0), app, "Jump to the front").clicked() {
         app.seek(0.0);
         if !app.playing() {
             app.deck.cue_point = 0.0;
         }
     }
-    if tip(button(ui, Rect::from_min_size(pos2(lx + 43.0, ly + 28.0), vec2(30.0, 26.0)), "rear", "⇥", BG2, TEXT, 15.0), app, "Jump to the rear").clicked() {
+    if tip(button(ui, Rect::from_min_size(pos2(lx + 43.0, ly + 28.0), vec2(30.0, 26.0)), "rear", "▶|", BG2, TEXT, 15.0), app, "Jump to the rear").clicked() {
         let d = app.deck.duration;
         app.seek((d - 0.5).max(0.0));
     }
@@ -65,7 +65,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     }
     let bj_rect = Rect::from_min_size(pos2(lx + 8.0, ly + 100.0), vec2(65.0, 30.0));
     let bj_label = if bj < 1.0 { format!("1/{}Beat", (1.0 / bj).round()) } else { format!("{}Beats", bj) };
-    let r = button(ui, bj_rect, "bjsize", &format!("{bj_label}\n⌄"), BTN, TEXT, 9.5);
+    let r = button(ui, bj_rect, "bjsize", &format!("{bj_label} ▼"), BTN, TEXT, 9.5);
     crate::ui_browser::dropdown(ui, &r, "bjpop", |ui: &mut Ui| {
         for v in [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
             let l = if v < 1.0 { format!("1/{} Beat", (1.0 / v) as i32) } else { format!("{} Beats", v) };
@@ -499,7 +499,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect) {
             app.memory_jump(1);
         }
         x += 28.0;
-        if tip(button(ui, Rect::from_min_size(pos2(x, y - 12.0), vec2(24.0, 24.0)), "memdel", "✕", BG2, WHITE, 13.0), app, "Delete Memory Cue(Loop)").clicked() {
+        if tip(button(ui, Rect::from_min_size(pos2(x, y - 12.0), vec2(24.0, 24.0)), "memdel", "×", BG2, WHITE, 13.0), app, "Delete Memory Cue(Loop)").clicked() {
             app.memory_delete_current();
         }
         x += 52.0;
@@ -728,14 +728,14 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let rr = Rect::from_min_size(pos2(list.min.x, list.min.y + i as f32 * row_h), vec2(list.width(), row_h));
                 p.line_segment([pos2(rr.min.x, rr.max.y), pos2(rr.max.x, rr.max.y)], Stroke::new(1.0, BG2));
                 let Some(c) = mems.get(i).cloned() else {
-                    p.text(pos2(rr.max.x - 10.0, rr.center().y), Align2::CENTER_CENTER, "✕", FontId::proportional(10.0), hex(0x3A3A3A));
+                    p.text(pos2(rr.max.x - 10.0, rr.center().y), Align2::CENTER_CENTER, "×", FontId::proportional(10.0), hex(0x3A3A3A));
                     continue;
                 };
                 let col = if c.color > 0 { label_color(c.color) } else { BAR_RED };
                 tri_up(&p, pos2(rr.min.x + 9.0, rr.center().y - 4.0), 4.0, col);
                 p.text(pos2(rr.min.x + 18.0, rr.center().y), Align2::LEFT_CENTER, cue_time(c.start), FontId::proportional(10.5), WHITE);
                 if c.is_loop() {
-                    p.text(pos2(rr.min.x + 82.0, rr.center().y), Align2::LEFT_CENTER, "⟲", FontId::proportional(11.0), if c.active_loop { LOOP } else { DIM });
+                    p.text(pos2(rr.min.x + 82.0, rr.center().y), Align2::LEFT_CENTER, "∞", FontId::proportional(11.0), if c.active_loop { LOOP } else { DIM });
                 }
                 let del = Rect::from_center_size(pos2(rr.max.x - 10.0, rr.center().y), vec2(16.0, row_h));
                 if app.deck.editing_comment == Some(c.id) {
@@ -754,7 +754,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 } else {
                     p.text(pos2(rr.min.x + 96.0, rr.center().y), Align2::LEFT_CENTER, &c.comment, FontId::proportional(10.5), DIM2);
                 }
-                p.text(del.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(10.0), DIM);
+                p.text(del.center(), Align2::CENTER_CENTER, "×", FontId::proportional(10.0), DIM);
                 let dr = child.interact(del, child.id().with(("memdel", c.id)), Sense::click());
                 if dr.clicked() {
                     app.delete_cue(c.id);
@@ -829,7 +829,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                         } else {
                             p.text(pos2(rr.min.x + 116.0, rr.center().y), Align2::LEFT_CENTER, &c.comment, FontId::proportional(10.5), DIM2);
                         }
-                        p.text(del.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(10.0), DIM);
+                        p.text(del.center(), Align2::CENTER_CENTER, "×", FontId::proportional(10.0), DIM);
                         if child.interact(del, child.id().with(("hcdel", slot)), Sense::click()).clicked() {
                             app.delete_cue(c.id);
                             continue;

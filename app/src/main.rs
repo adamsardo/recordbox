@@ -92,22 +92,24 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         return;
     }
     use egui::Key;
-    let (space, c_down, c_up, enter, up, down, cmd_a, del, m, left, right, shift) = ctx.input(|i| {
+    let fresh = |k: Key| ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } if *key == k && !modifiers.command)));
+    let (_s, _c, c_up, enter, up, down, cmd_a, del, _m, left, right, shift) = ctx.input(|i| {
         (
-            i.key_pressed(Key::Space),
-            i.key_pressed(Key::C),
+            false,
+            false,
             i.key_released(Key::C),
             i.key_pressed(Key::Enter),
             i.key_pressed(Key::ArrowUp),
             i.key_pressed(Key::ArrowDown),
             i.modifiers.command && i.key_pressed(Key::A),
             i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-            i.key_pressed(Key::M),
+            false,
             i.key_pressed(Key::ArrowLeft),
             i.key_pressed(Key::ArrowRight),
             i.modifiers.shift,
         )
     });
+    let (space, c_down, m) = (fresh(Key::Space), fresh(Key::C), fresh(Key::M));
     if space {
         app.play_pause();
     }
@@ -121,7 +123,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         app.memory_set();
     }
     for (k, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8].iter().enumerate() {
-        if ctx.input(|i| i.key_pressed(*key) && !i.modifiers.command) {
+        if fresh(*key) {
             app.hot_cue_down(k as i32);
         }
         if ctx.input(|i| i.key_released(*key)) {
@@ -165,6 +167,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         }
     }
 }
+
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
