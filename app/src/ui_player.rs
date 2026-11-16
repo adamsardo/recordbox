@@ -295,6 +295,23 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
     }
+    // Vocal positions (rekordbox's vocal detection): a band along the top, brighter where the
+    // vocal level is higher.
+    if let (true, Some(v)) = (app.prefs.show_vocal, &app.deck.vocal) {
+        let (step, levels) = (v.0, &v.1);
+        let w = r.width().max(1.0) as usize;
+        for i in 0..w {
+            let t0 = i as f64 / w as f64 * dur;
+            let t1 = (i + 1) as f64 / w as f64 * dur;
+            let (a, b) = ((t0 / step) as usize, ((t1 / step) as usize).max((t0 / step) as usize + 1));
+            let lvl = levels.get(a.min(levels.len())..b.min(levels.len())).and_then(|s| s.iter().max().copied()).unwrap_or(0);
+            if lvl > 0 {
+                let x = r.min.x + i as f32 + 0.5;
+                let col = hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0));
+                p.line_segment([pos2(x, r.min.y + 1.0), pos2(x, r.min.y + 3.5)], Stroke::new(1.0, col));
+            }
+        }
+    }
     // Phrase bar (as rekordbox shows phrase analysis): one coloured block per phrase.
     if let (Some(st), false) = (&app.deck.phrases, app.deck.beats.is_empty()) {
         let y0 = r.min.y + 38.5;

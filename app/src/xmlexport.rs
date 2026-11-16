@@ -69,8 +69,12 @@ pub fn build(app: &App) -> String {
             }
         ));
         if let Some(g) = app.db.grid(t.id) {
-            for a in &g.anchors {
-                x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", a.time, a.bpm, a.beat));
+            // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
+            let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
+            let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
+            for i in tempo_keep(&recs) {
+                let (beat, bpm, ms) = recs[i];
+                x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", ms as f64 * 0.001, bpm as f64 * 0.01, beat));
             }
         }
         for c in app.db.cues(t.id).unwrap_or_default() {
@@ -118,4 +122,113 @@ pub fn build(app: &App) -> String {
     node(app, 0, 0, &mut x);
     x.push_str("    </NODE>\n  </PLAYLISTS>\n</DJ_PLAYLISTS>\n");
     x
+}
+
+/// Which beat records become TEMPO nodes, as rekordbox's XML export chooses them with its
+/// default `bridgeExportBeatGrid` = 1 (traced in rekordbox-rea reports/native-xml-trace.md):
+/// a beat is kept when its BPM changes or its time (ms) matches neither the running
+/// prediction nor the prediction from the previous beat, each truncated with and without
+/// +0.5. Records are (beat in bar, BPM × 100, time in ms), as in PQTZ.
+pub fn tempo_keep(records: &[(u16, u16, u32)]) -> Vec<usize> {
+    let trunc = |x: f64| x as u32;
+    let (mut prev_bpm, mut expected, mut from_prev) = (0u16, 0.0f64, 0.0f64);
+    let mut out = vec![];
+    for (i, &(_, bpm, ms)) in records.iter().enumerate() {
+        let hit_expected = ms == trunc(expected) || ms == trunc(expected + 0.5);
+        let hit_prev = ms == trunc(from_prev) || ms == trunc(from_prev + 0.5);
+        if bpm != prev_bpm || !(hit_expected || hit_prev) {
+            out.push(i);
+            if !hit_expected {
+                expected = ms as f64;
+            }
+            prev_bpm = bpm;
+        }
+        let interval = if bpm > 0 { 6_000_000.0 / bpm as f64 } else { 0.0 };
+        expected += interval;
+        from_prev = ms as f64 + interval;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tempo_tests {
+    use super::tempo_keep;
+
+    #[test]
+    fn constant_grid_keeps_first_beat_only() {
+        // 128 BPM from 0.120 s, times rounded to ms as in PQTZ.
+        let recs: Vec<(u16, u16, u32)> = (0..64).map(|k| ((k % 4 + 1) as u16, 12800, (120.0 + k as f64 * 468.75).round() as u32)).collect();
+        assert_eq!(tempo_keep(&recs), vec![0]);
+        // A BPM change and a timing jump each add a node.
+        let mut v = recs.clone();
+        for r in v.iter_mut().skip(32) {
+            r.2 += 7;
+        }
+        assert_eq!(tempo_keep(&v), vec![0, 32]);
+    }
+
+    /// rekordbox's own XML export against its own PQTZ for the same tracks. Run with
+    /// PREPDECK_XML and PREPDECK_ANLZ_PAIRS set, --ignored.
+    #[test]
+    #[ignore]
+    fn matches_rekordbox_xml_tempo_nodes() {
+        let (Ok(xml), Ok(pairs)) = (std::env::var("PREPDECK_XML"), std::env::var("PREPDECK_ANLZ_PAIRS")) else { return };
+        let text = std::fs::read_to_string(xml).unwrap();
+        // Location -> TEMPO nodes as written.
+        use quick_xml::events::Event;
+        let mut r = quick_xml::Reader::from_str(&text);
+        let mut by_loc: std::collections::HashMap<String, Vec<(String, String, String)>> = Default::default();
+        let mut cur: Option<String> = None;
+        loop {
+            match r.read_event().unwrap() {
+                Event::Start(e) | Event::Empty(e) => {
+                    let a: std::collections::HashMap<String, String> = e.attributes().flatten().map(|a| (String::from_utf8_lossy(a.key.as_ref()).to_string(), a.unescape_value().unwrap().to_string())).collect();
+                    match e.name().as_ref() {
+                        b"TRACK" if a.contains_key("Location") => {
+                            let loc = crate::importer::decode_location(&a["Location"]);
+                            by_loc.entry(loc.clone()).or_default();
+                            cur = Some(loc);
+                        }
+                        b"TEMPO" => {
+                            if let Some(c) = &cur {
+                                by_loc.get_mut(c).unwrap().push((a["Inizio"].clone(), a["Bpm"].clone(), a["Battito"].clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Event::End(e) if e.name().as_ref() == b"TRACK" => cur = None,
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        let (mut same, mut total, mut nodes) = (0, 0, 0);
+        for line in std::fs::read_to_string(pairs).unwrap().lines() {
+            let Some((path, base)) = line.split_once('\t') else { continue };
+            let Some(want) = by_loc.get(path) else { continue };
+            let b = std::fs::read(format!("{base}.DAT")).unwrap();
+            let be32 = |o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+            let mut i = be32(4) as usize;
+            let mut recs = vec![];
+            while i + 12 <= b.len() {
+                if &b[i..i + 4] == b"PQTZ" {
+                    for k in 0..be32(i + 20) as usize {
+                        let o = i + 24 + k * 8;
+                        recs.push((u16::from_be_bytes([b[o], b[o + 1]]), u16::from_be_bytes([b[o + 2], b[o + 3]]), be32(o + 4)));
+                    }
+                }
+                i += be32(i + 8) as usize;
+            }
+            let got: Vec<(String, String, String)> = tempo_keep(&recs).into_iter().map(|k| (format!("{:.3}", recs[k].2 as f64 * 0.001), format!("{:.2}", recs[k].1 as f64 * 0.01), recs[k].0.to_string())).collect();
+            total += 1;
+            nodes += want.len();
+            if &got == want {
+                same += 1;
+            } else {
+                eprintln!("differs: {path}\n  rekordbox {want:?}\n  ours      {got:?}");
+            }
+        }
+        eprintln!("TEMPO nodes identical on {same} / {total} tracks ({nodes} nodes in rekordbox's XML)");
+        assert_eq!(same, total);
+    }
 }

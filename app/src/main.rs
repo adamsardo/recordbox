@@ -128,17 +128,22 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         return;
     }
     use egui::Key;
-    let fresh = |k: Key| ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } if *key == k && !modifiers.command)));
-    let keys: std::collections::HashMap<&str, Key> = prepdeck_actions().iter().filter_map(|a| app.prefs.key_for(a).map(|k| (*a, k))).collect();
-    let key = |a: &str| keys.get(a).copied();
-    let pressed = |a: &str| key(a).map(|k| ctx.input(|i| i.key_pressed(k) && !i.modifiers.command)).unwrap_or(false);
+    let shortcuts: std::collections::HashMap<&str, app::Shortcut> = prepdeck_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
+    let key = |a: &str| shortcuts.get(a).map(|s| s.key);
+    // A press of the action's key with exactly its modifiers (beat jumps also take Shift).
+    let hit = |a: &str, repeats: bool| {
+        let Some(sc) = shortcuts.get(a) else { return false };
+        let free_shift = a == "jump_back" || a == "jump_fwd";
+        ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat, modifiers, .. } if *key == sc.key && (repeats || !*repeat) && sc.mods_match(modifiers, free_shift))))
+    };
+    let pressed = |a: &str| hit(a, true);
     let released = |a: &str| key(a).map(|k| ctx.input(|i| i.key_released(k))).unwrap_or(false);
-    let first = |a: &str| key(a).map(fresh).unwrap_or(false);
+    let first = |a: &str| hit(a, false);
     let shift = ctx.input(|i| i.modifiers.shift);
     let cmd_a = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A));
     let (up, down, enter, left, right) = (pressed("list_up"), pressed("list_down"), pressed("load"), pressed("jump_back"), pressed("jump_fwd"));
     // Delete also answers to Backspace when it is on its default key.
-    let del = pressed("remove") || (key("remove") == Some(Key::Delete) && ctx.input(|i| i.key_pressed(Key::Backspace)));
+    let del = pressed("remove") || (shortcuts.get("remove").map(|s| s.name()) == Some("Delete".into()) && ctx.input(|i| i.key_pressed(Key::Backspace) && i.modifiers.is_none()));
     if first("play") {
         app.play_pause();
     }

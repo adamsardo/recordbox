@@ -618,3 +618,24 @@ mod schema_dump {
         let _ = std::fs::remove_dir_all(&dest);
     }
 }
+
+#[cfg(test)]
+mod onelibrary_probe {
+    /// Does the master.db key open a OneLibrary catalog? Run with --ignored.
+    #[test]
+    #[ignore]
+    fn probe_key() {
+        let p = std::env::var("PREPDECK_ONELIB").unwrap();
+        let c = rusqlite::Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        c.pragma_update(None, "key", super::MASTER_DB_KEY).unwrap();
+        match c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)) {
+            Ok(n) => {
+                println!("opened: {n} objects");
+                let mut st = c.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap();
+                println!("{:?}", st.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().collect::<Vec<_>>());
+                println!("property: {:?}", c.query_row("SELECT deviceName, dbVersion, numberOfContents, createdDate FROM property", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))));
+            }
+            Err(e) => println!("not opened: {e}"),
+        }
+    }
+}

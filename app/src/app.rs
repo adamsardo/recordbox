@@ -210,6 +210,18 @@ pub struct Prefs {
     pub import_device_history: bool,
     /// Keyboard shortcuts changed from their defaults: action id -> key name.
     pub keymap: std::collections::BTreeMap<String, String>,
+    /// Column browser (Genre / Artist / Album) above the track list.
+    pub column_browser: bool,
+    /// Sub-browser: a second track list under the main one.
+    pub sub_browser: bool,
+    /// Preferences > View > Browse: font size and line space steps (0–4), bold text, and
+    /// keeping the selected track in the middle of the list.
+    pub browse_font: u8,
+    pub browse_line: u8,
+    pub browse_bold: bool,
+    pub center_selected: bool,
+    /// Vocal positions above the overview waveform.
+    pub show_vocal: bool,
     /// The column set and sort not in use: playlists and the collection each keep their own
     /// (rekordbox shows # and fewer columns in playlists). `columns_for_playlist` says which
     /// set `columns` currently holds.
@@ -241,11 +253,76 @@ pub const ACTIONS: [(&str, &str, &str); 17] = [
     ("remove", "Remove from playlist", "Delete"),
 ];
 
+/// A key with modifiers, stored as "Ctrl+Alt+Shift+Cmd+Key" (any subset, in that order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    pub key: egui::Key,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub cmd: bool,
+}
+
+impl Shortcut {
+    pub fn parse(s: &str) -> Option<Shortcut> {
+        let mut sc = Shortcut { key: egui::Key::Space, ctrl: false, alt: false, shift: false, cmd: false };
+        let mut parts: Vec<&str> = s.split('+').collect();
+        // "Shift++" style is not used: the key name is always the last part.
+        let key = parts.pop()?;
+        for m in parts {
+            match m {
+                "Ctrl" => sc.ctrl = true,
+                "Alt" => sc.alt = true,
+                "Shift" => sc.shift = true,
+                "Cmd" => sc.cmd = true,
+                _ => return None,
+            }
+        }
+        sc.key = egui::Key::from_name(key)?;
+        Some(sc)
+    }
+    pub fn from_event(key: egui::Key, m: &egui::Modifiers) -> Shortcut {
+        Shortcut { key, ctrl: m.ctrl && !m.mac_cmd, alt: m.alt, shift: m.shift, cmd: m.mac_cmd || (m.command && !m.ctrl) }
+    }
+    /// Stored form.
+    pub fn name(&self) -> String {
+        let mut s = String::new();
+        for (on, n) in [(self.ctrl, "Ctrl+"), (self.alt, "Alt+"), (self.shift, "Shift+"), (self.cmd, "Cmd+")] {
+            if on {
+                s.push_str(n);
+            }
+        }
+        s.push_str(self.key.name());
+        s
+    }
+    /// As shown in menus on macOS: ⌃⌥⇧⌘ then the key.
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        for (on, n) in [(self.ctrl, "⌃"), (self.alt, "⌥"), (self.shift, "⇧"), (self.cmd, "⌘")] {
+            if on {
+                s.push_str(n);
+            }
+        }
+        s.push_str(self.key.name());
+        s
+    }
+    /// The held modifiers are exactly this shortcut's. `free_shift`: Shift may be added
+    /// (beat jumps use it for a one-beat jump).
+    pub fn mods_match(&self, m: &egui::Modifiers, free_shift: bool) -> bool {
+        let o = Shortcut::from_event(self.key, m);
+        o.ctrl == self.ctrl && o.alt == self.alt && o.cmd == self.cmd && (o.shift == self.shift || (free_shift && !self.shift))
+    }
+}
+
 impl Prefs {
-    /// The key assigned to an action (the user's choice, else the default).
-    pub fn key_for(&self, action: &str) -> Option<egui::Key> {
+    /// The shortcut assigned to an action (the user's choice, else the default).
+    pub fn shortcut_for(&self, action: &str) -> Option<Shortcut> {
         let name = self.keymap.get(action).cloned().or_else(|| ACTIONS.iter().find(|a| a.0 == action).map(|a| a.2.to_string()))?;
-        egui::Key::from_name(&name)
+        Shortcut::parse(&name)
+    }
+    /// The key of an action's shortcut (releases end previews whatever modifiers are held).
+    pub fn key_for(&self, action: &str) -> Option<egui::Key> {
+        self.shortcut_for(action).map(|s| s.key)
     }
 }
 
@@ -274,6 +351,29 @@ impl Default for RelatedRules {
 /// Distance between two keys on the key wheel: steps around the wheel plus one when the
 /// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
 #[cfg(test)]
+mod pvdi_tests {
+    #[test]
+    fn reads_vocal_levels() {
+        let mut s = b"PVDI".to_vec();
+        s.extend_from_slice(&24u32.to_be_bytes());
+        s.extend_from_slice(&28u32.to_be_bytes());
+        for w in [0u16, 1024, 22050, 1] {
+            s.extend_from_slice(&w.to_be_bytes());
+        }
+        s.extend_from_slice(&4u32.to_be_bytes());
+        s.extend_from_slice(&[0, 2, 4, 1]);
+        let v = super::parse_pvdi(&s).unwrap();
+        assert!((v.0 - 1024.0 / 22050.0).abs() < 1e-9);
+        assert_eq!(v.1, vec![0, 2, 4, 1]);
+        // Scrambled (negative discriminator) and truncated sections are refused.
+        let mut neg = s.clone();
+        neg[12] = 0xff;
+        assert!(super::parse_pvdi(&neg).is_none());
+        assert!(super::parse_pvdi(&s[..26]).is_none());
+    }
+}
+
+#[cfg(test)]
 mod keymap_tests {
     #[test]
     fn default_and_custom_keys() {
@@ -286,6 +386,19 @@ mod keymap_tests {
         assert_eq!(p.key_for("play"), Some(eframe::egui::Key::P));
         p.keymap.insert("cue".into(), String::new());
         assert_eq!(p.key_for("cue"), None);
+        // Modifiers.
+        p.keymap.insert("memory".into(), "Alt+Shift+M".into());
+        let sc = p.shortcut_for("memory").unwrap();
+        assert_eq!((sc.key, sc.alt, sc.shift, sc.ctrl, sc.cmd), (eframe::egui::Key::M, true, true, false, false));
+        assert_eq!(sc.name(), "Alt+Shift+M");
+        assert_eq!(sc.label(), "⌥⇧M");
+        let m = eframe::egui::Modifiers { alt: true, shift: true, ..Default::default() };
+        assert!(sc.mods_match(&m, false));
+        assert!(!sc.mods_match(&eframe::egui::Modifiers::NONE, false));
+        let left = p.shortcut_for("jump_back").unwrap();
+        assert!(left.mods_match(&eframe::egui::Modifiers::SHIFT, true));
+        assert!(!left.mods_match(&eframe::egui::Modifiers::SHIFT, false));
+        assert!(super::Shortcut::parse("Hyper+K").is_none());
     }
 }
 
@@ -349,6 +462,13 @@ impl Default for Prefs {
             stems_auto_download: true,
             import_device_history: true,
             keymap: Default::default(),
+            column_browser: false,
+            sub_browser: false,
+            browse_font: 0,
+            browse_line: 0,
+            browse_bold: false,
+            center_selected: false,
+            show_vocal: true,
             columns_other: vec![Col::Num, Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Genre, Col::Bpm, Col::Time, Col::Key, Col::DateAdded],
             sort_other: (Col::Num, true),
             columns_for_playlist: false,
@@ -442,6 +562,8 @@ pub struct Deck {
     /// rekordbox's own 3-band waveforms for this audio file (detail at 150 per second, and
     /// the 1200-column overview), when the track came from the rekordbox library.
     pub rb_wave: Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>>,
+    /// Vocal activity (rekordbox's PVDI): (seconds per entry, level 0–4 per entry).
+    pub vocal: Option<std::sync::Arc<(f64, Vec<u8>)>>,
     pub track: Option<i64>,
     pub audio: Option<Arc<Decoded>>,
     pub loading: Option<Receiver<(i64, Result<Arc<Decoded>, String>)>>,
@@ -472,6 +594,7 @@ impl Default for Deck {
             phrases: None,
             phrases_rx: None,
             rb_wave: None,
+            vocal: None,
             track: None,
             audio: None,
             loading: None,
@@ -576,6 +699,15 @@ pub struct App {
     pub anchor_id: Option<i64>,
     pub search: String,
     pub filter_open: bool,
+    /// Sub-browser source (shown while `prefs.sub_browser` is on) and its selection.
+    pub sub_view: View,
+    pub sub_sel: HashSet<i64>,
+    /// A track drag that started in the sub-browser (the main list is then a drop target).
+    pub sub_drag: bool,
+    /// Column browser selections (Genre, Artist, Album); None = All.
+    pub colbrowse: [Option<String>; 3],
+    /// Values each column browser column offers, with track counts (cascading left to right).
+    pub colbrowse_values: [Vec<(String, usize)>; 3],
     pub filter_bpm: (f64, f64),
     pub filter_key: i32,
     pub filter_rating: u8,
@@ -670,6 +802,11 @@ impl App {
             redo: vec![],
             search: String::new(),
             filter_open: false,
+            sub_view: View::Collection,
+            sub_sel: HashSet::new(),
+            sub_drag: false,
+            colbrowse: Default::default(),
+            colbrowse_values: Default::default(),
             filter_bpm: (0.0, 0.0),
             filter_key: -1,
             filter_rating: 0,
@@ -794,6 +931,19 @@ impl App {
                         cc.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(format!("prefs_subtab_{t}")), st));
                     }
                     "mytag" => app.prefs.show_mytag = true,
+                    "colbrowse" => {
+                        app.prefs.column_browser = true;
+                        app.list_dirty = true;
+                    }
+                    "trash" => app.dialogs.trash = Some(Default::default()),
+                    "subbrowser" => {
+                        app.prefs.sub_browser = true;
+                        // The largest playlist.
+                        let best = app.nodes.iter().filter(|n| n.kind == NodeKind::Playlist).max_by_key(|n| app.db.playlist_tracks(n.id).map(|v| v.len()).unwrap_or(0)).map(|n| n.id);
+                        if let Some(id) = best {
+                            app.sub_view = View::Playlist(id);
+                        }
+                    }
                     "export" => app.dialogs.export_open = true,
                     _ => {}
                 }
@@ -1007,7 +1157,12 @@ impl App {
     }
 
     pub fn view_tracks(&self) -> Vec<i64> {
-        match &self.view {
+        self.view_tracks_of(&self.view)
+    }
+
+    /// Tracks of any list view (the main browser's or the sub-browser's).
+    pub fn view_tracks_of(&self, view: &View) -> Vec<i64> {
+        match view {
             View::Collection => self.tracks.iter().map(|t| t.id).collect(),
             View::Playlist(id) => match self.node(*id) {
                 Some(n) if n.kind == NodeKind::Smart => n.smart.as_ref().map(|r| self.smart_tracks(r)).unwrap_or_default(),
@@ -1199,6 +1354,38 @@ impl App {
                 true
             })
             .collect();
+        // Column browser: each column lists the values left after the columns to its left.
+        if self.prefs.column_browser {
+            let field = |t: &Track, i: usize| -> String {
+                match i {
+                    0 => t.genre.trim().to_string(),
+                    1 => t.artist.trim().to_string(),
+                    _ => t.album.trim().to_string(),
+                }
+            };
+            let mut values: [Vec<(String, usize)>; 3] = Default::default();
+            for i in 0..3 {
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                for id in &v {
+                    if let Some(t) = self.track(*id) {
+                        *counts.entry(field(t, i)).or_default() += 1;
+                    }
+                }
+                let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+                list.sort_by(|a, b| (a.0.is_empty(), crate::smart::fold(&a.0)).cmp(&(b.0.is_empty(), crate::smart::fold(&b.0))));
+                // A selection that no longer exists here falls back to All.
+                if let Some(sel) = &self.colbrowse[i] {
+                    if !list.iter().any(|(x, _)| x == sel) {
+                        self.colbrowse[i] = None;
+                    }
+                }
+                if let Some(sel) = self.colbrowse[i].clone() {
+                    v.retain(|id| self.track(*id).map(|t| field(t, i) == sel).unwrap_or(false));
+                }
+                values[i] = list;
+            }
+            self.colbrowse_values = values;
+        }
         let col = self.prefs.sort_col;
         let asc = self.prefs.sort_asc;
         let alnum = self.prefs.key_alnum;
@@ -1317,6 +1504,15 @@ impl App {
         Some(std::sync::Arc::new((detail, overview)))
     }
 
+/// rekordbox's vocal detection for this audio file (PVDI in the .2EX file: a u16 hop in
+    /// samples and u16 sample rate, then one level 0–4 per hop).
+    fn rb_vocals(&self, path: &str) -> Option<std::sync::Arc<(f64, Vec<u8>)>> {
+        let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok())?;
+        let base = std::path::PathBuf::from(map.get(path)?);
+        let sec = crate::export::anlz::read_sections(&base.with_extension("2EX"));
+        parse_pvdi(sec.get("PVDI")?)
+    }
+
     /// Point the selection anchor at row `i` of the current list.
     pub fn set_anchor(&mut self, i: usize) {
         self.anchor = Some(i);
@@ -1326,6 +1522,7 @@ impl App {
     pub fn set_view(&mut self, v: View) {
         if self.view != v {
             self.view = v;
+            self.colbrowse = Default::default();
             let manual = matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
             // Switch to the other column set and sort when moving between playlists and the
             // rest; each keeps the user's own choices.
@@ -2062,6 +2259,7 @@ impl App {
         self.deck.duration = t.duration;
         self.deck.wave = self.db.wave(id);
         self.deck.rb_wave = self.rb_waveforms(&t.path);
+        self.deck.vocal = self.rb_vocals(&t.path);
         self.deck.cues = self.db.cues(id).unwrap_or_default();
         let g = self.db.grid(id).unwrap_or_default();
         self.set_deck_grid(g, false);
@@ -2800,6 +2998,13 @@ impl App {
         let mut devices = vec![];
         for (root, name, fs) in found {
             let p = std::path::Path::new(&root);
+            // An export that was cut short (crash, power loss, drive pulled) is finished or
+            // undone from the drive's journal before anything reads the drive.
+            if self.export_job.is_none() {
+                if let Some(msg) = crate::export::usb::recover_device(p) {
+                    self.toast(format!("{name}: {msg}"));
+                }
+            }
             let (lib, error) = if crate::export::usb::pdb_path(p).exists() {
                 match crate::export::usb::read_device(p) {
                     Ok(l) => (Some(l), None),
@@ -3094,6 +3299,24 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     } else {
         na == nb
     }
+}
+
+/// A PVDI section: header 24 bytes (u16 discriminator at 12, hop at 14, sample rate at 16,
+/// stride at 18, count at 20), then count × stride bytes. Scrambled sections (negative
+/// discriminator) are not readable yet.
+pub fn parse_pvdi(s: &[u8]) -> Option<std::sync::Arc<(f64, Vec<u8>)>> {
+    let u16at = |o: usize| -> Option<u16> { Some(u16::from_be_bytes(s.get(o..o + 2)?.try_into().ok()?)) };
+    let hlen = u32::from_be_bytes(s.get(4..8)?.try_into().ok()?) as usize;
+    if (u16at(12)? as i16) < 0 {
+        return None;
+    }
+    let (hop, sr, stride) = (u16at(14)? as f64, u16at(16)? as f64, u16at(18)?.max(1) as usize);
+    let n = u32::from_be_bytes(s.get(20..24)?.try_into().ok()?) as usize;
+    if hop <= 0.0 || sr <= 0.0 {
+        return None;
+    }
+    let body = s.get(hlen..hlen + n.checked_mul(stride)?)?;
+    Some(std::sync::Arc::new((hop / sr, body.chunks_exact(stride).map(|c| c[0]).collect())))
 }
 
 pub fn fmt_time(secs: f64, tenths: bool) -> String {

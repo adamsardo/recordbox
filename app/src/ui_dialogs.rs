@@ -160,6 +160,38 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                     let before = format!("{:?}", app.prefs);
                     match (app.dialogs.prefs_tab, sub_tab) {
                         (0, 0) => {
+                            card(ui, "Language", |ui| {
+                                egui::ComboBox::from_id_salt("lang").width(330.0).selected_text(RichText::new("English").font(bold(14.0))).show_ui(ui, |ui| {
+                                    let _ = ui.selectable_label(true, "English");
+                                });
+                            });
+                            card(ui, "Tooltips", |ui| {
+                                toggle(ui, &mut app.prefs.tooltips, "Show Tooltips");
+                            });
+                            card(ui, "Browse", |ui| {
+                                sub(ui, "Font Size");
+                                let mut f = app.prefs.browse_font as u32;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Small").size(12.0).color(DIM2));
+                                    if ui.add(egui::Slider::new(&mut f, 0..=4).show_value(false)).changed() {
+                                        app.prefs.browse_font = f as u8;
+                                    }
+                                    ui.label(RichText::new("Large").size(12.0).color(DIM2));
+                                });
+                                toggle(ui, &mut app.prefs.browse_bold, "Bold");
+                                ui.separator();
+                                sub(ui, "Line Space");
+                                let mut l = app.prefs.browse_line as u32;
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Small").size(12.0).color(DIM2));
+                                    if ui.add(egui::Slider::new(&mut l, 0..=4).show_value(false)).changed() {
+                                        app.prefs.browse_line = l as u8;
+                                    }
+                                    ui.label(RichText::new("Large").size(12.0).color(DIM2));
+                                });
+                                ui.separator();
+                                toggle(ui, &mut app.prefs.center_selected, "Show the selected track to the center");
+                            });
                             card(ui, "Key display format", |ui| {
                                 if ui.radio(!app.prefs.key_alnum, RichText::new("Classic").size(14.0)).clicked() {
                                     app.prefs.key_alnum = false;
@@ -169,9 +201,6 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                     app.prefs.key_alnum = true;
                                     app.list_dirty = true;
                                 }
-                            });
-                            card(ui, "Tooltips", |ui| {
-                                toggle(ui, &mut app.prefs.tooltips, "Show Tooltips");
                             });
                         }
                         (0, 1) => {
@@ -195,6 +224,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             });
                             card(ui, "Quantize", |ui| {
                                 toggle(ui, &mut app.prefs.quantize, "Cues and loops snap to the beat grid");
+                            });
+                            card(ui, "Vocal", |ui| {
+                                toggle(ui, &mut app.prefs.show_vocal, "Show vocal positions above the overview waveform");
+                                ui.label(RichText::new("From rekordbox's vocal detection, for tracks it analysed.").size(11.0).color(DIM));
                             });
                         }
                         (1, _) => {
@@ -352,16 +385,16 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                         }
                         (3, _) => {
                             card(ui, "Keyboard shortcuts", |ui| {
-                                ui.label(RichText::new("Click a key, then press the new key for that action (Esc cancels).").size(12.0).color(DIM2));
+                                ui.label(RichText::new("Click a shortcut, then press the new key for that action, with ⌃ ⌥ ⇧ ⌘ if you like (Esc cancels). ⌘ combinations used by the menus take priority.").size(12.0).color(DIM2));
                                 let wait_id = egui::Id::new("key_wait");
                                 let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
                                 if let Some(action) = &waiting {
-                                    let got = ui.input(|i| i.events.iter().find_map(|e| match e { egui::Event::Key { key, pressed: true, .. } => Some(*key), _ => None }));
-                                    if let Some(k) = got {
-                                        if k != egui::Key::Escape {
-                                            // A key belongs to one action: take it away from any other.
-                                            let name = k.name().to_string();
-                                            let others: Vec<String> = crate::app::ACTIONS.iter().map(|a| a.0.to_string()).filter(|a| a != action && app.prefs.key_for(a) == Some(k)).collect();
+                                    let got = ui.input(|i| i.events.iter().find_map(|e| match e { egui::Event::Key { key, pressed: true, modifiers, .. } => Some(crate::app::Shortcut::from_event(*key, modifiers)), _ => None }));
+                                    if let Some(sc) = got {
+                                        if sc.key != egui::Key::Escape {
+                                            // A shortcut belongs to one action: take it away from any other.
+                                            let name = sc.name();
+                                            let others: Vec<String> = crate::app::ACTIONS.iter().map(|a| a.0.to_string()).filter(|a| a != action && app.prefs.shortcut_for(a) == Some(sc)).collect();
                                             for o in others {
                                                 app.prefs.keymap.insert(o, String::new());
                                             }
@@ -373,7 +406,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                 egui::Grid::new("keymap_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
                                     for (id, label, _) in crate::app::ACTIONS {
                                         ui.label(RichText::new(label).size(13.0));
-                                        let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.key_for(id).map(|k| k.name().to_string()).unwrap_or_else(|| "—".into()) };
+                                        let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.shortcut_for(id).map(|k| k.label()).unwrap_or_else(|| "—".into()) };
                                         if ui.add(egui::Button::new(RichText::new(shown).size(13.0)).min_size(vec2(140.0, 22.0))).clicked() {
                                             ui.ctx().data_mut(|d| d.insert_temp(wait_id, Some(id.to_string())));
                                         }

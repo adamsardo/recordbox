@@ -140,7 +140,7 @@ pub struct XmlLibrary {
     pub playlists: Vec<XmlNode>,
 }
 
-fn decode_location(loc: &str) -> String {
+pub fn decode_location(loc: &str) -> String {
     let s = loc.strip_prefix("file://localhost").or_else(|| loc.strip_prefix("file://")).unwrap_or(loc);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

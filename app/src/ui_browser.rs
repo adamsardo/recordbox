@@ -373,6 +373,22 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
             ui.painter().text(pp + vec2(12.0, 4.0), Align2::LEFT_CENTER, &n.name, FontId::proportional(11.5), WHITE);
         }
     }
+    let track_view = !matches!(app.view, View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_));
+    let list = if app.prefs.sub_browser && track_view {
+        let split = list.min.y + (list.height() * 0.58).round();
+        let sub = Rect::from_min_max(pos2(list.min.x, split + 4.0), list.max);
+        sub_browser(app, ui, sub);
+        let main = Rect::from_min_max(list.min, pos2(list.max.x, split));
+        // Tracks dragged from the sub-browser can be dropped into the main playlist.
+        if app.sub_drag {
+            if let Some(pl) = app.is_manual_playlist() {
+                drop_targets.push((main, pl));
+            }
+        }
+        main
+    } else {
+        list
+    };
     let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(list));
     match app.view.clone() {
         View::Device { root, node } => device_list(app, &mut lui, &root, node, None),
@@ -409,6 +425,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
                 }
             }
             app.drag = None;
+            app.sub_drag = false;
         }
     }
 }
@@ -480,16 +497,17 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
         (crate::icons::link, "Related Tracks"),
         (crate::icons::funnel, "Filter"),
         (crate::icons::info, "Display information window."),
-        (crate::icons::split_panes, "Sub-browser (not available in this app)"),
+        (crate::icons::split_panes, "Sub-browser"),
     ];
     for (i, (draw, tipt)) in items.iter().enumerate() {
         let y = [193.0, 227.0, 261.0, 294.0, 328.0][i];
         let rr = Rect::from_center_size(pos2(r.center().x, r.min.y + y), vec2(19.0, 19.0));
-        let enabled = matches!(i, 0 | 1 | 2 | 3);
+        let enabled = true;
         let on = match i {
             0 => app.prefs.show_mytag,
             1 => app.view == View::Related,
             2 => app.filter_open,
+            4 => app.prefs.sub_browser,
             _ => false,
         };
         let resp = ui.interact(rr, ui.id().with(("ricon", i)), Sense::click());
@@ -523,6 +541,10 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
                     if let Some(id) = app.list.iter().find(|t| app.selected.contains(t)).copied() {
                         app.dialogs.info_track = app.track(id).cloned();
                     }
+                }
+                4 => {
+                    app.prefs.sub_browser = !app.prefs.sub_browser;
+                    app.save_prefs();
                 }
                 _ => {}
             }
@@ -1321,8 +1343,8 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     let vic: [(f32, IconFn, Option<bool>, &str); 4] = [
         (394.5, crate::icons::view_art_list, Some(with_art), "Track list with artwork"),
         (356.5, crate::icons::view_list, Some(!with_art), "Track list"),
-        (297.5, crate::icons::view_columns, None, "Column browser (not in this version yet)"),
-        (260.0, crate::icons::split_panes, None, "Sub-browser (not in this version yet)"),
+        (297.5, crate::icons::view_columns, Some(app.prefs.column_browser), "Column browser"),
+        (260.0, crate::icons::split_panes, Some(app.prefs.sub_browser), "Sub-browser"),
     ];
     for (i, (dx, draw, on, tipt)) in vic.into_iter().enumerate() {
         let vr = Rect::from_center_size(pos2(rx - dx, bar.center().y), vec2(18.0, 17.0));
@@ -1334,7 +1356,15 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         }
         draw(&p, vr.shrink(1.0), if on.is_some() { WHITE } else { hex(0x4A4A4A) });
         let resp = if app.prefs.tooltips || on.is_none() { resp.on_hover_text(tipt) } else { resp };
-        if resp.clicked() && on == Some(false) {
+        if resp.clicked() && i == 3 {
+            app.prefs.sub_browser = !app.prefs.sub_browser;
+            app.save_prefs();
+        } else if resp.clicked() && i == 2 {
+            app.prefs.column_browser = !app.prefs.column_browser;
+            app.colbrowse = Default::default();
+            app.list_dirty = true;
+            app.save_prefs();
+        } else if resp.clicked() && on == Some(false) && i < 2 {
             if i == 0 {
                 let at = app.prefs.columns.iter().position(|c| *c == Col::Title).unwrap_or(0);
                 app.prefs.columns.insert(at, Col::Artwork);
@@ -1400,6 +1430,11 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(fr.shrink2(vec2(10.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         filter_bar(app, &mut fui);
         top = fr.max.y;
+    }
+    if app.prefs.column_browser {
+        let cr = Rect::from_min_size(pos2(r.min.x, top.max(r.min.y + 27.0)), vec2(r.width(), 150.0));
+        column_browser(app, ui, cr);
+        top = cr.max.y + 4.0;
     }
     let top = top.max(r.min.y + 31.0) - 4.0;
     let area = Rect::from_min_max(pos2(r.min.x, top + 4.0), r.max);
@@ -1514,20 +1549,34 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             app.rebuild_list();
         }
         let n = app.list.len();
+        let rh = row_height(app);
         let mut sa = egui::ScrollArea::vertical().id_salt("vscroll").auto_shrink([false, false]);
         if app.scroll_to_selected {
             if let Some(i) = app.anchor {
                 let h = ui.available_height();
-                sa = sa.vertical_scroll_offset(((i as f32) * ROW_H - h * 0.4).max(0.0));
+                let y = i as f32 * rh;
+                if app.prefs.center_selected {
+                    sa = sa.vertical_scroll_offset((y - (h - rh) * 0.5).max(0.0));
+                } else {
+                    // Scroll only as far as needed to show the row.
+                    let id = ui.make_persistent_id("vscroll");
+                    let cur = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.offset.y).unwrap_or(0.0);
+                    let view_h = (h - rh).max(rh);
+                    if y < cur {
+                        sa = sa.vertical_scroll_offset(y);
+                    } else if y + rh > cur + view_h {
+                        sa = sa.vertical_scroll_offset((y + rh - view_h).max(0.0));
+                    }
+                }
             }
             app.scroll_to_selected = false;
         }
         let mut drop_line: Option<usize> = None;
-        sa.show_rows(ui, ROW_H, n, |ui, range| {
+        sa.show_rows(ui, rh, n, |ui, range| {
             for i in range {
                 let id = app.list[i];
                 let Some(t) = app.track(id).cloned() else { continue };
-                let (rr, resp) = ui.allocate_exact_size(vec2(w, ROW_H), Sense::click_and_drag());
+                let (rr, resp) = ui.allocate_exact_size(vec2(w, rh), Sense::click_and_drag());
                 let sel = app.selected.contains(&id);
                 let loaded = app.deck.track == Some(id);
                 let bg = if sel { SELECT } else if i % 2 == 0 { BG1 } else { BG2 };
@@ -1622,10 +1671,192 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// Sub-browser: a second track list (Collection or any playlist) under the main one. Rows drag
+/// onto playlists in the tree or into the main list's playlist; double-click loads.
+fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect) {
+    ui.painter().rect_filled(r, 0.0, BG1);
+    let view = app.sub_view.clone();
+    let name = match &view {
+        View::Playlist(id) => app.node(*id).map(|n| n.name.clone()).unwrap_or_else(|| "Collection".into()),
+        _ => "Collection".into(),
+    };
+    // The list is re-read at most once a second (playlists come from the database).
+    let cache_id = egui::Id::new("sub_cache");
+    let cached: Option<(String, f64, std::sync::Arc<Vec<i64>>)> = ui.ctx().data(|d| d.get_temp(cache_id));
+    let now = ui.input(|i| i.time);
+    let key = format!("{view:?}");
+    let ids = match cached.filter(|c| c.0 == key && now - c.1 < 1.0) {
+        Some(c) => c.2,
+        None => {
+            let v = std::sync::Arc::new(app.view_tracks_of(&view));
+            ui.ctx().data_mut(|d| d.insert_temp(cache_id, (key, now, v.clone())));
+            v
+        }
+    };
+    let bar = Rect::from_min_size(r.min, vec2(r.width(), 22.0));
+    ui.painter().rect_filled(bar, 0.0, BG2);
+    ui.painter().text(pos2(bar.min.x + 10.5, bar.center().y), Align2::LEFT_CENTER, format!("{name} ({} Tracks)", ids.len()), FontId::proportional(11.5), WHITE);
+    let pick = Rect::from_min_max(pos2(bar.max.x - 190.0, bar.min.y + 3.0), pos2(bar.max.x - 8.0, bar.max.y - 3.0));
+    ui.painter().rect_stroke(pick, 2.0, Stroke::new(1.0, DIM), egui::StrokeKind::Inside);
+    ui.painter().text(pos2(pick.min.x + 6.0, pick.center().y), Align2::LEFT_CENTER, "Show list…", FontId::proportional(11.0), TEXT);
+    crate::icons::chevron_down(ui.painter(), Rect::from_center_size(pos2(pick.max.x - 8.0, pick.center().y), vec2(10.0, 8.0)), TEXT);
+    let presp = ui.interact(pick, ui.id().with("sub_pick"), Sense::click());
+    dropdown(ui, &presp, "sub_pick_menu", |ui| {
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            if ui.selectable_label(view == View::Collection, "Collection").clicked() {
+                app.sub_view = View::Collection;
+                app.sub_sel.clear();
+            }
+            fn add(app: &mut App, ui: &mut Ui, parent: i64, depth: usize) {
+                let kids: Vec<(i64, String, NodeKind)> = app.nodes.iter().filter(|n| n.parent == parent).map(|n| (n.id, n.name.clone(), n.kind.clone())).collect();
+                for (id, name, kind) in kids {
+                    let label = format!("{}{}{name}", "    ".repeat(depth), if kind == NodeKind::Folder { "▸ " } else { "" });
+                    if ui.selectable_label(app.sub_view == View::Playlist(id), label).clicked() {
+                        app.sub_view = View::Playlist(id);
+                        app.sub_sel.clear();
+                    }
+                    if kind == NodeKind::Folder {
+                        add(app, ui, id, depth + 1);
+                    }
+                }
+            }
+            add(app, ui, 0, 0);
+        });
+    });
+    // Header and rows: Track Title, Artist, BPM, Key, Time.
+    let body = Rect::from_min_max(pos2(r.min.x, bar.max.y), r.max);
+    let fixed = 60.0 + 50.0 + 56.0;
+    let tw = ((body.width() - fixed - 12.0) * 0.55).max(80.0);
+    let aw = (body.width() - fixed - 12.0 - tw).max(60.0);
+    let cols: [(&str, f32, bool); 5] = [("Track Title", tw, false), ("Artist", aw, false), ("BPM", 60.0, true), ("Key", 50.0, false), ("Time", 56.0, true)];
+    let hr = Rect::from_min_size(body.min, vec2(body.width(), 13.5));
+    ui.painter().rect_filled(hr, 0.0, BG2);
+    let mut x = hr.min.x + 8.0;
+    for (label, w, _) in cols {
+        ui.painter().text(pos2(x, hr.center().y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), WHITE);
+        x += w;
+    }
+    let rows = Rect::from_min_max(pos2(body.min.x, hr.max.y), body.max);
+    let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(rows));
+    rui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    let alnum = app.prefs.key_alnum;
+    egui::ScrollArea::vertical().id_salt("sub_rows").auto_shrink([false, false]).show_rows(&mut rui, 19.0, ids.len(), |ui, range| {
+        for i in range {
+            let id = ids[i];
+            let Some(t) = app.track(id).cloned() else { continue };
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 19.0), Sense::click_and_drag());
+            let sel = app.sub_sel.contains(&id);
+            if sel {
+                ui.painter().rect_filled(rr, 0.0, SELECT);
+            } else if i % 2 == 1 {
+                ui.painter().rect_filled(rr, 0.0, BG2.gamma_multiply(0.5));
+            }
+            let mut x = rr.min.x + 8.0;
+            let texts = [t.display_title(), t.artist.clone(), if t.bpm > 0.0 { format!("{:.2}", t.bpm) } else { String::new() }, key_name(t.key, alnum), if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }];
+            for ((_, w, right), txt) in cols.iter().zip(texts) {
+                let cell = Rect::from_min_size(pos2(x, rr.min.y), vec2(*w - 6.0, rr.height()));
+                let p = ui.painter().with_clip_rect(cell);
+                if *right {
+                    p.text(pos2(cell.max.x - 4.0, cell.center().y), Align2::RIGHT_CENTER, txt, FontId::proportional(11.5), TEXT);
+                } else {
+                    p.text(pos2(cell.min.x, cell.center().y), Align2::LEFT_CENTER, txt, FontId::proportional(11.5), if t.missing { DIM } else { TEXT });
+                }
+                x += w;
+            }
+            if resp.clicked() {
+                let cmd = ui.input(|i| i.modifiers.command);
+                if cmd {
+                    if !app.sub_sel.remove(&id) {
+                        app.sub_sel.insert(id);
+                    }
+                } else {
+                    app.sub_sel.clear();
+                    app.sub_sel.insert(id);
+                }
+            }
+            if resp.double_clicked() {
+                app.load_track(id);
+            }
+            if resp.drag_started() && app.drag.is_none() {
+                let ids: Vec<i64> = if sel { ids.iter().copied().filter(|x| app.sub_sel.contains(x)).collect() } else { vec![id] };
+                app.drag = Some(ids);
+                app.sub_drag = true;
+            }
+        }
+    });
+}
+
+/// Column browser: Genre, Artist and Album lists; each choice narrows the columns to its
+/// right and the track list.
+fn column_browser(app: &mut App, ui: &mut Ui, r: Rect) {
+    if app.list_dirty {
+        app.rebuild_list();
+    }
+    ui.painter().rect_filled(r, 0.0, BG1);
+    let w = r.width() / 3.0;
+    for (i, name) in ["Genre", "Artist", "Album"].iter().enumerate() {
+        let cr = Rect::from_min_size(pos2(r.min.x + w * i as f32, r.min.y), vec2(w, r.height()));
+        if i > 0 {
+            ui.painter().line_segment([pos2(cr.min.x, cr.min.y), pos2(cr.min.x, cr.max.y)], Stroke::new(1.0, BG));
+        }
+        let hr = Rect::from_min_size(cr.min, vec2(w, 14.0));
+        ui.painter().rect_filled(hr, 0.0, BG2);
+        ui.painter().text(pos2(hr.min.x + 6.0, hr.center().y), Align2::LEFT_CENTER, *name, FontId::proportional(11.0), WHITE);
+        let body = Rect::from_min_max(pos2(cr.min.x + 1.0, hr.max.y), pos2(cr.max.x - 1.0, cr.max.y));
+        let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+        bui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        let values = app.colbrowse_values[i].clone();
+        let total: usize = values.iter().map(|v| v.1).sum();
+        let mut pick: Option<Option<String>> = None;
+        egui::ScrollArea::vertical().id_salt(("colbrowse", i)).auto_shrink([false, false]).show(&mut bui, |ui| {
+            let mut row = |ui: &mut Ui, label: String, val: Option<String>| {
+                let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::click());
+                let on = app.colbrowse[i] == val;
+                if on {
+                    ui.painter().rect_filled(rr, 0.0, BLUE);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rr, 0.0, BG2);
+                }
+                ui.painter().text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), if on { WHITE } else { TEXT });
+                if resp.clicked() {
+                    pick = Some(val);
+                }
+            };
+            row(ui, format!("All ({total})"), None);
+            for (v, n) in values {
+                let label = if v.is_empty() { format!("(No {}) ({n})", name.to_lowercase()) } else { format!("{v} ({n})") };
+                row(ui, label, Some(v));
+            }
+        });
+        if let Some(val) = pick {
+            app.colbrowse[i] = val;
+            for j in i + 1..3 {
+                app.colbrowse[j] = None;
+            }
+            app.list_dirty = true;
+        }
+    }
+}
+
+/// Track list row height: Preferences > View > Browse font size and line space.
+pub fn row_height(app: &App) -> f32 {
+    ROW_H + app.prefs.browse_font.min(4) as f32 * 1.5 + app.prefs.browse_line.min(4) as f32 * 2.5
+}
+
+/// Track list text font (Preferences > View > Browse).
+pub fn list_font(app: &App) -> FontId {
+    let size = 11.5 + app.prefs.browse_font.min(4) as f32 * 1.0;
+    if app.prefs.browse_bold {
+        bold(size)
+    } else {
+        FontId::proportional(size)
+    }
+}
+
 fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize) {
     let p = ui.painter().with_clip_rect(r.shrink2(vec2(3.0, 0.0)));
     let text_pos = |right: bool| if right { pos2(r.max.x - 6.0, r.center().y) } else { pos2(r.min.x + 6.0, r.center().y) };
-    let font = FontId::proportional(11.5);
+    let font = list_font(app);
     let col = if t.missing { CAUTION_TX } else { TEXT };
     let txt = |s: String| {
         let right = c.right_aligned();

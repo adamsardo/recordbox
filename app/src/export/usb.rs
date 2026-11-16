@@ -546,24 +546,155 @@ pub struct ExportRequest {
 
 /// Files this export created. Unless the export commits, they are removed again, so a
 /// stopped or failed export leaves the drive as it was.
+/// Export journal on the drive (`/.PrepDeck/journal/journal.log`): every file this export
+/// creates ("C" lines) and, before an existing file is overwritten, a durable copy of its old
+/// bytes ("R" lines). "P" is written once both new databases are fully on the drive. An
+/// export that fails is undone from it at once; one cut short by a crash, power loss or the
+/// drive being pulled is undone (before "P") or finished (after "P") by [`recover_device`]
+/// the next time the drive is seen.
 struct Created {
+    root: PathBuf,
+    dir: PathBuf,
+    log: Option<std::fs::File>,
     files: Vec<PathBuf>,
-    /// Existing files this export overwrote, with their previous bytes.
-    replaced: Vec<(PathBuf, Vec<u8>)>,
+    /// Existing files this export overwrote, with the journal copy of their previous bytes.
+    replaced: Vec<(PathBuf, PathBuf)>,
+    publishing: bool,
     committed: bool,
+}
+
+fn journal_dir(root: &Path) -> PathBuf {
+    root.join(".PrepDeck").join("journal")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fault injection: fail at this journal step (1-based); with `CRASH`, skip the in-process
+    /// rollback as if the program had died there.
+    pub(crate) static FAIL_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STEP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CRASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn fault_point() -> Result<()> {
+    #[cfg(test)]
+    {
+        let n = STEP.with(|s| {
+            s.set(s.get() + 1);
+            s.get()
+        });
+        if FAIL_AT.with(|f| f.get()) == n {
+            return Err(anyhow!("injected fault at step {n}"));
+        }
+    }
+    Ok(())
+}
+
+impl Created {
+    fn begin(root: &Path) -> Result<Created> {
+        let dir = journal_dir(root);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let log = std::fs::File::create(dir.join("journal.log"))?;
+        let mut c = Created { root: root.to_path_buf(), dir, log: Some(log), files: vec![], replaced: vec![], publishing: false, committed: false };
+        c.line("B", true)?;
+        Ok(c)
+    }
+    fn rel(&self, p: &Path) -> String {
+        p.strip_prefix(&self.root).unwrap_or(p).to_string_lossy().to_string()
+    }
+    fn line(&mut self, l: &str, sync: bool) -> Result<()> {
+        use std::io::Write;
+        fault_point()?;
+        if let Some(f) = self.log.as_mut() {
+            writeln!(f, "{l}")?;
+            if sync {
+                f.sync_all()?;
+            }
+        }
+        fault_point()
+    }
+    /// A new file this export is about to write.
+    fn note_created(&mut self, p: &Path) -> Result<()> {
+        self.files.push(p.to_path_buf());
+        let l = format!("C\t{}", self.rel(p));
+        self.line(&l, false)
+    }
+    /// About to write `p`: keep a durable copy of what is there now, or note it as new.
+    fn will_replace(&mut self, p: &Path) -> Result<()> {
+        if !p.is_file() {
+            return self.note_created(p);
+        }
+        let backup = self.dir.join(format!("r{}", self.replaced.len()));
+        std::fs::copy(p, &backup)?;
+        std::fs::File::options().write(true).open(&backup)?.sync_all()?;
+        let l = format!("R\t{}\t{}", self.rel(p), backup.file_name().unwrap_or_default().to_string_lossy());
+        self.line(&l, true)?;
+        self.replaced.push((p.to_path_buf(), backup));
+        Ok(())
+    }
+    /// Both new databases are on the drive: from here on the export is finished, not undone.
+    fn publishing(&mut self) -> Result<()> {
+        self.line("P", true)?;
+        self.publishing = true;
+        Ok(())
+    }
+    fn finish(&mut self) {
+        self.committed = true;
+        self.log = None;
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl Drop for Created {
     fn drop(&mut self) {
-        if !self.committed {
-            for f in self.files.iter().rev() {
-                let _ = std::fs::remove_file(f);
-            }
-            for (p, old) in self.replaced.iter().rev() {
-                let _ = std::fs::write(p, old);
+        #[cfg(test)]
+        if CRASH.with(|c| c.get()) {
+            return;
+        }
+        if self.committed {
+            return;
+        }
+        self.log = None;
+        let _ = recover_device(&self.root);
+    }
+}
+
+/// Finish or undo an export that did not complete, from the drive's journal. Returns what was
+/// done, or None when there was nothing to recover.
+pub fn recover_device(root: &Path) -> Option<String> {
+    let dir = journal_dir(root);
+    let text = std::fs::read_to_string(dir.join("journal.log")).ok()?;
+    let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+    let rb = root.join("PIONEER").join("rekordbox");
+    let msg = if lines.iter().any(|l| l[0] == "P") {
+        for f in ["export.pdb", "exportExt.pdb"] {
+            if tmp_for(&rb.join(f)).exists() {
+                let _ = publish_tmp(&rb.join(f));
             }
         }
-    }
+        "An export to this device that was interrupted has been completed."
+    } else {
+        for l in lines.iter().rev() {
+            match l.as_slice() {
+                ["R", path, backup] => {
+                    if let Ok(b) = std::fs::read(dir.join(backup)) {
+                        let _ = write_atomic(&root.join(path), &b);
+                    }
+                }
+                ["C", path] => {
+                    let _ = std::fs::remove_file(root.join(path));
+                }
+                _ => {}
+            }
+        }
+        for f in ["export.pdb", "exportExt.pdb"] {
+            let _ = std::fs::remove_file(tmp_for(&rb.join(f)));
+        }
+        "An export to this device that was interrupted has been undone; the device is as it was before."
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(msg.to_string())
 }
 
 fn sha256_file(p: &Path) -> Result<[u8; 32]> {
@@ -664,7 +795,7 @@ fn sync_dir(dir: &Path) {
 /// that the full length arrived before giving it its final name.
 fn copy_durable(src: &Path, dest: &Path, created: &mut Created) -> Result<()> {
     let tmp = dest.with_file_name(format!("{}.part", dest.file_name().unwrap_or_default().to_string_lossy()));
-    created.files.push(tmp.clone());
+    created.note_created(&tmp)?;
     let n = std::fs::copy(src, &tmp)?;
     std::fs::File::options().write(true).open(&tmp)?.sync_all()?;
     let want = std::fs::metadata(src)?.len();
@@ -675,9 +806,8 @@ fn copy_durable(src: &Path, dest: &Path, created: &mut Created) -> Result<()> {
     if sha256_file(src)? != sha256_file(&tmp)? {
         return Err(anyhow!("copy of {} does not match the original; the drive may be failing", src.display()));
     }
+    created.note_created(dest)?;
     std::fs::rename(&tmp, dest)?;
-    created.files.pop();
-    created.files.push(dest.to_path_buf());
     if let Some(p) = dest.parent() {
         sync_dir(p);
     }
@@ -698,6 +828,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     if !root.is_dir() {
         return Err(anyhow!("The device is not available"));
     }
+    recover_device(&root);
     let mut lib = match read_device(&root) {
         Ok(l) => l,
         Err(e) => return Err(anyhow!("Device library is corrupted ({e}). Nothing was changed.")),
@@ -773,7 +904,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let total = req.tracks.len();
-    let mut created = Created { files: vec![], replaced: vec![], committed: false };
+    let mut created = Created::begin(&root)?;
     let mut cue_record = read_cue_record(&root);
     let mut map: HashMap<i64, u32> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
@@ -871,16 +1002,13 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         std::fs::create_dir_all(base_fs.parent().unwrap())?;
         for (ext_name, data) in [("DAT", &files.dat), ("EXT", &files.ext), ("2EX", &files.ex2)] {
             let path = base_fs.with_extension(ext_name);
-            match std::fs::read(&path) {
-                Ok(old) => created.replaced.push((path.clone(), old)),
-                Err(_) => created.files.push(path.clone()),
-            }
+            created.will_replace(&path)?;
             write_atomic(&path, data)?;
         }
         cue_record.insert(usb_path.clone(), anlz::cue_fingerprint(&anlz::parse_cues(&anlz::section_list(&files.ext), &anlz::section_list(&files.dat))));
         // Artwork.
         let artwork_path = if !t.artwork.is_empty() && Path::new(&t.artwork).exists() {
-            write_artwork(&root, dev_id, &t.artwork).unwrap_or_default()
+            write_artwork(&root, dev_id, &t.artwork, &mut created).unwrap_or_default()
         } else {
             String::new()
         };
@@ -945,25 +1073,21 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         return Err(anyhow!("Export was stopped. The device library was not changed, and files copied by this export were removed."));
     }
     lib.browse = Some(req.browse.clone());
-    backup_device_db(&root);
-    {
-        let mut published = false;
-        let r = write_device_then(&root, &lib, &mut || published = true);
-        if published {
-            created.committed = true;
-        }
-        r?;
-    }
-    created.committed = true;
-    // Player settings, as rekordbox writes them with every export.
-    for (name, bytes) in req.settings.files() {
-        let _ = write_atomic(&root.join("PIONEER").join(name), &bytes);
-    }
-    // Sidecar with local sources (never read by players).
+    // Sidecar with local sources and the cue record (PrepDeck's own; never read by players).
+    // Written first so a finished-after-interruption export has them too; entries for files
+    // an undone export removed are simply never looked up.
     let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
     let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources).unwrap_or_default());
     cue_record.retain(|path, _| lib.tracks.values().any(|t| &t.file_path == path));
     let _ = write_cue_record(&root, &cue_record);
+    backup_device_db(&root);
+    write_device_journaled(&root, &lib, &mut created)?;
+    created.finish();
+    // Player settings, as rekordbox writes them with every export.
+    for (name, bytes) in req.settings.files() {
+        let _ = write_atomic(&root.join("PIONEER").join(name), &bytes);
+    }
+
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
     if has_onelibrary(&root) {
         msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which PrepDeck does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
@@ -1054,11 +1178,13 @@ fn publish_tmp(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_artwork(root: &Path, id: u32, src: &str) -> Result<String> {
+fn write_artwork(root: &Path, id: u32, src: &str, created: &mut Created) -> Result<String> {
     let img = image::open(src)?;
     let rel = format!("/PIONEER/Artwork/00001/a{id}.jpg");
     let dir = root.join("PIONEER/Artwork/00001");
     std::fs::create_dir_all(&dir)?;
+    created.will_replace(&dir.join(format!("a{id}.jpg")))?;
+    created.will_replace(&dir.join(format!("a{id}_m.jpg")))?;
     let small = img.resize_to_fill(80, 80, image::imageops::FilterType::Triangle).to_rgb8();
     small.save(dir.join(format!("a{id}.jpg")))?;
     let big = img.resize_to_fill(240, 240, image::imageops::FilterType::Triangle).to_rgb8();
@@ -1535,6 +1661,26 @@ pub fn write_device(root: &Path, lib: &DeviceLibrary) -> Result<()> {
 
 /// As write_device; `published` runs as soon as the new export.pdb is in place (from then on
 /// the drive's library refers to the files this export copied).
+/// Write both databases under the export's journal: fully written and flushed, then "P",
+/// then the two renames.
+fn write_device_journaled(root: &Path, lib: &DeviceLibrary, created: &mut Created) -> Result<()> {
+    let dir = root.join("PIONEER").join("rekordbox");
+    std::fs::create_dir_all(&dir)?;
+    let main = build_export_pdb(lib);
+    let check = parse_pdb(main.clone())?;
+    if check.tracks.len() != lib.tracks.len() {
+        return Err(anyhow!("internal check failed: wrote {} tracks, read back {}", lib.tracks.len(), check.tracks.len()));
+    }
+    let ext = build_export_ext(lib);
+    write_tmp(&dir.join("export.pdb"), &main)?;
+    write_tmp(&dir.join("exportExt.pdb"), &ext)?;
+    created.publishing()?;
+    publish_tmp(&dir.join("export.pdb"))?;
+    fault_point()?;
+    publish_tmp(&dir.join("exportExt.pdb"))?;
+    fault_point()
+}
+
 pub fn write_device_then(root: &Path, lib: &DeviceLibrary, published: &mut dyn FnMut()) -> Result<()> {
     let dir = root.join("PIONEER").join("rekordbox");
     std::fs::create_dir_all(&dir)?;
