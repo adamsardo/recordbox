@@ -82,6 +82,61 @@ pub struct DeviceLibrary {
     /// category itself is keyed by its name). Reused on the next export so IDs stay stable.
     #[serde(default)]
     pub tag_ids: BTreeMap<String, u32>,
+    /// Browse categories and sort options the players offer (Preferences > DJ System >
+    /// Category / Sort). None keeps the original's defaults.
+    #[serde(default)]
+    pub browse: Option<UsbBrowse>,
+}
+
+/// Active browse categories and sort options, in order, by COLUMNS id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbBrowse {
+    pub categories: Vec<u16>,
+    pub sorts: Vec<u16>,
+}
+
+/// Categories that are always active (shown greyed in the original's Category page).
+pub const FIXED_CATEGORIES: [u16; 5] = [4, 17, 19, 20, 24];
+/// Sort options that are always active (DEFAULT, ALPHABET/TRACK NAME).
+pub const FIXED_SORTS: [u16; 2] = [0x19, 0x1a];
+
+impl Default for UsbBrowse {
+    fn default() -> Self {
+        let order = |rows: &[[u8; 8]], vis: usize, pos: usize| -> Vec<u16> {
+            let mut v: Vec<(u8, u16)> = rows.iter().filter(|r| r[vis] != 1).map(|r| (r[pos], u16::from_le_bytes([r[0], r[1]]))).collect();
+            v.sort();
+            v.into_iter().map(|x| x.1).collect()
+        };
+        UsbBrowse { categories: order(&MENU, 5, 6), sorts: order(&TABLE18, 4, 5) }
+    }
+}
+
+impl UsbBrowse {
+    /// Every category the Category page can offer (id, name).
+    pub fn all_categories() -> Vec<(u16, &'static str)> {
+        MENU.iter().map(|r| u16::from_le_bytes([r[0], r[1]])).filter_map(|id| column_name(id).map(|n| (id, n))).collect()
+    }
+    pub fn all_sorts() -> Vec<(u16, &'static str)> {
+        TABLE18.iter().map(|r| u16::from_le_bytes([r[0], r[1]])).filter_map(|id| column_name(id).map(|n| (id, n))).collect()
+    }
+    /// Fixed entries first, in the original's order, then the user's choices.
+    pub fn normalized(&self) -> UsbBrowse {
+        let mut c: Vec<u16> = self.categories.iter().copied().filter(|id| MENU.iter().any(|r| u16::from_le_bytes([r[0], r[1]]) == *id)).collect();
+        for f in FIXED_CATEGORIES {
+            if !c.contains(&f) {
+                c.push(f);
+            }
+        }
+        let mut s: Vec<u16> = FIXED_SORTS.to_vec();
+        s.extend(self.sorts.iter().copied().filter(|id| !FIXED_SORTS.contains(id) && TABLE18.iter().any(|r| u16::from_le_bytes([r[0], r[1]]) == *id)));
+        c.dedup();
+        s.dedup();
+        UsbBrowse { categories: c, sorts: s }
+    }
+}
+
+pub fn column_name(id: u16) -> Option<&'static str> {
+    COLUMNS.iter().find(|c| c.0 == id).map(|c| c.2)
 }
 
 /// Key for a tag inside its category (tags with the same name in two categories differ).
@@ -375,6 +430,10 @@ pub struct ExportTrack {
     pub grid: Option<BeatGrid>,
     pub wave: Option<Waveform>,
     pub tags: Vec<(String, String)>, // (category, tag)
+    /// rekordbox's own analysis files for this audio file (base path without extension).
+    pub rb_anlz: Option<PathBuf>,
+    /// The track's grid is still the one rekordbox analysed (phrases/extended grid stay valid).
+    pub grid_same: bool,
 }
 
 /// A playlist (or folder) to create on the device, depth-first order.
@@ -404,6 +463,8 @@ pub struct ExportRequest {
     pub analysis: crate::analysis::AnalysisSettings,
     /// Player settings files written to /PIONEER (MYSETTING.DAT etc.).
     pub settings: super::settings::UsbSettings,
+    /// Browse categories / sort options for the players' menus.
+    pub browse: UsbBrowse,
 }
 
 /// Files this export created. Unless the export commits, they are removed again, so a
@@ -652,7 +713,14 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         let full_len = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
         let beats = et.grid.as_ref().map(|g| g.beats(full_len.max(t.duration))).unwrap_or_default();
         let wave = et.wave.clone().unwrap_or_default();
-        let files = anlz::build(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate);
+        let ov = et.rb_anlz.as_ref().map(|b| {
+            let mut sections = std::collections::HashMap::new();
+            for e in ["2EX", "EXT", "DAT"] {
+                sections.extend(anlz::read_sections(&b.with_extension(e)));
+            }
+            anlz::Overrides { sections, grid_same: et.grid_same }
+        });
+        let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let prev = lib.tracks.get(&dev_id).cloned().unwrap_or_default();
         let base = match anlz_base(&prev.analyze_path) {
             Some(b) => b,
@@ -738,6 +806,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     if cancel.load(Relaxed) {
         return Err(anyhow!("Export was stopped. The device library was not changed, and files copied by this export were removed."));
     }
+    lib.browse = Some(req.browse.clone());
     backup_device_db(&root);
     write_device(&root, &lib)?;
     created.committed = true;
@@ -1143,8 +1212,49 @@ pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
             r
         })
         .collect();
-    let menu_rows = MENU.iter().map(|m| m.to_vec()).collect();
-    let t18_rows = TABLE18.iter().map(|m| m.to_vec()).collect();
+    // Menu (17) and sort (18) tables: the original's rows with visibility and position taken
+    // from the Category/Sort preferences (visible rows keep their observed visibility value).
+    let browse = lib.browse.clone().map(|b| b.normalized());
+    let menu_rows = MENU
+        .iter()
+        .map(|m| {
+            let mut r = m.to_vec();
+            if let Some(b) = &browse {
+                let id = u16::from_le_bytes([m[0], m[1]]);
+                match b.categories.iter().position(|x| *x == id) {
+                    Some(i) => {
+                        r[5] = if m[5] == 1 { 0 } else { m[5] };
+                        r[6..8].copy_from_slice(&(i as u16 + 1).to_le_bytes());
+                    }
+                    None => {
+                        r[5] = 1;
+                        r[6..8].copy_from_slice(&0u16.to_le_bytes());
+                    }
+                }
+            }
+            r
+        })
+        .collect();
+    let t18_rows = TABLE18
+        .iter()
+        .map(|m| {
+            let mut r = m.to_vec();
+            if let Some(b) = &browse {
+                let id = u16::from_le_bytes([m[0], m[1]]);
+                match b.sorts.iter().position(|x| *x == id) {
+                    Some(i) => {
+                        r[4] = 0;
+                        r[5] = i as u8 + 1;
+                    }
+                    None => {
+                        r[4] = 1;
+                        r[5] = 0;
+                    }
+                }
+            }
+            r
+        })
+        .collect();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut sync = vec![0x80, 0x02, 0, 0];
     sync.extend((lib.tracks.len() as u32).to_le_bytes());
@@ -1279,6 +1389,21 @@ pub fn write_device(root: &Path, lib: &DeviceLibrary) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_browse_matches_original_tables() {
+        let d = UsbBrowse::default();
+        // Category page defaults: ARTIST, ALBUM, TRACK, KEY, PLAYLIST, HISTORY, SEARCH,
+        // MATCHING, FOLDER, DATE ADDED.
+        assert_eq!(d.categories, vec![2, 3, 4, 11, 17, 19, 20, 27, 24, 22]);
+        // Sort page defaults: DEFAULT, ALPHABET, ARTIST, ALBUM, BPM, RATING, KEY.
+        assert_eq!(d.sorts, vec![0x19, 0x1a, 2, 3, 5, 6, 11]);
+        // Writing the defaults reproduces the original rows byte for byte.
+        let mut lib = DeviceLibrary::default();
+        let plain = build_export_pdb(&lib);
+        lib.browse = Some(d);
+        assert_eq!(build_export_pdb(&lib), plain);
+    }
+
     #[test]
     fn anlz_numbering_matches_original() {
         let base = std::env::temp_dir().join(format!("prepdeck_anlz_num_{}", std::process::id()));

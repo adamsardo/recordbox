@@ -14,6 +14,7 @@ mod key;
 mod menus;
 mod model;
 mod rbimport;
+mod stems;
 mod smart;
 mod theme;
 mod ui_browser;
@@ -35,6 +36,7 @@ impl eframe::App for Gui {
         app.poll_load();
         app.poll_export();
         app.poll_rekordbox_sync();
+        app.poll_stems();
         menus::poll(app);
         shortcuts(app, ctx);
 

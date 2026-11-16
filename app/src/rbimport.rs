@@ -88,6 +88,8 @@ pub struct RbTrack {
     pub xt: XmlTrack,
     /// (category, tag) My Tag assignments.
     pub tags: Vec<(String, String)>,
+    /// rekordbox's own analysis files for this track, without extension (".../ANLZ0000").
+    pub anlz_base: Option<std::path::PathBuf>,
 }
 
 pub struct RbLibrary {
@@ -303,12 +305,13 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
         };
         let anlz = g("AnalysisDataPath");
         let grid = if anlz.is_empty() { None } else { read_pqtz_grid(&share_dir.join(anlz.trim_start_matches('/'))) };
+        let anlz_base = (!anlz.is_empty()).then(|| share_dir.join(anlz.trim_start_matches('/')).with_extension("")).filter(|p| p.with_extension("DAT").is_file());
         let tags = song_tags.remove(&rb_id).unwrap_or_default();
         let mut tag_names: Vec<String> = tags.iter().map(|(c, t)| format!("{c}/{t}")).collect();
         tag_names.sort();
         let fingerprint = format!("{}|{}|{}|{}", g("updated_at"), cue_stamp.get(&rb_id).cloned().unwrap_or_default(), g("AnalysisUpdated"), tag_names.join(","));
         let xt = XmlTrack { xml_id: rb_id.clone(), track: t, grid, cues: cues.remove(&rb_id).unwrap_or_default() };
-        tracks.push(RbTrack { rb_id, fingerprint, xt, tags });
+        tracks.push(RbTrack { rb_id, fingerprint, xt, tags, anlz_base });
     }
 
     // Playlist tree.

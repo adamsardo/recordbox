@@ -171,6 +171,10 @@ pub struct PlayState {
     pub loop_range: Option<(f64, f64)>,
     pub metronome: Option<Arc<Vec<f64>>>,
     pub metronome_vol: f32,
+    /// Separated stems of the loaded track (44.1 kHz) and which are audible, in source order
+    /// drums, bass, other, vocals. With all on (or no stems) the original mix plays.
+    pub stems: Option<Arc<crate::stems::Stems>>,
+    pub stem_on: [bool; 4],
     click_phase: usize,
     next_click: usize,
 }
@@ -186,6 +190,8 @@ impl Default for PlayState {
             loop_range: None,
             metronome: None,
             metronome_vol: 0.5,
+            stems: None,
+            stem_on: [true; 4],
             click_phase: usize::MAX,
             next_click: 0,
         }
@@ -258,6 +264,9 @@ fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate:
     let frames = audio.frames();
     let vol = s.volume * s.gain;
     let click_len = (rate as f64 * 0.03) as usize;
+    let stems = if s.stem_on.iter().all(|x| *x) { None } else { s.stems.clone() };
+    let stem_on = s.stem_on;
+    let stem_ratio = crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64;
     for f in out.chunks_mut(channels) {
         if let Some((a, b)) = s.loop_range {
             let bf = b * audio.sr as f64;
@@ -273,8 +282,25 @@ fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate:
             break;
         }
         let fr = (p - i as f64) as f32;
-        let l = audio.samples[i * 2] * (1.0 - fr) + audio.samples[i * 2 + 2] * fr;
-        let r = audio.samples[i * 2 + 1] * (1.0 - fr) + audio.samples[i * 2 + 3] * fr;
+        let (l, r) = match &stems {
+            // Some stems muted: sum the audible ones at the same position.
+            Some(st) if st.len > 1 => {
+                let sp = p * stem_ratio;
+                let si = (sp as usize).min(st.len - 2);
+                let sf = (sp - si as f64) as f32;
+                let (mut l, mut r) = (0.0f32, 0.0f32);
+                for (src, on) in stem_on.iter().enumerate() {
+                    if *on {
+                        let lb = src * 2 * st.len;
+                        let rb = lb + st.len;
+                        l += st.data[lb + si] * (1.0 - sf) + st.data[lb + si + 1] * sf;
+                        r += st.data[rb + si] * (1.0 - sf) + st.data[rb + si + 1] * sf;
+                    }
+                }
+                (l, r)
+            }
+            _ => (audio.samples[i * 2] * (1.0 - fr) + audio.samples[i * 2 + 2] * fr, audio.samples[i * 2 + 1] * (1.0 - fr) + audio.samples[i * 2 + 3] * fr),
+        };
         let mut click = 0.0f32;
         if let Some(beats) = s.metronome.clone() {
             let t = p / audio.sr as f64;

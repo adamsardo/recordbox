@@ -32,6 +32,11 @@ fn export_matches_collection_xml() {
             });
         }
     });
+    let rb_pairs: HashMap<String, std::path::PathBuf> = std::env::var("PREPDECK_ANLZ_PAIRS")
+        .ok()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|t| t.lines().filter_map(|l| l.split_once('\t')).map(|(a, b)| (a.to_string(), std::path::PathBuf::from(b))).collect())
+        .unwrap_or_default();
     for (i, (_, xt, r)) in results.into_inner().unwrap().into_iter().enumerate() {
         let id = i as i64 + 1;
         let mut t = xt.track.clone();
@@ -45,7 +50,13 @@ fn export_matches_collection_xml() {
         }
         let cues: Vec<Cue> = xt.cues.iter().map(|c| Cue { track_id: id, ..c.clone() }).collect();
         xml_ids.insert(xt.xml_id.clone(), id);
-        tracks.insert(id, ExportTrack { track: t, cues, grid: xt.grid.clone(), wave: r.map(|r| r.wave), tags: vec![] });
+        // With PREPDECK_ANLZ_PAIRS, tracks carry rekordbox's own analysis files (as after a sync).
+        let rb_anlz = rb_pairs.get(&t.path).cloned().filter(|b: &std::path::PathBuf| b.with_extension("DAT").is_file());
+        let grid_same = match (&rb_anlz, &xt.grid) {
+            (Some(b), Some(g)) => crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| crate::app::grids_match(&r, g)).unwrap_or(false),
+            _ => false,
+        };
+        tracks.insert(id, ExportTrack { track: t, cues, grid: xt.grid.clone(), wave: r.map(|r| r.wave), tags: vec![], rb_anlz, grid_same });
     }
     fn nodes(n: &[crate::importer::XmlNode], ids: &HashMap<String, i64>) -> Vec<ExportNode> {
         n.iter()
@@ -57,9 +68,40 @@ fn export_matches_collection_xml() {
     let root = base.join(chrono::Local::now().format("usb_%H%M%S").to_string());
     std::fs::create_dir_all(&root).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default() }, &|_| {}, &cancel).unwrap();
+    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default() }, &|_| {}, &cancel).unwrap();
     eprintln!("{msg}");
     let dev = read_device(&root).unwrap();
+    // Sections passed through from rekordbox's own analysis are byte-identical to its files.
+    {
+        let (mut same, mut total, mut with_grid, mut pssi) = (0, 0, 0, 0);
+        for et in tracks.values() {
+            let Some(b) = &et.rb_anlz else { continue };
+            let Some(dt) = dev.tracks.values().find(|d| d.source == et.track.path) else { continue };
+            let base = root.join(dt.analyze_path.trim_start_matches('/')).with_extension("");
+            for (e, tags) in [("DAT", vec!["PWAV", "PWV2", "PVBR"]), ("EXT", vec!["PWV3", "PWV4", "PWV5"]), ("2EX", vec!["PWV6", "PWV7", "PWVC", "PVDI"])] {
+                let mine = super::anlz::read_sections(&base.with_extension(e));
+                let theirs = super::anlz::read_sections(&b.with_extension(e));
+                for t in tags {
+                    if let Some(x) = theirs.get(t) {
+                        total += 1;
+                        if mine.get(t) == Some(x) {
+                            same += 1;
+                        }
+                    }
+                }
+            }
+            if et.grid_same {
+                with_grid += 1;
+                if super::anlz::read_sections(&base.with_extension("EXT")).contains_key("PSSI") {
+                    pssi += 1;
+                }
+            }
+        }
+        eprintln!("rekordbox sections passed through byte-identical: {same} / {total}; grid unchanged on {with_grid} tracks, {pssi} with phrases (PSSI)");
+        if total > 0 {
+            assert_eq!(same, total);
+        }
+    }
 
     let mut checks: Vec<(&str, usize, usize)> = vec![];
     let mut bump = |name: &'static str, ok: bool, checks: &mut Vec<(&str, usize, usize)>| {

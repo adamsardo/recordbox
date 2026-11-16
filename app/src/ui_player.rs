@@ -609,6 +609,9 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
         // Q 1206.6..1238.4, menu 1259.5
         let q = app.prefs.quantize;
+        if tip(seg_button(ui, at(1165.0, 46.0), "stems_btn", "STEMS", false), app, "Show the stem (part) controls").clicked() {
+            app.deck.ctrl_tab = 2;
+        }
         if tip(seg_button(ui, at(1222.5, 31.8), "quant", "Q", q), app, "Quantize ON/OFF").clicked() {
             app.prefs.quantize = !q;
             app.save_prefs();
@@ -643,8 +646,66 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                 }
             }
         });
+    } else if app.deck.ctrl_tab == 2 {
+        stems_strip(app, ui, s, main);
     } else {
         grid_strip(app, ui, s, x0);
+    }
+}
+
+/// Stem controls: VOCAL / INST / BASS / DRUMS (mute a part by switching it off), the model in
+/// use and separation progress.
+fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
+    let p = ui.painter().clone();
+    let y = s.min.y + 22.6;
+    let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 26.0));
+    let have = app.player.state.lock().stems.is_some();
+    let on = app.player.state.lock().stem_on;
+    let loaded = app.deck.track.is_some();
+    // (label, source index, colour)
+    let parts: [(&str, usize, Color32); 4] = [("VOCAL", 3, hex(0x3CC85A)), ("INST", 2, hex(0xA05AE6)), ("BASS", 1, hex(0xF08C28)), ("DRUMS", 0, hex(0x2E7DF0))];
+    for (i, (label, src, col)) in parts.iter().enumerate() {
+        let r = at(452.0 + i as f32 * 78.0, 70.0);
+        let resp = ui.interact(r, ui.id().with(("stem", i)), Sense::click());
+        let lit = have && on[*src];
+        p.rect_filled(r, 3.0, if lit { col.gamma_multiply(0.85) } else if resp.hovered() { hex(0x2A2A2A) } else { hex(0x161616) });
+        p.rect_stroke(r, 3.0, Stroke::new(1.0, if have { *col } else { hex(0x3C3C3C) }), egui::StrokeKind::Inside);
+        p.text(r.center(), Align2::CENTER_CENTER, *label, bold(10.5), if have { WHITE } else { DIM });
+        let resp = resp.on_hover_text(if have { "Switch this part on or off" } else { "Separate this track into parts first" });
+        if resp.clicked() && loaded {
+            app.toggle_stem(*src);
+        }
+    }
+    // Status and actions.
+    let model = app.stem.model.as_deref().and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
+    let status = if let Some((d, t)) = app.stem.downloading {
+        if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
+    } else if let Some((_, pr)) = app.stem.separating {
+        format!("Separating with {model}: {:.0}%", pr * 100.0)
+    } else if app.stem.loading.is_some() {
+        "Loading stems…".to_string()
+    } else if let Some(e) = &app.stem.error {
+        e.clone()
+    } else if have {
+        format!("Stems ready ({model}). Click a part to mute it.")
+    } else if !loaded {
+        "Load a track to separate it into parts.".to_string()
+    } else {
+        format!("Not separated yet. Model: {model}.")
+    };
+    p.text(pos2(sx(main, 770.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
+    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
+    if busy {
+        if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {
+            app.stop_separation();
+        }
+    } else if !have && loaded {
+        if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", "SEPARATE"), app, "Split this track into vocal, instrument, bass and drum parts").clicked() {
+            app.separate_loaded();
+        }
+    }
+    if tip(seg_button(ui, at(1222.5, 40.0), "stems_back", "BACK", false), app, "Back to the cue and loop controls").clicked() {
+        app.deck.ctrl_tab = 0;
     }
 }
 

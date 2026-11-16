@@ -333,24 +333,72 @@ pub struct AnlzFiles {
 /// `raw_samples`/`sample_rate`: the file's full decoded length, which the original uses for the
 /// seek index total and the number of detail waveform frames (0 = unknown, use the waveform).
 pub fn build(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue], raw_samples: u64, sample_rate: u32) -> AnlzFiles {
+    build_with(usb_path, beats, wave, cues, raw_samples, sample_rate, None)
+}
+
+/// Sections taken from rekordbox's own analysis of the same audio file (for tracks synced from
+/// the rekordbox library). Waveforms, the VBR seek index and vocal detection always apply; the
+/// beat grid, extended grid (PQT2) and phrases (PSSI) only when `grid_same` (the track's grid
+/// is still the one rekordbox analysed, since phrases are counted in its beats).
+pub struct Overrides {
+    pub sections: std::collections::HashMap<String, Vec<u8>>,
+    pub grid_same: bool,
+}
+
+/// Every top-level section of an ANLZ file, by tag (first occurrence), as raw bytes.
+pub fn read_sections(path: &std::path::Path) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(b) = std::fs::read(path) else { return out };
+    if b.len() < 12 || &b[..4] != b"PMAI" {
+        return out;
+    }
+    let be32 = |o: usize| -> Option<usize> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize) };
+    let mut i = be32(4).unwrap_or(b.len());
+    while i + 12 <= b.len() {
+        let Some(total) = be32(i + 8) else { break };
+        if total < 12 || i + total > b.len() {
+            break;
+        }
+        let tag = String::from_utf8_lossy(&b[i..i + 4]).to_string();
+        out.entry(tag).or_insert_with(|| b[i..i + total].to_vec());
+        i += total;
+    }
+    out
+}
+
+pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue], raw_samples: u64, sample_rate: u32, ov: Option<&Overrides>) -> AnlzFiles {
     let mut hot: Vec<&Cue> = cues.iter().filter(|c| c.kind == CueKind::Hot && (0..8).contains(&c.slot)).collect();
     hot.sort_by_key(|c| c.slot);
     let mut mem: Vec<&Cue> = cues.iter().filter(|c| c.kind == CueKind::Memory).collect();
     mem.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     let frames = padded_frames(wave, raw_samples, sample_rate);
-    let dat = file(vec![ppth(usb_path), pvbr(raw_samples), pqtz(beats), pwav(wave), pwv2(wave), pcob(true, &hot), pcob(false, &mem)]);
-    let ext = file(vec![
+    let take = |tag: &str| ov.and_then(|o| o.sections.get(tag).cloned());
+    let take_grid = |tag: &str| ov.filter(|o| o.grid_same).and_then(|o| o.sections.get(tag).cloned());
+    let or = |tag: &str, f: &dyn Fn() -> Vec<u8>| take(tag).unwrap_or_else(f);
+    let dat = vec![
         ppth(usb_path),
-        pwv3(&frames),
-        pcob(true, &[]),
-        pcob(false, &[]),
-        pco2(true, &hot),
-        pco2(false, &mem),
-        pwv5(&frames),
-        pwv4(wave),
-    ]);
-    let ex2 = file(vec![ppth(usb_path), pwv7(&frames), pwv6(wave), pwvc()]);
-    AnlzFiles { dat, ext, ex2 }
+        or("PVBR", &|| pvbr(raw_samples)),
+        take_grid("PQTZ").unwrap_or_else(|| pqtz(beats)),
+        or("PWAV", &|| pwav(wave)),
+        or("PWV2", &|| pwv2(wave)),
+        pcob(true, &hot),
+        pcob(false, &mem),
+    ];
+    // Section order as rekordbox writes it: PPTH, PWV3, PCOB×2, PCO2×2, PQT2, PWV5, PWV4, PSSI.
+    let mut ext = vec![ppth(usb_path), or("PWV3", &|| pwv3(&frames)), pcob(true, &[]), pcob(false, &[]), pco2(true, &hot), pco2(false, &mem)];
+    if let Some(s) = take_grid("PQT2") {
+        ext.push(s);
+    }
+    ext.push(or("PWV5", &|| pwv5(&frames)));
+    ext.push(or("PWV4", &|| pwv4(wave)));
+    if let Some(s) = take_grid("PSSI") {
+        ext.push(s);
+    }
+    let mut ex2 = vec![ppth(usb_path), or("PWV7", &|| pwv7(&frames)), or("PWV6", &|| pwv6(wave)), or("PWVC", &pwvc)];
+    if let Some(s) = take("PVDI") {
+        ex2.push(s);
+    }
+    AnlzFiles { dat: file(dat), ext: file(ext), ex2: file(ex2) }
 }
 
 /// Folder for a track's analysis files, from its media path on the drive (hash recovered from

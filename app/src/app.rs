@@ -200,6 +200,12 @@ pub struct Prefs {
     /// Which field the track-list search looks in (0 = all; see SEARCH_SCOPES).
     pub search_scope: u8,
     pub related: RelatedRules,
+    /// Browse categories and sort options written to USB (Preferences > DJ System).
+    pub usb_browse: crate::export::usb::UsbBrowse,
+    /// Separation model chosen for this machine (None: choose on next launch).
+    pub stem_model: Option<String>,
+    /// Download the chosen model in the background at launch.
+    pub stems_auto_download: bool,
 }
 
 /// Related Tracks rules (the original offers Same Key / Related Key 1–3, BPM range and more).
@@ -243,6 +249,11 @@ mod related_tests {
     }
 }
 
+/// Two grids describe the same beats (same anchors within 1 ms and 0.01 BPM).
+pub fn grids_match(a: &BeatGrid, b: &BeatGrid) -> bool {
+    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| (x.time - y.time).abs() < 0.001 && (x.bpm - y.bpm).abs() < 0.01 && x.beat == y.beat)
+}
+
 pub fn key_distance(a: i32, b: i32) -> Option<i32> {
     if !(0..24).contains(&a) || !(0..24).contains(&b) {
         return None;
@@ -276,6 +287,9 @@ impl Default for Prefs {
             usb_settings: Default::default(),
             search_scope: 0,
             related: Default::default(),
+            usb_browse: Default::default(),
+            stem_model: None,
+            stems_auto_download: true,
             delete_device_tracks: false,
             target_lufs: -8.0,
             tooltips: true,
@@ -290,6 +304,37 @@ impl Default for Prefs {
 
 /// Seconds shown across the enlarged waveform; the default (index 2) matches the original's default
 /// zoom, measured at about 21 beats from the playhead to the right edge at 126 BPM.
+pub enum StemMsg {
+    Hardware(crate::stems::Hardware, String),
+    Download(u64, u64),
+    DownloadDone(Result<(), String>),
+    Progress(i64, f32),
+    Done(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
+}
+
+/// Stem separation status: hardware, model, download and the current separation.
+pub struct StemState {
+    pub hw: Option<crate::stems::Hardware>,
+    pub model: Option<String>,
+    pub model_ready: bool,
+    pub downloading: Option<(u64, u64)>,
+    pub separating: Option<(i64, f32)>,
+    pub loading: Option<i64>,
+    pub error: Option<String>,
+    /// Track to separate as soon as the model download finishes.
+    pub pending: Option<i64>,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub tx: crossbeam_channel::Sender<StemMsg>,
+    pub rx: crossbeam_channel::Receiver<StemMsg>,
+}
+
+impl StemState {
+    pub fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), tx, rx }
+    }
+}
+
 pub const ZOOMS: [f64; 6] = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -447,6 +492,7 @@ pub struct App {
     pub load_after_import: Option<String>,
     /// Playlist/folder being dragged in the tree.
     pub node_drag: Option<i64>,
+    pub stem: StemState,
     pub pool: AnalysisPool,
     pub analysis_total: usize,
     pub analysis_done: usize,
@@ -500,6 +546,7 @@ impl App {
             related_built_for: None,
             load_after_import: None,
             node_drag: None,
+            stem: StemState::new(),
             search: String::new(),
             filter_open: false,
             filter_bpm: (0.0, 0.0),
@@ -559,6 +606,9 @@ impl App {
                 let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
                 app.analyze(&ids, false);
             }
+        }
+        if app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_STEMS").is_ok() {
+            app.stems_init();
         }
         // Test switch: open Preferences at launch.
         if std::env::var("PREPDECK_OPEN_PREFS").is_ok() {
@@ -643,6 +693,29 @@ impl App {
             if let Some(t) = first {
                 app.load_track(t);
                 app.selected.insert(t);
+                // PREPDECK_SHOT_STEMS=1: show the stems strip; =separate: separate the whole
+                // track first (synchronously, model from PREPDECK_STEM_MODEL) and mute vocals.
+                if let Ok(v) = std::env::var("PREPDECK_SHOT_STEMS") {
+                    app.deck.ctrl_tab = 2;
+                    let m = std::env::var("PREPDECK_STEM_MODEL").ok().and_then(|id| crate::stems::spec(&id)).unwrap_or(&crate::stems::CATALOG[1]);
+                    app.stem.model = Some(m.id.to_string());
+                    if v == "separate" {
+                        if let Some(tr) = app.track(t).cloned() {
+                            let t0 = std::time::Instant::now();
+                            let r = crate::audio::decode_file(&tr.path).map_err(|e| e.to_string()).and_then(|dec| crate::stems::separate(m, &dec.samples, dec.sr, &mut |_| true).map_err(|e| e.to_string()));
+                            match r {
+                                Ok(st) => {
+                                    eprintln!("separated {} ({:.0} s of audio) in {:.1} s", tr.display_title(), st.len as f64 / 44100.0, t0.elapsed().as_secs_f64());
+                                    let _ = crate::stems::save(&crate::stems::cache_path(&tr.path, m.id), &st);
+                                    let mut ps = app.player.state.lock();
+                                    ps.stems = Some(std::sync::Arc::new(st));
+                                    ps.stem_on = [true, true, true, false];
+                                }
+                                Err(e) => eprintln!("separation failed: {e}"),
+                            }
+                        }
+                    }
+                }
                 if let Some(rx) = app.deck.loading.take() {
                     if let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(20)) {
                         let (tx2, rx2) = crossbeam_channel::bounded(1);
@@ -1136,6 +1209,192 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------ stems
+    /// Assess the hardware, settle on a model and download it if needed (background thread).
+    pub fn stems_init(&mut self) {
+        let tx = self.stem.tx.clone();
+        let ctx = self.ctx.clone();
+        let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
+        let auto = self.prefs.stems_auto_download;
+        let cancel = self.stem.cancel.clone();
+        std::thread::spawn(move || {
+            let hw = crate::stems::assess();
+            let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
+            let _ = tx.send(StemMsg::Hardware(hw, m.id.to_string()));
+            ctx.request_repaint();
+            if auto && !crate::stems::model_ready(m) {
+                let tx2 = tx.clone();
+                let ctx2 = ctx.clone();
+                let mut last = std::time::Instant::now();
+                let r = crate::stems::download(m, &mut |d, t, _| {
+                    if last.elapsed().as_millis() > 200 {
+                        let _ = tx2.send(StemMsg::Download(d, t));
+                        ctx2.request_repaint();
+                        last = std::time::Instant::now();
+                    }
+                }, &cancel);
+                let _ = tx.send(StemMsg::DownloadDone(r.map_err(|e| e.to_string())));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    pub fn stems_download(&mut self) {
+        let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else { return };
+        if self.stem.downloading.is_some() {
+            return;
+        }
+        self.stem.downloading = Some((0, 0));
+        self.stem.error = None;
+        let tx = self.stem.tx.clone();
+        let ctx = self.ctx.clone();
+        let cancel = self.stem.cancel.clone();
+        std::thread::spawn(move || {
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let mut last = std::time::Instant::now();
+            let r = crate::stems::download(m, &mut |d, t, _| {
+                if last.elapsed().as_millis() > 200 {
+                    let _ = tx2.send(StemMsg::Download(d, t));
+                    ctx2.request_repaint();
+                    last = std::time::Instant::now();
+                }
+            }, &cancel);
+            let _ = tx.send(StemMsg::DownloadDone(r.map_err(|e| e.to_string())));
+            ctx.request_repaint();
+        });
+    }
+
+    fn load_cached_stems(&mut self, id: i64) {
+        let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return };
+        let path = crate::stems::cache_path(&t.path, &model);
+        if !path.exists() {
+            return;
+        }
+        self.stem.loading = Some(id);
+        let tx = self.stem.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::stems::load(&path).map(std::sync::Arc::new).map_err(|e| e.to_string());
+            let _ = tx.send(StemMsg::Done(id, r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Separate the loaded track (downloading the model first if it is missing).
+    pub fn separate_loaded(&mut self) {
+        let Some(id) = self.deck.track else { return };
+        if self.stem.separating.is_some() || self.stem.loading == Some(id) {
+            return;
+        }
+        let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else {
+            self.toast_err("Checking this computer for stem separation; try again in a moment.");
+            return;
+        };
+        if !crate::stems::model_ready(m) {
+            self.stem.pending = Some(id);
+            self.stems_download();
+            return;
+        }
+        let Some(t) = self.track(id).cloned() else { return };
+        self.stem.separating = Some((id, 0.0));
+        self.stem.error = None;
+        let tx = self.stem.tx.clone();
+        let ctx = self.ctx.clone();
+        let cancel = self.stem.cancel.clone();
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
+                let dec = crate::audio::decode_file(&t.path)?;
+                let tx2 = tx.clone();
+                let ctx2 = ctx.clone();
+                let st = crate::stems::separate(m, &dec.samples, dec.sr, &mut |p| {
+                    let _ = tx2.send(StemMsg::Progress(id, p));
+                    ctx2.request_repaint();
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                })?;
+                let _ = crate::stems::save(&crate::stems::cache_path(&t.path, m.id), &st);
+                Ok(std::sync::Arc::new(st))
+            };
+            let _ = tx.send(StemMsg::Done(id, run().map_err(|e| e.to_string())));
+            ctx.request_repaint();
+        });
+    }
+
+    pub fn stop_separation(&mut self) {
+        self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mute or unmute one part (source index: 0 drums, 1 bass, 2 other, 3 vocals).
+    pub fn toggle_stem(&mut self, src: usize) {
+        let have = self.player.state.lock().stems.is_some();
+        if !have {
+            self.separate_loaded();
+            return;
+        }
+        let mut st = self.player.state.lock();
+        st.stem_on[src] = !st.stem_on[src];
+    }
+
+    pub fn poll_stems(&mut self) {
+        while let Ok(m) = self.stem.rx.try_recv() {
+            match m {
+                StemMsg::Hardware(hw, model) => {
+                    self.stem.model_ready = crate::stems::spec(&model).map(crate::stems::model_ready).unwrap_or(false);
+                    if self.prefs.stem_model.is_none() {
+                        self.prefs.stem_model = Some(model.clone());
+                        self.save_prefs();
+                    }
+                    self.stem.model = Some(model);
+                    self.stem.hw = Some(hw);
+                    if !self.stem.model_ready && self.prefs.stems_auto_download {
+                        self.stem.downloading = Some((0, 0));
+                    }
+                    if let Some(id) = self.deck.track {
+                        self.load_cached_stems(id);
+                    }
+                }
+                StemMsg::Download(d, t) => self.stem.downloading = Some((d, t)),
+                StemMsg::DownloadDone(r) => {
+                    self.stem.downloading = None;
+                    match r {
+                        Ok(()) => {
+                            self.stem.model_ready = true;
+                            if let Some(id) = self.stem.pending.take() {
+                                if self.deck.track == Some(id) {
+                                    self.separate_loaded();
+                                }
+                            }
+                        }
+                        Err(e) if e == "stopped" => {}
+                        Err(e) => {
+                            self.stem.error = Some(format!("Model download failed: {e}"));
+                            self.stem.pending = None;
+                        }
+                    }
+                }
+                StemMsg::Progress(id, p) => self.stem.separating = Some((id, p)),
+                StemMsg::Done(id, r) => {
+                    if self.stem.separating.map(|s| s.0) == Some(id) {
+                        self.stem.separating = None;
+                    }
+                    if self.stem.loading == Some(id) {
+                        self.stem.loading = None;
+                    }
+                    match r {
+                        Ok(st) => {
+                            if self.deck.track == Some(id) {
+                                self.player.state.lock().stems = Some(st);
+                            }
+                        }
+                        Err(e) if e == "stopped" => {}
+                        Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
     /// Copy rekordbox's library into PrepDeck's data folder and read the copy, off the UI thread.
     /// rekordbox's own files are only read (byte copy), never opened by a database or written.
     pub fn start_rekordbox_sync(&mut self) {
@@ -1192,6 +1451,14 @@ impl App {
         }
         let (mut added, mut updated) = (0, 0);
         let mut idmap: HashMap<String, i64> = HashMap::new();
+        // Where rekordbox's own analysis of each audio file lives (used by the USB export).
+        let mut rb_anlz: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        for rt in lib.tracks.iter() {
+            if let Some(b) = &rt.anlz_base {
+                rb_anlz.insert(rt.xt.track.path.clone(), b.to_string_lossy().to_string());
+            }
+        }
+        self.db.set_setting("rb_anlz", &serde_json::to_string(&rb_anlz).unwrap_or_default());
         for rt in lib.tracks {
             let changed = seen.get(&rt.rb_id) != Some(&rt.fingerprint);
             let id = match self.db.track_by_path(&rt.xt.track.path) {
@@ -1520,6 +1787,12 @@ impl App {
         let first_mem = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).fold(f64::NAN, f64::min);
         self.deck.cue_point = if first_mem.is_nan() { self.deck.beats.first().map(|b| b.time).unwrap_or(0.0) } else { first_mem };
         self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone()));
+        {
+            let mut st = self.player.state.lock();
+            st.stems = None;
+            st.stem_on = [true; 4];
+        }
+        self.load_cached_stems(id);
         if t.analyzed == 0 {
             self.analyze(&[id], false);
         }
@@ -2185,6 +2458,7 @@ impl App {
         let names: HashMap<i64, (String, i64)> = self.mytags.iter().map(|t| (t.id, (t.name.clone(), t.parent))).collect();
         let mut tracks = HashMap::new();
         let mut skipped: Vec<String> = vec![];
+        let rb_anlz: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let settings = self.analysis_settings();
         let mut ids: Vec<i64> = track_ids.into_iter().collect();
         ids.sort();
@@ -2203,7 +2477,14 @@ impl App {
                 .get(id)
                 .map(|s| s.iter().filter_map(|x| names.get(x)).map(|(n, p)| (names.get(p).map(|c| c.0.clone()).unwrap_or_default(), n.clone())).collect())
                 .unwrap_or_default();
-            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid: self.db.grid(*id), wave: self.db.wave(*id), track: t, tags });
+            // rekordbox's own analysis of this file, when the library was synced from it.
+            let grid = self.db.grid(*id);
+            let rb_anlz = rb_anlz.get(&t.path).map(std::path::PathBuf::from).filter(|b| b.with_extension("DAT").is_file());
+            let grid_same = match (&rb_anlz, &grid) {
+                (Some(b), Some(g)) => crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| grids_match(&r, g)).unwrap_or(false),
+                _ => false,
+            };
+            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same });
         }
         // Tracks without analysis are analysed by the export job itself (off the UI thread).
         let tag_categories: Vec<(String, Vec<String>)> = self
@@ -2212,7 +2493,7 @@ impl App {
             .filter(|c| c.parent == 0)
             .map(|c| (c.name.clone(), self.mytags.iter().filter(|t| t.parent == c.id).map(|t| t.name.clone()).collect()))
             .collect();
-        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone() };
+        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone(), browse: self.prefs.usb_browse.clone() };
         self.export_job = Some(spawn_export(req, self.ctx.clone()));
     }
 

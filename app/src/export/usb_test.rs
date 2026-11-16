@@ -29,10 +29,10 @@ fn full_export_to_folder() {
             Cue { id: 1, track_id: t.id, kind: CueKind::Hot, slot: 0, start: 1.0, end: None, color: 43, comment: "Intro".into(), active_loop: false },
             Cue { id: 2, track_id: t.id, kind: CueKind::Memory, slot: -1, start: 8.0, end: Some(12.0), color: 3, comment: String::new(), active_loop: false },
         ];
-        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())] });
+        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())], rb_anlz: None, grid_same: false });
     }
     let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1] }], tracks: vec![] }];
-    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default() };
+    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default() };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let msg = run_export(req, &|_| {}, &cancel).unwrap();
     assert!(msg.contains("2 tracks"), "{msg}");
@@ -49,7 +49,7 @@ fn full_export_to_folder() {
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/Album_ One_/")));
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/UnknownAlbum/")));
     // Exporting the same playlist again updates in place instead of duplicating.
-    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default() };
+    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default() };
     run_export(req2, &|_| {}, &cancel).unwrap();
     let lib2 = read_device(&root).unwrap();
     assert_eq!(lib2.tracks.len(), 2);

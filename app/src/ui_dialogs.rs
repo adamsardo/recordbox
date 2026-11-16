@@ -132,7 +132,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                 let tabs: &[&str] = match app.dialogs.prefs_tab {
                     0 => &["Display Type", "Color", "Player"],
                     1 => &["Track Analysis", "CUE Analysis"],
-                    2 => &["General", "My Settings", "Device"],
+                    2 => &["General", "Category", "Sort", "Column", "My Settings", "Device"],
                     _ => &["Library"],
                 };
                 let key = format!("prefs_subtab_{}", app.dialogs.prefs_tab);
@@ -265,7 +265,72 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                 ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; the setting above chooses which one the players show.").size(12.0).color(DIM2));
                             });
                         }
-                        (2, 1) => {
+                        (2, 1) | (2, 2) => {
+                            let is_cat = sub_tab == 1;
+                            let all = if is_cat { crate::export::usb::UsbBrowse::all_categories() } else { crate::export::usb::UsbBrowse::all_sorts() };
+                            let fixed: &[u16] = if is_cat { &crate::export::usb::FIXED_CATEGORIES } else { &crate::export::usb::FIXED_SORTS };
+                            let mut b = app.prefs.usb_browse.normalized();
+                            let active: Vec<u16> = if is_cat { b.categories.clone() } else { b.sorts.clone() };
+                            let mut new_active = active.clone();
+                            card(ui, if is_cat { "Category" } else { "Sort" }, |ui| {
+                                ui.label(RichText::new(if is_cat { "Browse categories shown on CDJ/XDJ for USBs you export. Greyed items are always shown." } else { "Sort options offered on CDJ/XDJ for USBs you export." }).size(12.0).color(DIM2));
+                                ui.horizontal_top(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(220.0);
+                                        ui.label(RichText::new(if is_cat { "Inactive Categories" } else { "Inactive Sort Options" }).size(14.0).strong());
+                                        let mut inactive: Vec<(u16, &str)> = all.iter().copied().filter(|(id, _)| !active.contains(id)).collect();
+                                        inactive.sort_by_key(|x| x.1);
+                                        for (id, name) in inactive {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("›").on_hover_text("Make active").clicked() {
+                                                    new_active.push(id);
+                                                }
+                                                ui.label(RichText::new(name).size(13.0));
+                                            });
+                                        }
+                                    });
+                                    ui.add_space(20.0);
+                                    ui.vertical(|ui| {
+                                        ui.set_width(260.0);
+                                        ui.label(RichText::new(if is_cat { "Active Categories" } else { "Active Sort Options" }).size(14.0).strong());
+                                        for (i, id) in active.iter().enumerate() {
+                                            let name = crate::export::usb::column_name(*id).unwrap_or("?");
+                                            let is_fixed = fixed.contains(id);
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(name).size(13.0).color(if is_fixed { OFF } else { WHITE }));
+                                                if !is_fixed {
+                                                    if ui.small_button("‹").on_hover_text("Make inactive").clicked() {
+                                                        new_active.retain(|x| x != id);
+                                                    }
+                                                }
+                                                if (is_cat || !is_fixed) && i > 0 && !(!is_cat && fixed.contains(&active[i - 1])) && ui.small_button("▲").clicked() {
+                                                    new_active.swap(i, i - 1);
+                                                }
+                                                if (is_cat || !is_fixed) && i + 1 < active.len() && ui.small_button("▼").clicked() {
+                                                    new_active.swap(i, i + 1);
+                                                }
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                            if new_active != active {
+                                if is_cat {
+                                    b.categories = new_active;
+                                } else {
+                                    b.sorts = new_active;
+                                }
+                                app.prefs.usb_browse = b.normalized();
+                            }
+                        }
+                        (2, 3) => {
+                            card(ui, "Column", |ui| {
+                                sub(ui, "Select item which is shown next to track name on CDJ/XDJ");
+                                ui.add_enabled(false, egui::Button::new("KEY"));
+                                ui.label(RichText::new("Not written yet: where the players store this choice has not been confirmed, so they show their default (KEY).").size(11.0).color(DIM));
+                            });
+                        }
+                        (2, 4) => {
                             card(ui, "My Settings", |ui| {
                                 ui.label(RichText::new("Player settings written to every USB you export (MYSETTING.DAT). CDJ/XDJ players apply them when the USB is loaded.").size(12.0).color(DIM2));
                                 egui::Grid::new("my_settings_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
@@ -304,6 +369,42 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                 ui.label(RichText::new("Your music files are only read. Edits (tags, cues, grids) are kept in this private library.").size(11.0).color(DIM));
                                 if ui.button("Show in Finder").clicked() {
                                     let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+                                }
+                            });
+                            card(ui, "Stem separation", |ui| {
+                                if let Some(hw) = &app.stem.hw {
+                                    ui.label(RichText::new(format!(
+                                        "This computer: {}{} cores, {:.0} GB memory, {}.",
+                                        if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
+                                        hw.cores,
+                                        hw.ram_gb,
+                                        if hw.gpu { "GPU (Metal) available" } else { "no usable GPU, separation runs on the CPU" }
+                                    )).size(12.0));
+                                    ui.label(RichText::new(format!("Recommended model: {}", crate::stems::choose(hw).name)).size(12.0).color(DIM2));
+                                } else {
+                                    ui.label(RichText::new("Checking this computer…").size(12.0).color(DIM));
+                                }
+                                let cur = app.stem.model.clone().or_else(|| app.prefs.stem_model.clone()).unwrap_or_default();
+                                for m in crate::stems::CATALOG.iter() {
+                                    let ready = crate::stems::model_ready(m);
+                                    let label = format!("{}{}", m.name, if ready { "  (downloaded)" } else { "" });
+                                    if ui.radio(cur == m.id, RichText::new(label).size(13.0)).on_hover_text(m.about).clicked() && cur != m.id {
+                                        app.prefs.stem_model = Some(m.id.to_string());
+                                        app.stem.model = Some(m.id.to_string());
+                                        app.stem.model_ready = ready;
+                                    }
+                                    ui.label(RichText::new(m.about).size(11.0).color(DIM));
+                                }
+                                toggle(ui, &mut app.prefs.stems_auto_download, "Download the model automatically at launch");
+                                if !app.stem.model_ready && app.stem.downloading.is_none() && ui.button("Download now").clicked() {
+                                    app.stems_download();
+                                }
+                                if let Some((d, t)) = app.stem.downloading {
+                                    ui.label(RichText::new(if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() }).size(12.0));
+                                }
+                                ui.label(RichText::new(format!("Separated stems are kept so each track is only split once: {:.1} GB in use.", crate::stems::cache_size() as f64 / 1e9)).size(11.0).color(DIM));
+                                if ui.button("Clear separated stems").clicked() {
+                                    crate::stems::clear_cache();
                                 }
                             });
                             card(ui, "rekordbox Library", |ui| {
