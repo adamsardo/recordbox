@@ -1,9 +1,9 @@
 //! Reading the user's existing rekordbox library (master.db).
 //!
 //! rekordbox's own files are never opened by a database engine and never written. On every
-//! launch the database and its write-ahead log are copied into PrepDeck's data folder (and the
+//! launch the database and its write-ahead log are copied into Recordbox's data folder (and the
 //! copy is checked against the source so a write by a running rekordbox mid-copy is detected and
-//! retried). Only that copy is opened, read-only, and synced into PrepDeck's own library.
+//! retried). Only that copy is opened, read-only, and synced into Recordbox's own library.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ use crate::model::*;
 use rusqlite::types::Value;
 use std::collections::HashMap;
 
-/// One rekordbox track as PrepDeck needs it, plus what is used to notice later changes.
+/// One rekordbox track as Recordbox needs it, plus what is used to notice later changes.
 pub struct RbTrack {
     pub rb_id: String,
     /// Changes whenever rekordbox changes the track, its cues or its My Tags.
@@ -106,13 +106,13 @@ pub struct RbLibrary {
     pub tag_categories: Vec<(String, Vec<String>)>,
     /// Tracks without a local file (streaming services or moved files).
     pub not_local: usize,
-    /// Intelligent playlists that use a condition PrepDeck has no equivalent for (not copied).
+    /// Intelligent playlists that use a condition Recordbox has no equivalent for (not copied).
     pub smart_lists: usize,
     /// Play histories (rekordbox's Histories tree); `track_keys` are content IDs.
     pub histories: Vec<XmlNode>,
 }
 
-/// The tag placeholder a translated My Tag condition carries until the sync knows PrepDeck's
+/// The tag placeholder a translated My Tag condition carries until the sync knows Recordbox's
 /// tag ids.
 pub fn tag_placeholder(cat: &str, tag: &str) -> String {
     format!("\u{1}{cat}\u{1f}{tag}")
@@ -120,7 +120,7 @@ pub fn tag_placeholder(cat: &str, tag: &str) -> String {
 
 /// Translate a rekordbox intelligent playlist (djmdPlaylist.SmartList XML: a NODE with
 /// LogicalOperator 1 = all / 2 = any and CONDITION children). None when a condition has no
-/// PrepDeck equivalent, since dropping it would change what the list matches.
+/// Recordbox equivalent, since dropping it would change what the list matches.
 pub fn translate_smartlist(xml: &str, tag_of: &HashMap<String, (String, String)>, keys: &HashMap<String, String>) -> Option<crate::smart::SmartRule> {
     use crate::smart::{Condition, Field, Op, SmartRule};
     use quick_xml::events::Event;
@@ -313,7 +313,7 @@ fn cue_slot(kind: i64) -> Option<i32> {
     }
 }
 
-/// Read everything PrepDeck imports from a snapshot opened with [`open_snapshot`].
+/// Read everything Recordbox imports from a snapshot opened with [`open_snapshot`].
 /// `share_dir` is rekordbox's "share" folder, where its analysis files and artwork live.
 pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibrary> {
     let artists = names(c, "djmdArtist")?;
@@ -508,7 +508,7 @@ mod tests {
     #[ignore]
     fn reads_local_library_snapshot() {
         let Some(src) = library_dir() else { return };
-        let dest = std::env::temp_dir().join(format!("prepdeck_rb_snapshot_{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("recordbox_rb_snapshot_{}", std::process::id()));
         let before = stamp(&src.join("master.db"));
         let db = snapshot(&src, &dest).unwrap();
         let c = open_snapshot(&db).unwrap();
@@ -579,7 +579,7 @@ mod schema_dump {
     #[ignore]
     fn dump_columns() {
         let Some(src) = super::library_dir() else { return };
-        let dest = std::env::temp_dir().join(format!("prepdeck_rb_schema_{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("recordbox_rb_schema_{}", std::process::id()));
         let c = super::open_snapshot(&super::snapshot(&src, &dest).unwrap()).unwrap();
         for t in ["djmdContent", "djmdCue", "djmdPlaylist", "djmdSongPlaylist", "djmdKey", "djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel", "djmdColor", "djmdMyTag", "djmdSongMyTag"] {
             let mut st = c.prepare(&format!("PRAGMA table_info({t})")).unwrap();
@@ -666,7 +666,7 @@ mod cue_origin_probe {
     #[ignore]
     fn cue_creation_times() {
         let Some(src) = super::library_dir() else { return };
-        let dest = std::env::temp_dir().join(format!("prepdeck_cue_origin_{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("recordbox_cue_origin_{}", std::process::id()));
         let c = super::open_snapshot(&super::snapshot(&src, &dest).unwrap()).unwrap();
         let mut st = c.prepare("SELECT k.Kind, k.Comment, k.ColorTableIndex, k.created_at, c.created_at, c.updated_at, c.AnalysisUpdated FROM djmdCue k JOIN djmdContent c ON c.ID = k.ContentID WHERE k.rb_local_deleted = 0 LIMIT 12").unwrap();
         for r in st.query_map([], |r| Ok((0..7).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {

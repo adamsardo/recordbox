@@ -1,11 +1,11 @@
 [package]
-name = "prepdeck"
+name = "recordbox"
 version = "0.1.0"
 edition = "2021"
 description = "Local DJ library, track analysis, set preparation and Pioneer-compatible USB export"
 
 [[bin]]
-name = "prepdeck"
+name = "recordbox"
 path = "src/main.rs"
 
 [dependencies]

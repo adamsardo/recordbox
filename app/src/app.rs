@@ -193,7 +193,7 @@ pub struct Prefs {
     pub devices_extra: Vec<String>,
     pub widths: HashMap<String, f32>,
     pub browser_only: bool,
-    /// Copy and sync the installed rekordbox library (master.db) every time PrepDeck starts.
+    /// Copy and sync the installed rekordbox library (master.db) every time Recordbox starts.
     pub rekordbox_sync: bool,
     /// Player settings written to every exported USB (Preferences > DJ System).
     pub usb_settings: crate::export::settings::UsbSettings,
@@ -220,7 +220,7 @@ pub struct Prefs {
     pub auto_first_downbeat_cue: bool,
     /// Stem pads: 4 (vocal, inst, bass, drums) or 3 (vocal, inst with bass, drums).
     pub stem_parts: u8,
-    /// Settings this version doesn't know (written by a newer PrepDeck), kept as they are
+    /// Settings this version doesn't know (written by a newer Recordbox), kept as they are
     /// when the preferences are saved again.
     #[serde(flatten)]
     pub other: std::collections::BTreeMap<String, serde_json::Value>,
@@ -398,7 +398,7 @@ mod relocation_tests {
 mod lufs_migration_tests {
     #[test]
     fn shifts_library_and_trash_once() {
-        let dir = std::env::temp_dir().join(format!("prepdeck_lufs_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_lufs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = crate::db::Db::open(&dir.join("library.db")).unwrap();
@@ -707,14 +707,14 @@ pub enum SideMode {
 }
 
 pub struct Deck {
-    /// Phrase structure shown under the overview (rekordbox's own, or PrepDeck's).
+    /// Phrase structure shown under the overview (rekordbox's own, or Recordbox's).
     pub phrases: Option<crate::phrase::Structure>,
     /// Phrase analysis running in the background for (track id).
     pub phrases_rx: Option<Receiver<(i64, Option<crate::phrase::Structure>)>>,
     /// rekordbox's own 3-band waveforms for this audio file (detail at 150 per second, and
     /// the 1200-column overview), when the track came from the rekordbox library.
     pub rb_wave: Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>>,
-    /// Vocal activity (rekordbox's PVDI, else PrepDeck's): (seconds per entry, level 0–4).
+    /// Vocal activity (rekordbox's PVDI, else Recordbox's): (seconds per entry, level 0–4).
     pub vocal: Option<std::sync::Arc<(f64, Vec<u8>)>>,
     pub vocal_rx: Option<Receiver<(i64, Option<Vec<u8>>)>>,
     pub track: Option<i64>,
@@ -824,7 +824,7 @@ pub struct PlayerEdits {
 pub struct PlayerEditItem {
     pub track: i64,
     pub edit: crate::export::usb::PlayerCueEdit,
-    /// The track's cues were also changed in PrepDeck since the export.
+    /// The track's cues were also changed in Recordbox since the export.
     pub conflict: bool,
     pub pick: bool,
 }
@@ -1037,7 +1037,7 @@ impl App {
             let files = crate::demo::ensure_demo_files();
             for f in files {
                 let mut t = crate::importer::read_track(&f);
-                t.artist = "PrepDeck".into();
+                t.artist = "Recordbox".into();
                 t.album = "Demo Tracks".into();
                 t.genre = "Demo".into();
                 let _ = app.db.insert_track(&t);
@@ -1136,7 +1136,7 @@ impl App {
                         // End-to-end check of player cue edits: export two tracks with hot cues to
                         // a scratch folder device, move one cue in its analysis file as a player
                         // would, then scan.
-                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("prepdeck_shot_device").to_string_lossy().to_string()));
+                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("recordbox_shot_device").to_string_lossy().to_string()));
                         let _ = std::fs::remove_dir_all(&root);
                         let _ = std::fs::create_dir_all(&root);
                         let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && app.db.cues(t.id).map(|c| c.iter().any(|c| c.kind == CueKind::Hot)).unwrap_or(false)).take(2).map(|t| t.id).collect();
@@ -1162,7 +1162,7 @@ impl App {
                                 let f = crate::export::anlz::build(&t.file_path, &[], &Waveform::default(), &cues, 0, 44100);
                                 let _ = std::fs::write(base.with_extension("DAT"), &f.dat);
                                 let _ = std::fs::write(base.with_extension("EXT"), &f.ext);
-                                if let Ok(file) = std::fs::File::options().write(true).open(root.join(".PrepDeck/cues.json")) {
+                                if let Ok(file) = std::fs::File::options().write(true).open(root.join(".Recordbox/cues.json")) {
                                     let _ = file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
                                 }
                             }
@@ -1179,7 +1179,7 @@ impl App {
                     "updatedevice" => {
                         // Check of Update Playlists on This Device: the drive has "Update Check"
                         // with one track; the library's "Update Check" has three.
-                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("prepdeck_shot_update").to_string_lossy().to_string()));
+                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("recordbox_shot_update").to_string_lossy().to_string()));
                         let _ = std::fs::remove_dir_all(&root);
                         let _ = std::fs::create_dir_all(&root);
                         let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && t.analyzed == 1).take(3).map(|t| t.id).collect();
@@ -1344,7 +1344,7 @@ impl App {
             } else if t.analyzed == 3 {
                 t.analyzed = 0;
             }
-            // The audio file changed since PrepDeck analysed it (size or modification time differ
+            // The audio file changed since Recordbox analysed it (size or modification time differ
             // from the stamp taken then): its waveform no longer fits.
             if let (Some(m), Some(stamp)) = (meta, stamps.get(&t.id)) {
                 if t.analyzed == 1 && !t.grid_locked && media_stamp(&m) != *stamp {
@@ -1883,7 +1883,7 @@ impl App {
         let (last, told) = self.audio_retry.unwrap_or((Instant::now() - std::time::Duration::from_secs(10), false));
         if !told {
             self.player.state.lock().playing = false;
-            self.toast_err("The audio output stopped working (device disconnected?). PrepDeck will reconnect when it is available.");
+            self.toast_err("The audio output stopped working (device disconnected?). Recordbox will reconnect when it is available.");
         }
         if last.elapsed() >= std::time::Duration::from_secs(2) {
             // The system's default output: opening it needs no device search (which can block),
@@ -2251,7 +2251,7 @@ impl App {
         }
     }
 
-    /// Copy rekordbox's library into PrepDeck's data folder and read the copy, off the UI thread.
+    /// Copy rekordbox's library into Recordbox's data folder and read the copy, off the UI thread.
     /// rekordbox's own files are only read (byte copy), never opened by a database or written.
     pub fn start_rekordbox_sync(&mut self) {
         if self.rb_job.is_some() {
@@ -2280,7 +2280,7 @@ impl App {
 
     /// Merge a rekordbox library read from a snapshot. New tracks are added; a track that
     /// rekordbox changed since the last sync gets rekordbox's metadata, grid, cues and My Tags;
-    /// one it did not change keeps any edits made in PrepDeck. The playlist tree is mirrored
+    /// one it did not change keeps any edits made in Recordbox. The playlist tree is mirrored
     /// into the "rekordbox" folder, which is rebuilt on every sync.
     pub fn apply_rekordbox(&mut self, lib: crate::rbimport::RbLibrary) {
         // One transaction for the whole sync (much faster, and all-or-nothing).
@@ -2315,7 +2315,7 @@ impl App {
             }
         }
         self.db.set_setting("rb_anlz", &serde_json::to_string(&rb_anlz).unwrap_or_default());
-        // Tracks the user removed from PrepDeck stay removed.
+        // Tracks the user removed from Recordbox stay removed.
         let removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let mut failed: Option<String> = None;
         for rt in lib.tracks {
@@ -2391,7 +2391,7 @@ impl App {
                 }
             }
             // Cues: new tracks and tracks without cues get rekordbox's; a changed track gets
-            // them only when rekordbox has some (PrepDeck's are never wiped by an empty list).
+            // them only when rekordbox has some (Recordbox's are never wiped by an empty list).
             if (fresh || my_cues.is_empty() || changed) && !(rt.xt.cues.is_empty() && !my_cues.is_empty()) {
                 if let Err(e) = self.db.replace_cues(id, &rt.xt.cues) {
                     failed.get_or_insert(e.to_string());
@@ -2481,13 +2481,13 @@ impl App {
             msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
         }
         if first && lib.smart_lists > 0 {
-            msg.push_str(&format!(" {} intelligent playlist(s) use a condition PrepDeck doesn't have and were not copied.", lib.smart_lists));
+            msg.push_str(&format!(" {} intelligent playlist(s) use a condition Recordbox doesn't have and were not copied.", lib.smart_lists));
         }
         if !msg.is_empty() {
             self.toast(msg);
         }
         if added > 0 && self.prefs.auto_analysis {
-            // Waveforms and loudness are PrepDeck's own; grids and keys from rekordbox are kept.
+            // Waveforms and loudness are Recordbox's own; grids and keys from rekordbox are kept.
             let todo: Vec<i64> = self.tracks.iter().filter(|t| t.analyzed == 0 && !t.missing).map(|t| t.id).collect();
             self.analyze(&todo, false);
         }
@@ -3654,14 +3654,14 @@ impl App {
         }
     }
 
-    /// A device track's counterpart in the collection: the local file PrepDeck exported, else
+    /// A device track's counterpart in the collection: the local file Recordbox exported, else
     /// the same title and artist.
     pub fn match_device_track(&self, source: &str, title: &str, artist: &str) -> Option<i64> {
         let by_source = (!source.is_empty()).then(|| self.db.track_by_path(source)).flatten();
         by_source.or_else(|| self.tracks.iter().find(|t| t.display_title().eq_ignore_ascii_case(title) && t.artist.eq_ignore_ascii_case(artist)).map(|t| t.id))
     }
 
-    /// Compare the cues on a drive with what PrepDeck last exported there and offer edits made
+    /// Compare the cues on a drive with what Recordbox last exported there and offer edits made
     /// on players for import. `asked`: the user chose the menu item (report when nothing is
     /// found, and include edits dismissed before). Returns whether the review dialog opened.
     pub fn check_player_cue_edits(&mut self, root: &str, asked: bool) -> bool {
@@ -3674,7 +3674,7 @@ impl App {
             if !asked && dismissed.contains(&format!("{}\u{1f}{}", edit.file_path, edit.now)) {
                 continue;
             }
-            // Cues are replaced, so only the exact local file PrepDeck exported counts as a match.
+            // Cues are replaced, so only the exact local file Recordbox exported counts as a match.
             let Some(track) = (!edit.source.is_empty()).then(|| self.db.track_by_path(&edit.source)).flatten() else { continue };
             let local = crate::export::anlz::local_cue_fingerprint(&self.db.cues(track).unwrap_or_default());
             if local == edit.now {
@@ -3727,7 +3727,7 @@ impl App {
     }
 
     /// Copy play histories saved on connected devices into the "Histories" folder as playlists
-    /// (once each). Device tracks are matched to the collection by the local file PrepDeck
+    /// (once each). Device tracks are matched to the collection by the local file Recordbox
     /// exported, else by title and artist. The device itself is not changed.
     pub fn import_device_histories(&mut self) -> usize {
         // How many entries of each device history (device + name) were imported already. A
@@ -3757,7 +3757,7 @@ impl App {
                 let mut plays = vec![];
                 for e in &h.entries[done..] {
                     let Some(dt) = lib.tracks.get(e) else { continue };
-                    // Play counts only for the exact file PrepDeck exported; the history list
+                    // Play counts only for the exact file Recordbox exported; the history list
                     // itself also takes title/artist matches.
                     let exact = (!dt.source.is_empty()).then(|| self.db.track_by_path(&dt.source)).flatten();
                     if let Some(id) = exact {

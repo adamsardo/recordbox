@@ -1,6 +1,6 @@
 //! Stem separation (vocals / instruments / bass / drums), free for everyone.
 //!
-//! On first use PrepDeck assesses the machine, picks the most capable open model that runs
+//! On first use Recordbox assesses the machine, picks the most capable open model that runs
 //! well on it, downloads it once (checked against its published SHA-256 prefix) and keeps it in
 //! the data folder. Separated stems are cached per track so they are only computed once.
 //! rekordbox's own (vendor) models are never used.

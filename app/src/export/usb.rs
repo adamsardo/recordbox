@@ -53,7 +53,7 @@ pub struct DevTrack {
     #[serde(default)]
     pub tags: Vec<String>,
     /// The row's original fixed header and 21 strings when it was read from a drive, so fields
-    /// PrepDeck does not manage (ISRC, unknown slots and constants) are written back unchanged.
+    /// Recordbox does not manage (ISRC, unknown slots and constants) are written back unchanged.
     #[serde(skip)]
     pub raw_head: Vec<u8>,
     #[serde(skip)]
@@ -179,25 +179,25 @@ pub fn pdb_path(root: &Path) -> PathBuf {
 }
 
 fn sidecar_path(root: &Path) -> PathBuf {
-    root.join(".PrepDeck").join("device.json")
+    root.join(".Recordbox").join("device.json")
 }
 
 fn cue_record_path(root: &Path) -> PathBuf {
-    root.join(".PrepDeck").join("cues.json")
+    root.join(".Recordbox").join("cues.json")
 }
 
-/// Cue fingerprints of the tracks PrepDeck last wrote to this drive, by media path.
+/// Cue fingerprints of the tracks Recordbox last wrote to this drive, by media path.
 pub fn read_cue_record(root: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(cue_record_path(root)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-/// Update the drive's cue record (PrepDeck's own folder; players never read it).
+/// Update the drive's cue record (Recordbox's own folder; players never read it).
 pub fn write_cue_record(root: &Path, record: &HashMap<String, String>) -> Result<()> {
-    std::fs::create_dir_all(root.join(".PrepDeck"))?;
+    std::fs::create_dir_all(root.join(".Recordbox"))?;
     write_atomic(&cue_record_path(root), &serde_json::to_vec_pretty(&record.iter().collect::<BTreeMap<_, _>>())?)
 }
 
-/// A track whose cues on the drive differ from what PrepDeck last wrote there: edited on a
+/// A track whose cues on the drive differ from what Recordbox last wrote there: edited on a
 /// player (or by another program).
 #[derive(Clone, Debug)]
 pub struct PlayerCueEdit {
@@ -206,13 +206,13 @@ pub struct PlayerCueEdit {
     pub title: String,
     pub artist: String,
     pub cues: Vec<Cue>,
-    /// Fingerprint PrepDeck recorded at export.
+    /// Fingerprint Recordbox recorded at export.
     pub exported: String,
     /// Fingerprint of the cues now on the drive.
     pub now: String,
 }
 
-/// Tracks on the drive whose cues changed since PrepDeck exported them.
+/// Tracks on the drive whose cues changed since Recordbox exported them.
 pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> {
     let record = read_cue_record(root);
     // An edit made on a player rewrites the analysis file, so only files newer than the record
@@ -249,7 +249,7 @@ pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> 
 /// (left behind by deleted playlists, other programs or copies made by hand), with sizes.
 /// Nothing is listed while an interrupted export's journal is still on the drive.
 pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
-    // A OneLibrary database (which PrepDeck can't read) may use files export.pdb doesn't.
+    // A OneLibrary database (which Recordbox can't read) may use files export.pdb doesn't.
     if journal_dir(root).join("journal.log").exists() || has_onelibrary(root) {
         return vec![];
     }
@@ -327,7 +327,19 @@ pub fn delete_unused(root: &Path, files: &[PathBuf]) -> Result<usize> {
     Ok(n)
 }
 
+/// Drives written before the rename keep Recordbox's own data in `/.PrepDeck`: it moves to
+/// `/.Recordbox` (journal, backups, sidecar and cue record included) the first time the drive
+/// is read or written.
+pub fn migrate_app_dir(root: &Path) {
+    let (old, new) = (root.join(".PrepDeck"), root.join(".Recordbox"));
+    if !new.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &new);
+        sync_dir(root);
+    }
+}
+
 pub fn read_device(root: &Path) -> Result<DeviceLibrary> {
+    migrate_app_dir(root);
     let p = pdb_path(root);
     if !p.exists() {
         return Ok(DeviceLibrary::default());
@@ -594,7 +606,7 @@ pub struct ExportTrack {
     pub rb_anlz: Option<PathBuf>,
     /// The track's grid is still the one rekordbox analysed (phrases/extended grid stay valid).
     pub grid_same: bool,
-    /// PrepDeck's vocal detection (levels 0–4 per 46.4 ms), written as PVDI when rekordbox's
+    /// Recordbox's vocal detection (levels 0–4 per 46.4 ms), written as PVDI when rekordbox's
     /// own is not available.
     pub vocal: Option<Vec<u8>>,
 }
@@ -641,7 +653,7 @@ pub struct ExportRequest {
 
 /// Files this export created. Unless the export commits, they are removed again, so a
 /// stopped or failed export leaves the drive as it was.
-/// Export journal on the drive (`/.PrepDeck/journal/journal.log`): every file this export
+/// Export journal on the drive (`/.Recordbox/journal/journal.log`): every file this export
 /// creates ("C" lines) and, before an existing file is overwritten, a durable copy of its old
 /// bytes ("R" lines). "P" is written once both new databases are fully on the drive. An
 /// export that fails is undone from it at once; one cut short by a crash, power loss or the
@@ -659,7 +671,7 @@ struct Created {
 }
 
 fn journal_dir(root: &Path) -> PathBuf {
-    root.join(".PrepDeck").join("journal")
+    root.join(".Recordbox").join("journal")
 }
 
 #[cfg(test)]
@@ -759,6 +771,7 @@ impl Drop for Created {
 /// Finish or undo an export that did not complete, from the drive's journal. Returns what was
 /// done, or None when there was nothing to recover.
 pub fn recover_device(root: &Path) -> Option<String> {
+    migrate_app_dir(root);
     let dir = journal_dir(root);
     let text = std::fs::read_to_string(dir.join("journal.log")).ok()?;
     let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
@@ -784,7 +797,7 @@ pub fn recover_device(root: &Path) -> Option<String> {
                     // Folders this export created and left empty go too (never the top ones).
                     let mut dir = p.parent().map(Path::to_path_buf);
                     while let Some(d) = dir {
-                        if d == root || d == root.join("Contents") || d == root.join("PIONEER") || d == root.join(".PrepDeck") || !d.starts_with(root) || std::fs::remove_dir(&d).is_err() {
+                        if d == root || d == root.join("Contents") || d == root.join("PIONEER") || d == root.join(".Recordbox") || !d.starts_with(root) || std::fs::remove_dir(&d).is_err() {
                             break;
                         }
                         dir = d.parent().map(Path::to_path_buf);
@@ -864,14 +877,14 @@ fn anlz_base(analyze_path: &str) -> Option<String> {
     }
 }
 
-/// Copy the drive's current databases to /.PrepDeck/backup before they are replaced,
+/// Copy the drive's current databases to /.Recordbox/backup before they are replaced,
 /// keeping the five most recent copies.
 fn backup_device_db(root: &Path) {
     let src = root.join("PIONEER").join("rekordbox");
     if !src.join("export.pdb").exists() {
         return;
     }
-    let dir = root.join(".PrepDeck").join("backup");
+    let dir = root.join(".Recordbox").join("backup");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -1205,10 +1218,10 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         return Err(anyhow!("Export was stopped. The device library was not changed, and files copied by this export were removed."));
     }
     lib.browse = Some(req.browse.clone());
-    // Sidecar with local sources and the cue record (PrepDeck's own; never read by players).
+    // Sidecar with local sources and the cue record (Recordbox's own; never read by players).
     // Written first so a finished-after-interruption export has them too; entries for files
     // an undone export removed are simply never looked up.
-    let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
+    let _ = std::fs::create_dir_all(root.join(".Recordbox"));
     // Journaled, so an undone export also puts these back.
     created.will_replace(&sidecar_path(&root))?;
     // Sorted, so the same content always gives the same bytes.
@@ -1231,7 +1244,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
 
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
     if has_onelibrary(&root) {
-        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which PrepDeck does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
+        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which Recordbox does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
     }
     if !skipped.is_empty() {
         msg.push_str(&format!(". {} track(s) were not exported: {}", skipped.len(), short_list(&skipped, 5)));
@@ -1589,7 +1602,7 @@ pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
         f.push(t.rating);
         f.extend_from_slice(&t.file_type.to_le_bytes());
         debug_assert_eq!(f.len(), 0x5c);
-        // A row read from the drive keeps the bytes PrepDeck does not manage: the row header
+        // A row read from the drive keeps the bytes Recordbox does not manage: the row header
         // bitmask (0x04..0x08; 0x02 is the positional index shift), the 0x14 value, the 0x18/0x1a values and the 0x56 constant.
         if t.raw_head.len() == 0x5c {
             for range in [0x04..0x08, 0x14..0x1c, 0x56..0x58] {
@@ -1597,7 +1610,7 @@ pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
             }
         }
         let fname = Path::new(&t.file_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        // String slots PrepDeck does not manage keep the drive's value (ISRC, slots 2–4, 6,
+        // String slots Recordbox does not manage keep the drive's value (ISRC, slots 2–4, 6,
         // 8, 9, 13, 18).
         let keep = |i: usize, default: &str| -> String { t.raw_strings.get(i).cloned().unwrap_or_else(|| default.to_string()) };
         let (s0, s2, s3, s4, s6, s8, s9, s13, s18) = (keep(0, ""), keep(2, "3"), keep(3, "3"), keep(4, ""), keep(6, ""), keep(8, ""), keep(9, ""), keep(13, ""), keep(18, ""));
@@ -1877,7 +1890,7 @@ mod tests {
         }
     }
 
-    /// The fixed tables PrepDeck writes (colours, columns, menu, sort, table 19) match a real
+    /// The fixed tables Recordbox writes (colours, columns, menu, sort, table 19) match a real
     /// rekordbox export row for row, byte for byte (rekordcrate's demo_tracks export).
     #[test]
     fn fixed_tables_match_a_real_rekordbox_export() {
@@ -1907,7 +1920,7 @@ mod tests {
                     }
                 }
                 let diff: Vec<usize> = (0..n).filter(|&k| x[k] != y[k]).collect();
-                assert!(diff.is_empty(), "table {t} row {i}: bytes {diff:?} differ (rekordbox {:?}, PrepDeck {:?})", diff.iter().map(|&k| x[k]).collect::<Vec<_>>(), diff.iter().map(|&k| y[k]).collect::<Vec<_>>());
+                assert!(diff.is_empty(), "table {t} row {i}: bytes {diff:?} differ (rekordbox {:?}, Recordbox {:?})", diff.iter().map(|&k| x[k]).collect::<Vec<_>>(), diff.iter().map(|&k| y[k]).collect::<Vec<_>>());
             }
         }
     }
@@ -1929,7 +1942,7 @@ mod tests {
 
     #[test]
     fn anlz_numbering_matches_original() {
-        let base = std::env::temp_dir().join(format!("prepdeck_anlz_num_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("recordbox_anlz_num_{}", std::process::id()));
         let case = |files: &[&str]| -> String {
             let d = base.join(files.join("_").replace('.', "-"));
             let _ = std::fs::remove_dir_all(&d);
@@ -1991,8 +2004,8 @@ mod tests {
         lib.nodes.push(DevNode { id: 2, parent: 1, name: "Set".into(), folder: false, seq: 0, entries: vec![3, 1, 2] });
         lib.tag_categories = vec![("Genre".into(), vec!["Techno".into()])];
         let bytes = build_export_pdb(&lib);
-        let _ = std::fs::write(std::env::temp_dir().join("prepdeck_sample_export.pdb"), &bytes);
-        let _ = std::fs::write(std::env::temp_dir().join("prepdeck_sample_exportExt.pdb"), build_export_ext(&lib));
+        let _ = std::fs::write(std::env::temp_dir().join("recordbox_sample_export.pdb"), &bytes);
+        let _ = std::fs::write(std::env::temp_dir().join("recordbox_sample_exportExt.pdb"), build_export_ext(&lib));
         let back = parse_pdb(bytes).unwrap();
         assert_eq!(back.tracks.len(), 60);
         assert_eq!(back.tracks[&5].title, "Track 5 – ünïcode");
@@ -2011,7 +2024,7 @@ mod tests {
     /// A cue moved on a player (the drive's analysis file rewritten) is found; an untouched one is not.
     #[test]
     fn finds_cues_changed_on_players() {
-        let root = std::env::temp_dir().join(format!("prepdeck_player_edits_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("recordbox_player_edits_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let base = "/PIONEER/USBANLZ/P000/00000001/ANLZ0000";
         let dir = root.join(base.trim_start_matches('/')).parent().unwrap().to_path_buf();
@@ -2044,7 +2057,7 @@ mod tests {
 
     #[test]
     fn finds_and_deletes_only_unused_files() {
-        let root = std::env::temp_dir().join(format!("prepdeck_unused_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("recordbox_unused_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mk = |rel: &str| {
             let p = root.join(rel);
@@ -2077,8 +2090,28 @@ mod tests {
     }
 
     #[test]
+    fn drives_from_before_the_rename_keep_their_data() {
+        let root = std::env::temp_dir().join(format!("recordbox_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".PrepDeck/journal")).unwrap();
+        std::fs::write(root.join(".PrepDeck/cues.json"), b"{\"/Contents/a.mp3\":\"x\"}").unwrap();
+        // An unfinished export's journal must still be found after the move.
+        std::fs::write(root.join(".PrepDeck/journal/journal.log"), b"B\n").unwrap();
+        assert_eq!(read_cue_record(&root).len(), 0, "nothing read before the move");
+        let undone = recover_device(&root);
+        assert!(undone.is_some(), "the old folder's journal was recovered");
+        assert!(!root.join(".PrepDeck").exists() && root.join(".Recordbox").is_dir());
+        assert_eq!(read_cue_record(&root).get("/Contents/a.mp3").map(String::as_str), Some("x"));
+        // A drive that already has the new folder is left alone.
+        std::fs::create_dir_all(root.join(".PrepDeck")).unwrap();
+        migrate_app_dir(&root);
+        assert!(root.join(".PrepDeck").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn artwork_names_avoid_used_and_existing_files() {
-        let root = std::env::temp_dir().join(format!("prepdeck_art_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("recordbox_art_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("PIONEER/Artwork/00001");
         std::fs::create_dir_all(&dir).unwrap();

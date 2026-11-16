@@ -10,10 +10,10 @@ pub fn build() -> Option<Menu> {
     let menu = Menu::new();
     let item = |id: &str, text: &str, acc: Option<(Modifiers, Code)>| MenuItem::with_id(id, text, true, acc.map(|(m, c)| Accelerator::new(m, c)));
     let cmd = Modifiers::META;
-    let app_menu = Submenu::new("PrepDeck", true);
+    let app_menu = Submenu::new("Recordbox", true);
     app_menu
         .append_items(&[
-            &item("about", "About PrepDeck", None),
+            &item("about", "About Recordbox", None),
             &PredefinedMenuItem::separator(),
             &item("prefs", "Preferences…", Some((cmd, Code::Comma))),
             &PredefinedMenuItem::separator(),
@@ -97,7 +97,7 @@ pub fn build() -> Option<Menu> {
         ])
         .ok()?;
     let help = Submenu::new("Help", true);
-    help.append_items(&[&item("about", "About PrepDeck", None), &item("shortcuts", "Keyboard Shortcuts", None)]).ok()?;
+    help.append_items(&[&item("about", "About Recordbox", None), &item("shortcuts", "Keyboard Shortcuts", None)]).ok()?;
     menu.append_items(&[&app_menu, &file, &edit, &view, &track, &playlist, &help]).ok()?;
     #[cfg(target_os = "macos")]
     menu.init_for_nsapp();
@@ -170,7 +170,7 @@ pub fn handle(app: &mut App, id: &str) {
             app.selected = missing.into_iter().collect();
         }
         "backup" => {
-            if let Some(f) = rfd::FileDialog::new().set_file_name("PrepDeck-library-backup.db").save_file() {
+            if let Some(f) = rfd::FileDialog::new().set_file_name("Recordbox-library-backup.db").save_file() {
                 let _ = app.db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                 match std::fs::copy(crate::db::data_dir().join("library.db"), &f) {
                     Ok(_) => app.toast("Library backed up."),

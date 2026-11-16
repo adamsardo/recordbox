@@ -76,7 +76,7 @@ fn prefs_window(app: &mut App, ctx: &Context) {
         prefs_embedded(app, ctx);
         return;
     }
-    let vid = egui::ViewportId::from_hash_of("prepdeck_preferences");
+    let vid = egui::ViewportId::from_hash_of("recordbox_preferences");
     let builder = egui::ViewportBuilder::default().with_title("Preferences").with_inner_size([800.0, 828.0]).with_min_inner_size([640.0, 480.0]);
     ctx.show_viewport_immediate(vid, builder, |vctx, class| {
         if class == egui::ViewportClass::Embedded {
@@ -509,7 +509,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                         app.prefs.keymap.clear();
                                     }
                                     if ui.button("Export…").clicked() {
-                                        if let Some(f) = rfd::FileDialog::new().set_file_name("prepdeck-shortcuts.json").save_file() {
+                                        if let Some(f) = rfd::FileDialog::new().set_file_name("recordbox-shortcuts.json").save_file() {
                                             let _ = std::fs::write(f, serde_json::to_vec_pretty(&app.prefs.keymap).unwrap_or_default());
                                         }
                                     }
@@ -517,7 +517,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                         if let Some(f) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                                             match std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&b).ok()) {
                                                 Some(m) => app.prefs.keymap = m.into_iter().filter(|(k, _)| crate::app::ACTIONS.iter().any(|a| a.0 == k)).collect(),
-                                                None => app.toast_err("That file is not a PrepDeck shortcut profile."),
+                                                None => app.toast_err("That file is not a Recordbox shortcut profile."),
                                             }
                                         }
                                     }
@@ -582,8 +582,8 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                 }
                             });
                             card(ui, "rekordbox Library", |ui| {
-                                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when PrepDeck starts");
-                                ui.label(RichText::new("PrepDeck copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.").size(11.0).color(DIM));
+                                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when Recordbox starts");
+                                ui.label(RichText::new("Recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.").size(11.0).color(DIM));
                                 if ui.button("Sync now").clicked() {
                                     app.start_rekordbox_sync();
                                 }
@@ -921,7 +921,7 @@ fn export_window(app: &mut App, ctx: &Context) {
                 ui.label(RichText::new("This drive is formatted as APFS, which DJ players cannot read. Use FAT32 or exFAT.").color(CAUTION_TX));
             }
             if crate::export::usb::has_onelibrary(std::path::Path::new(&d.root)) {
-                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). PrepDeck updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
+                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). Recordbox updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
             }
             if let Some(l) = &d.lib {
                 ui.label(RichText::new(format!("Already on the device: {} tracks, {} playlists. New items are added; existing ones are updated.", l.tracks.len(), l.nodes.iter().filter(|n| !n.folder).count())).size(11.0).color(DIM));
@@ -1169,8 +1169,8 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
         let mut close = None;
         let pe = app.dialogs.player_edits.as_mut().unwrap();
         egui::Window::new("Cue changes made on players").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!("{} track(s) on {} have cues that were changed after the last export from PrepDeck.", pe.items.len(), pe.device));
-            ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in PrepDeck with the ones on the device. The device is not changed.").size(11.0).color(DIM));
+            ui.label(format!("{} track(s) on {} have cues that were changed after the last export from Recordbox.", pe.items.len(), pe.device));
+            ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in Recordbox with the ones on the device. The device is not changed.").size(11.0).color(DIM));
             ui.add_space(4.0);
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 for it in pe.items.iter_mut() {
@@ -1181,7 +1181,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                         ui.label(format!("{} – {}", it.edit.title, it.edit.artist));
                         ui.label(RichText::new(format!("{hot} hot, {mem} memory")).size(11.0).color(DIM));
                         if it.conflict {
-                            ui.label(RichText::new("also changed in PrepDeck").size(11.0).color(CAUTION_TX)).on_hover_text("The cues were edited in PrepDeck too since the export. Importing replaces those edits.");
+                            ui.label(RichText::new("also changed in Recordbox").size(11.0).color(CAUTION_TX)).on_hover_text("The cues were edited in Recordbox too since the export. Importing replaces those edits.");
                         }
                     });
                 }
@@ -1208,8 +1208,8 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     }
     if app.dialogs.about {
         let mut open = true;
-        egui::Window::new("About PrepDeck").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(RichText::new("PrepDeck").size(18.0).strong());
+        egui::Window::new("About Recordbox").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(RichText::new("Recordbox").size(18.0).strong());
             ui.label("Library management, track analysis, set preparation and USB export for CDJ/XDJ players.");
             ui.label(RichText::new("Everything stays on this Mac. Your music files and any existing rekordbox library are never modified.").size(11.0).color(DIM));
         });

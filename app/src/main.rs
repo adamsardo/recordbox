@@ -1,4 +1,4 @@
-//! PrepDeck: local DJ library, track analysis, set preparation and Pioneer-compatible USB export.
+//! Recordbox: local DJ library, track analysis, set preparation and Pioneer-compatible USB export.
 
 use eframe::egui;
 mod analysis;
@@ -39,8 +39,8 @@ impl eframe::App for Gui {
         }
         let Some((r, pos, pps)) = self.app.deck.detail_map else { return };
         let Some(a) = self.app.deck.cues.iter().find(|c| c.kind == model::CueKind::Hot && c.slot == 0).cloned() else { return };
-        let ax = r.center().x + ((a.start - pos) * pps) as f32 + 6.0;
-        let y = r.min.y + 6.0;
+        let ax = r.center().x + ((a.start - pos) * pps) as f32 + 2.0;
+        let y = r.min.y - 7.0;
         static START: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
         let press = |down: bool, x: f32| egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
         let mv = |x: f32| egui::Event::PointerMoved(egui::pos2(x, y));
@@ -152,7 +152,7 @@ impl eframe::App for Gui {
     }
 }
 
-fn prepdeck_actions() -> Vec<&'static str> {
+fn recordbox_actions() -> Vec<&'static str> {
     app::ACTIONS.iter().map(|a| a.0).collect()
 }
 
@@ -200,7 +200,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         return;
     }
     use egui::Key;
-    let shortcuts: std::collections::HashMap<&str, app::Shortcut> = prepdeck_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
+    let shortcuts: std::collections::HashMap<&str, app::Shortcut> = recordbox_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
     let key = |a: &str| shortcuts.get(a).map(|s| s.key);
     // A press of the action's key with exactly its modifiers (beat jumps also take Shift).
     let hit = |a: &str, repeats: bool| {
@@ -278,7 +278,7 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
     let shot_mode = screenshot.is_some();
-    let mut viewport = egui::ViewportBuilder::default().with_title("PrepDeck").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
+    let mut viewport = egui::ViewportBuilder::default().with_title("Recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
     if shot_mode {
         viewport = viewport.with_active(false);
         #[cfg(target_os = "windows")]
@@ -298,5 +298,5 @@ fn main() -> eframe::Result<()> {
         }));
         options.run_and_return = false;
     }
-    eframe::run_native("PrepDeck", options, Box::new(move |cc| Ok(Box::new(Gui { app: App::new(cc, screenshot) }))))
+    eframe::run_native("Recordbox", options, Box::new(move |cc| Ok(Box::new(Gui { app: App::new(cc, screenshot) }))))
 }

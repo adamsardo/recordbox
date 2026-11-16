@@ -363,13 +363,13 @@ pub fn build(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue], raw_
 pub struct Overrides {
     pub sections: std::collections::HashMap<String, Vec<u8>>,
     pub grid_same: bool,
-    /// PrepDeck's own phrase section (unmasked), used when rekordbox's can't be.
+    /// Recordbox's own phrase section (unmasked), used when rekordbox's can't be.
     pub pssi: Option<Vec<u8>>,
     /// The track's analysis files already on the drive, by extension ("DAT", "EXT", "2EX"), in
-    /// file order. Audio-derived sections fall back to these, and sections PrepDeck does not
+    /// file order. Audio-derived sections fall back to these, and sections Recordbox does not
     /// know are carried over unchanged.
     pub device: std::collections::HashMap<&'static str, Vec<(String, Vec<u8>)>>,
-    /// PrepDeck's own vocal section, used when rekordbox's is not available.
+    /// Recordbox's own vocal section, used when rekordbox's is not available.
     pub pvdi: Option<Vec<u8>>,
 }
 
@@ -384,7 +384,7 @@ pub fn pvdi(levels: &[u8]) -> Vec<u8> {
     section(b"PVDI", &h, levels)
 }
 
-/// Section tags PrepDeck writes itself (or deliberately drops when the grid changed).
+/// Section tags Recordbox writes itself (or deliberately drops when the grid changed).
 const KNOWN_TAGS: [&str; 16] = ["PPTH", "PVBR", "PQTZ", "PWAV", "PWV2", "PCOB", "PWV3", "PCO2", "PQT2", "PWV5", "PWV4", "PSSI", "PWV7", "PWV6", "PWVC", "PVDI"];
 /// Sections that depend only on the audio, so a copy already on the drive stays valid.
 const AUDIO_TAGS: [&str; 10] = ["PVBR", "PWAV", "PWV2", "PWV3", "PWV4", "PWV5", "PWV6", "PWV7", "PWVC", "PVDI"];
@@ -537,7 +537,7 @@ pub fn parse_cues(ext: &[(String, Vec<u8>)], dat: &[(String, Vec<u8>)]) -> Vec<C
 }
 
 /// A stable digest of a cue list as the drive stores it (millisecond positions, colour, name),
-/// so edits made on a player can be told apart from what PrepDeck exported.
+/// so edits made on a player can be told apart from what Recordbox exported.
 pub fn cue_fingerprint(cues: &[Cue]) -> String {
     let mut rows: Vec<String> = cues
         .iter()
@@ -552,7 +552,7 @@ pub fn cue_fingerprint(cues: &[Cue]) -> String {
     format!("{h:016x}")
 }
 
-/// The fingerprint PrepDeck's own cues get once written to a drive (same normalisation as
+/// The fingerprint Recordbox's own cues get once written to a drive (same normalisation as
 /// [`build_with`]: hot cues A–H, default colours filled in).
 pub fn local_cue_fingerprint(cues: &[Cue]) -> String {
     let files = build("/x", &[], &Waveform::default(), cues, 0, 44100);
@@ -592,7 +592,7 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
     }
     ext.push(or("PWV5", &|| pwv5(&frames)));
     ext.push(or("PWV4", &|| pwv4(wave)));
-    // Phrases: rekordbox's own when its grid still applies, else PrepDeck's. Written with the
+    // Phrases: rekordbox's own when its grid still applies, else Recordbox's. Written with the
     // XOR mask rekordbox 6+ applies to exported files.
     if let Some(mut s) = take_grid("PSSI").or_else(|| ov.and_then(|o| o.pssi.clone())) {
         if !crate::phrase::is_masked(&s) {
@@ -605,8 +605,8 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
         ex2.push(s);
     }
     let mut dat = dat;
-    // Sections a newer rekordbox (or another tool) wrote that PrepDeck doesn't know stay in
-    // their file, after PrepDeck's own.
+    // Sections a newer rekordbox (or another tool) wrote that Recordbox doesn't know stay in
+    // their file, after Recordbox's own.
     if let Some(o) = ov {
         for (ext_name, list) in [("DAT", &mut dat), ("EXT", &mut ext), ("2EX", &mut ex2)] {
             for (tag, bytes) in o.device.get(ext_name).into_iter().flatten() {
@@ -644,7 +644,7 @@ mod tests {
         let w = Waveform { frames: vec![[100, 80, 40, 20, 60, 50, 20, 10]; 1500] };
         let g = crate::model::BeatGrid::constant(0.1, 120.0, 1).beats(10.0);
         let first = build("/Contents/a.mp3", &g, &w, &[], 441_000, 44100);
-        let dir = std::env::temp_dir().join(format!("prepdeck_anlz_keep_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_anlz_keep_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A device file with an extra unknown section appended.
         let mut ext_sections: Vec<Vec<u8>> = vec![];
@@ -740,9 +740,9 @@ mod tests {
         let wav = build("/Contents/a/b/c.wav", &g, &w, &[], 441_000, 44100);
         assert_eq!(pvbr_tail(&wav.dat), [0, 0, 0, 0]);
         let t = std::env::temp_dir();
-        let _ = std::fs::write(t.join("prepdeck_ANLZ0000.DAT"), &f.dat);
-        let _ = std::fs::write(t.join("prepdeck_ANLZ0000.EXT"), &f.ext);
-        let _ = std::fs::write(t.join("prepdeck_ANLZ0000.2EX"), &f.ex2);
+        let _ = std::fs::write(t.join("recordbox_ANLZ0000.DAT"), &f.dat);
+        let _ = std::fs::write(t.join("recordbox_ANLZ0000.EXT"), &f.ext);
+        let _ = std::fs::write(t.join("recordbox_ANLZ0000.2EX"), &f.ex2);
         for d in [&f.dat, &f.ext, &f.ex2] {
             assert_eq!(&d[0..4], b"PMAI");
             let total = u32::from_be_bytes([d[8], d[9], d[10], d[11]]) as usize;

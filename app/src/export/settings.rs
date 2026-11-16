@@ -77,7 +77,7 @@ fn padded(s: &str) -> [u8; 32] {
     b
 }
 
-/// The settings PrepDeck writes to a USB, as raw payloads (so bytes PrepDeck does not interpret
+/// The settings Recordbox writes to a USB, as raw payloads (so bytes Recordbox does not interpret
 /// are kept as they are).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsbSettings {
@@ -141,7 +141,7 @@ impl UsbSettings {
     }
 
     /// The settings to write to a drive: where the drive already has a valid file (right
-    /// length and checksum), its bytes are kept and only the fields PrepDeck lets you set
+    /// length and checksum), its bytes are kept and only the fields Recordbox lets you set
     /// (Preferences > DJ System) are written over them, so values set elsewhere survive.
     pub fn merged_onto_drive(&self, pioneer_dir: &std::path::Path) -> UsbSettings {
         let mut out = self.clone().normalized();
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn drive_bytes_kept_except_managed_fields() {
-        let dir = std::env::temp_dir().join(format!("prepdeck_settings_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_settings_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // The drive's DEVSETTING has an unmanaged byte (20) set by something else, and a

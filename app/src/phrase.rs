@@ -1,6 +1,6 @@
 //! Phrase analysis (song structure) for tracks rekordbox has not analysed, and the PSSI section
 //! the players read. Layout and the RB6+ XOR mask follow rekordcrate (src/anlz.rs); the
-//! segmentation and labels are PrepDeck's own, tuned against rekordbox's phrases for the
+//! segmentation and labels are Recordbox's own, tuned against rekordbox's phrases for the
 //! user's library (rekordbox's models are not used).
 
 use crate::model::Beat;
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(parse(&b), Some(s));
     }
 
-    /// Compare PrepDeck's phrases with rekordbox's for the user's library, on rekordbox's own
+    /// Compare Recordbox's phrases with rekordbox's for the user's library, on rekordbox's own
     /// grids. PREPDECK_ANLZ_PAIRS = tsv "audio path\trekordbox ANLZ base". Run with --ignored.
     #[test]
     #[ignore]
@@ -273,7 +273,7 @@ mod tests {
         // starts are scored the same way for reference.
         // The user's cues come from a snapshot of the rekordbox library (the original is not
         // touched); rekordbox keeps cues in master.db, not in its analysis files.
-        let dest = std::env::temp_dir().join(format!("prepdeck_cuebench_{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("recordbox_cuebench_{}", std::process::id()));
         let Ok(Some(lib)) = crate::rbimport::load_installed(&dest) else { return };
         let rows: Vec<(String, String, Vec<f64>)> = lib
             .tracks
@@ -323,7 +323,7 @@ mod tests {
         let o = sum(&|x| x.1);
         let t = sum(&|x| x.2);
         eprintln!("{} tracks, {users} user cues", r.len());
-        eprintln!("PrepDeck phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * o.0 as f64 / users as f64, 100.0 * o.1 as f64 / o.2.max(1) as f64, o.2);
+        eprintln!("Recordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * o.0 as f64 / users as f64, 100.0 * o.1 as f64 / o.2.max(1) as f64, o.2);
         eprintln!("rekordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * t.0 as f64 / users as f64, 100.0 * t.1 as f64 / t.2.max(1) as f64, t.2);
     }
 

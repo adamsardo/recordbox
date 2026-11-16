@@ -68,7 +68,7 @@ fn full_export_to_folder() {
         assert_eq!(lib2.tracks[id].analyze_path, t.analyze_path);
     }
     assert_eq!(lib2.tag_ids, lib.tag_ids);
-    assert!(std::fs::read_dir(root.join(".PrepDeck/backup")).unwrap().count() >= 2);
+    assert!(std::fs::read_dir(root.join(".Recordbox/backup")).unwrap().count() >= 2);
     // No temporary files are left behind.
     let mut stack = vec![root.clone()];
     while let Some(d) = stack.pop() {
@@ -114,18 +114,18 @@ fn copy_dir(a: &std::path::Path, b: &std::path::Path) {
     }
 }
 
-/// Every file on the drive outside PrepDeck's own folder, with its contents.
+/// Every file on the drive outside Recordbox's own folder, with its contents.
 fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let rel = e.path().strip_prefix(root).unwrap().to_string_lossy().to_string();
-            // PrepDeck's own folder: only the files a rollback must restore are compared.
-            if rel.starts_with(".PrepDeck") && rel != ".PrepDeck/device.json" && rel != ".PrepDeck/cues.json" && !rel.starts_with(".PrepDeck/journal") && e.path().is_file() {
+            // Recordbox's own folder: only the files a rollback must restore are compared.
+            if rel.starts_with(".Recordbox") && rel != ".Recordbox/device.json" && rel != ".Recordbox/cues.json" && !rel.starts_with(".Recordbox/journal") && e.path().is_file() {
                 continue;
             }
-            if rel.starts_with(".PrepDeck/backup") || rel.starts_with(".PrepDeck/journal") {
+            if rel.starts_with(".Recordbox/backup") || rel.starts_with(".Recordbox/journal") {
                 continue;
             }
             if e.path().is_dir() {
@@ -212,7 +212,7 @@ fn interrupted_export_recovers_to_before_or_after() {
 }
 
 fn journal_exists(root: &std::path::Path) -> bool {
-    root.join(".PrepDeck/journal").exists()
+    root.join(".Recordbox/journal").exists()
 }
 
 /// Run journal recovery on a drive given in PREPDECK_RECOVER (manual check). --ignored.

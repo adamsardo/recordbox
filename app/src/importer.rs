@@ -121,7 +121,7 @@ pub struct XmlTrack {
     pub track: Track,
     pub grid: Option<BeatGrid>,
     pub cues: Vec<Cue>,
-    /// What PrepDeck doesn't model, kept to be written back on XML export: unknown TRACK
+    /// What Recordbox doesn't model, kept to be written back on XML export: unknown TRACK
     /// attributes and unknown child elements (e.g. fade-in/out and load marks).
     pub extra: XmlExtra,
 }
@@ -132,8 +132,8 @@ pub struct XmlExtra {
     pub attrs: Vec<(String, String)>,
     /// Unknown child elements, as (tag, attributes in order).
     pub nodes: Vec<(String, Vec<(String, String)>)>,
-    /// Known attributes whose imported text differs from how PrepDeck writes the imported
-    /// value: (attribute, original text or ABSENT, PrepDeck's text at import). Written back
+    /// Known attributes whose imported text differs from how Recordbox writes the imported
+    /// value: (attribute, original text or ABSENT, Recordbox's text at import). Written back
     /// while the field is unedited.
     #[serde(default)]
     pub orig: Vec<(String, String, String)>,
@@ -175,7 +175,7 @@ impl XmlExtra {
     }
 }
 
-/// TRACK attributes PrepDeck reads (and writes back from its own data).
+/// TRACK attributes Recordbox reads (and writes back from its own data).
 pub const XML_TRACK_ATTRS: [&str; 26] = [
     "TrackID", "Name", "Artist", "Composer", "Album", "Grouping", "Genre", "Kind", "Size", "TotalTime", "DiscNumber", "TrackNumber", "Year", "AverageBpm", "DateAdded", "BitRate", "SampleRate", "Comments", "PlayCount", "Rating", "Location", "Remixer", "Tonality", "Label", "Mix", "Colour",
 ];
@@ -558,7 +558,7 @@ mod xml_children_tests {
         let out = crate::xmlexport::track_children(&xt.track, &extra, xt.grid.clone(), xt.cues.clone());
         assert!(out.contains(r#"<TEMPO Inizio="0.1204" Bpm="128.00" Metro="3/4" Battito="1"/>"#), "{out}");
         assert!(out.contains(r#"Start="12.34567" Num="0" Red="40" Green="226" Blue="20" Future="x"/>"#), "{out}");
-        // A moved cue is written from PrepDeck's data instead (the grid still verbatim).
+        // A moved cue is written from Recordbox's data instead (the grid still verbatim).
         let mut moved = xt.cues.clone();
         moved[0].start = 13.0;
         let out2 = crate::xmlexport::track_children(&xt.track, &extra, xt.grid.clone(), moved);
@@ -590,7 +590,7 @@ mod xml_extra_tests {
         assert_eq!(t.extra.nodes[0].0, "POSITION_MARK");
         assert!(t.extra.nodes[0].1.contains(&("Start".to_string(), "2.5000004".to_string())));
         assert_eq!(t.extra.nodes[1], ("NEWTHING".to_string(), vec![("A".to_string(), "b".to_string())]));
-        // Unchanged fields come back with their original text; edited ones from PrepDeck.
+        // Unchanged fields come back with their original text; edited ones from Recordbox.
         let line = crate::xmlexport::track_line(&super::Track { id: 7, ..t.track.clone() }, &t.extra);
         assert!(line.contains(" Name=\"A &amp; B\""), "{line}");
         assert!(line.contains(" Location=\"file://localhost/x/a.mp3\""));

@@ -26,7 +26,7 @@ fn location(path: &str) -> String {
 /// Marks an attribute the imported XML did not have (written back as absent).
 pub const ABSENT: &str = "\u{0}absent";
 
-/// TRACK attributes as PrepDeck writes them, unescaped (TrackID aside). Colour is empty when
+/// TRACK attributes as Recordbox writes them, unescaped (TrackID aside). Colour is empty when
 /// the track has none (then not written).
 pub fn track_attrs(t: &Track) -> Vec<(&'static str, String)> {
     let rating = [0, 51, 102, 153, 204, 255][t.rating.min(5) as usize];
@@ -73,13 +73,13 @@ pub fn track_attrs(t: &Track) -> Vec<(&'static str, String)> {
 
 /// The opening TRACK element. A field whose value is unchanged since an XML import is written
 /// with the imported text (precision, key spelling, URL encoding, absent attributes); edited
-/// fields are written from PrepDeck's value; unknown attributes follow.
+/// fields are written from Recordbox's value; unknown attributes follow.
 pub fn track_line(t: &Track, extra: &crate::importer::XmlExtra) -> String {
     track_line_id(t, extra, &t.id.to_string())
 }
 
 /// TrackIDs for export: each imported track keeps the ID its XML gave it when no other track
-/// already has it; the rest use PrepDeck's own ID, or the next free number on a clash.
+/// already has it; the rest use Recordbox's own ID, or the next free number on a clash.
 pub fn export_ids(tracks: &[(i64, String)]) -> std::collections::HashMap<i64, String> {
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = std::collections::HashMap::new();
@@ -125,12 +125,12 @@ pub fn track_line_id(t: &Track, extra: &crate::importer::XmlExtra, id: &str) -> 
 pub fn build(app: &App) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DJ_PLAYLISTS Version=\"1.0.0\">\n");
-    x.push_str("  <PRODUCT Name=\"PrepDeck\" Version=\"1.0\" Company=\"\"/>\n");
+    x.push_str("  <PRODUCT Name=\"Recordbox\" Version=\"1.0\" Company=\"\"/>\n");
     x.push_str(&format!("  <COLLECTION Entries=\"{}\">\n", app.tracks.len()));
     let extras: std::collections::HashMap<i64, crate::importer::XmlExtra> = app.tracks.iter().map(|t| (t.id, app.db.xml_extra(t.id))).collect();
     let ids = export_ids(&app.tracks.iter().map(|t| (t.id, extras[&t.id].xml_id.clone())).collect::<Vec<_>>());
     for t in &app.tracks {
-        // Fields PrepDeck doesn't model, and original text of unchanged fields, as imported.
+        // Fields Recordbox doesn't model, and original text of unchanged fields, as imported.
         let extra = &extras[&t.id];
         x.push_str(&track_line_id(t, extra, &ids[&t.id]));
         let (_, extra_nodes) = extra_xml(extra, "      ");
@@ -327,7 +327,7 @@ pub fn extra_xml(e: &crate::importer::XmlExtra, pad: &str) -> (String, String) {
 }
 
 /// A TRACK's TEMPO and cue POSITION_MARK elements: the imported originals while the grid /
-/// cues are unchanged since an XML import, else from PrepDeck's data as rekordbox writes them.
+/// cues are unchanged since an XML import, else from Recordbox's data as rekordbox writes them.
 pub fn track_children(t: &Track, extra: &crate::importer::XmlExtra, grid: Option<BeatGrid>, cues: Vec<Cue>) -> String {
     let mut x = String::new();
         let raw = |attrs: &Vec<(String, String)>, tag: &str| format!("      <{tag}{}/>\n", attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect::<String>());
@@ -337,7 +337,7 @@ pub fn track_children(t: &Track, extra: &crate::importer::XmlExtra, grid: Option
                 x.push_str(&raw(a, "TEMPO"));
             }
         } else if let Some(g) = grid {
-            // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
+            // The per-beat records Recordbox writes to PQTZ, filtered as rekordbox does.
             let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
             let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
             for i in tempo_select(&recs, BRIDGE_EXPORT_BEAT_GRID) {

@@ -1,4 +1,4 @@
-//! The app's own private library database (SQLite in ~/Library/Application Support/PrepDeck).
+//! The app's own private library database (SQLite in ~/Library/Application Support/Recordbox).
 //! It never opens or writes rekordbox's library, and never writes to audio files.
 
 use crate::model::*;
@@ -14,7 +14,12 @@ pub fn data_dir() -> PathBuf {
         return p;
     }
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let p = base.join("PrepDeck");
+    let p = base.join("Recordbox");
+    // The app was called PrepDeck before: its library folder moves over once, unchanged.
+    let old = base.join("PrepDeck");
+    if !p.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &p);
+    }
     let _ = std::fs::create_dir_all(&p);
     p
 }
@@ -37,7 +42,7 @@ pub const SCHEMA_VERSION: i64 = 2;
 
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Db> {
-        // Refuse a library from a newer PrepDeck; back up an older one before upgrading it.
+        // Refuse a library from a newer Recordbox; back up an older one before upgrading it.
         let existed = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
         if existed {
             let probe = Connection::open(path)?;
@@ -45,7 +50,7 @@ impl Db {
             let has_tables: bool = probe.query_row("SELECT count(*) FROM sqlite_master WHERE name='tracks'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
             drop(probe);
             if v > SCHEMA_VERSION {
-                anyhow::bail!("This library was written by a newer version of PrepDeck (schema {v}); update PrepDeck to open it. It was not changed.");
+                anyhow::bail!("This library was written by a newer version of Recordbox (schema {v}); update Recordbox to open it. It was not changed.");
             }
             if v < SCHEMA_VERSION && has_tables {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -337,7 +342,7 @@ impl Db {
         Ok(())
     }
 
-    /// Size and modification time of each audio file when PrepDeck last analysed it.
+    /// Size and modification time of each audio file when Recordbox last analysed it.
     pub fn media_stamps(&self) -> std::collections::HashMap<i64, (i64, i64)> {
         let mut m = std::collections::HashMap::new();
         if let Ok(mut st) = self.conn.prepare("SELECT track_id, size, mtime FROM media_stamps") {
@@ -352,7 +357,7 @@ impl Db {
         Ok(())
     }
 
-    /// PrepDeck's vocal detection: one level 0–4 per 2048 samples at 44.1 kHz (as PVDI).
+    /// Recordbox's vocal detection: one level 0–4 per 2048 samples at 44.1 kHz (as PVDI).
     pub fn vocal(&self, track: i64) -> Option<Vec<u8>> {
         self.conn.query_row("SELECT data FROM vocals WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten()
     }
@@ -361,7 +366,7 @@ impl Db {
         Ok(())
     }
 
-    /// XML fields PrepDeck doesn't model, kept from an XML import for the next XML export.
+    /// XML fields Recordbox doesn't model, kept from an XML import for the next XML export.
     pub fn xml_extra(&self, track: i64) -> crate::importer::XmlExtra {
         let s: Option<String> = self.conn.query_row("SELECT json FROM xml_extra WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten();
         s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -639,7 +644,7 @@ mod schema_tests {
 
     #[test]
     fn trash_and_restore_keep_everything() {
-        let dir = std::env::temp_dir().join(format!("prepdeck_trash_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_trash_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("library.db")).unwrap();
@@ -685,7 +690,7 @@ mod schema_tests {
 
     #[test]
     fn unavailable_gain_stays_unavailable() {
-        let dir = std::env::temp_dir().join(format!("prepdeck_gain_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_gain_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("library.db")).unwrap();
@@ -701,7 +706,7 @@ mod schema_tests {
 
     #[test]
     fn upgrades_with_backup_and_refuses_newer() {
-        let dir = std::env::temp_dir().join(format!("prepdeck_schema_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recordbox_schema_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("library.db");

@@ -90,39 +90,52 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     let rx = r.max.x;
     let now = chrono::Local::now().format("%H:%M").to_string();
     p.text(pos2(rx - 20.0, cy), Align2::RIGHT_CENTER, now, FontId::proportional(11.5), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, cy), vec2(22.0, 22.0));
-    let gear = ui.interact(gear_r, ui.id().with("gear"), Sense::click());
+    // Measured on the original (reference 01): gear 14 pt, sync mark a 3/4 ring with an
+    // arrowhead (radius 7.5 pt, 3 pt stroke), level meter two 3 pt bars 3 pt apart.
+    let gear_r = Rect::from_center_size(pos2(rx - 261.0, cy - 1.0), vec2(16.5, 16.5));
+    let gear = ui.interact(gear_r.expand(3.0), ui.id().with("gear"), Sense::click());
     crate::icons::gear(&p, gear_r, WHITE);
     if tipf(gear, "Preferences").clicked() {
         app.dialogs.prefs_open = true;
     }
-    // Sync / analysis activity mark (blue arc).
-    let arc_c = pos2(rx - 223.0, cy + 1.0);
+    // Sync / analysis activity mark (blue circular arrow; turns while work is running).
+    let arc_c = pos2(rx - 223.0, cy);
     let busy = app.analysis_total > 0 || app.export_job.is_some() || app.importing.is_some();
-    let mut pts = vec![];
     let spin = if busy { ui.input(|i| i.time) as f32 * 4.0 } else { 0.0 };
-    for i in 0..=16 {
-        let a = std::f32::consts::PI * (0.9 + i as f32 * 1.2 / 16.0) + spin;
-        pts.push(arc_c + vec2(a.cos(), a.sin()) * 7.0);
+    let (a0, a1) = (130f32.to_radians() + spin, 395f32.to_radians() + spin);
+    let rad = 7.5;
+    let pts: Vec<egui::Pos2> = (0..=28).map(|i| {
+        let a = a0 + (a1 - a0) * i as f32 / 28.0;
+        arc_c + vec2(a.cos(), a.sin()) * rad
+    }).collect();
+    p.add(egui::Shape::line(pts, Stroke::new(3.0, BLUE)));
+    {
+        let dir = vec2(-a1.sin(), a1.cos());
+        let out = vec2(a1.cos(), a1.sin());
+        let tip = arc_c + out * rad + dir * 3.5;
+        p.add(egui::Shape::convex_polygon(vec![tip, arc_c + out * (rad + 3.2) - dir * 1.0, arc_c + out * (rad - 3.2) - dir * 1.0], BLUE, Stroke::NONE));
     }
-    p.add(egui::Shape::line(pts, Stroke::new(2.4, BLUE)));
     if busy {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     }
-    // Level meter: level of the playing track at the play position.
-    let meter = Rect::from_min_max(pos2(rx - 204.0, cy - 2.5), pos2(rx - 125.0, cy + 2.5));
-    p.rect_filled(meter, 1.0, hex(0x3A3A3A));
+    // Level meter (left and right): level of the playing track at the play position.
+    let bars = [Rect::from_min_max(pos2(rx - 204.0, cy - 4.5), pos2(rx - 124.5, cy - 1.5)), Rect::from_min_max(pos2(rx - 204.0, cy + 1.5), pos2(rx - 124.5, cy + 4.5))];
+    for b in bars {
+        p.rect_filled(b, 0.0, hex(0x323232));
+    }
     if app.playing() {
         if let Some(w) = &app.deck.wave {
             let f = (app.pos() * WAVE_FPS) as usize;
             if let Some(fr) = w.frames.get(f) {
                 let lvl = (fr[0] as f32 / 255.0).min(1.0);
-                p.rect_filled(Rect::from_min_max(meter.min, pos2(meter.min.x + meter.width() * lvl, meter.max.y)), 1.0, hex(0xB0B0B0));
+                for b in bars {
+                    p.rect_filled(Rect::from_min_max(b.min, pos2(b.min.x + b.width() * lvl, b.max.y)), 0.0, hex(0xB0B0B0));
+                }
             }
         }
     }
     // Master volume slider.
-    let sl = Rect::from_min_max(pos2(rx - 106.0, cy - 6.0), pos2(rx - 72.0, cy + 6.0));
+    let sl = Rect::from_min_max(pos2(rx - 105.0, cy - 6.0), pos2(rx - 70.0, cy + 6.0));
     let sresp = ui.interact(sl, ui.id().with("vol"), Sense::click_and_drag());
     let mut v = app.player.state.lock().volume;
     if sresp.dragged() || sresp.clicked() {
@@ -131,8 +144,8 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
             app.player.state.lock().volume = v;
         }
     }
-    p.line_segment([pos2(sl.min.x, cy), pos2(sl.max.x, cy)], Stroke::new(2.0, hex(0x3A3A3A)));
-    p.line_segment([pos2(sl.min.x, cy), pos2(sl.min.x + sl.width() * v, cy)], Stroke::new(2.0, BLUE));
+    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, cy - 1.5), pos2(sl.max.x, cy + 1.5)), 0.0, hex(0x323232));
+    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, cy - 1.5), pos2(sl.min.x + (sl.width() * v).max(1.5), cy + 1.5)), 0.0, BLUE);
     let _ = tipf(sresp, "Master volume (preview)");
 }
 
@@ -186,7 +199,7 @@ fn menus(app: &mut App, ui: &mut Ui) {
         }
         if ui.button("Backup Library…").clicked() {
             ui.close_menu();
-            if let Some(f) = rfd::FileDialog::new().set_file_name("PrepDeck-library-backup.db").save_file() {
+            if let Some(f) = rfd::FileDialog::new().set_file_name("Recordbox-library-backup.db").save_file() {
                 let _ = app.db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                 match std::fs::copy(crate::db::data_dir().join("library.db"), &f) {
                     Ok(_) => app.toast("Library backed up."),
@@ -244,7 +257,7 @@ fn menus(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.menu_button(small("Help"), |ui| {
-        if ui.button("About PrepDeck").clicked() {
+        if ui.button("About Recordbox").clicked() {
             app.dialogs.about = true;
             ui.close_menu();
         }
@@ -300,7 +313,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     let mc = pos2(r.min.x + 17.0, r.center().y);
     p.circle_stroke(mc, 6.0, Stroke::new(1.8, WHITE));
     p.circle_filled(mc, 2.2, WHITE);
-    p.text(pos2(r.min.x + 27.0, r.center().y), Align2::LEFT_CENTER, "PrepDeck", bold(15.5), WHITE);
+    p.text(pos2(r.min.x + 27.0, r.center().y), Align2::LEFT_CENTER, "Recordbox", bold(15.5), WHITE);
     // totals
     let (n, secs, bytes) = if let View::Device { .. } = app.view {
         (0usize, 0.0, 0u64)
@@ -911,7 +924,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
                     Some((name, _)) if crate::export::usb::has_onelibrary(std::path::Path::new(&r2)) => {
-                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which PrepDeck can't read yet, so it can't tell which files are unused."));
+                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which Recordbox can't read yet, so it can't tell which files are unused."));
                     }
                     Some((name, Some(lib))) => {
                         let files = crate::export::usb::unused_files(std::path::Path::new(&r2), &lib);
@@ -925,7 +938,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 }
                 ui.close_menu();
             }
-            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from PrepDeck.").clicked() {
+            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from Recordbox.").clicked() {
                 app.check_player_cue_edits(&r2, true);
                 ui.close_menu();
             }
@@ -960,7 +973,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new(e).size(10.5).color(CAUTION_TX));
         }
         if fs != "folder" && crate::export::usb::has_onelibrary(std::path::Path::new(&root)) {
-            ui.label(RichText::new("Has a OneLibrary database that PrepDeck does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by PrepDeck.");
+            ui.label(RichText::new("Has a OneLibrary database that Recordbox does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by Recordbox.");
         }
         if let Some(nodes) = nodes {
             fn rows(app: &mut App, ui: &mut Ui, root: &str, nodes: &[crate::export::usb::DevNode], parent: u32, depth: usize) {
