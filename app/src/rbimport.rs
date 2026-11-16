@@ -628,12 +628,30 @@ mod onelibrary_probe {
     fn probe_key() {
         let p = std::env::var("PREPDECK_ONELIB").unwrap();
         let c = rusqlite::Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        c.pragma_update(None, "key", super::MASTER_DB_KEY).unwrap();
+        let key = std::env::var("PREPDECK_ONELIB_KEY_FILE").ok().map(|f| std::fs::read_to_string(f).unwrap()).unwrap_or_else(|| super::MASTER_DB_KEY.to_string());
+        c.pragma_update(None, "key", key.trim()).unwrap();
         match c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)) {
             Ok(n) => {
                 println!("opened: {n} objects");
                 let mut st = c.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap();
                 println!("{:?}", st.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().collect::<Vec<_>>());
+                if let Ok(out) = std::env::var("PREPDECK_ONELIB_DDL") { let out = out.as_str();
+                    let mut st = c.prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid").unwrap();
+                    let ddl: Vec<String> = st.query_map([], |r| Ok(format!("-- {} {}\n{};", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).unwrap().flatten().collect();
+                    std::fs::write(out, ddl.join("\n\n")).unwrap();
+                    let mut rows = String::new();
+                    for t in ["menuItem", "category", "sort", "property", "color", "key", "myTag", "image"] {
+                        let mut st = c.prepare(&format!("SELECT * FROM {t}")).unwrap();
+                        let n = st.column_count();
+                        for r in st.query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap())).collect::<Vec<_>>().join(", "))).unwrap().flatten() {
+                            rows.push_str(&format!("{t}: {r}\n"));
+                        }
+                    }
+                    std::fs::write(format!("{out}.rows"), rows).unwrap();
+                    for pr in ["journal_mode", "page_size", "cipher_version", "kdf_iter", "cipher_page_size", "cipher_hmac_algorithm", "cipher_kdf_algorithm", "user_version", "encoding"] {
+                        println!("{pr}: {:?}", c.query_row(&format!("PRAGMA {pr}"), [], |r| r.get::<_, rusqlite::types::Value>(0)));
+                    }
+                }
                 println!("property: {:?}", c.query_row("SELECT deviceName, dbVersion, numberOfContents, createdDate FROM property", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))));
             }
             Err(e) => println!("not opened: {e}"),
@@ -653,6 +671,13 @@ mod cue_origin_probe {
         let mut st = c.prepare("SELECT k.Kind, k.Comment, k.ColorTableIndex, k.created_at, c.created_at, c.updated_at, c.AnalysisUpdated FROM djmdCue k JOIN djmdContent c ON c.ID = k.ContentID WHERE k.rb_local_deleted = 0 LIMIT 12").unwrap();
         for r in st.query_map([], |r| Ok((0..7).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
             println!("cue: {r}");
+        }
+        for q in ["SELECT Analysed, count(*) FROM djmdContent WHERE rb_local_deleted = 0 GROUP BY 1", "SELECT group_concat(name, ' ') FROM pragma_table_info('djmdContent')", "SELECT Analysed, AnalysisDataPath IS NOT NULL, count(*) FROM djmdContent WHERE rb_local_deleted = 0 GROUP BY 1,2", "SELECT DBID FROM djmdProperty", "SELECT ID, MasterDBID, MasterSongID, ContentLink, ModifiedByRBM, SearchStr, DateCreated, StockDate, CueUpdated, AnalysisUpdated, TrackInfoUpdated, DeliveryControl, HotCueAutoLoad, Analysed FROM djmdContent WHERE rb_local_deleted = 0 LIMIT 6"] {
+            let mut st = c.prepare(q).unwrap();
+            let n = st.column_count();
+            for r in st.query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap())).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
+                println!("{q}: {r}");
+            }
         }
         let n: i64 = c.query_row("SELECT count(DISTINCT substr(created_at,1,16)) FROM djmdCue WHERE rb_local_deleted = 0", [], |r| r.get(0)).unwrap();
         println!("distinct creation minutes: {n}");

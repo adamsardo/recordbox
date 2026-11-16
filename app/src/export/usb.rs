@@ -1479,6 +1479,60 @@ fn simple_row(id: u32, name: &str) -> Vec<u8> {
     r
 }
 
+/// Menu (17) and sort (18) rows: the original's rows with visibility and position taken from
+/// the Category/Sort preferences. Shared with OneLibrary's category and sort tables.
+pub(crate) fn browse_tables(lib: &DeviceLibrary) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    // Menu (17) and sort (18) tables: the original's rows with visibility and position taken
+    // from the Category/Sort preferences (visible rows keep their observed visibility value).
+    let browse = lib.browse.clone().map(|b| b.normalized());
+    let menu_rows: Vec<Vec<u8>> = MENU
+        .iter()
+        .map(|m| {
+            let mut r = m.to_vec();
+            if let Some(b) = &browse {
+                let id = u16::from_le_bytes([m[0], m[1]]);
+                match b.categories.iter().position(|x| *x == id) {
+                    Some(i) => {
+                        r[5] = if m[5] == 1 { 0 } else { m[5] };
+                        r[6..8].copy_from_slice(&(i as u16 + 1).to_le_bytes());
+                    }
+                    None => {
+                        r[5] = 1;
+                        r[6..8].copy_from_slice(&0u16.to_le_bytes());
+                    }
+                }
+            }
+            r
+        })
+        .collect();
+    let t18_rows: Vec<Vec<u8>> = TABLE18
+        .iter()
+        .map(|m| {
+            let mut r = m.to_vec();
+            if let Some(b) = &browse {
+                let id = u16::from_le_bytes([m[0], m[1]]);
+                match b.sorts.iter().position(|x| *x == id) {
+                    Some(i) => {
+                        r[4] = 0;
+                        r[5] = i as u8 + 1;
+                    }
+                    None => {
+                        r[4] = 1;
+                        r[5] = 0;
+                    }
+                }
+            }
+            r
+        })
+        .collect();
+    (menu_rows, t18_rows)
+}
+
+/// The browse columns (id, kind, name) every export carries.
+pub(crate) fn browse_columns() -> &'static [(u16, u16, &'static str)] {
+    &COLUMNS
+}
+
 pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
     let mut artists = Interner::new();
     let mut genres = Interner::new();
@@ -1664,49 +1718,7 @@ pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
             r
         })
         .collect();
-    // Menu (17) and sort (18) tables: the original's rows with visibility and position taken
-    // from the Category/Sort preferences (visible rows keep their observed visibility value).
-    let browse = lib.browse.clone().map(|b| b.normalized());
-    let menu_rows = MENU
-        .iter()
-        .map(|m| {
-            let mut r = m.to_vec();
-            if let Some(b) = &browse {
-                let id = u16::from_le_bytes([m[0], m[1]]);
-                match b.categories.iter().position(|x| *x == id) {
-                    Some(i) => {
-                        r[5] = if m[5] == 1 { 0 } else { m[5] };
-                        r[6..8].copy_from_slice(&(i as u16 + 1).to_le_bytes());
-                    }
-                    None => {
-                        r[5] = 1;
-                        r[6..8].copy_from_slice(&0u16.to_le_bytes());
-                    }
-                }
-            }
-            r
-        })
-        .collect();
-    let t18_rows = TABLE18
-        .iter()
-        .map(|m| {
-            let mut r = m.to_vec();
-            if let Some(b) = &browse {
-                let id = u16::from_le_bytes([m[0], m[1]]);
-                match b.sorts.iter().position(|x| *x == id) {
-                    Some(i) => {
-                        r[4] = 0;
-                        r[5] = i as u8 + 1;
-                    }
-                    None => {
-                        r[4] = 1;
-                        r[5] = 0;
-                    }
-                }
-            }
-            r
-        })
-        .collect();
+    let (menu_rows, t18_rows) = browse_tables(lib);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut sync = vec![0x80, 0x02, 0, 0];
     sync.extend((lib.tracks.len() as u32).to_le_bytes());
