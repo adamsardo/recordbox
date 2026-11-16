@@ -19,7 +19,16 @@ This is being built in the open. An AI coding agent (Claude Code, run through Cr
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
 - **USB export:** drives that CDJ/XDJ players can read, the same way rekordbox does
 
-Performance features (mixing live, effects, lighting, video, streaming) are out of scope. The focus is everything you do *before* the set.
+## Scope
+
+The first version is deliberately limited to preparation: everything you do *before* the set. Performance features such as live mixing, effects, lighting and video aren't part of it.
+
+Once the first version has landed, extended features can be added if enough people ask for them. For example:
+
+- streaming service support
+- connecting CDJs and Pioneer DJ controllers
+
+If there's something you'd use, [open an issue](https://github.com/adamsardo/recordbox/issues) or give an existing one a 👍 so it's easy to see what people want most.
 
 ## Privacy and safety
 
@@ -56,4 +65,4 @@ Ideas and bug reports are welcome in [Issues](https://github.com/adamsardo/recor
 
 ## Licence
 
-No licence has been chosen yet, so all rights are reserved for the moment.
+MIT. See [LICENSE](LICENSE).
