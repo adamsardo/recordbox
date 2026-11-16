@@ -630,7 +630,7 @@ fn info_window(app: &mut App, ctx: &Context) {
     let mut save = false;
     egui::Window::new("Property").open(&mut open).default_width(460.0).collapsible(false).show(ctx, |ui| {
         egui::Grid::new("prop").num_columns(2).spacing(vec2(10.0, 5.0)).show(ui, |ui| {
-            let mut field = |ui: &mut Ui, label: &str, v: &mut String| {
+            let field = |ui: &mut Ui, label: &str, v: &mut String| {
                 ui.label(RichText::new(label).color(DIM2));
                 ui.add(egui::TextEdit::singleline(v).desired_width(320.0));
                 ui.end_row();

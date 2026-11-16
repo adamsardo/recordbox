@@ -380,6 +380,74 @@ mod prefs_tests {
 }
 
 #[cfg(test)]
+mod relocation_tests {
+    use std::path::PathBuf;
+    #[test]
+    fn picks_only_unambiguous_files() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100)], 100), Some(p("/a/x.mp3")));
+        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 100), None, "lone file of another size");
+        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 0), Some(p("/a/x.mp3")), "size unknown");
+        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99), (p("/b/x.mp3"), 100)], 100), Some(p("/b/x.mp3")));
+        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100), (p("/b/x.mp3"), 100)], 100), None, "two with the same size");
+        assert_eq!(super::pick_relocation(&[], 100), None);
+    }
+}
+
+#[cfg(test)]
+mod lufs_migration_tests {
+    #[test]
+    fn shifts_library_and_trash_once() {
+        let dir = std::env::temp_dir().join(format!("prepdeck_lufs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("library.db")).unwrap();
+        let mk = |p: &str, g: f32| crate::model::Track { path: p.into(), analyzed: 1, gain_db: g, ..Default::default() };
+        let a = db.insert_track(&mk("/a.mp3", 3.0)).unwrap();
+        let b = db.insert_track(&mk("/b.mp3", 1.5)).unwrap();
+        db.trash_track(b).unwrap();
+        let mut prefs = super::Prefs::default();
+        prefs.target_lufs = -8.0;
+        let next = super::migrate_lufs_default(&db, &prefs, None).unwrap();
+        assert_eq!(next.target_lufs, -10.0);
+        assert!((db.track(a).unwrap().gain_db - 1.0).abs() < 1e-6);
+        let t = db.trash_list().unwrap()[0].0;
+        let back = db.restore_trash(t).unwrap().unwrap();
+        assert!((db.track(back).unwrap().gain_db - (-0.5)).abs() < 1e-6, "trashed gain shifted too");
+        assert_eq!(db.setting("lufs_default_migrated").as_deref(), Some("1"));
+        // A user already on -10 (or a new library) gets no shift.
+        let c = db.insert_track(&mk("/c.mp3", 2.0)).unwrap();
+        let _ = super::migrate_lufs_default(&db, &next, None).unwrap();
+        assert!((db.track(c).unwrap().gain_db - 2.0).abs() < 1e-6);
+        // Unparsable preferences: the old target is still found in the raw text.
+        let d = db.insert_track(&mk("/d.mp3", 2.0)).unwrap();
+        let fallback = super::Prefs::default();
+        let n2 = super::migrate_lufs_default(&db, &fallback, Some(r#"{"target_lufs": -8.0, "broken": "#)).unwrap_or(fallback.clone());
+        let _ = n2;
+        let raw_ok = super::migrate_lufs_default(&db, &fallback, Some(r#"{"target_lufs": -8.0}"#)).unwrap();
+        assert_eq!(raw_ok.target_lufs, -10.0);
+        assert!((db.track(d).unwrap().gain_db - 0.0).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod history_key_tests {
+    use std::collections::HashSet;
+    #[test]
+    fn keys_and_legacy_migration() {
+        // Same drive and history names on two sticks: different first files, different keys.
+        assert_ne!(super::history_key("NO NAME", "HISTORY 001", "/Contents/a.mp3"), super::history_key("NO NAME", "HISTORY 001", "/Contents/b.mp3"));
+        // An earlier version's key with entries [3, 5] counts as 2 imported when the history now
+        // starts with them; a different history with the same name does not match.
+        let old: HashSet<String> = ["NO NAME\u{1f}HISTORY 001\u{1f}[3, 5]".to_string()].into_iter().collect();
+        assert_eq!(super::legacy_imported(&old, "NO NAME", "HISTORY 001", &[3, 5, 9]), Some(2));
+        assert_eq!(super::legacy_imported(&old, "NO NAME", "HISTORY 001", &[4, 5, 9]), None);
+        assert_eq!(super::legacy_imported(&old, "NO NAME", "HISTORY 002", &[3, 5]), None);
+    }
+}
+
+#[cfg(test)]
 mod quantize_tests {
     use crate::model::Beat;
     #[test]
@@ -875,10 +943,10 @@ impl App {
         // was never changed moves to the new default once.
         let mut prefs = prefs;
         if db.setting("lufs_default_migrated").is_none() {
-            if prefs.target_lufs == -8.0 {
-                prefs.target_lufs = -10.0;
+            match migrate_lufs_default(&db, &prefs, raw_prefs.as_deref()) {
+                Ok(next) => prefs = next,
+                Err(e) => eprintln!("loudness default migration postponed: {e}"),
             }
-            db.set_setting("lufs_default_migrated", "1");
         }
         let audio_device = prefs.audio_device.clone();
         let pool = AnalysisPool::new(cc.egui_ctx.clone());
@@ -2582,6 +2650,7 @@ impl App {
         // Earlier analysis means a stored waveform (a grid alone can come from an import).
         let had_analysis = self.db.wave(id).is_some();
         let key_requested = self.key_requested.remove(&id);
+        let mut locked_peak: Option<f32> = None;
         let Some(t) = self.track_mut(id) else { return };
         match r {
             Err(e) => {
@@ -2589,8 +2658,9 @@ impl App {
             }
             Ok(res) if t.grid_locked && had_analysis => {
                 // Analysis Lock: a locked track keeps its grid, key, waveform and gain, whatever
-                // the job's queued state (the lock is checked here, when results arrive).
-                let _ = res;
+                // the job's queued state (the lock is checked here, when results arrive). Its
+                // measured peak is still recorded (for the optional peak cap).
+                locked_peak = Some(res.peak);
                 t.analyzed = 1;
             }
             Ok(res) => {
@@ -2670,6 +2740,9 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(pk) = locked_peak.filter(|p| *p > 0.0) {
+            let _ = self.db.set_peak(id, pk);
         }
         // Analysis results are not user edits: keep them off the undo stack.
         self.save_track_quiet(id);
@@ -3644,17 +3717,10 @@ impl App {
                 // The first entry's file: fixed from the history's first play on, so the key
                 // stays the same as the history grows.
                 let head = h.entries.first().and_then(|e| lib.tracks.get(e)).map(|t| t.file_path.clone()).unwrap_or_default();
-                let key = format!("{dev_name}\u{1f}{}\u{1f}{head}", h.name);
+                let key = history_key(&dev_name, &h.name, &head);
                 // An earlier version recorded the entries it imported; if they are the start of
                 // this history, only what came after them is new.
-                let legacy_prefix = format!("{dev_name}\u{1f}{}\u{1f}[", h.name);
-                let legacy = old
-                    .iter()
-                    .filter_map(|k| k.strip_prefix(&legacy_prefix[..legacy_prefix.len() - 1]))
-                    .filter_map(|list| serde_json::from_str::<Vec<u32>>(list).ok())
-                    .filter(|prev| h.entries.starts_with(prev))
-                    .map(|prev| prev.len())
-                    .max();
+                let legacy = legacy_imported(&old, &dev_name, &h.name, &h.entries);
                 let done = counts.get(&key).copied().or(legacy).unwrap_or(0);
                 if h.entries.len() <= done {
                     counts.insert(key, done);
@@ -3840,16 +3906,8 @@ impl App {
         for (id, name, size) in missing {
             let cands = by_name.get(&crate::smart::fold(&name)).cloned().unwrap_or_default();
             let cands: Vec<std::path::PathBuf> = cands.into_iter().filter(|p| self.db.track_by_path(&p.to_string_lossy()).is_none()).collect();
-            let size_ok = |p: &std::path::PathBuf| size == 0 || std::fs::metadata(p).map(|m| m.len() == size).unwrap_or(false);
-            let pick = match cands.len() {
-                0 => None,
-                // A lone file with that name but another size is a different recording.
-                1 => cands.into_iter().next().filter(|p| size_ok(p)),
-                _ => {
-                    let same: Vec<_> = cands.iter().filter(|p| size > 0 && std::fs::metadata(p).map(|m| m.len() == size).unwrap_or(false)).cloned().collect();
-                    if same.len() == 1 { same.into_iter().next() } else { None }
-                }
-            };
+            let sized: Vec<(std::path::PathBuf, u64)> = cands.into_iter().map(|p| { let l = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX); (p, l) }).collect();
+            let pick = pick_relocation(&sized, size);
             match pick {
                 Some(p) => {
                     if self.relocate_track(id, &p.to_string_lossy()) {
@@ -4011,6 +4069,73 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     } else {
         na == nb
     }
+}
+
+/// Which same-named file a missing track moves to: a lone candidate only if its size matches
+/// (when the track's size is known), several only if exactly one has the track's size.
+pub fn pick_relocation(cands: &[(std::path::PathBuf, u64)], size: u64) -> Option<std::path::PathBuf> {
+    match cands {
+        [] => None,
+        [(p, l)] => (size == 0 || *l == size).then(|| p.clone()),
+        _ => {
+            let same: Vec<_> = cands.iter().filter(|(_, l)| size > 0 && *l == size).collect();
+            if same.len() == 1 { Some(same[0].0.clone()) } else { None }
+        }
+    }
+}
+
+/// One-time move of the reference loudness from the old default -8 LUFS to rekordbox's -10.
+/// Stored gains (library and trash) are measured against the target, so they shift by -2 dB
+/// with it. Everything happens in one transaction with the "done" flag; on error nothing
+/// changes and the caller tries again next launch. Returns the preferences to use.
+pub fn migrate_lufs_default(db: &Db, prefs: &Prefs, raw_prefs: Option<&str>) -> anyhow::Result<Prefs> {
+    // Read from the raw text too, in case the preferences could not be parsed as a whole.
+    let was_old_default = prefs.target_lufs == -8.0 || raw_prefs.and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()).and_then(|v| v.get("target_lufs").and_then(|x| x.as_f64())) == Some(-8.0);
+    let mut next = prefs.clone();
+    if was_old_default {
+        next.target_lufs = -10.0;
+    }
+    db.conn.execute_batch("BEGIN")?;
+    let r = (|| -> anyhow::Result<()> {
+        if was_old_default {
+            db.conn.execute("UPDATE tracks SET gain_db = gain_db - 2.0 WHERE analyzed = 1 AND gain_db IS NOT NULL", [])?;
+            db.conn.execute(
+                "UPDATE trash SET json = json_set(json, '$.track.gain_db', json_extract(json, '$.track.gain_db') - 2.0) WHERE json_extract(json, '$.track.analyzed') = 1 AND json_extract(json, '$.track.gain_db') IS NOT NULL",
+                [],
+            )?;
+            db.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('prefs', ?1)", [serde_json::to_string(&next)?])?;
+        }
+        db.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('lufs_default_migrated', '1')", [])?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => {
+            db.conn.execute_batch("COMMIT")?;
+            Ok(next)
+        }
+        Err(e) => {
+            let _ = db.conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Identity of a device play history for "already imported" counting: drive name, history
+/// name and the file of its first entry (stable as the history grows).
+pub fn history_key(device: &str, name: &str, first_file: &str) -> String {
+    format!("{device}\u{1f}{name}\u{1f}{first_file}")
+}
+
+/// Entries of `entries` an earlier version imported (its keys held the full entry list then):
+/// the longest recorded list that is a prefix of the current one.
+pub fn legacy_imported(old: &HashSet<String>, device: &str, name: &str, entries: &[u32]) -> Option<usize> {
+    let prefix = format!("{device}\u{1f}{name}\u{1f}");
+    old.iter()
+        .filter_map(|k| k.strip_prefix(&prefix))
+        .filter_map(|list| serde_json::from_str::<Vec<u32>>(list).ok())
+        .filter(|prev| entries.starts_with(prev))
+        .map(|prev| prev.len())
+        .max()
 }
 
 /// Snap `t` to the nearest 1/`div` of a beat along the grid's own beats (div 1 = whole

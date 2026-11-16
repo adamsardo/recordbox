@@ -4,7 +4,7 @@ use eframe::egui;
 use crate::app::*;
 use crate::model::*;
 use crate::theme::*;
-use crate::ui_player::{button, star};
+use crate::ui_player::star;
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Ui};
 use std::collections::{HashMap, HashSet};
 

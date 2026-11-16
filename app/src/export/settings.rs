@@ -140,6 +140,41 @@ impl UsbSettings {
         self
     }
 
+    /// The settings to write to a drive: where the drive already has a valid file (right
+    /// length and checksum), its bytes are kept and only the fields PrepDeck lets you set
+    /// (Preferences > DJ System) are written over them, so values set elsewhere survive.
+    pub fn merged_onto_drive(&self, pioneer_dir: &std::path::Path) -> UsbSettings {
+        let mut out = self.clone().normalized();
+        let read = |name: &str, len: usize, whole: bool| -> Option<Vec<u8>> {
+            let b = std::fs::read(pioneer_dir.join(name)).ok()?;
+            if b.len() != 108 + len || u32::from_le_bytes(b.get(100..104)?.try_into().ok()?) as usize != len {
+                return None;
+            }
+            let crc = u32::from_le_bytes(b[104 + len..108 + len].try_into().ok()?) as u16;
+            let covered = if whole { &b[..104 + len] } else { &b[104..104 + len] };
+            (crc == crc16_xmodem(covered)).then(|| b[104..104 + len].to_vec())
+        };
+        let managed = |f: SettingFile| -> Vec<usize> {
+            let mut v: Vec<usize> = crate::export::settings_fields::MY_SETTINGS.iter().filter(|x| x.file == f).map(|x| x.offset).collect();
+            if f == SettingFile::Dev {
+                v.extend([DEV_WAVEFORM_COLOR, DEV_WAVEFORM_POSITION]);
+            }
+            v
+        };
+        for (f, name, len, whole) in [(SettingFile::My, "MYSETTING.DAT", 40, false), (SettingFile::My2, "MYSETTING2.DAT", 40, false), (SettingFile::Dev, "DEVSETTING.DAT", 32, false), (SettingFile::Djm, "DJMMYSETTING.DAT", 52, true)] {
+            if let Some(mut base) = read(name, len, whole) {
+                let mine = out.payload_mut(f).clone();
+                for o in managed(f) {
+                    if o < len {
+                        base[o] = mine[o];
+                    }
+                }
+                *out.payload_mut(f) = base;
+            }
+        }
+        out
+    }
+
     /// (file name, bytes) for each of the four files.
     pub fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
         let s = self.clone().normalized();
@@ -177,6 +212,33 @@ pub fn build_whole_crc(vendor: &str, product: &str, version: &str, payload: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_bytes_kept_except_managed_fields() {
+        let dir = std::env::temp_dir().join(format!("prepdeck_settings_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The drive's DEVSETTING has an unmanaged byte (20) set by something else, and a
+        // waveform colour that differs from the user's preference.
+        let mut drive = UsbSettings::default();
+        drive.dev[20] = 0x42;
+        drive.dev[DEV_WAVEFORM_COLOR] = 1;
+        for (n, b) in drive.files() {
+            std::fs::write(dir.join(n), b).unwrap();
+        }
+        let mut mine = UsbSettings::default();
+        mine.dev[DEV_WAVEFORM_COLOR] = 4;
+        let merged = mine.merged_onto_drive(&dir);
+        assert_eq!(merged.dev[20], 0x42);
+        assert_eq!(merged.dev[DEV_WAVEFORM_COLOR], 4);
+        // A damaged file (bad checksum) is not used as the base.
+        let mut bad = std::fs::read(dir.join("DEVSETTING.DAT")).unwrap();
+        let n = bad.len();
+        bad[n - 4] ^= 0xff;
+        std::fs::write(dir.join("DEVSETTING.DAT"), bad).unwrap();
+        assert_eq!(mine.merged_onto_drive(&dir).dev[20], UsbSettings::default().dev[20]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn crc_matches_reference() {

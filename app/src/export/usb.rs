@@ -1219,7 +1219,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     // Player settings, as rekordbox writes them with every export: part of the journaled
     // export, and a failure to write them fails it.
     std::fs::create_dir_all(root.join("PIONEER"))?;
-    for (name, bytes) in req.settings.files() {
+    for (name, bytes) in req.settings.merged_onto_drive(&root.join("PIONEER")).files() {
         let p = root.join("PIONEER").join(name);
         created.will_replace(&p)?;
         write_atomic(&p, &bytes).map_err(|e| anyhow!("writing the player settings file {name}: {e}"))?;
@@ -1820,12 +1820,7 @@ pub fn build_export_ext(lib: &DeviceLibrary) -> Vec<u8> {
     pdb::write_database(&tables, 5, 6)
 }
 
-pub fn write_device(root: &Path, lib: &DeviceLibrary) -> Result<()> {
-    write_device_then(root, lib, &mut || {})
-}
 
-/// As write_device; `published` runs as soon as the new export.pdb is in place (from then on
-/// the drive's library refers to the files this export copied).
 /// Write both databases under the export's journal: fully written and flushed, then "P",
 /// then the two renames.
 fn write_device_journaled(root: &Path, lib: &DeviceLibrary, created: &mut Created) -> Result<()> {
@@ -1844,26 +1839,6 @@ fn write_device_journaled(root: &Path, lib: &DeviceLibrary, created: &mut Create
     fault_point()?;
     publish_tmp(&dir.join("exportExt.pdb"))?;
     fault_point()
-}
-
-pub fn write_device_then(root: &Path, lib: &DeviceLibrary, published: &mut dyn FnMut()) -> Result<()> {
-    let dir = root.join("PIONEER").join("rekordbox");
-    std::fs::create_dir_all(&dir)?;
-    let main = build_export_pdb(lib);
-    // Verify by reading back before replacing the drive's database.
-    let check = parse_pdb(main.clone())?;
-    if check.tracks.len() != lib.tracks.len() {
-        return Err(anyhow!("internal check failed: wrote {} tracks, read back {}", lib.tracks.len(), check.tracks.len()));
-    }
-    // Both databases are fully written and flushed before either replaces the old one, so
-    // the window in which the pair is inconsistent is two renames long.
-    let ext = build_export_ext(lib);
-    write_tmp(&dir.join("export.pdb"), &main)?;
-    write_tmp(&dir.join("exportExt.pdb"), &ext)?;
-    publish_tmp(&dir.join("export.pdb"))?;
-    published();
-    publish_tmp(&dir.join("exportExt.pdb"))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2086,6 +2061,20 @@ mod tests {
         assert_eq!(n, 2);
         assert!(!root.join("Contents/B").exists() && !root.join("PIONEER/USBANLZ/P002").exists());
         assert!(root.join("Contents/A/kept.mp3").exists() && root.join("PIONEER/Artwork/00001/a1_m.jpg").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn artwork_names_avoid_used_and_existing_files() {
+        let root = std::env::temp_dir().join(format!("prepdeck_art_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("PIONEER/Artwork/00001");
+        std::fs::create_dir_all(&dir).unwrap();
+        // a2_m.jpg exists on the drive (from rekordbox); a1 is used by a track in the library.
+        std::fs::write(dir.join("a2_m.jpg"), b"x").unwrap();
+        let mut lib = DeviceLibrary::default();
+        lib.tracks.insert(9, DevTrack { id: 9, artwork_path: "/PIONEER/Artwork/00001/a1.jpg".into(), ..Default::default() });
+        assert_eq!(free_artwork_name(&root, &lib), "/PIONEER/Artwork/00001/a3.jpg");
         let _ = std::fs::remove_dir_all(&root);
     }
 

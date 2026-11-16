@@ -248,7 +248,7 @@ impl Db {
         let playlists = st.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut st = self.conn.prepare("SELECT tag_id FROM track_tags WHERE track_id=?1")?;
         let tags = st.query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, xml_extra: self.xml_extra(id), vocal: self.vocal(id), track: track.clone() };
+        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, xml_extra: self.xml_extra(id), vocal: self.vocal(id), peak: self.peak(id), stamp: self.media_stamps().get(&id).copied(), track: track.clone() };
         let wave: Option<(Vec<u8>, Vec<u8>)> = self.conn.query_row("SELECT data, preview FROM waves WHERE track_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         self.conn.execute(
@@ -290,6 +290,12 @@ impl Db {
             self.set_xml_extra(id, &e.xml_extra)?;
             if let Some(v) = &e.vocal {
                 self.save_vocal(id, v)?;
+            }
+            if let Some(p) = e.peak {
+                self.set_peak(id, p)?;
+            }
+            if let Some(st) = e.stamp {
+                self.set_media_stamp(id, st)?;
             }
             if let (Some(w), Some(p)) = (wave, preview) {
                 self.conn.execute("INSERT OR REPLACE INTO waves(track_id,data,preview) VALUES(?1,?2,?3)", params![id, w, p])?;
@@ -621,6 +627,10 @@ struct TrashEntry {
     xml_extra: crate::importer::XmlExtra,
     #[serde(default)]
     vocal: Option<Vec<u8>>,
+    #[serde(default)]
+    peak: Option<f32>,
+    #[serde(default)]
+    stamp: Option<(i64, i64)>,
 }
 
 #[cfg(test)]
