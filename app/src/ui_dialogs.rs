@@ -251,6 +251,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             card(ui, "Track Analysis Setting", |ui| {
                                 ui.checkbox(&mut app.prefs.analyze_grid, RichText::new("BPM / Grid").size(14.0));
                                 ui.checkbox(&mut app.prefs.analyze_key, RichText::new("KEY").size(14.0));
+                                ui.checkbox(&mut app.prefs.vocal_analysis, RichText::new("Vocal").size(14.0)).on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
                                 ui.checkbox(&mut app.prefs.phrase_analysis, RichText::new("Phrase").size(14.0)).on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
                                 ui.label(RichText::new("If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.").size(11.0).color(DIM));
                             });
@@ -976,8 +977,15 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 if ui.add_enabled(!picked.is_empty(), egui::Button::new(format!("Restore {}", picked.len()))).clicked() {
                     act = Some(true);
                 }
-                if ui.add_enabled(!picked.is_empty(), egui::Button::new("Delete Permanently")).on_hover_text("Forget these entries now. The music files are not affected.").clicked() {
-                    act = Some(false);
+                // Two clicks: the entries cannot be restored afterwards.
+                let confirm_id = egui::Id::new("trash_confirm");
+                let armed: bool = ui.ctx().data(|d| d.get_temp(confirm_id)).unwrap_or(false);
+                let label = if armed { format!("Click again to forget {} permanently", picked.len()) } else { "Delete Permanently".to_string() };
+                if ui.add_enabled(!picked.is_empty(), egui::Button::new(label)).on_hover_text("Forget these entries now; they can't be restored afterwards. The music files are not affected.").clicked() {
+                    if armed {
+                        act = Some(false);
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(confirm_id, !armed));
                 }
             });
         });

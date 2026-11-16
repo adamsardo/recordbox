@@ -349,6 +349,19 @@ pub struct Overrides {
     /// file order. Audio-derived sections fall back to these, and sections PrepDeck does not
     /// know are carried over unchanged.
     pub device: std::collections::HashMap<&'static str, Vec<(String, Vec<u8>)>>,
+    /// PrepDeck's own vocal section, used when rekordbox's is not available.
+    pub pvdi: Option<Vec<u8>>,
+}
+
+/// Vocal detection section (2EX): discriminator 0, hop 1024 at 22,050 Hz, stride 1, then one
+/// level 0–4 per hop, as rekordbox writes it unscrambled.
+pub fn pvdi(levels: &[u8]) -> Vec<u8> {
+    let mut h = vec![];
+    for w in [0u16, 1024, 22050, 1] {
+        h.extend_from_slice(&w.to_be_bytes());
+    }
+    h.extend_from_slice(&(levels.len() as u32).to_be_bytes());
+    section(b"PVDI", &h, levels)
 }
 
 /// Section tags PrepDeck writes itself (or deliberately drops when the grid changed).
@@ -501,7 +514,9 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
     let or = |tag: &str, f: &dyn Fn() -> Vec<u8>| take(tag).unwrap_or_else(f);
     let dat = vec![
         ppth(usb_path),
-        or("PVBR", &|| pvbr(raw_samples)),
+        // The trailing sample count is written for MP3 files only (rekordbox writes 0 for WAV:
+        // 13 of 13 reference files; 117 MP3s carry the count).
+        or("PVBR", &|| pvbr(if usb_path.to_ascii_lowercase().ends_with(".mp3") { raw_samples } else { 0 })),
         take_grid("PQTZ").unwrap_or_else(|| pqtz(beats)),
         or("PWAV", &|| pwav(wave)),
         or("PWV2", &|| pwv2(wave)),
@@ -524,7 +539,7 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
         ext.push(s);
     }
     let mut ex2 = vec![ppth(usb_path), or("PWV7", &|| pwv7(&frames)), or("PWV6", &|| pwv6(wave)), or("PWVC", &pwvc)];
-    if let Some(s) = take("PVDI") {
+    if let Some(s) = take("PVDI").or_else(|| ov.and_then(|o| o.pvdi.clone())) {
         ex2.push(s);
     }
     let mut dat = dat;
@@ -595,7 +610,7 @@ mod tests {
             }
         }
         device.insert("EXT", list);
-        let ov = Overrides { sections: Default::default(), grid_same: false, pssi: None, device };
+        let ov = Overrides { sections: Default::default(), grid_same: false, pssi: None, device, pvdi: None };
         let again = build_with("/Contents/a.mp3", &g, &w, &[], 441_000, 44100, Some(&ov));
         std::fs::write(dir.join("B.EXT"), &again.ext).unwrap();
         let out = read_section_list(&dir.join("B.EXT"));
@@ -642,6 +657,10 @@ mod tests {
         let f = build("/Contents/a/b/c.mp3", &g, &w, &[cue, mem], 441_000, 44100);
         // Seek index ends with the total sample count; detail waveform spans the full length.
         assert!(f.dat.windows(4).any(|x| x == 441_000u32.to_be_bytes()));
+        let pvbr_tail = |dat: &[u8]| section_list(dat).into_iter().find(|(t, _)| t == "PVBR").map(|(_, b)| b[b.len() - 4..].to_vec()).unwrap();
+        assert_eq!(pvbr_tail(&f.dat), 441_000u32.to_be_bytes());
+        let wav = build("/Contents/a/b/c.wav", &g, &w, &[], 441_000, 44100);
+        assert_eq!(pvbr_tail(&wav.dat), [0, 0, 0, 0]);
         let t = std::env::temp_dir();
         let _ = std::fs::write(t.join("prepdeck_ANLZ0000.DAT"), &f.dat);
         let _ = std::fs::write(t.join("prepdeck_ANLZ0000.EXT"), &f.ext);

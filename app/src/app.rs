@@ -222,6 +222,8 @@ pub struct Prefs {
     pub center_selected: bool,
     /// Vocal positions above the overview waveform.
     pub show_vocal: bool,
+    /// Detect vocals (with the stem model) for loaded tracks rekordbox never analysed.
+    pub vocal_analysis: bool,
     /// The column set and sort not in use: playlists and the collection each keep their own
     /// (rekordbox shows # and fewer columns in playlists). `columns_for_playlist` says which
     /// set `columns` currently holds.
@@ -371,6 +373,21 @@ mod pvdi_tests {
         assert!(super::parse_pvdi(&neg).is_none());
         assert!(super::parse_pvdi(&s[..26]).is_none());
     }
+
+    #[test]
+    fn own_vocal_section_reads_back() {
+        let levels = vec![0u8, 0, 1, 3, 4, 4, 2, 0];
+        let sec = crate::export::anlz::pvdi(&levels);
+        let v = super::parse_pvdi(&sec).unwrap();
+        assert_eq!(v.1, levels);
+        assert!((v.0 - crate::stems::VOCAL_HOP as f64 / 44100.0).abs() < 1e-9);
+        // Silence has no vocals; a loud vocal over a quiet mix does.
+        let quiet = vec![0f32; 2048 * 100];
+        assert!(crate::stems::vocal_levels(&quiet, &quiet).iter().all(|l| *l == 0));
+        let voc: Vec<f32> = (0..2048 * 100).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+        let mix: Vec<f32> = voc.iter().map(|x| x * 1.2).collect();
+        assert!(crate::stems::vocal_levels(&voc, &mix).iter().all(|l| *l >= 3));
+    }
 }
 
 #[cfg(test)]
@@ -469,12 +486,14 @@ impl Default for Prefs {
             browse_bold: false,
             center_selected: false,
             show_vocal: true,
+            vocal_analysis: true,
             columns_other: vec![Col::Num, Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Genre, Col::Bpm, Col::Time, Col::Key, Col::DateAdded],
             sort_other: (Col::Num, true),
             columns_for_playlist: false,
             phrase_analysis: true,
             delete_device_tracks: false,
-            target_lufs: -8.0,
+            // rekordbox's standard: gain = -10 - integrated loudness.
+            target_lufs: -10.0,
             tooltips: true,
             show_mytag: false,
             grid_from_current: false,
@@ -562,8 +581,9 @@ pub struct Deck {
     /// rekordbox's own 3-band waveforms for this audio file (detail at 150 per second, and
     /// the 1200-column overview), when the track came from the rekordbox library.
     pub rb_wave: Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>>,
-    /// Vocal activity (rekordbox's PVDI): (seconds per entry, level 0–4 per entry).
+    /// Vocal activity (rekordbox's PVDI, else PrepDeck's): (seconds per entry, level 0–4).
     pub vocal: Option<std::sync::Arc<(f64, Vec<u8>)>>,
+    pub vocal_rx: Option<Receiver<(i64, Option<Vec<u8>>)>>,
     pub track: Option<i64>,
     pub audio: Option<Arc<Decoded>>,
     pub loading: Option<Receiver<(i64, Result<Arc<Decoded>, String>)>>,
@@ -595,6 +615,7 @@ impl Default for Deck {
             phrases_rx: None,
             rb_wave: None,
             vocal: None,
+            vocal_rx: None,
             track: None,
             audio: None,
             loading: None,
@@ -772,6 +793,15 @@ impl App {
             }
             None => Prefs::default(),
         };
+        // The reference loudness used to default to -8 LUFS; rekordbox's is -10. A saved -8 that
+        // was never changed moves to the new default once.
+        let mut prefs = prefs;
+        if db.setting("lufs_default_migrated").is_none() {
+            if prefs.target_lufs == -8.0 {
+                prefs.target_lufs = -10.0;
+            }
+            db.set_setting("lufs_default_migrated", "1");
+        }
         let pool = AnalysisPool::new(cc.egui_ctx.clone());
         let mut app = App {
             db,
@@ -935,7 +965,13 @@ impl App {
                         app.prefs.column_browser = true;
                         app.list_dirty = true;
                     }
-                    "trash" => app.dialogs.trash = Some(Default::default()),
+                    "trash" => {
+                        if app.db.trash_list().map(|l| l.is_empty()).unwrap_or(true) {
+                            let ids: Vec<i64> = app.tracks.iter().rev().take(2).map(|t| t.id).collect();
+                            app.remove_from_collection(&ids);
+                        }
+                        app.dialogs.trash = Some(app.db.trash_list().unwrap_or_default().first().map(|e| e.0).into_iter().collect());
+                    }
                     "subbrowser" => {
                         app.prefs.sub_browser = true;
                         // The largest playlist.
@@ -1478,6 +1514,41 @@ impl App {
         self.deck.phrases_rx = Some(rx);
     }
 
+/// Vocal detection for the loaded track when neither rekordbox nor an earlier run has it:
+    /// the vocal stem of an already-downloaded separation model, in the background.
+    fn start_deck_vocal(&mut self, a: Arc<Decoded>) {
+        if !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
+            return;
+        }
+        // Only with a downloaded model and a GPU (about a minute per track there; much slower on
+        // the CPU).
+        if !crate::stems::CATALOG.iter().any(crate::stems::model_ready) || !self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false) {
+            return;
+        }
+        let Some(id) = self.deck.track else { return };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
+            let _ = tx.send((id, r));
+            ctx.request_repaint();
+        });
+        self.deck.vocal_rx = Some(rx);
+    }
+
+    pub fn poll_vocal(&mut self) {
+        let Some(rx) = &self.deck.vocal_rx else { return };
+        if let Ok((id, r)) = rx.try_recv() {
+            self.deck.vocal_rx = None;
+            if let Some(levels) = r {
+                let _ = self.db.save_vocal(id, &levels);
+                if self.deck.track == Some(id) {
+                    self.deck.vocal = Some(std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels)));
+                }
+            }
+        }
+    }
+
     pub fn poll_phrases(&mut self) {
         let Some(rx) = &self.deck.phrases_rx else { return };
         if let Ok((id, r)) = rx.try_recv() {
@@ -1786,6 +1857,18 @@ impl App {
                     }
                     match r {
                         Ok(st) => {
+                            // Separated stems give vocal detection for free.
+                            if self.db.vocal(id).is_none() && st.len > 0 {
+                                let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
+                                let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+                                // The mix is the sum of the four stems.
+                                let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
+                                let levels = crate::stems::vocal_levels(&mono, &mix);
+                                let _ = self.db.save_vocal(id, &levels);
+                                if self.deck.track == Some(id) && self.deck.vocal.is_none() {
+                                    self.deck.vocal = Some(std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels)));
+                                }
+                            }
                             if self.deck.track == Some(id) {
                                 self.player.state.lock().stems = Some(st);
                             }
@@ -2080,6 +2163,9 @@ impl App {
             if let Some(g) = &xt.grid {
                 let _ = self.db.save_grid(id, g);
             }
+            if !xt.extra.is_empty() {
+                let _ = self.db.set_xml_extra(id, &xt.extra);
+            }
             if !xt.cues.is_empty() {
                 let _ = self.db.replace_cues(id, &xt.cues);
             }
@@ -2259,7 +2345,7 @@ impl App {
         self.deck.duration = t.duration;
         self.deck.wave = self.db.wave(id);
         self.deck.rb_wave = self.rb_waveforms(&t.path);
-        self.deck.vocal = self.rb_vocals(&t.path);
+        self.deck.vocal = self.rb_vocals(&t.path).or_else(|| self.db.vocal(id).map(|v| std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, v))));
         self.deck.cues = self.db.cues(id).unwrap_or_default();
         let g = self.db.grid(id).unwrap_or_default();
         self.set_deck_grid(g, false);
@@ -2299,6 +2385,7 @@ impl App {
                     self.set_deck_grid(g, false);
                     self.deck.phrases = None;
                     self.start_deck_phrases(a.clone());
+                    self.start_deck_vocal(a.clone());
                 }
                 Err(e) => {
                     if let Some((old, pos, gain)) = self.deck_backup.take() {
@@ -2559,6 +2646,12 @@ impl App {
             None => (if self.playing() { self.quantized(self.pos()) } else { self.deck.cue_point }, None),
         };
         if self.deck.cues.iter().any(|c| c.kind == CueKind::Memory && (c.start - start).abs() < 0.001 && c.end == end) {
+            return;
+        }
+        // One shared capacity of ten memory cues and loops per track (rekordbox-rea AUD-004:
+        // the duplicate check comes first, then a new one is admitted only at a count of 0–9).
+        if self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).count() >= 10 {
+            self.toast_err("This track already has 10 memory cues and loops, the most it can hold. Delete one to add another.");
             return;
         }
         let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Memory, slot: -1, start, end, color: 0, comment: String::new(), active_loop: false };
@@ -3054,7 +3147,8 @@ impl App {
             if !asked && dismissed.contains(&format!("{}\u{1f}{}", edit.file_path, edit.now)) {
                 continue;
             }
-            let Some(track) = self.match_device_track(&edit.source, &edit.title, &edit.artist) else { continue };
+            // Cues are replaced, so only the exact local file PrepDeck exported counts as a match.
+            let Some(track) = (!edit.source.is_empty()).then(|| self.db.track_by_path(&edit.source)).flatten() else { continue };
             let local = crate::export::anlz::local_cue_fingerprint(&self.db.cues(track).unwrap_or_default());
             if local == edit.now {
                 continue;
@@ -3122,11 +3216,7 @@ impl App {
                 let mut ids = vec![];
                 for e in &h.entries {
                     let Some(dt) = lib.tracks.get(e) else { continue };
-                    let by_source = (!dt.source.is_empty()).then(|| self.db.track_by_path(&dt.source)).flatten();
-                    let found = by_source.or_else(|| {
-                        self.tracks.iter().find(|t| t.display_title().eq_ignore_ascii_case(&dt.title) && t.artist.eq_ignore_ascii_case(&dt.artist)).map(|t| t.id)
-                    });
-                    if let Some(id) = found {
+                    if let Some(id) = self.match_device_track(&dt.source, &dt.title, &dt.artist) {
                         ids.push(id);
                     }
                 }
@@ -3240,7 +3330,7 @@ impl App {
             let grid = self.db.grid(*id);
             let rb_anlz = rb_anlz.get(&t.path).map(std::path::PathBuf::from).filter(|b| b.with_extension("DAT").is_file());
             // Whether the grid still matches rekordbox's is worked out on the export thread.
-            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same: false });
+            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same: false, vocal: self.db.vocal(*id) });
         }
         // Tracks without analysis are analysed by the export job itself (off the UI thread).
         let tag_categories: Vec<(String, Vec<String>)> = self

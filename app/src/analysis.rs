@@ -18,7 +18,7 @@ pub struct AnalysisSettings {
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
-        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, do_key: true, target_lufs: -8.0 }
+        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, do_key: true, target_lufs: -10.0 }
     }
 }
 
@@ -718,50 +718,121 @@ pub fn detect_key(mono: &[f32], sr: f64) -> i32 {
 // Loudness (ITU-R BS.1770 style: K-weighting, 400 ms blocks, absolute + relative gating)
 // ------------------------------------------------------------------------------------------
 
+/// Integrated loudness (LUFS) as rekordbox's library analysis measures it (rekordbox-rea
+/// reports/loudness-and-auto-gain.md and loudness-analysis-feed.md): the file is read in
+/// two-second blocks and only every F-th block is measured, F = min(16, floor(D / 30) + 1)
+/// for D whole seconds; samples are truncated to 16 bits; the selected blocks run through one
+/// continuous EBU R128 measurement (K-weighting, 400 ms windows every 100 ms, absolute gate
+/// -70 LUFS, relative gate -10 LU, both inclusive). Negative infinity when there is too
+/// little audio.
 pub fn loudness(dec: &Decoded) -> f64 {
-    let sr = dec.sr as f64;
+    let rate = dec.sr as usize;
+    let frames = dec.frames();
+    if rate == 0 || frames == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let e = frames - 1;
+    let d = e / rate;
+    let f = (d / 30 + 1).min(16);
+    let block = 2 * rate;
+    let q = |x: f32| ((x * 32768.0).clamp(-32768.0, 32767.0).trunc()) / 32768.0;
+    let mut fed: Vec<f32> = Vec::with_capacity(2 * frames / f + 2 * block);
+    let mut start = 0;
+    let mut ordinal = 0usize;
+    while start < frames {
+        let n = block.min(frames - start);
+        if ordinal % f == 0 {
+            fed.extend(dec.samples[start * 2..(start + n) * 2].iter().map(|x| q(*x)));
+        }
+        start += n;
+        ordinal += 1;
+    }
+    r128_integrated(&fed, dec.sr as f64)
+}
+
+/// EBU R128 integrated loudness of interleaved stereo (libebur128's non-histogram mode).
+pub fn r128_integrated(samples: &[f32], sr: f64) -> f64 {
     let mut ch: Vec<(Biquad, Biquad)> = (0..2)
         .map(|_| (Biquad::new("hs", 1681.97, 0.7072, sr, 4.0), Biquad::new("hp", 38.13, 0.5003, sr, 0.0)))
         .collect();
-    let block = (sr * 0.4) as usize;
-    let step = (sr * 0.1) as usize;
-    let frames = dec.frames();
-    let mut sq = vec![0f64; frames];
+    let step = ((sr as usize) + 5) / 10;
+    let window = 4 * step;
+    let frames = samples.len() / 2;
+    let mut pre = vec![0f64; frames + 1];
     for i in 0..frames {
         let mut s = 0.0;
         for c in 0..2 {
-            let x = dec.samples[i * 2 + c] as f64;
+            let x = samples[i * 2 + c] as f64;
             let f = &mut ch[c];
             let y0 = f.0.run(x);
             let y = f.1.run(y0);
             s += y * y;
         }
-        sq[i] = s;
-    }
-    // Prefix sums for block energies.
-    let mut pre = vec![0f64; frames + 1];
-    for i in 0..frames {
-        pre[i + 1] = pre[i] + sq[i];
+        pre[i + 1] = pre[i] + s;
     }
     let mut blocks = vec![];
     let mut s = 0;
-    while s + block <= frames {
-        let z = (pre[s + block] - pre[s]) / block as f64;
-        blocks.push(z);
+    while s + window <= frames {
+        blocks.push((pre[s + window] - pre[s]) / window as f64);
         s += step;
     }
-    let lk = |z: f64| -0.691 + 10.0 * z.max(1e-12).log10();
-    let abs: Vec<f64> = blocks.into_iter().filter(|z| lk(*z) > -70.0).collect();
+    let lk = |z: f64| -0.691 + 10.0 * z.max(1e-300).log10();
+    let abs: Vec<f64> = blocks.into_iter().filter(|z| lk(*z) >= -70.0).collect();
     if abs.is_empty() {
         return f64::NEG_INFINITY;
     }
     let mean = abs.iter().sum::<f64>() / abs.len() as f64;
-    let rel = lk(mean) - 10.0;
-    let gated: Vec<f64> = abs.into_iter().filter(|z| lk(*z) > rel).collect();
+    let gated: Vec<f64> = abs.into_iter().filter(|z| *z >= 0.1 * mean).collect();
     if gated.is_empty() {
         return lk(mean);
     }
     lk(gated.iter().sum::<f64>() / gated.len() as f64)
+}
+
+#[cfg(test)]
+mod loudness_tests {
+    use super::*;
+
+    fn tone(secs: f64, sr: u32, amp: f32) -> Decoded {
+        let n = (secs * sr as f64) as usize;
+        let samples: Vec<f32> = (0..n).flat_map(|i| {
+            let v = amp * (2.0 * std::f32::consts::PI * 997.0 * i as f32 / sr as f32).sin();
+            [v, v]
+        }).collect();
+        Decoded { sr, samples, raw_frames: n }
+    }
+
+    #[test]
+    fn steady_tone_and_block_sampling() {
+        // A steady tone measures the same whether every block or every 16th is fed.
+        let short = loudness(&tone(20.0, 44100, 0.1));
+        let long = loudness(&tone(500.0, 44100, 0.1));
+        assert!((short - long).abs() < 0.05, "{short} vs {long}");
+        // 997 Hz at -20 dBFS (0.1) in both channels: about -20 + 3 - 0.7 + K-weighting's
+        // small gain at 1 kHz.
+        assert!(short > -18.5 && short < -16.5, "{short}");
+        // Silence and too-short audio have no loudness.
+        assert!(loudness(&tone(10.0, 44100, 0.0)).is_infinite());
+        assert!(loudness(&tone(0.2, 48000, 0.1)).is_infinite());
+        // rekordbox's gain for it: -10 - L.
+        assert!(((-10.0 - short) - (-10.0 - long)).abs() < 0.05);
+    }
+
+    #[test]
+    fn only_selected_blocks_count() {
+        // 100 s: F = 4, so blocks 0, 4, 8, ... (2 s each) are measured. A loud section placed
+        // only in unselected blocks does not change the result.
+        let mut d = tone(100.0, 44100, 0.05);
+        let sr = 44100usize;
+        for blk in [1usize, 2, 3] {
+            for i in blk * 2 * sr..(blk + 1) * 2 * sr {
+                d.samples[2 * i] *= 10.0;
+                d.samples[2 * i + 1] *= 10.0;
+            }
+        }
+        let base = loudness(&tone(100.0, 44100, 0.05));
+        assert!((loudness(&d) - base).abs() < 0.01);
+    }
 }
 
 #[cfg(test)]

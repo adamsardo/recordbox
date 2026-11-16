@@ -215,11 +215,21 @@ pub struct PlayerCueEdit {
 /// Tracks on the drive whose cues changed since PrepDeck exported them.
 pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> {
     let record = read_cue_record(root);
+    // An edit made on a player rewrites the analysis file, so only files newer than the record
+    // (with FAT's 2-second timestamp resolution as margin) need reading.
+    let since = std::fs::metadata(cue_record_path(root)).and_then(|m| m.modified()).ok().map(|t| t + std::time::Duration::from_secs(2));
+    let newer = |p: &Path| match (since, std::fs::metadata(p).and_then(|m| m.modified())) {
+        (Some(s), Ok(m)) => m > s,
+        _ => true,
+    };
     let mut out = vec![];
     for t in lib.tracks.values() {
         let Some(exported) = record.get(&t.file_path) else { continue };
         let Some(base) = anlz_base(&t.analyze_path) else { continue };
         let b = root.join(base.trim_start_matches('/'));
+        if !newer(&b.with_extension("EXT")) && !newer(&b.with_extension("DAT")) {
+            continue;
+        }
         let ext = anlz::read_section_list(&b.with_extension("EXT"));
         let dat = anlz::read_section_list(&b.with_extension("DAT"));
         if ext.is_empty() && dat.is_empty() {
@@ -502,6 +512,9 @@ pub struct ExportTrack {
     pub rb_anlz: Option<PathBuf>,
     /// The track's grid is still the one rekordbox analysed (phrases/extended grid stay valid).
     pub grid_same: bool,
+    /// PrepDeck's vocal detection (levels 0–4 per 46.4 ms), written as PVDI when rekordbox's
+    /// own is not available.
+    pub vocal: Option<Vec<u8>>,
 }
 
 impl ExportTrack {
@@ -986,7 +999,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                 device.insert(e, anlz::read_section_list(&b.with_extension(e)));
             }
         }
-        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device });
+        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device, pvdi: et.vocal.as_deref().map(anlz::pvdi) });
         let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let base = match anlz_base(&prev.analyze_path) {
             Some(b) => b,
@@ -1842,6 +1855,9 @@ mod tests {
         let mut lib = DeviceLibrary::default();
         lib.tracks.insert(1, DevTrack { id: 1, title: "A".into(), file_path: "/Contents/a.mp3".into(), analyze_path: format!("{base}.DAT"), ..Default::default() });
         write_cue_record(&root, &HashMap::from([("/Contents/a.mp3".to_string(), fp.clone())])).unwrap();
+        // As if the export had happened a minute ago.
+        let backdate = |p: &Path| std::fs::File::options().write(true).open(p).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
+        backdate(&cue_record_path(&root));
         assert!(player_cue_edits(&root, &lib).is_empty());
         assert_eq!(fp, anlz::local_cue_fingerprint(&[cue(1.0)]));
         write(&[cue(2.0)]);

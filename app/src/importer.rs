@@ -121,7 +121,34 @@ pub struct XmlTrack {
     pub track: Track,
     pub grid: Option<BeatGrid>,
     pub cues: Vec<Cue>,
+    /// What PrepDeck doesn't model, kept to be written back on XML export: unknown TRACK
+    /// attributes and unknown child elements (e.g. fade-in/out and load marks).
+    pub extra: XmlExtra,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct XmlExtra {
+    /// Unknown TRACK attributes in document order.
+    pub attrs: Vec<(String, String)>,
+    /// Unknown child elements, as (tag, attributes in order).
+    pub nodes: Vec<(String, Vec<(String, String)>)>,
+    /// Known attributes whose imported text differs from how PrepDeck writes the imported
+    /// value: (attribute, original text or ABSENT, PrepDeck's text at import). Written back
+    /// while the field is unedited.
+    #[serde(default)]
+    pub orig: Vec<(String, String, String)>,
+}
+
+impl XmlExtra {
+    pub fn is_empty(&self) -> bool {
+        self.attrs.is_empty() && self.nodes.is_empty() && self.orig.is_empty()
+    }
+}
+
+/// TRACK attributes PrepDeck reads (and writes back from its own data).
+pub const XML_TRACK_ATTRS: [&str; 26] = [
+    "TrackID", "Name", "Artist", "Composer", "Album", "Grouping", "Genre", "Kind", "Size", "TotalTime", "DiscNumber", "TrackNumber", "Year", "AverageBpm", "DateAdded", "BitRate", "SampleRate", "Comments", "PlayCount", "Rating", "Location", "Remixer", "Tonality", "Label", "Mix", "Colour",
+];
 
 pub struct XmlNode {
     pub name: String,
@@ -202,9 +229,11 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
         };
         let Some(e) = e else { continue };
         let mut attrs = std::collections::HashMap::new();
+        let mut ordered: Vec<(String, String)> = vec![];
         for a in e.attributes().flatten() {
             let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
             let v = a.unescape_value().map(|v| v.to_string()).unwrap_or_default();
+            ordered.push((k.clone(), v.clone()));
             attrs.insert(k, v);
         }
         let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
@@ -261,7 +290,16 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                     "660099" => 8,
                     _ => 0,
                 };
-                let xt = XmlTrack { xml_id: get("TrackID"), track: Track { color, ..t }, grid: None, cues: vec![] };
+                let extra = XmlExtra { attrs: ordered.iter().filter(|(k, _)| !XML_TRACK_ATTRS.contains(&k.as_str())).cloned().collect(), nodes: vec![], orig: vec![] };
+                let mut extra = extra;
+                let track = Track { color, ..t };
+                for (k, v) in crate::xmlexport::track_attrs(&track) {
+                    let original = attrs.get(k).cloned().unwrap_or_else(|| if k == "Colour" { String::new() } else { crate::xmlexport::ABSENT.to_string() });
+                    if original != v {
+                        extra.orig.push((k.to_string(), original, v));
+                    }
+                }
+                let xt = XmlTrack { xml_id: get("TrackID"), track, grid: None, cues: vec![], extra };
                 if empty {
                     tracks.push(xt);
                 } else {
@@ -270,6 +308,12 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
             }
             b"TEMPO" => {
                 tempos.push((num("Inizio"), num("Bpm"), get("Battito").parse::<u8>().unwrap_or(1)));
+            }
+            b"POSITION_MARK" if cur.is_some() && !matches!(get("Type").trim(), "0" | "4" | "") => {
+                // Fade-in (1), fade-out (2), load (3) and unknown types: kept as written.
+                if let Some(t) = cur.as_mut() {
+                    t.extra.nodes.push(("POSITION_MARK".into(), ordered.clone()));
+                }
             }
             b"POSITION_MARK" => {
                 if let Some(t) = cur.as_mut() {
@@ -281,6 +325,13 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                     let kind = if n >= 0 { CueKind::Hot } else { CueKind::Memory };
                     let color = if kind == CueKind::Hot && (r, g, b) != (0, 0, 0) { nearest_hot_color([r, g, b]) } else if kind == CueKind::Hot { HOTCUE_DEFAULT } else { 0 };
                     t.cues.push(Cue { id: 0, track_id: 0, kind, slot: n, start, end, color, comment: get("Name"), active_loop: false });
+                }
+            }
+            tag if cur.is_some() && in_collection && !matches!(tag, b"TEMPO" | b"POSITION_MARK" | b"TRACK") => {
+                // Unknown element inside a collection track: kept (its attributes) as written.
+                let name = String::from_utf8_lossy(tag).to_string();
+                if let Some(t) = cur.as_mut() {
+                    t.extra.nodes.push((name, ordered.clone()));
                 }
             }
             b"NODE" => {
@@ -382,5 +433,47 @@ mod tests {
         assert_eq!(t.grid.as_ref().unwrap().anchors.len(), 1);
         assert_eq!(lib.playlists.len(), 1);
         assert_eq!(lib.playlists[0].track_keys, vec!["7"]);
+    }
+}
+
+#[cfg(test)]
+mod xml_extra_tests {
+    #[test]
+    fn keeps_unknown_track_fields_and_marks() {
+        let x = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="1">
+<TRACK TrackID="7" Name="A &amp; B" Location="file://localhost/x/a.mp3" Future="1.23456789" AverageBpm="128.0040" Tonality="1d" Rating="60">
+<TEMPO Inizio="0.120" Bpm="128.00" Metro="4/4" Battito="1"/>
+<POSITION_MARK Name="" Type="0" Start="1.000" Num="0" Red="40" Green="226" Blue="20"/>
+<POSITION_MARK Name="fade" Type="1" Start="2.5000004" Num="-1"/>
+<NEWTHING A="b"/>
+</TRACK></COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"></NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
+        let lib = super::parse_rekordbox_xml(x).unwrap();
+        let t = &lib.tracks[0];
+        assert_eq!(t.cues.len(), 1);
+        assert_eq!(t.extra.attrs, vec![("Future".to_string(), "1.23456789".to_string())]);
+        assert_eq!(t.extra.nodes.len(), 2);
+        assert_eq!(t.extra.nodes[0].0, "POSITION_MARK");
+        assert!(t.extra.nodes[0].1.contains(&("Start".to_string(), "2.5000004".to_string())));
+        assert_eq!(t.extra.nodes[1], ("NEWTHING".to_string(), vec![("A".to_string(), "b".to_string())]));
+        // Unchanged fields come back with their original text; edited ones from PrepDeck.
+        let line = crate::xmlexport::track_line(&super::Track { id: 7, ..t.track.clone() }, &t.extra);
+        assert!(line.contains(" Name=\"A &amp; B\""), "{line}");
+        assert!(line.contains(" Location=\"file://localhost/x/a.mp3\""));
+        assert!(line.contains(" Tonality=\"1d\""), "{line}");
+        assert!(line.contains(" Rating=\"60\""), "{line}");
+        assert!(line.contains(" AverageBpm=\"128.0040\""), "{line}");
+        assert!(!line.contains("Grouping="), "absent attributes stay absent: {line}");
+        assert!(line.contains(" Future=\"1.23456789\""));
+        let mut edited = t.track.clone();
+        edited.id = 7;
+        edited.rating = 4;
+        let line2 = crate::xmlexport::track_line(&edited, &t.extra);
+        assert!(line2.contains(" Rating=\"204\"") && line2.contains(" Tonality=\"1d\""), "{line2}");
+        // Written back unchanged.
+        let (a, n) = crate::xmlexport::extra_xml(&t.extra, "      ");
+        assert_eq!(a, " Future=\"1.23456789\"");
+        assert!(n.contains("<POSITION_MARK Name=\"fade\" Type=\"1\" Start=\"2.5000004\" Num=\"-1\"/>"));
+        assert!(n.contains("<NEWTHING A=\"b\"/>"));
     }
 }

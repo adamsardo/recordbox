@@ -85,6 +85,8 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS xml_extra(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL, path TEXT NOT NULL,
                 title TEXT NOT NULL, artist TEXT NOT NULL, removed_at INTEGER NOT NULL, json TEXT NOT NULL, wave BLOB, preview BLOB);",
         )?;
@@ -227,7 +229,7 @@ impl Db {
         let playlists = st.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut st = self.conn.prepare("SELECT tag_id FROM track_tags WHERE track_id=?1")?;
         let tags = st.query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, track: track.clone() };
+        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, xml_extra: self.xml_extra(id), track: track.clone() };
         let wave: Option<(Vec<u8>, Vec<u8>)> = self.conn.query_row("SELECT data, preview FROM waves WHERE track_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         self.conn.execute(
@@ -266,6 +268,7 @@ impl Db {
             if let Some(g) = &e.grid {
                 self.save_grid(id, g)?;
             }
+            self.set_xml_extra(id, &e.xml_extra)?;
             if let (Some(w), Some(p)) = (wave, preview) {
                 self.conn.execute("INSERT OR REPLACE INTO waves(track_id,data,preview) VALUES(?1,?2,?3)", params![id, w, p])?;
             }
@@ -295,6 +298,29 @@ impl Db {
             Some(t) => self.conn.execute("DELETE FROM trash WHERE removed_at < ?1", [t])?,
             None => self.conn.execute("DELETE FROM trash", [])?,
         })
+    }
+
+/// PrepDeck's vocal detection: one level 0–4 per 2048 samples at 44.1 kHz (as PVDI).
+    pub fn vocal(&self, track: i64) -> Option<Vec<u8>> {
+        self.conn.query_row("SELECT data FROM vocals WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten()
+    }
+    pub fn save_vocal(&self, track: i64, levels: &[u8]) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO vocals(track_id,data) VALUES(?1,?2)", params![track, levels])?;
+        Ok(())
+    }
+
+    /// XML fields PrepDeck doesn't model, kept from an XML import for the next XML export.
+    pub fn xml_extra(&self, track: i64) -> crate::importer::XmlExtra {
+        let s: Option<String> = self.conn.query_row("SELECT json FROM xml_extra WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten();
+        s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+    pub fn set_xml_extra(&self, track: i64, e: &crate::importer::XmlExtra) -> Result<()> {
+        if e.is_empty() {
+            self.conn.execute("DELETE FROM xml_extra WHERE track_id=?1", [track])?;
+        } else {
+            self.conn.execute("INSERT OR REPLACE INTO xml_extra(track_id,json) VALUES(?1,?2)", params![track, serde_json::to_string(e)?])?;
+        }
+        Ok(())
     }
 
     pub fn delete_track(&self, id: i64) -> Result<()> {
@@ -545,6 +571,8 @@ struct TrashEntry {
     /// (playlist id, position)
     playlists: Vec<(i64, i64)>,
     tags: Vec<i64>,
+    #[serde(default)]
+    xml_extra: crate::importer::XmlExtra,
 }
 
 #[cfg(test)]

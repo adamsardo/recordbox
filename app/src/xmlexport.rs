@@ -21,53 +21,81 @@ fn location(path: &str) -> String {
     out
 }
 
+/// Marks an attribute the imported XML did not have (written back as absent).
+pub const ABSENT: &str = "\u{0}absent";
+
+/// TRACK attributes as PrepDeck writes them, unescaped (TrackID aside). Colour is empty when
+/// the track has none (then not written).
+pub fn track_attrs(t: &Track) -> Vec<(&'static str, String)> {
+    let rating = [0, 51, 102, 153, 204, 255][t.rating.min(5) as usize];
+    let colour = match t.color {
+        1 => "0xFF007F",
+        2 => "0xFF0000",
+        3 => "0xFFA500",
+        4 => "0xFFFF00",
+        5 => "0x00FF00",
+        6 => "0x25FDE9",
+        7 => "0x0000FF",
+        8 => "0x660099",
+        _ => "",
+    };
+    vec![
+        ("Name", t.display_title()),
+        ("Artist", t.artist.clone()),
+        ("Composer", t.composer.clone()),
+        ("Album", t.album.clone()),
+        ("Grouping", t.grouping.clone()),
+        ("Genre", t.genre.clone()),
+        ("Kind", format!("{} File", t.file_type.to_ascii_uppercase())),
+        ("Size", t.file_size.to_string()),
+        ("TotalTime", (t.duration.round() as u64).to_string()),
+        ("DiscNumber", t.disc_no.to_string()),
+        ("TrackNumber", t.track_no.to_string()),
+        ("Year", t.year.to_string()),
+        ("AverageBpm", format!("{:.2}", t.bpm)),
+        ("DateAdded", t.date_added.clone()),
+        ("BitRate", t.bitrate.to_string()),
+        ("SampleRate", t.sample_rate.to_string()),
+        ("Comments", t.comment.clone()),
+        ("PlayCount", t.play_count.to_string()),
+        ("Rating", rating.to_string()),
+        ("Location", location(&t.path)),
+        ("Remixer", t.remixer.clone()),
+        ("Tonality", key_name(t.key, false)),
+        ("Label", t.label.clone()),
+        ("Mix", t.mix_name.clone()),
+        // Track colour, as rekordbox writes it (0xRRGGBB of its eight track colours).
+        ("Colour", colour.to_string()),
+    ]
+}
+
+/// The opening TRACK element. A field whose value is unchanged since an XML import is written
+/// with the imported text (precision, key spelling, URL encoding, absent attributes); edited
+/// fields are written from PrepDeck's value; unknown attributes follow.
+pub fn track_line(t: &Track, extra: &crate::importer::XmlExtra) -> String {
+    let mut line = format!("    <TRACK TrackID=\"{}\"", t.id);
+    for (k, v) in track_attrs(t) {
+        let v = extra.orig.iter().find(|o| o.0 == k && o.2 == v).map(|o| o.1.clone()).unwrap_or(v);
+        if v == ABSENT || (k == "Colour" && v.is_empty()) {
+            continue;
+        }
+        line.push_str(&format!(" {k}=\"{}\"", esc(&v)));
+    }
+    line.push_str(&extra_xml(extra, "").0);
+    line.push_str(">\n");
+    line
+}
+
 pub fn build(app: &App) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DJ_PLAYLISTS Version=\"1.0.0\">\n");
     x.push_str("  <PRODUCT Name=\"PrepDeck\" Version=\"1.0\" Company=\"\"/>\n");
     x.push_str(&format!("  <COLLECTION Entries=\"{}\">\n", app.tracks.len()));
     for t in &app.tracks {
-        let rating = [0, 51, 102, 153, 204, 255][t.rating.min(5) as usize];
-        x.push_str(&format!(
-            "    <TRACK TrackID=\"{}\" Name=\"{}\" Artist=\"{}\" Composer=\"{}\" Album=\"{}\" Grouping=\"{}\" Genre=\"{}\" Kind=\"{} File\" Size=\"{}\" TotalTime=\"{}\" DiscNumber=\"{}\" TrackNumber=\"{}\" Year=\"{}\" AverageBpm=\"{:.2}\" DateAdded=\"{}\" BitRate=\"{}\" SampleRate=\"{}\" Comments=\"{}\" PlayCount=\"{}\" Rating=\"{}\" Location=\"{}\" Remixer=\"{}\" Tonality=\"{}\" Label=\"{}\" Mix=\"{}\"{}>\n",
-            t.id,
-            esc(&t.display_title()),
-            esc(&t.artist),
-            esc(&t.composer),
-            esc(&t.album),
-            esc(&t.grouping),
-            esc(&t.genre),
-            esc(&t.file_type.to_ascii_uppercase()),
-            t.file_size,
-            t.duration.round() as u64,
-            t.disc_no,
-            t.track_no,
-            t.year,
-            t.bpm,
-            esc(&t.date_added),
-            t.bitrate,
-            t.sample_rate,
-            esc(&t.comment),
-            t.play_count,
-            rating,
-            location(&t.path),
-            esc(&t.remixer),
-            esc(&key_name(t.key, false)),
-            esc(&t.label),
-            esc(&t.mix_name),
-            // Track colour, as rekordbox writes it (0xRRGGBB of its eight track colours).
-            match t.color {
-                1 => " Colour=\"0xFF007F\"",
-                2 => " Colour=\"0xFF0000\"",
-                3 => " Colour=\"0xFFA500\"",
-                4 => " Colour=\"0xFFFF00\"",
-                5 => " Colour=\"0x00FF00\"",
-                6 => " Colour=\"0x25FDE9\"",
-                7 => " Colour=\"0x0000FF\"",
-                8 => " Colour=\"0x660099\"",
-                _ => "",
-            }
-        ));
+        // Fields PrepDeck doesn't model, and original text of unchanged fields, as imported.
+        let extra = app.db.xml_extra(t.id);
+        x.push_str(&track_line(t, &extra));
+        let (_, extra_nodes) = extra_xml(&extra, "      ");
         if let Some(g) = app.db.grid(t.id) {
             // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
             let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
@@ -93,6 +121,7 @@ pub fn build(app: &App) -> String {
             };
             x.push_str(&format!("      <POSITION_MARK Name=\"{}\" Type=\"{}\" Start=\"{:.3}\"{} Num=\"{}\"{}/>\n", esc(&c.comment), ty, c.start, end, num, rgb));
         }
+        x.push_str(&extra_nodes);
         x.push_str("    </TRACK>\n");
     }
     x.push_str("  </COLLECTION>\n  <PLAYLISTS>\n");
@@ -231,4 +260,16 @@ mod tempo_tests {
         eprintln!("TEMPO nodes identical on {same} / {total} tracks ({nodes} nodes in rekordbox's XML)");
         assert_eq!(same, total);
     }
+}
+
+/// Unknown TRACK attributes (" Key=\"value\"…") and child elements (one line each, with
+/// `pad`), written exactly as imported.
+pub fn extra_xml(e: &crate::importer::XmlExtra, pad: &str) -> (String, String) {
+    let attrs: String = e.attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect();
+    let nodes: String = e
+        .nodes
+        .iter()
+        .map(|(tag, a)| format!("{pad}<{tag}{}/>\n", a.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect::<String>()))
+        .collect();
+    (attrs, nodes)
 }

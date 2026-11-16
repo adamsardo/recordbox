@@ -431,7 +431,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
         let mut tag_names: Vec<String> = tags.iter().map(|(c, t)| format!("{c}/{t}")).collect();
         tag_names.sort();
         let fingerprint = format!("{}|{}|{}|{}", g("updated_at"), cue_stamp.get(&rb_id).cloned().unwrap_or_default(), g("AnalysisUpdated"), tag_names.join(","));
-        let xt = XmlTrack { xml_id: rb_id.clone(), track: t, grid, cues: cues.remove(&rb_id).unwrap_or_default() };
+        let xt = XmlTrack { xml_id: rb_id.clone(), track: t, grid, cues: cues.remove(&rb_id).unwrap_or_default(), extra: Default::default() };
         tracks.push(RbTrack { rb_id, fingerprint, xt, tags, anlz_base });
     }
 

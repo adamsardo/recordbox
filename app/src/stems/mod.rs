@@ -239,6 +239,135 @@ pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMu
     Ok(Stems { len, data: out })
 }
 
+/// The vocal stem alone (mono, 44.1 kHz): the vocals specialist of HTDemucs fine-tuned when
+/// it is downloaded, else HTDemucs. Used for vocal detection.
+pub fn separate_vocals(samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Vec<f32>> {
+    separate_one(3, samples, sr, progress)
+}
+
+/// One source (0 drums, 1 bass, 2 other, 3 vocals) as mono 44.1 kHz, running a single model:
+/// that source's specialist of HTDemucs fine-tuned when downloaded, else HTDemucs.
+pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Vec<f32>> {
+    let ft = &CATALOG[0];
+    let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
+    let device = device();
+    let inter = resample_to_44k(samples, sr);
+    let len = inter.len() / 2;
+    let mut planar = vec![0f32; 2 * len];
+    for i in 0..len {
+        planar[i] = inter[2 * i];
+        planar[len + i] = inter[2 * i + 1];
+    }
+    let graph = htdemucs::Graph::load(&models_dir().join(file), &device).map_err(|e| anyhow!("loading {file}: {e}"))?;
+    let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
+    let y = htdemucs::separate(&graph, &device, &planar, len, &mut cb).map_err(|e| anyhow!("{e}"))?;
+    let (l, r) = (&y[source * 2 * len..(source * 2 + 1) * len], &y[(source * 2 + 1) * len..(source * 2 + 2) * len]);
+    Ok(l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect())
+}
+
+/// Samples per vocal level (rekordbox's PVDI uses 1024 at 22,050 Hz: the same 46.4 ms).
+pub const VOCAL_HOP: usize = 2048;
+/// Feature: per 46.4 ms frame, the mean of the vocal stem's level (dB) and its level relative
+/// to the mix (smoothed over 21 frames), then a centred moving mean over VOCAL_SMOOTH frames;
+/// levels from four thresholds. Fitted against rekordbox's own vocal detection (PVDI) on
+/// local tracks with leave-one-track-out checks; see PARITY-GAPS.md.
+pub const VOCAL_SMOOTH: usize = 15;
+pub const VOCAL_THRESHOLDS: [f32; 4] = [-25.41, -21.05, -17.95, -15.47];
+
+fn frame_db(x: &[f32]) -> Vec<f32> {
+    x.chunks(VOCAL_HOP).map(|c| 10.0 * (c.iter().map(|v| v * v).sum::<f32>() / c.len().max(1) as f32 + 1e-10).log10()).collect()
+}
+
+/// Centred moving mean with the edges held (as numpy's edge padding).
+fn moving_mean(x: &[f32], w: usize) -> Vec<f32> {
+    let n = x.len();
+    if w <= 1 || n == 0 {
+        return x.to_vec();
+    }
+    let pad = w / 2;
+    let at = |i: isize| x[i.clamp(0, n as isize - 1) as usize];
+    (0..n as isize).map(|i| (0..w as isize).map(|k| at(i - pad as isize + k)).sum::<f32>() / w as f32).collect()
+}
+
+/// Mono 44.1 kHz from interleaved stereo at any rate.
+pub fn mono_44k(samples: &[f32], sr: u32) -> Vec<f32> {
+    resample_to_44k(samples, sr).chunks_exact(2).map(|c| 0.5 * (c[0] + c[1])).collect()
+}
+
+/// Vocal levels 0–4 per 2048 samples from mono 44.1 kHz vocal stem and mix.
+pub fn vocal_levels(vocal: &[f32], mix: &[f32]) -> Vec<u8> {
+    let v = frame_db(vocal);
+    let m = moving_mean(&frame_db(mix), 21);
+    let f: Vec<f32> = v.iter().enumerate().map(|(i, x)| 0.5 * x + 0.5 * (x - m.get(i).copied().unwrap_or(*x))).collect();
+    moving_mean(&f, VOCAL_SMOOTH).iter().map(|x| VOCAL_THRESHOLDS.iter().filter(|t| x >= *t).count() as u8).collect()
+}
+
+#[cfg(test)]
+mod key_bench {
+    /// Key from the drum-free mix (mix minus the drums stem) against rekordbox's keys.
+    /// PREPDECK_KEYGT (path<TAB>key), PREPDECK_KEY_N; run with --ignored.
+    #[test]
+    #[ignore]
+    fn key_without_drums() {
+        let rows: Vec<(String, i32)> = std::fs::read_to_string(std::env::var("PREPDECK_KEYGT").unwrap()).unwrap().lines().filter_map(|l| l.split_once('\t').map(|(p, k)| (p.to_string(), crate::model::parse_key(k)))).collect();
+        let n: usize = std::env::var("PREPDECK_KEY_N").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        let step = (rows.len() / n).max(1);
+        let (mut full_ok, mut harm_ok, mut total) = (0, 0, 0);
+        for (p, want) in rows.iter().step_by(step).take(n) {
+            let Ok(d) = crate::audio::decode_file(p) else { continue };
+            let mix44 = super::resample_to_44k(&d.samples, d.sr);
+            let mono: Vec<f32> = mix44.chunks_exact(2).map(|c| 0.5 * (c[0] + c[1])).collect();
+            let drums = super::separate_one(0, &d.samples, d.sr, &mut |_| true).unwrap();
+            let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
+            let k_full = crate::key::detect_key(&mono, 44100.0);
+            let k_harm = crate::key::detect_key(&harm, 44100.0);
+            total += 1;
+            full_ok += (k_full == *want) as usize;
+            harm_ok += (k_harm == *want) as usize;
+            eprintln!("{} want {} full {} harm {}", p.rsplit('/').next().unwrap_or(""), crate::model::key_name(*want, false), crate::model::key_name(k_full, false), crate::model::key_name(k_harm, false));
+        }
+        eprintln!("key: full mix {full_ok}/{total}, without drums {harm_ok}/{total}");
+    }
+}
+
+#[cfg(test)]
+mod vocal_bench {
+    /// Dump per-frame vocal-stem features next to rekordbox's PVDI levels, for fitting.
+    /// PREPDECK_ANLZ_PAIRS, PREPDECK_VOCAL_N, PREPDECK_VOCAL_OUT; run with --ignored.
+    #[test]
+    #[ignore]
+    fn dump_vocal_features() {
+        use std::io::Write;
+        let pairs = std::fs::read_to_string(std::env::var("PREPDECK_ANLZ_PAIRS").unwrap()).unwrap();
+        let n: usize = std::env::var("PREPDECK_VOCAL_N").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let mut out = std::fs::File::create(std::env::var("PREPDECK_VOCAL_OUT").unwrap()).unwrap();
+        writeln!(out, "track\tframe\tvocal_db\tmix_db\tlevel").unwrap();
+        // Spread over the list (every k-th pair).
+        let lines: Vec<&str> = pairs.lines().collect();
+        let step = (lines.len() / n).max(1);
+        for (ti, line) in lines.iter().step_by(step).take(n).enumerate() {
+            let Some((path, base)) = line.split_once('\t') else { continue };
+            let sec = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.2EX")));
+            let Some(pv) = sec.get("PVDI").and_then(|s| crate::app::parse_pvdi(s)) else { continue };
+            let Ok(dec) = crate::audio::decode_file(path) else { continue };
+            let t0 = std::time::Instant::now();
+            let voc = super::separate_vocals(&dec.samples, dec.sr, &mut |_| true).unwrap();
+            let mix = super::resample_to_44k(&dec.samples, dec.sr);
+            let hop = (pv.0 * 44100.0).round() as usize;
+            for (f, lvl) in pv.1.iter().enumerate() {
+                let a = f * hop;
+                if a + hop > voc.len() {
+                    break;
+                }
+                let e_v: f32 = voc[a..a + hop].iter().map(|x| x * x).sum::<f32>() / hop as f32;
+                let e_m: f32 = (a..a + hop).map(|i| 0.25 * (mix[2 * i] + mix[2 * i + 1]).powi(2)).sum::<f32>() / hop as f32;
+                writeln!(out, "{ti}\t{f}\t{:.2}\t{:.2}\t{lvl}", 10.0 * (e_v + 1e-10).log10(), 10.0 * (e_m + 1e-10).log10()).unwrap();
+            }
+            eprintln!("{ti}: {} in {:.1}s", path.rsplit('/').next().unwrap_or(""), t0.elapsed().as_secs_f32());
+        }
+    }
+}
+
 // ------------------------------------------------------------------ cache
 
 /// Cache file for a track's stems: keyed by the audio file's path, size and modification time

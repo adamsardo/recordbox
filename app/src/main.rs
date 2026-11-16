@@ -39,6 +39,7 @@ impl eframe::App for Gui {
         app.poll_rekordbox_sync();
         app.poll_stems();
         app.poll_phrases();
+        app.poll_vocal();
         menus::poll(app);
         shortcuts(app, ctx);
 
