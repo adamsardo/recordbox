@@ -457,9 +457,11 @@ pub fn run_export(req: ExportRequest, progress: &dyn Fn(Progress), cancel: &std:
         };
         sources.insert(usb_path.clone(), t.path.clone());
         // Analysis files.
-        let beats = et.grid.as_ref().map(|g| g.beats(t.duration)).unwrap_or_default();
+        // Beats and waveform frames span the file's full decoded length, as in the original.
+        let full_len = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
+        let beats = et.grid.as_ref().map(|g| g.beats(full_len.max(t.duration))).unwrap_or_default();
         let wave = et.wave.clone().unwrap_or_default();
-        let files = anlz::build(&usb_path, &beats, &wave, &et.cues);
+        let files = anlz::build(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate);
         let folder = anlz::anlz_folder(&usb_path);
         let dir = root.join(folder.trim_start_matches('/'));
         std::fs::create_dir_all(&dir)?;

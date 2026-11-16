@@ -180,6 +180,8 @@ pub struct Track {
     pub gain_db: f32,
     pub artwork: String,
     pub missing: bool,
+    #[serde(default)]
+    pub raw_samples: u64,
 }
 
 impl Track {
@@ -279,7 +281,9 @@ impl BeatGrid {
                 beat_no = a.beat as i64;
             }
             let p = 60.0 / a.bpm.max(1.0);
-            while t < end - 1e-6 && t <= duration {
+            // A beat closer than half a period to the next anchor belongs to that anchor.
+            let stop = if ai + 1 < self.anchors.len() { end - p * 0.5 } else { end - 1e-6 };
+            while t < stop && t <= duration {
                 if t >= -1e-6 {
                     out.push(Beat { time: t.max(0.0), bpm: a.bpm, beat: beat_no as u8, index: idx });
                     idx += 1;
@@ -314,39 +318,79 @@ pub fn nearest_beat(beats: &[Beat], t: f64) -> Option<Beat> {
     best
 }
 
-/// Waveform data: per 1/150 s frame the peak level of the full signal and three bands (0..255).
+/// Waveform data per 1/150 s frame, linear levels of the full signal and three bands:
+/// bytes 0..4 = peak × 255 (full, low, mid, high), bytes 4..8 = RMS × 510.
 #[derive(Clone, Debug, Default)]
 pub struct Waveform {
-    pub frames: Vec<[u8; 4]>,
+    pub frames: Vec<[u8; 8]>,
 }
 pub const WAVE_FPS: f64 = 150.0;
 
+/// Display gains per band applied before the display curve (estimated for legibility).
+const DISP_GAIN: [f32; 4] = [1.0, 1.0, 1.5, 2.6];
+
 impl Waveform {
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.frames.iter().flat_map(|f| f.iter().copied()).collect()
+        let mut v = vec![2u8];
+        v.extend(self.frames.iter().flat_map(|f| f.iter().copied()));
+        v
     }
     pub fn from_bytes(b: &[u8]) -> Waveform {
-        Waveform { frames: b.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect() }
+        if b.len() % 8 == 1 && b.first() == Some(&2) {
+            return Waveform { frames: b[1..].chunks_exact(8).map(|c| [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]).collect() };
+        }
+        // Older format (display levels only): approximate the linear values.
+        let frames = b
+            .chunks_exact(4)
+            .map(|c| {
+                let mut f = [0u8; 8];
+                for k in 0..4 {
+                    let lin = ((c[k] as f32 / 255.0).powf(1.0 / 0.85) / DISP_GAIN[k]).min(1.0);
+                    f[k] = (lin * 255.0) as u8;
+                    f[4 + k] = (lin * 0.5 * 510.0).min(255.0) as u8;
+                }
+                f
+            })
+            .collect();
+        Waveform { frames }
     }
-    /// Downsample to `n` columns (max of each bucket).
-    pub fn columns(&self, n: usize) -> Vec<[u8; 4]> {
+    /// Downsample to `n` columns (max of peaks, mean of RMS per bucket).
+    pub fn columns(&self, n: usize) -> Vec<[u8; 8]> {
         let len = self.frames.len();
         if len == 0 || n == 0 {
-            return vec![[0; 4]; n];
+            return vec![[0; 8]; n];
         }
         (0..n)
             .map(|i| {
                 let a = i * len / n;
                 let b = ((i + 1) * len / n).max(a + 1).min(len);
-                let mut m = [0u8; 4];
+                let mut m = [0u8; 8];
+                let mut acc = [0u32; 4];
                 for f in &self.frames[a..b] {
                     for k in 0..4 {
                         m[k] = m[k].max(f[k]);
+                        acc[k] += f[4 + k] as u32;
                     }
+                }
+                for k in 0..4 {
+                    m[4 + k] = (acc[k] / (b - a) as u32) as u8;
                 }
                 m
             })
             .collect()
+    }
+    /// Display levels (0..255) of a frame or column: full, low, mid, high.
+    pub fn disp(v: &[u8; 8]) -> [u8; 4] {
+        let mut o = [0u8; 4];
+        for k in 0..4 {
+            let x = (v[k] as f32 / 255.0 * DISP_GAIN[k]).min(1.0).powf(0.85);
+            o[k] = (x * 255.0).round() as u8;
+        }
+        o
+    }
+    /// Display-level preview with `n` columns, 4 bytes each (stored for the track list).
+    pub fn preview_bytes(&self, n: usize) -> Vec<u8> {
+        self.columns(n).iter().flat_map(|c| Self::disp(c)).collect()
     }
 }
 

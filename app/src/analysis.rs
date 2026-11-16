@@ -37,6 +37,9 @@ pub const BPM_RANGES: [(f64, f64); 10] = [
 
 pub struct AnalysisResult {
     pub duration: f64,
+    /// Length in sample frames of the file's full (untrimmed) decode; the original counts
+    /// waveform frames and beats over this length.
+    pub raw_samples: u64,
     pub sample_rate: u32,
     pub bpm: f64,
     pub grid: Option<BeatGrid>,
@@ -58,7 +61,7 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let key = if s.do_key { crate::key::detect_key(&mono, sr) } else { -1 };
     let lufs = loudness(dec);
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { 0.0 };
-    AnalysisResult { duration: dec.duration(), sample_rate: dec.sr, bpm, grid, key, wave, gain_db }
+    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -66,7 +69,7 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
 // ------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct Biquad {
+pub struct Biquad {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -77,7 +80,7 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn new(kind: &str, f: f64, q: f64, sr: f64, gain_db: f64) -> Biquad {
+    pub fn new(kind: &str, f: f64, q: f64, sr: f64, gain_db: f64) -> Biquad {
         let w = 2.0 * std::f64::consts::PI * f / sr;
         let (sn, cs) = (w.sin(), w.cos());
         let alpha = sn / (2.0 * q);
@@ -101,7 +104,7 @@ impl Biquad {
         Biquad { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
     }
     #[inline]
-    fn run(&mut self, x: f64) -> f64 {
+    pub fn run(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
@@ -125,7 +128,9 @@ pub fn waveform(mono: &[f32], sr: f64) -> Waveform {
     let mut hp2 = Biquad::new("hp", HIGH_CUT, 0.707, sr, 0.0);
     let mut mh = Biquad::new("hp", LOW_CUT, 0.707, sr, 0.0);
     let mut ml = Biquad::new("lp", HIGH_CUT, 0.707, sr, 0.0);
-    let mut raw = vec![[0f32; 4]; n];
+    let mut peak = vec![[0f32; 4]; n];
+    let mut sq = vec![[0f64; 4]; n];
+    let mut cnt = vec![0u32; n];
     for (i, &x) in mono.iter().enumerate() {
         let x = x as f64;
         let lo = lp2.run(lp1.run(x));
@@ -135,21 +140,19 @@ pub fn waveform(mono: &[f32], sr: f64) -> Waveform {
         if fi >= n {
             break;
         }
-        let r = &mut raw[fi];
-        r[0] = r[0].max(x.abs() as f32);
-        r[1] = r[1].max(lo.abs() as f32);
-        r[2] = r[2].max(mi.abs() as f32);
-        r[3] = r[3].max(hi.abs() as f32);
+        for (k, v) in [x, lo, mi, hi].iter().enumerate() {
+            peak[fi][k] = peak[fi][k].max(v.abs() as f32);
+            sq[fi][k] += v * v;
+        }
+        cnt[fi] += 1;
     }
-    // Band display gains (estimated so that typical dance music fills the height).
-    let gains = [1.0f32, 1.0, 1.5, 2.6];
-    let frames = raw
-        .iter()
-        .map(|r| {
-            let mut o = [0u8; 4];
+    let frames = (0..n)
+        .map(|i| {
+            let mut o = [0u8; 8];
             for k in 0..4 {
-                let v = (r[k] * gains[k]).min(1.0).powf(0.85);
-                o[k] = (v * 255.0).round() as u8;
+                o[k] = (peak[i][k].min(1.0) * 255.0).round() as u8;
+                let rms = (sq[i][k] / cnt[i].max(1) as f64).sqrt();
+                o[4 + k] = (rms * 510.0).round().min(255.0) as u8;
             }
             o
         })
@@ -428,7 +431,10 @@ fn downbeat_start_bonus() -> f64 {
 }
 
 /// Fraction of the steepest rise that marks the start of a kick's attack.
-const ATTACK_FRACTION: f32 = 0.7;
+const ATTACK_FRACTION: f32 = 0.85;
+fn attack_fraction() -> f32 {
+    std::env::var("PREPDECK_ATTACK").ok().and_then(|v| v.parse().ok()).unwrap_or(ATTACK_FRACTION)
+}
 
 fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
     let mut lp1 = Biquad::new("lp", 150.0, 0.707, sr, 0.0);
@@ -471,7 +477,7 @@ fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
             };
             let mut start = best.0;
             for d in (best.0 - 12).max(-40)..best.0 {
-                if rise_at(d) >= ATTACK_FRACTION * best.1 {
+                if rise_at(d) >= attack_fraction() * best.1 {
                     start = d;
                     break;
                 }

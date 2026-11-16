@@ -20,7 +20,7 @@ pub struct KeyParams {
     pub minor_bias: f64,
 }
 
-pub const DEFAULT: KeyParams = KeyParams { tuning: false, peaks: true, bass_weight: 0.6, profile: 2, power: 1.0, minor_bias: 0.1 };
+pub const DEFAULT: KeyParams = KeyParams { tuning: false, peaks: true, bass_weight: 0.45, profile: 2, power: 1.0, minor_bias: 0.15 };
 
 /// (name, major, minor) templates, index 0 = tonic.
 pub const PROFILES: [(&str, [f64; 12], [f64; 12]); 5] = [

@@ -115,6 +115,7 @@ pub fn collect_audio(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
 // rekordbox XML (File > Export Collection in xml format) import
 // ------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct XmlTrack {
     pub xml_id: String,
     pub track: Track,
@@ -308,13 +309,12 @@ fn finish_grid(t: &mut XmlTrack, tempos: &[(f64, f64, u8)]) {
     if tempos.is_empty() {
         return;
     }
-    let mut anchors = vec![];
-    for (i, (time, bpm, beat)) in tempos.iter().enumerate() {
-        if i > 0 {
-            let prev: &GridAnchor = anchors.last().unwrap();
-            if (prev.bpm - bpm).abs() < 1e-6 {
-                continue;
-            }
+    // Every TEMPO entry is kept: the original also writes same-tempo entries where its
+    // millisecond beat positions drift from the rounded tempo, so they carry timing.
+    let mut anchors: Vec<GridAnchor> = vec![];
+    for (time, bpm, beat) in tempos {
+        if anchors.last().map(|a| *time <= a.time).unwrap_or(false) {
+            continue;
         }
         anchors.push(GridAnchor { time: *time, bpm: *bpm, beat: (*beat).clamp(1, 4) });
     }

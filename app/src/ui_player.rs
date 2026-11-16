@@ -232,7 +232,7 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         for (i, c) in cols.iter().enumerate() {
             let x = r.min.x + i as f32 + 0.5;
             let played = (i as f64 / n as f64) * dur < pos;
-            for (h, col) in wave_bars(app.prefs.wave_color, *c) {
+            for (h, col) in wave_bars(app.prefs.wave_color, Waveform::disp(c)) {
                 let col = if played { col.gamma_multiply(0.45) } else { col };
                 // overview is drawn from the baseline upwards like the original
                 p.line_segment([pos2(x, mid + half * 0.15), pos2(x, mid + half * 0.15 - h * half * 1.15)], Stroke::new(1.0, col));
@@ -342,13 +342,13 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 let a = ((t0 * fps).max(0.0) as usize).min(n);
                 let b = (((t1 * fps).ceil()) as usize).clamp(a + 1, n.max(a + 1)).min(n);
                 if a < n {
-                    let mut m = [0u8; 4];
+                    let mut m = [0u8; 8];
                     for f in &w.frames[a..b.max(a + 1).min(n)] {
                         for k in 0..4 {
                             m[k] = m[k].max(f[k]);
                         }
                     }
-                    for (h, col) in wave_bars(app.prefs.wave_color, m) {
+                    for (h, col) in wave_bars(app.prefs.wave_color, Waveform::disp(&m)) {
                         let hh = h * half;
                         p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0, col));
                     }

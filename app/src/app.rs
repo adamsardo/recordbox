@@ -970,6 +970,7 @@ impl App {
                 t.analyzed = 1;
                 t.duration = res.duration;
                 t.sample_rate = res.sample_rate;
+                t.raw_samples = res.raw_samples;
                 t.gain_db = res.gain_db;
                 // A locked grid, or one that came with an imported library, is kept as it is.
                 let keep_grid = t.grid_locked || existing_grid.is_some();

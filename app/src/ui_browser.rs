@@ -1032,9 +1032,22 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
         Col::Preview => {
             if let Some(pv) = app.previews.get(&t.id) {
                 let n = (r.width() - 8.0).max(1.0) as usize;
-                let frames: Vec<[u8; 4]> = pv.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
-                let w = Waveform { frames };
-                let cols = w.columns(n);
+                // Stored preview: 400 display-level columns of 4 bytes; resample to the cell width.
+                let src: Vec<[u8; 4]> = pv.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+                let len = src.len().max(1);
+                let cols: Vec<[u8; 4]> = (0..n)
+                    .map(|i| {
+                        let a = i * len / n;
+                        let b = ((i + 1) * len / n).max(a + 1).min(len);
+                        let mut m = [0u8; 4];
+                        for f in src.get(a..b).unwrap_or(&[]) {
+                            for k in 0..4 {
+                                m[k] = m[k].max(f[k]);
+                            }
+                        }
+                        m
+                    })
+                    .collect();
                 let base = r.max.y - 2.0;
                 let hh = r.height() - 4.0;
                 for (k, v) in cols.iter().enumerate() {

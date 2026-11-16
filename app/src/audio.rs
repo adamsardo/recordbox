@@ -14,6 +14,8 @@ use symphonia::core::probe::Hint;
 pub struct Decoded {
     pub sr: u32,
     pub samples: Vec<f32>,
+    /// Length in sample frames of the file's full (untrimmed) decode.
+    pub raw_frames: usize,
 }
 
 impl Decoded {
@@ -145,6 +147,10 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
             }
         }
     }
+    let mut raw_frames = out.len() / 2;
+    if class == Mp3Timing::Ffmpeg {
+        raw_frames += track.codec_params.delay.unwrap_or(0) as usize + track.codec_params.padding.unwrap_or(0) as usize;
+    }
     if class == Mp3Timing::Untagged {
         let drop = (MP3_UNTAGGED_SKIP * 2).min(out.len());
         out.drain(..drop);
@@ -152,7 +158,7 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     if out.is_empty() {
         return Err(anyhow!("no audio decoded"));
     }
-    Ok(Decoded { sr, samples: out })
+    Ok(Decoded { sr, samples: out, raw_frames })
 }
 
 /// Shared playback state read by the audio callback.
