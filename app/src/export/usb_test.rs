@@ -32,7 +32,7 @@ fn full_export_to_folder() {
         tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())] });
     }
     let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1] }], tracks: vec![] }];
-    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])] };
+    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default() };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let msg = run_export(req, &|_| {}, &cancel).unwrap();
     assert!(msg.contains("2 tracks"), "{msg}");
@@ -43,16 +43,33 @@ fn full_export_to_folder() {
     for t in lib.tracks.values() {
         assert!(root.join(t.file_path.trim_start_matches('/')).exists(), "{}", t.file_path);
         assert!(root.join(t.analyze_path.trim_start_matches('/')).exists());
-        assert_eq!(t.tags, vec!["Techno".to_string()]);
+        assert_eq!(t.tags, vec![tag_key("Genre", "Techno")]);
         assert!(!t.source.is_empty());
     }
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/Album_ One_/")));
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/UnknownAlbum/")));
     // Exporting the same playlist again updates in place instead of duplicating.
-    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![] };
+    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default() };
     run_export(req2, &|_| {}, &cancel).unwrap();
     let lib2 = read_device(&root).unwrap();
     assert_eq!(lib2.tracks.len(), 2);
     assert_eq!(lib2.nodes.len(), 2);
+    // Re-export keeps each track's analysis path and the My Tag IDs, and backs up the old DB.
+    for (id, t) in &lib.tracks {
+        assert_eq!(lib2.tracks[id].analyze_path, t.analyze_path);
+    }
+    assert_eq!(lib2.tag_ids, lib.tag_ids);
+    assert!(std::fs::read_dir(root.join(".PrepDeck/backup")).unwrap().count() >= 2);
+    // No temporary files are left behind.
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            assert!(!n.ends_with(".part") && !n.ends_with(".tmp_write"), "left over: {n}");
+            if e.path().is_dir() {
+                stack.push(e.path());
+            }
+        }
+    }
     std::fs::write(base.join("LAST"), root.to_string_lossy().as_bytes()).unwrap();
 }

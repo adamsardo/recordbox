@@ -148,17 +148,15 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
             let cur = app.anchor.unwrap_or(0);
             let next = if up { cur.saturating_sub(1) } else { (cur + 1).min(app.list.len() - 1) };
             let next = if app.anchor.is_none() { 0 } else { next };
-            app.anchor = Some(next);
+            app.set_anchor(next);
             app.selected.clear();
             app.selected.insert(app.list[next]);
             app.scroll_to_selected = true;
         }
     }
     if enter {
-        if let Some(i) = app.anchor {
-            if let Some(id) = app.list.get(i).copied() {
-                app.load_track(id);
-            }
+        if let Some(id) = app.anchor_id.filter(|id| app.list.contains(id)) {
+            app.load_track(id);
         }
     }
     if cmd_a {

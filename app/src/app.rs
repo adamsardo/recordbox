@@ -348,6 +348,9 @@ pub struct App {
     pub list_dirty: bool,
     pub selected: HashSet<i64>,
     pub anchor: Option<usize>,
+    /// Track the keyboard/shift-click anchor points at; `anchor` is its row in `list` and is
+    /// re-derived whenever the list is rebuilt (sort, search, view change).
+    pub anchor_id: Option<i64>,
     pub search: String,
     pub filter_open: bool,
     pub filter_bpm: (f64, f64),
@@ -358,6 +361,9 @@ pub struct App {
     pub filter_tags_all: bool,
     pub player: Player,
     pub deck: Deck,
+    /// The deck as it was before the load in progress, with its playback position and gain;
+    /// put back if the new file can't be decoded, so a failed load never empties the player.
+    pub deck_backup: Option<(Deck, f64, f32)>,
     pub pool: AnalysisPool,
     pub analysis_total: usize,
     pub analysis_done: usize,
@@ -404,6 +410,8 @@ impl App {
             list_dirty: true,
             selected: HashSet::new(),
             anchor: None,
+            anchor_id: None,
+            deck_backup: None,
             search: String::new(),
             filter_open: false,
             filter_bpm: (0.0, 0.0),
@@ -789,7 +797,14 @@ impl App {
         self.list = v;
         let idx = &self.index;
         self.selected.retain(|id| idx.contains_key(id));
+        self.anchor = self.anchor_id.and_then(|id| self.list.iter().position(|x| *x == id));
         self.list_dirty = false;
+    }
+
+    /// Point the selection anchor at row `i` of the current list.
+    pub fn set_anchor(&mut self, i: usize) {
+        self.anchor = Some(i);
+        self.anchor_id = self.list.get(i).copied();
     }
 
     pub fn set_view(&mut self, v: View) {
@@ -811,6 +826,7 @@ impl App {
             }
             self.list_dirty = true;
             self.anchor = None;
+            self.anchor_id = None;
         }
     }
 
@@ -942,7 +958,9 @@ impl App {
         let mut n = 0;
         for id in ids {
             let Some(t) = self.track_mut(*id) else { continue };
-            if t.missing || (t.analyzed == 3) || (!force && t.analyzed == 1) {
+            // Analysis Lock: a locked track is never re-analysed (its grid, key, waveform and
+            // gain stay as they are), even by "Re-analyze".
+            if t.missing || (t.analyzed == 3) || (!force && t.analyzed == 1) || (t.grid_locked && t.analyzed == 1) {
                 continue;
             }
             t.analyzed = 3;
@@ -972,7 +990,12 @@ impl App {
             Err(e) => {
                 t.analyzed = if e == "stopped" { 0 } else { 2 };
             }
+            Ok(res) if t.grid_locked && t.analyzed == 1 => {
+                // Locked while the job was running: keep everything that was there.
+                let _ = res;
+            }
             Ok(res) => {
+                let first_analysis = t.analyzed != 1;
                 t.analyzed = 1;
                 t.duration = res.duration;
                 t.sample_rate = res.sample_rate;
@@ -980,7 +1003,9 @@ impl App {
                 t.gain_db = res.gain_db;
                 // A locked grid, or one that came with an imported library, is kept as it is.
                 let keep_grid = t.grid_locked || existing_grid.is_some();
-                if res.key >= 0 && (t.key < 0 || !keep_grid) {
+                // A key the user set (or one from an imported library) is only replaced when the
+                // track had no key, or on its first analysis when the key came from tags.
+                if res.key >= 0 && (t.key < 0 || (first_analysis && !keep_grid)) {
                     t.key = res.key;
                 }
                 let mut save_grid = None;
@@ -1053,18 +1078,24 @@ impl App {
             self.toast_err(format!("The file for \"{}\" cannot be found.", t.display_title()));
             return;
         }
-        {
+        let (old_pos, old_gain) = {
             let mut s = self.player.state.lock();
+            let keep = (s.pos, s.gain);
             s.playing = false;
             s.audio = None;
             s.pos = 0.0;
             s.loop_range = None;
             s.metronome = None;
             s.gain = 10f32.powf(t.gain_db / 20.0).min(4.0);
-        }
+            keep
+        };
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
-        self.deck = Deck { ctrl_tab: ctrl, panel_tab: panel, ..Deck::default() };
+        let old = std::mem::replace(&mut self.deck, Deck { ctrl_tab: ctrl, panel_tab: panel, ..Deck::default() });
+        // Keep the last successfully loaded deck (not a deck that is itself still loading).
+        if old.audio.is_some() {
+            self.deck_backup = Some((old, old_pos, old_gain));
+        }
         self.deck.track = Some(id);
         self.deck.duration = t.duration;
         self.deck.wave = self.db.wave(id);
@@ -1089,6 +1120,7 @@ impl App {
             }
             match r {
                 Ok(a) => {
+                    self.deck_backup = None;
                     self.deck.duration = a.duration();
                     let cp = self.deck.cue_point;
                     let mut s = self.player.state.lock();
@@ -1099,7 +1131,17 @@ impl App {
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
                 }
-                Err(e) => self.toast_err(format!("This file cannot be played: {e}")),
+                Err(e) => {
+                    if let Some((old, pos, gain)) = self.deck_backup.take() {
+                        let mut s = self.player.state.lock();
+                        s.audio = old.audio.clone();
+                        s.pos = pos;
+                        s.gain = gain;
+                        drop(s);
+                        self.deck = old;
+                    }
+                    self.toast_err(format!("This file cannot be played: {e}"));
+                }
             }
         }
     }
@@ -1437,6 +1479,10 @@ impl App {
     pub fn grid_set_downbeat(&mut self) {
         let Some(tid) = self.deck.track else { return };
         let p = self.pos();
+        if self.track(tid).map(|t| t.grid_locked).unwrap_or(false) {
+            self.toast_err("The beat grid is locked (Analysis Lock). Unlock it to edit.");
+            return;
+        }
         if self.deck.grid.is_empty() {
             let bpm = self.track(tid).map(|t| t.bpm).filter(|b| *b > 0.0).unwrap_or(120.0);
             self.push_grid(BeatGrid::constant(p, bpm, 1));
@@ -1466,6 +1512,10 @@ impl App {
         self.push_grid(g);
     }
     pub fn grid_tap(&mut self) {
+        if self.deck.track.and_then(|id| self.track(id)).map(|t| t.grid_locked).unwrap_or(false) {
+            self.toast_err("The beat grid is locked (Analysis Lock). Unlock it to edit.");
+            return;
+        }
         let now = Instant::now();
         if let Some(l) = self.deck.taps.last() {
             if now.duration_since(*l).as_secs_f64() > 2.0 {
@@ -1720,17 +1770,18 @@ impl App {
         }
         let names: HashMap<i64, (String, i64)> = self.mytags.iter().map(|t| (t.id, (t.name.clone(), t.parent))).collect();
         let mut tracks = HashMap::new();
-        let mut unsupported = 0;
+        let mut skipped: Vec<String> = vec![];
         let settings = self.analysis_settings();
         let mut ids: Vec<i64> = track_ids.into_iter().collect();
         ids.sort();
         for id in &ids {
             let Some(t) = self.track(*id).cloned() else { continue };
             if t.missing {
+                skipped.push(format!("{} (file not found)", t.display_title()));
                 continue;
             }
             if !crate::export::usb::player_supported(&t.file_type) {
-                unsupported += 1;
+                skipped.push(format!("{} (file type not supported by the players)", t.display_title()));
                 continue;
             }
             let tags: Vec<(String, String)> = self
@@ -1740,41 +1791,30 @@ impl App {
                 .unwrap_or_default();
             tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid: self.db.grid(*id), wave: self.db.wave(*id), track: t, tags });
         }
-        if unsupported > 0 {
-            self.toast_err("Some of the imported files cannot be exported as they are not supported by the CDJ.");
-        }
-        // Tracks without analysis are analysed first (as the original does when exporting).
-        let needs: Vec<(i64, String)> = tracks.values().filter(|t| t.wave.is_none() || t.grid.is_none()).map(|t| (t.track.id, t.track.path.clone())).collect();
-        for (id, path) in needs {
-            if let Ok(r) = crate::analysis::analyze_file(&path, &settings) {
-                self.apply_analysis(id, Ok(r));
-                if let Some(et) = tracks.get_mut(&id) {
-                    et.grid = self.db.grid(id);
-                    et.wave = self.db.wave(id);
-                    if let Some(t) = self.track(id) {
-                        et.track = t.clone();
-                    }
-                }
-            }
-        }
+        // Tracks without analysis are analysed by the export job itself (off the UI thread).
         let tag_categories: Vec<(String, Vec<String>)> = self
             .mytags
             .iter()
             .filter(|c| c.parent == 0)
             .map(|c| (c.name.clone(), self.mytags.iter().filter(|t| t.parent == c.id).map(|t| t.name.clone()).collect()))
             .collect();
-        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories };
+        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings };
         self.export_job = Some(spawn_export(req, self.ctx.clone()));
     }
 
     pub fn poll_export(&mut self) {
         let Some(job) = self.export_job.as_mut() else { return };
         let mut finished = None;
+        let mut analyzed = vec![];
         while let Ok(p) = job.rx.try_recv() {
             match p {
                 crate::export::usb::Progress::Step { done, total, text } => job.last = (done, total, text),
+                crate::export::usb::Progress::Analyzed(id, r) => analyzed.push((id, *r)),
                 crate::export::usb::Progress::Finished(r) => finished = Some(r),
             }
+        }
+        for (id, r) in analyzed {
+            self.apply_analysis(id, r);
         }
         if let Some(r) = finished {
             self.export_job = None;

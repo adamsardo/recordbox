@@ -1140,11 +1140,11 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                         if !app.selected.insert(id) {
                             app.selected.remove(&id);
                         }
-                        app.anchor = Some(i);
+                        app.set_anchor(i);
                     } else {
                         app.selected.clear();
                         app.selected.insert(id);
-                        app.anchor = Some(i);
+                        app.set_anchor(i);
                     }
                 }
                 if resp.double_clicked() {
@@ -1154,7 +1154,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                     if !app.selected.contains(&id) {
                         app.selected.clear();
                         app.selected.insert(id);
-                        app.anchor = Some(i);
+                        app.set_anchor(i);
                     }
                     let ids: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
                     app.drag = Some(ids);
@@ -1172,7 +1172,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                 if resp.secondary_clicked() && !app.selected.contains(&id) {
                     app.selected.clear();
                     app.selected.insert(id);
-                    app.anchor = Some(i);
+                    app.set_anchor(i);
                 }
                 resp.context_menu(|ui| {
                     let sel: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
