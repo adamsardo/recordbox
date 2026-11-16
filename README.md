@@ -8,7 +8,7 @@ An unofficial, open-source macOS app for getting ready for a DJ set: organise yo
 
 **Building**
 
-No app code has been written yet.
+So far: 2 source files, 1 lines of Rust.
 
 This is being built in the open. An AI coding agent (Claude Code, run through Craft Anything) is writing the code, and this repo syncs from its build folder about every 15 minutes, so you're watching it come together in real time. Expect gaps and the occasional broken build until a first release. Star or watch the repo to follow along.
 
@@ -37,7 +37,15 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 
 ## Running it
 
-Nothing to run yet. Instructions will appear here once the first version builds.
+You need [Rust](https://rustup.rs). Then:
+
+```bash
+git clone https://github.com/adamsardo/recordbox
+cd recordbox/app
+cargo run --release
+```
+
+This is a work in progress: it may not build at every moment while the agent is mid-change.
 
 ## The brief
 
