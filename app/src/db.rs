@@ -170,7 +170,7 @@ impl Db {
             analyzed: r.get(33)?,
             grid_locked: r.get::<_, i64>(34)? != 0,
             autoload_hotcue: r.get::<_, i64>(35)? != 0,
-            gain_db: r.get(36)?,
+            gain_db: r.get::<_, Option<f32>>(36)?.unwrap_or(f32::NAN),
             artwork: r.get(37)?,
             raw_samples: r.get::<_, i64>(38)? as u64,
             missing: false,
@@ -225,11 +225,12 @@ impl Db {
     /// kept so it can be restored with [`Db::restore_trash`].
     pub fn trash_track(&self, id: i64) -> Result<()> {
         let Some(track) = self.track(id) else { return Ok(()) };
-        let mut st = self.conn.prepare("SELECT playlist_id, seq FROM playlist_tracks WHERE track_id=?1")?;
+        // Position in each playlist (rows before it), not the raw sequence number with its gaps.
+        let mut st = self.conn.prepare("SELECT p.playlist_id, (SELECT COUNT(*) FROM playlist_tracks q WHERE q.playlist_id = p.playlist_id AND q.seq < p.seq) FROM playlist_tracks p WHERE p.track_id=?1")?;
         let playlists = st.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut st = self.conn.prepare("SELECT tag_id FROM track_tags WHERE track_id=?1")?;
         let tags = st.query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, xml_extra: self.xml_extra(id), track: track.clone() };
+        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, xml_extra: self.xml_extra(id), vocal: self.vocal(id), track: track.clone() };
         let wave: Option<(Vec<u8>, Vec<u8>)> = self.conn.query_row("SELECT data, preview FROM waves WHERE track_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         self.conn.execute(
@@ -269,6 +270,9 @@ impl Db {
                 self.save_grid(id, g)?;
             }
             self.set_xml_extra(id, &e.xml_extra)?;
+            if let Some(v) = &e.vocal {
+                self.save_vocal(id, v)?;
+            }
             if let (Some(w), Some(p)) = (wave, preview) {
                 self.conn.execute("INSERT OR REPLACE INTO waves(track_id,data,preview) VALUES(?1,?2,?3)", params![id, w, p])?;
             }
@@ -568,11 +572,13 @@ struct TrashEntry {
     track: Track,
     cues: Vec<Cue>,
     grid: Option<BeatGrid>,
-    /// (playlist id, position)
+    /// (playlist id, position among its tracks when removed)
     playlists: Vec<(i64, i64)>,
     tags: Vec<i64>,
     #[serde(default)]
     xml_extra: crate::importer::XmlExtra,
+    #[serde(default)]
+    vocal: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -606,12 +612,38 @@ mod schema_tests {
         assert!(db.grid(b).is_some());
         assert!(db.track_tags().unwrap()[&b].contains(&tag));
         assert!(db.trash_list().unwrap().is_empty());
+        // Two removed from the middle come back in their places when restored newest first.
+        db.trash_track(b).unwrap();
+        db.trash_track(c).unwrap();
+        assert_eq!(db.playlist_tracks(pl).unwrap(), vec![a]);
+        let mut ids: Vec<i64> = db.trash_list().unwrap().into_iter().map(|e| e.0).collect();
+        ids.sort_by(|x, y| y.cmp(x));
+        for t in ids {
+            db.restore_trash(t).unwrap();
+        }
+        assert_eq!(db.playlist_tracks(pl).unwrap(), vec![a, b, c]);
         // A track re-imported meanwhile is not duplicated.
         db.trash_track(a).unwrap();
         db.insert_track(&mk("/a.mp3")).unwrap();
         let t = db.trash_list().unwrap()[0].0;
         assert_eq!(db.restore_trash(t).unwrap(), None);
         assert_eq!(db.purge_trash(None).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unavailable_gain_stays_unavailable() {
+        let dir = std::env::temp_dir().join(format!("prepdeck_gain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("library.db")).unwrap();
+        let id = db.insert_track(&Track { path: "/s.wav".into(), gain_db: f32::NAN, ..Default::default() }).unwrap();
+        assert!(db.track(id).unwrap().gain_db.is_nan());
+        // Through the trash (JSON) and back.
+        db.trash_track(id).unwrap();
+        let t = db.trash_list().unwrap()[0].0;
+        let back = db.restore_trash(t).unwrap().unwrap();
+        assert!(db.track(back).unwrap().gain_db.is_nan());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

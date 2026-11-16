@@ -202,6 +202,9 @@ pub struct Track {
     pub analyzed: u8,
     pub grid_locked: bool,
     pub autoload_hotcue: bool,
+    /// Auto gain in dB; NaN when loudness could not be measured (silence, too short), which
+    /// plays without auto gain (stored as NULL).
+    #[serde(default, deserialize_with = "f32_or_nan")]
     pub gain_db: f32,
     pub artwork: String,
     pub missing: bool,
@@ -475,4 +478,9 @@ mod tests {
         assert!((b2[0].time - 0.25).abs() < 1e-9);
         assert_eq!(b2[0].beat, 1);
     }
+}
+
+/// An f32 that may have been written as null (serde_json writes NaN that way).
+fn f32_or_nan<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(<Option<f32> as serde::Deserialize>::deserialize(d)?.unwrap_or(f32::NAN))
 }

@@ -194,7 +194,7 @@ pub fn read_cue_record(root: &Path) -> HashMap<String, String> {
 /// Update the drive's cue record (PrepDeck's own folder; players never read it).
 pub fn write_cue_record(root: &Path, record: &HashMap<String, String>) -> Result<()> {
     std::fs::create_dir_all(root.join(".PrepDeck"))?;
-    write_atomic(&cue_record_path(root), &serde_json::to_vec_pretty(record)?)
+    write_atomic(&cue_record_path(root), &serde_json::to_vec_pretty(&record.iter().collect::<BTreeMap<_, _>>())?)
 }
 
 /// A track whose cues on the drive differ from what PrepDeck last wrote there: edited on a
@@ -243,6 +243,80 @@ pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> 
     }
     out.sort_by(|a, b| a.title.cmp(&b.title));
     out
+}
+
+/// Files in the drive's music, analysis and artwork folders that no track in its library uses
+/// (left behind by deleted playlists, other programs or copies made by hand), with sizes.
+/// Nothing is listed while an interrupted export's journal is still on the drive.
+pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
+    // A OneLibrary database (which PrepDeck can't read) may use files export.pdb doesn't.
+    if journal_dir(root).join("journal.log").exists() || has_onelibrary(root) {
+        return vec![];
+    }
+    let mut used: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for t in lib.tracks.values() {
+        if !t.file_path.is_empty() {
+            used.insert(root.join(t.file_path.trim_start_matches('/')));
+        }
+        if let Some(b) = anlz_base(&t.analyze_path) {
+            let b = root.join(b.trim_start_matches('/'));
+            for e in ["DAT", "EXT", "2EX"] {
+                used.insert(b.with_extension(e));
+            }
+        }
+        if !t.artwork_path.is_empty() {
+            let a = root.join(t.artwork_path.trim_start_matches('/'));
+            if let (Some(stem), Some(ext)) = (a.file_stem().map(|x| x.to_string_lossy().to_string()), a.extension().map(|x| x.to_string_lossy().to_string())) {
+                used.insert(a.with_file_name(format!("{stem}_m.{ext}")));
+            }
+            used.insert(a);
+        }
+    }
+    let mut out = vec![];
+    let mut stack: Vec<PathBuf> = [root.join("Contents"), root.join("PIONEER").join("USBANLZ"), root.join("PIONEER").join("Artwork")].into_iter().filter(|d| d.is_dir()).collect();
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_file() && !used.contains(&p) {
+                let name = e.file_name().to_string_lossy().to_string();
+                // macOS bookkeeping files are not the library's concern.
+                if name == ".DS_Store" || name.starts_with("._") {
+                    continue;
+                }
+                out.push((p, e.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Delete the given unused files (re-checked against the drive's current library) and then
+/// any folders left empty. Returns how many files were deleted.
+pub fn delete_unused(root: &Path, files: &[PathBuf]) -> Result<usize> {
+    let lib = read_device(root)?;
+    let still: std::collections::HashSet<PathBuf> = unused_files(root, &lib).into_iter().map(|f| f.0).collect();
+    let mut n = 0;
+    for f in files.iter().filter(|f| still.contains(*f)) {
+        if std::fs::remove_file(f).is_ok() {
+            n += 1;
+            let mut dir = f.parent().map(Path::to_path_buf);
+            while let Some(d) = dir {
+                if d == root.join("Contents") || d == root.join("PIONEER").join("USBANLZ") || d == root.join("PIONEER").join("Artwork") || !d.starts_with(root) {
+                    break;
+                }
+                if std::fs::remove_dir(&d).is_err() {
+                    break;
+                }
+                dir = d.parent().map(Path::to_path_buf);
+            }
+        }
+    }
+    Ok(n)
 }
 
 pub fn read_device(root: &Path) -> Result<DeviceLibrary> {
@@ -631,7 +705,8 @@ impl Created {
     fn note_created(&mut self, p: &Path) -> Result<()> {
         self.files.push(p.to_path_buf());
         let l = format!("C\t{}", self.rel(p));
-        self.line(&l, false)
+        // Durable before the file exists, so a crash can't leave an unlisted file.
+        self.line(&l, true)
     }
     /// About to write `p`: keep a durable copy of what is there now, or note it as new.
     fn will_replace(&mut self, p: &Path) -> Result<()> {
@@ -696,9 +771,22 @@ pub fn recover_device(root: &Path) -> Option<String> {
                     }
                 }
                 ["C", path] => {
-                    let _ = std::fs::remove_file(root.join(path));
+                    let p = root.join(path);
+                    let _ = std::fs::remove_file(&p);
+                    // Folders this export created and left empty go too (never the top ones).
+                    let mut dir = p.parent().map(Path::to_path_buf);
+                    while let Some(d) = dir {
+                        if d == root || d == root.join("Contents") || d == root.join("PIONEER") || d == root.join(".PrepDeck") || !d.starts_with(root) || std::fs::remove_dir(&d).is_err() {
+                            break;
+                        }
+                        dir = d.parent().map(Path::to_path_buf);
+                    }
                 }
                 _ => {}
+            }
+            // Half-written replacements of any listed file.
+            if let Some(path) = l.get(1) {
+                let _ = std::fs::remove_file(tmp_for(&root.join(path)));
             }
         }
         for f in ["export.pdb", "exportExt.pdb"] {
@@ -954,9 +1042,19 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             continue;
         }
         // Already on the device?
-        let existing = lib.tracks.values().find(|d| d.source == t.path).map(|d| (d.id, d.file_path.clone()));
+        // A row whose file is still there wins over one whose file went missing.
+        let on_drive = |d: &&DevTrack| root.join(d.file_path.trim_start_matches('/')).exists();
+        let existing = lib.tracks.values().filter(|d| d.source == t.path).find(on_drive).or_else(|| lib.tracks.values().find(|d| d.source == t.path)).map(|d| (d.id, d.file_path.clone()));
         let (dev_id, usb_path) = match existing {
             Some((id, p)) if root.join(p.trim_start_matches('/')).exists() => (id, p),
+            Some((id, p)) if !p.is_empty() => {
+                // The file went missing from the drive: copy it back to the same place, keeping
+                // the track's ID, playlists and analysis path.
+                let dest = root.join(p.trim_start_matches('/'));
+                std::fs::create_dir_all(dest.parent().unwrap())?;
+                copy_durable(src, &dest, &mut created)?;
+                (id, p)
+            }
             _ => {
                 let dir = media_dir(&t.artist, &t.album);
                 let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
@@ -1021,7 +1119,11 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         cue_record.insert(usb_path.clone(), anlz::cue_fingerprint(&anlz::parse_cues(&anlz::section_list(&files.ext), &anlz::section_list(&files.dat))));
         // Artwork.
         let artwork_path = if !t.artwork.is_empty() && Path::new(&t.artwork).exists() {
-            write_artwork(&root, dev_id, &t.artwork, &mut created).unwrap_or_default()
+            // Artwork files are numbered by artwork row, not track: reuse this track's own file
+            // only when no other track shows it, else take the next free number.
+            let shared = |p: &str| lib.tracks.values().any(|o| o.id != dev_id && o.artwork_path == p);
+            let rel = if !prev.artwork_path.is_empty() && prev.artwork_path.starts_with("/PIONEER/Artwork/") && !shared(&prev.artwork_path) { prev.artwork_path.clone() } else { free_artwork_name(&root, &lib) };
+            write_artwork(&root, &rel, &t.artwork, &mut created).unwrap_or_default()
         } else {
             String::new()
         };
@@ -1090,8 +1192,12 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     // Written first so a finished-after-interruption export has them too; entries for files
     // an undone export removed are simply never looked up.
     let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
-    let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources).unwrap_or_default());
+    // Journaled, so an undone export also puts these back.
+    created.will_replace(&sidecar_path(&root))?;
+    // Sorted, so the same content always gives the same bytes.
+    let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources.iter().collect::<BTreeMap<_, _>>()).unwrap_or_default());
     cue_record.retain(|path, _| lib.tracks.values().any(|t| &t.file_path == path));
+    created.will_replace(&cue_record_path(&root))?;
     let _ = write_cue_record(&root, &cue_record);
     backup_device_db(&root);
     write_device_journaled(&root, &lib, &mut created)?;
@@ -1191,18 +1297,31 @@ fn publish_tmp(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_artwork(root: &Path, id: u32, src: &str, created: &mut Created) -> Result<String> {
-    let img = image::open(src)?;
-    let rel = format!("/PIONEER/Artwork/00001/a{id}.jpg");
+/// The next artwork file name no file on the drive and no track in its library uses.
+fn free_artwork_name(root: &Path, lib: &DeviceLibrary) -> String {
     let dir = root.join("PIONEER/Artwork/00001");
-    std::fs::create_dir_all(&dir)?;
-    created.will_replace(&dir.join(format!("a{id}.jpg")))?;
-    created.will_replace(&dir.join(format!("a{id}_m.jpg")))?;
+    let used: std::collections::HashSet<&str> = lib.tracks.values().map(|t| t.artwork_path.as_str()).collect();
+    (1u32..)
+        .map(|n| (n, format!("/PIONEER/Artwork/00001/a{n}.jpg")))
+        .find(|(n, rel)| !used.contains(rel.as_str()) && !dir.join(format!("a{n}.jpg")).exists() && !dir.join(format!("a{n}_m.jpg")).exists())
+        .map(|x| x.1)
+        .unwrap()
+}
+
+/// Write a track's artwork (80 px and the 240 px "_m" variant) at `rel`.
+fn write_artwork(root: &Path, rel: &str, src: &str, created: &mut Created) -> Result<String> {
+    let img = image::open(src)?;
+    let small_p = root.join(rel.trim_start_matches('/'));
+    let stem = small_p.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+    let big_p = small_p.with_file_name(format!("{stem}_m.jpg"));
+    std::fs::create_dir_all(small_p.parent().unwrap())?;
+    created.will_replace(&small_p)?;
+    created.will_replace(&big_p)?;
     let small = img.resize_to_fill(80, 80, image::imageops::FilterType::Triangle).to_rgb8();
-    small.save(dir.join(format!("a{id}.jpg")))?;
+    small.save(&small_p)?;
     let big = img.resize_to_fill(240, 240, image::imageops::FilterType::Triangle).to_rgb8();
-    big.save(dir.join(format!("a{id}_m.jpg")))?;
-    Ok(rel)
+    big.save(&big_p)?;
+    Ok(rel.to_string())
 }
 
 pub fn free_space(root: &Path) -> Option<u64> {
@@ -1865,6 +1984,37 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].exported, fp);
         assert_eq!(edits[0].cues[0].start, 2.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finds_and_deletes_only_unused_files() {
+        let root = std::env::temp_dir().join(format!("prepdeck_unused_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        mk("Contents/A/kept.mp3");
+        let orphan = mk("Contents/B/old.mp3");
+        mk("PIONEER/USBANLZ/P001/0000AAAA/ANLZ0000.DAT");
+        mk("PIONEER/USBANLZ/P001/0000AAAA/ANLZ0000.EXT");
+        let orphan_anlz = mk("PIONEER/USBANLZ/P002/0000BBBB/ANLZ0000.DAT");
+        mk("PIONEER/Artwork/00001/a1.jpg");
+        mk("PIONEER/Artwork/00001/a1_m.jpg");
+        mk("Contents/A/.DS_Store");
+        let mut lib = DeviceLibrary::default();
+        lib.tracks.insert(1, DevTrack { id: 1, file_path: "/Contents/A/kept.mp3".into(), analyze_path: "/PIONEER/USBANLZ/P001/0000AAAA/ANLZ0000.DAT".into(), artwork_path: "/PIONEER/Artwork/00001/a1.jpg".into(), ..Default::default() });
+        let found: Vec<PathBuf> = unused_files(&root, &lib).into_iter().map(|f| f.0).collect();
+        assert_eq!(found, { let mut v = vec![orphan.clone(), orphan_anlz.clone()]; v.sort(); v });
+        // Deletion re-reads the drive's library: with no export.pdb there, every file is
+        // unused, so only the listed ones go.
+        let n = delete_unused(&root, &found).unwrap();
+        assert_eq!(n, 2);
+        assert!(!root.join("Contents/B").exists() && !root.join("PIONEER/USBANLZ/P002").exists());
+        assert!(root.join("Contents/A/kept.mp3").exists() && root.join("PIONEER/Artwork/00001/a1_m.jpg").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

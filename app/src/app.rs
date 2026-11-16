@@ -670,6 +670,8 @@ pub struct Dialogs {
     pub trash: Option<HashSet<i64>>,
     /// Cue edits found on a connected drive, waiting for review.
     pub player_edits: Option<PlayerEdits>,
+    /// Unused files on a drive, waiting for confirmation: (root, device name, files with sizes).
+    pub device_cleanup: Option<(String, String, Vec<(std::path::PathBuf, u64)>)>,
 }
 
 pub struct PlayerEdits {
@@ -762,6 +764,11 @@ pub struct App {
     pub devices_scanned: Option<Instant>,
     /// Drives already checked for player cue edits while connected.
     pub edits_checked: HashSet<String>,
+    /// Key analysis on the drum-free mix in the background: results (track, key) and the
+    /// number of tracks asked for.
+    pub key_job: Option<(Receiver<(i64, i32)>, usize, usize)>,
+    /// Tracks whose vocal detection failed this session (not retried on every load).
+    pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
@@ -856,6 +863,8 @@ impl App {
             devices: vec![],
             devices_scanned: None,
             edits_checked: HashSet::new(),
+            key_job: None,
+            vocal_failed: HashSet::new(),
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
@@ -1526,6 +1535,9 @@ impl App {
             return;
         }
         let Some(id) = self.deck.track else { return };
+        if self.vocal_failed.contains(&id) {
+            return;
+        }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -1536,10 +1548,75 @@ impl App {
         self.deck.vocal_rx = Some(rx);
     }
 
+/// Track > Analyze Key. With a downloaded separation model and a GPU the key is found on the
+    /// mix without its drums (the drums stem subtracted), which agrees with rekordbox more
+    /// often; otherwise with the ordinary analysis.
+    pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
+        let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false);
+        if !stems_ok || self.key_job.is_some() {
+            for id in ids {
+                if let Some(t) = self.track_mut(*id) {
+                    t.key = -1;
+                }
+            }
+            self.analyze(ids, true);
+            return;
+        }
+        let jobs: Vec<(i64, String)> = ids.iter().filter_map(|id| self.track(*id).filter(|t| !t.missing).map(|t| (t.id, t.path.clone()))).collect();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let ctx = self.ctx.clone();
+        let n = jobs.len();
+        std::thread::spawn(move || {
+            for (id, path) in jobs {
+                let key = (|| {
+                    let d = crate::audio::decode_file(&path).ok()?;
+                    let mono = crate::stems::mono_44k(&d.samples, d.sr);
+                    let drums = crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true).ok()?;
+                    let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
+                    Some(crate::key::detect_key(&harm, 44100.0))
+                })()
+                .unwrap_or(-1);
+                if tx.send((id, key)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+        self.key_job = Some((rx, n, 0));
+        self.toast(format!("Analyzing the key of {n} track(s) with the stem model (about a minute each)…"));
+    }
+
+    pub fn poll_key_job(&mut self) {
+        let Some((rx, n, done)) = &mut self.key_job else { return };
+        let mut results = vec![];
+        while let Ok(r) = rx.try_recv() {
+            results.push(r);
+            *done += 1;
+        }
+        let finished = *done >= *n;
+        let total = *n;
+        for (id, key) in results {
+            if key >= 0 && self.track(id).map(|t| t.key != key).unwrap_or(false) {
+                if let Some(t) = self.track_mut(id) {
+                    t.key = key;
+                }
+                self.save_track(id);
+            }
+        }
+        if finished {
+            self.key_job = None;
+            self.list_dirty = true;
+            self.toast(format!("Key analysis finished for {total} track(s)."));
+        }
+    }
+
     pub fn poll_vocal(&mut self) {
         let Some(rx) = &self.deck.vocal_rx else { return };
         if let Ok((id, r)) = rx.try_recv() {
             self.deck.vocal_rx = None;
+            if r.is_none() {
+                self.vocal_failed.insert(id);
+            }
             if let Some(levels) = r {
                 let _ = self.db.save_vocal(id, &levels);
                 if self.deck.track == Some(id) {
@@ -2163,9 +2240,7 @@ impl App {
             if let Some(g) = &xt.grid {
                 let _ = self.db.save_grid(id, g);
             }
-            if !xt.extra.is_empty() {
-                let _ = self.db.set_xml_extra(id, &xt.extra);
-            }
+            let _ = self.db.set_xml_extra(id, &xt.extra);
             if !xt.cues.is_empty() {
                 let _ = self.db.replace_cues(id, &xt.cues);
             }
@@ -2331,7 +2406,7 @@ impl App {
             s.pos = 0.0;
             s.loop_range = None;
             s.metronome = None;
-            s.gain = 10f32.powf(t.gain_db / 20.0).min(4.0);
+            s.gain = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
             keep
         };
         let ctrl = self.deck.ctrl_tab;
@@ -2962,8 +3037,8 @@ impl App {
                 removed.insert(t.path.clone());
             }
         }
-        self.db.set_setting("rb_removed_paths", &serde_json::to_string(&removed).unwrap_or_default());
         let _ = self.db.conn.execute_batch("BEGIN");
+        self.db.set_setting("rb_removed_paths", &serde_json::to_string(&removed).unwrap_or_default());
         let mut failed = None;
         for id in ids {
             if let Err(e) = self.db.trash_track(*id) {
@@ -2996,7 +3071,10 @@ impl App {
         let list = self.db.trash_list().unwrap_or_default();
         let mut removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let (mut ok, mut dup, mut err) = (0, 0, None);
-        for id in trash_ids {
+        // Newest removal first, so each track goes back into the playlist positions it had.
+        let mut trash_ids = trash_ids.to_vec();
+        trash_ids.sort_by(|a, b| b.cmp(a));
+        for id in &trash_ids {
             match self.db.restore_trash(*id) {
                 Ok(Some(_)) => {
                     ok += 1;

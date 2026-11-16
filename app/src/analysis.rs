@@ -60,7 +60,8 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let (bpm, grid) = if s.do_grid { tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max) } else { (0.0, None) };
     let key = if s.do_key { crate::key::detect_key(&mono, sr) } else { -1 };
     let lufs = loudness(dec);
-    let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { 0.0 };
+    // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
+    let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
     AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db }
 }
 
@@ -808,9 +809,9 @@ mod loudness_tests {
         let short = loudness(&tone(20.0, 44100, 0.1));
         let long = loudness(&tone(500.0, 44100, 0.1));
         assert!((short - long).abs() < 0.05, "{short} vs {long}");
-        // 997 Hz at -20 dBFS (0.1) in both channels: about -20 + 3 - 0.7 + K-weighting's
-        // small gain at 1 kHz.
-        assert!(short > -18.5 && short < -16.5, "{short}");
+        // 997 Hz at amplitude 0.1 in both channels: mean square 0.005 per channel, summed
+        // -20 dB, minus 0.691, plus K-weighting's small gain near 1 kHz: about -20.3 LUFS.
+        assert!(short > -20.8 && short < -19.8, "{short}");
         // Silence and too-short audio have no loudness.
         assert!(loudness(&tone(10.0, 44100, 0.0)).is_infinite());
         assert!(loudness(&tone(0.2, 48000, 0.1)).is_infinite());

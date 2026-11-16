@@ -121,7 +121,11 @@ fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
             let rel = e.path().strip_prefix(root).unwrap().to_string_lossy().to_string();
-            if rel.starts_with(".PrepDeck") {
+            // PrepDeck's own folder: only the files a rollback must restore are compared.
+            if rel.starts_with(".PrepDeck") && rel != ".PrepDeck/device.json" && rel != ".PrepDeck/cues.json" && !rel.starts_with(".PrepDeck/journal") && e.path().is_file() {
+                continue;
+            }
+            if rel.starts_with(".PrepDeck/backup") || rel.starts_with(".PrepDeck/journal") {
                 continue;
             }
             if e.path().is_dir() {

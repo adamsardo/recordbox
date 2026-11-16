@@ -341,7 +341,7 @@ mod vocal_bench {
         let pairs = std::fs::read_to_string(std::env::var("PREPDECK_ANLZ_PAIRS").unwrap()).unwrap();
         let n: usize = std::env::var("PREPDECK_VOCAL_N").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
         let mut out = std::fs::File::create(std::env::var("PREPDECK_VOCAL_OUT").unwrap()).unwrap();
-        writeln!(out, "track\tframe\tvocal_db\tmix_db\tlevel").unwrap();
+        writeln!(out, "track\tframe\tvocal_db\tmix_db\tlevel\tvocal_hp_db").unwrap();
         // Spread over the list (every k-th pair).
         let lines: Vec<&str> = pairs.lines().collect();
         let step = (lines.len() / n).max(1);
@@ -353,6 +353,19 @@ mod vocal_bench {
             let t0 = std::time::Instant::now();
             let voc = super::separate_vocals(&dec.samples, dec.sr, &mut |_| true).unwrap();
             let mix = super::resample_to_44k(&dec.samples, dec.sr);
+            // Vocal stem high-passed at ~200 Hz (one-pole, twice) to drop bass/kick bleed.
+            let a = (1.0 / (1.0 + 2.0 * std::f32::consts::PI * 200.0 / 44100.0)) as f32;
+            let hp = |x: &[f32]| {
+                let mut y = vec![0f32; x.len()];
+                let (mut px, mut py) = (0f32, 0f32);
+                for (i, v) in x.iter().enumerate() {
+                    py = a * (py + v - px);
+                    px = *v;
+                    y[i] = py;
+                }
+                y
+            };
+            let voc_hp = hp(&hp(&voc));
             let hop = (pv.0 * 44100.0).round() as usize;
             for (f, lvl) in pv.1.iter().enumerate() {
                 let a = f * hop;
@@ -361,7 +374,8 @@ mod vocal_bench {
                 }
                 let e_v: f32 = voc[a..a + hop].iter().map(|x| x * x).sum::<f32>() / hop as f32;
                 let e_m: f32 = (a..a + hop).map(|i| 0.25 * (mix[2 * i] + mix[2 * i + 1]).powi(2)).sum::<f32>() / hop as f32;
-                writeln!(out, "{ti}\t{f}\t{:.2}\t{:.2}\t{lvl}", 10.0 * (e_v + 1e-10).log10(), 10.0 * (e_m + 1e-10).log10()).unwrap();
+                let e_h: f32 = voc_hp[a..a + hop].iter().map(|x| x * x).sum::<f32>() / hop as f32;
+                writeln!(out, "{ti}\t{f}\t{:.2}\t{:.2}\t{lvl}\t{:.2}", 10.0 * (e_v + 1e-10).log10(), 10.0 * (e_m + 1e-10).log10(), 10.0 * (e_h + 1e-10).log10()).unwrap();
             }
             eprintln!("{ti}: {} in {:.1}s", path.rsplit('/').next().unwrap_or(""), t0.elapsed().as_secs_f32());
         }

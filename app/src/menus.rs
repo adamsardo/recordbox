@@ -205,14 +205,7 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "analyze" => app.reanalyze(&sel),
-        "analyze_key" => {
-            for id in &sel {
-                if let Some(t) = app.track_mut(*id) {
-                    t.key = -1;
-                }
-            }
-            app.analyze(&sel, true);
-        }
+        "analyze_key" => app.analyze_key_tracks(&sel),
         "analysis_lock" => {
             let locked = sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));
             for id in &sel {

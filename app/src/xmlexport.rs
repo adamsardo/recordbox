@@ -5,7 +5,9 @@ use crate::app::App;
 use crate::model::*;
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    // Newlines and tabs as character references: XML parsers turn literal ones in attribute
+    // values into spaces.
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "&#10;").replace('\r', "&#13;").replace('\t', "&#9;")
 }
 
 fn location(path: &str) -> String {

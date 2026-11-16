@@ -40,6 +40,7 @@ impl eframe::App for Gui {
         app.poll_stems();
         app.poll_phrases();
         app.poll_vocal();
+        app.poll_key_job();
         menus::poll(app);
         shortcuts(app, ctx);
 

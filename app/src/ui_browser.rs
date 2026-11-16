@@ -903,6 +903,24 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 app.dialogs.export_root = Some(r2.clone());
                 ui.close_menu();
             }
+            if ui.button("Clean Up Unused Files…").on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
+                let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
+                match dev {
+                    Some((name, _)) if crate::export::usb::has_onelibrary(std::path::Path::new(&r2)) => {
+                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which PrepDeck can't read yet, so it can't tell which files are unused."));
+                    }
+                    Some((name, Some(lib))) => {
+                        let files = crate::export::usb::unused_files(std::path::Path::new(&r2), &lib);
+                        if files.is_empty() {
+                            app.toast(format!("{name} has no unused files."));
+                        } else {
+                            app.dialogs.device_cleanup = Some((r2.clone(), name, files));
+                        }
+                    }
+                    _ => app.toast_err("This device has no library to compare with."),
+                }
+                ui.close_menu();
+            }
             if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from PrepDeck.").clicked() {
                 app.check_player_cue_edits(&r2, true);
                 ui.close_menu();
@@ -2248,12 +2266,7 @@ pub fn track_menu_items(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         ui.close_menu();
     }
     if ui.button(if one { "Analyze Key" } else { "Analyze Keys" }).clicked() {
-        for id in sel {
-            if let Some(t) = app.track_mut(*id) {
-                t.key = -1;
-            }
-        }
-        app.analyze(sel, true);
+        app.analyze_key_tracks(sel);
         ui.close_menu();
     }
     let locked = sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));

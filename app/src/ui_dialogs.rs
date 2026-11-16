@@ -251,8 +251,8 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             card(ui, "Track Analysis Setting", |ui| {
                                 ui.checkbox(&mut app.prefs.analyze_grid, RichText::new("BPM / Grid").size(14.0));
                                 ui.checkbox(&mut app.prefs.analyze_key, RichText::new("KEY").size(14.0));
-                                ui.checkbox(&mut app.prefs.vocal_analysis, RichText::new("Vocal").size(14.0)).on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
                                 ui.checkbox(&mut app.prefs.phrase_analysis, RichText::new("Phrase").size(14.0)).on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
+                                ui.checkbox(&mut app.prefs.vocal_analysis, RichText::new("Vocal").size(14.0)).on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
                                 ui.label(RichText::new("If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.").size(11.0).color(DIM));
                             });
                             card(ui, "Auto Analysis", |ui| {
@@ -921,9 +921,13 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             ui.label(RichText::new(if del { "Its tracks that are in no other playlist are also deleted from the device." } else { "Tracks stay on the device (change this in Preferences > DJ System)." }).size(11.0).color(DIM));
             ui.horizontal(|ui| {
                 if ui.button("Delete").clicked() {
-                    match crate::export::usb::remove_node(std::path::Path::new(&root), id, del) {
-                        Ok(_) => app.toast(format!("Deleted \"{name}\" from the device")),
-                        Err(e) => app.toast_err(format!("Could not change the device: {e}")),
+                    if app.export_job.is_some() {
+                        app.toast_err("Wait for the export to finish before changing the device.");
+                    } else {
+                        match crate::export::usb::remove_node(std::path::Path::new(&root), id, del) {
+                            Ok(_) => app.toast(format!("Deleted \"{name}\" from the device")),
+                            Err(e) => app.toast_err(format!("Could not change the device: {e}")),
+                        }
                     }
                     app.dialogs.device_remove = None;
                     app.scan_devices();
@@ -934,6 +938,49 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 }
             });
         });
+    }
+    if let Some((root, name, files)) = app.dialogs.device_cleanup.clone() {
+        let mut close = false;
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        egui::Window::new("Clean Up Unused Files").collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
+            ui.label(format!("{} file(s) on {name} ({:.1} MB) are not used by any track in its library.", files.len(), total as f64 / 1e6));
+            ui.label(RichText::new("They were left by deleted playlists, other programs or copies made by hand. Deleting them cannot be undone.").size(11.0).color(DIM));
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                for (p, sz) in files.iter().take(500) {
+                    let rel = p.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()).unwrap_or_default();
+                    ui.label(RichText::new(format!("{rel}  ({:.1} MB)", *sz as f64 / 1e6)).size(11.0));
+                }
+                if files.len() > 500 {
+                    ui.label(RichText::new(format!("… and {} more", files.len() - 500)).size(11.0).color(DIM));
+                }
+            });
+            ui.horizontal(|ui| {
+                let confirm_id = egui::Id::new("cleanup_confirm");
+                let armed: bool = ui.ctx().data(|d| d.get_temp(confirm_id)).unwrap_or(false);
+                let label = if armed { format!("Click again to delete {} file(s)", files.len()) } else { format!("Delete {} File(s)", files.len()) };
+                if ui.button(label).clicked() {
+                    if armed && app.export_job.is_some() {
+                        app.toast_err("Wait for the export to finish before changing the device.");
+                    } else if armed {
+                        let paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.0.clone()).collect();
+                        match crate::export::usb::delete_unused(std::path::Path::new(&root), &paths) {
+                            Ok(n) => app.toast(format!("Deleted {n} unused file(s) from {name}.")),
+                            Err(e) => app.toast_err(format!("Could not clean up the device: {e}")),
+                        }
+                        close = true;
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(confirm_id, !armed));
+                }
+                if ui.button("Cancel").clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("cleanup_confirm"), false));
+                    close = true;
+                }
+            });
+        });
+        if close {
+            app.dialogs.device_cleanup = None;
+            app.scan_devices();
+        }
     }
     if app.dialogs.trash.is_some() {
         let mut open = true;
