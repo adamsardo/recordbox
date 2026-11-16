@@ -282,6 +282,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             });
                             card(ui, "Auto Gain", |ui| {
                                 ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));
+                                toggle(ui, &mut app.prefs.auto_gain_peak_cap, "Limit gain so the loudest peak stays below full scale");
                                 ui.label(RichText::new("Used for the preview player's gain and stored per track when analysing.").size(11.0).color(DIM));
                             });
                             if ui.button("Re-analyze all tracks now").clicked() {

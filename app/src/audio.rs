@@ -16,6 +16,10 @@ pub struct Decoded {
     pub samples: Vec<f32>,
     /// Length in sample frames of the file's full (untrimmed) decode.
     pub raw_frames: usize,
+    /// Packets that could not be decoded and were skipped (damaged file).
+    pub damaged: usize,
+    /// The file ends more than a second before the length its header declares (cut short).
+    pub truncated: bool,
 }
 
 impl Decoded {
@@ -107,10 +111,13 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     let track_id = track.id;
     let mut sr = track.codec_params.sample_rate.unwrap_or(44100);
     let mut out: Vec<f32> = Vec::new();
+    let declared_frames = track.codec_params.n_frames;
+    let time_base = track.codec_params.time_base;
     if let Some(n) = track.codec_params.n_frames {
         out.reserve((n as usize).min(60 * 60 * 48000) * 2);
     }
     let mut sbuf: Option<SampleBuffer<f32>> = None;
+    let mut damaged = 0usize;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -123,7 +130,13 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
         }
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
-            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => {
+                // Silence for the packet's length, so everything after stays where it belongs.
+                damaged += 1;
+                let n = (packet.dur as usize).min(1 << 20);
+                out.extend(std::iter::repeat(0.0f32).take(n * 2));
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         let spec = *decoded.spec();
@@ -140,14 +153,60 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
                 out.push(*v);
                 out.push(*v);
             }
-        } else {
-            for f in s.chunks_exact(ch) {
+        } else if ch == 2 {
+            for f in s.chunks_exact(2) {
                 out.push(f[0]);
                 out.push(f[1]);
             }
+        } else {
+            // More than two channels: a standard stereo downmix by channel position (centre and
+            // surrounds at -3 dB, LFE left out) instead of keeping only the first two.
+            use symphonia::core::audio::Channels;
+            let g = std::f32::consts::FRAC_1_SQRT_2;
+            let w: Vec<(f32, f32)> = spec
+                .channels
+                .iter()
+                .map(|c| {
+                    if c == Channels::FRONT_LEFT {
+                        (1.0, 0.0)
+                    } else if c == Channels::FRONT_RIGHT {
+                        (0.0, 1.0)
+                    } else if c == Channels::FRONT_CENTRE {
+                        (g, g)
+                    } else if c == Channels::LFE1 || c == Channels::LFE2 {
+                        (0.0, 0.0)
+                    } else if c == Channels::REAR_LEFT || c == Channels::SIDE_LEFT || c == Channels::FRONT_LEFT_CENTRE || c == Channels::REAR_LEFT_CENTRE {
+                        (g, 0.0)
+                    } else if c == Channels::REAR_RIGHT || c == Channels::SIDE_RIGHT || c == Channels::FRONT_RIGHT_CENTRE || c == Channels::REAR_RIGHT_CENTRE {
+                        (0.0, g)
+                    } else {
+                        (0.5 * g, 0.5 * g)
+                    }
+                })
+                .collect();
+            for f in s.chunks_exact(ch) {
+                let (mut l, mut r) = (0f32, 0f32);
+                for (v, (wl, wr)) in f.iter().zip(&w) {
+                    l += v * wl;
+                    r += v * wr;
+                }
+                out.push(l);
+                out.push(r);
+            }
         }
     }
-    let mut raw_frames = out.len() / 2;
+    let decoded_frames = out.len() / 2;
+    // Compared in seconds: some containers (MP4) count the declared length in their own time
+    // units rather than sample frames.
+    let declared_secs = declared_frames.map(|n| match time_base {
+        Some(tb) => {
+            let t = tb.calc_time(n);
+            t.seconds as f64 + t.frac
+        }
+        None => n as f64 / sr.max(1) as f64,
+    });
+    let truncated = declared_secs.map(|d| decoded_frames as f64 / sr.max(1) as f64 + 1.0 < d).unwrap_or(false);
+    let mut raw_frames = decoded_frames;
     if class == Mp3Timing::Ffmpeg {
         raw_frames += track.codec_params.delay.unwrap_or(0) as usize + track.codec_params.padding.unwrap_or(0) as usize;
     }
@@ -158,7 +217,7 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     if out.is_empty() {
         return Err(anyhow!("no audio decoded"));
     }
-    Ok(Decoded { sr, samples: out, raw_frames })
+    Ok(Decoded { sr, samples: out, raw_frames, damaged, truncated })
 }
 
 /// Shared playback state read by the audio callback.
@@ -315,6 +374,15 @@ impl Player {
     }
 }
 
+/// Catmull-Rom interpolation between y1 (t = 0) and y2 (t = 1).
+#[inline]
+fn cubic(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+    let a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    let b = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let c = -0.5 * y0 + 0.5 * y2;
+    ((a * t + b) * t + c) * t + y1
+}
+
 fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate: u32) {
     for v in out.iter_mut() {
         *v = 0.0;
@@ -331,6 +399,7 @@ fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate:
     let stems = if s.stem_on.iter().all(|x| *x) { None } else { s.stems.clone() };
     let stem_on = s.stem_on;
     let stem_ratio = crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64;
+    let metro = s.metronome.clone();
     for f in out.chunks_mut(channels) {
         if let Some((a, b)) = s.loop_range {
             let bf = b * audio.sr as f64;
@@ -353,20 +422,34 @@ fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate:
                 let si = (sp as usize).min(st.len - 2);
                 let sf = (sp - si as f64) as f32;
                 let (mut l, mut r) = (0.0f32, 0.0f32);
+                let n = st.len as isize;
                 for (src, on) in stem_on.iter().enumerate() {
                     if *on {
                         let lb = src * 2 * st.len;
                         let rb = lb + st.len;
-                        l += st.data[lb + si] * (1.0 - sf) + st.data[lb + si + 1] * sf;
-                        r += st.data[rb + si] * (1.0 - sf) + st.data[rb + si + 1] * sf;
+                        let at = |base: usize, k: isize| st.data[base + k.clamp(0, n - 1) as usize];
+                        let k = si as isize;
+                        l += cubic(at(lb, k - 1), at(lb, k), at(lb, k + 1), at(lb, k + 2), sf);
+                        r += cubic(at(rb, k - 1), at(rb, k), at(rb, k + 1), at(rb, k + 2), sf);
                     }
                 }
                 (l, r)
             }
-            _ => (audio.samples[i * 2] * (1.0 - fr) + audio.samples[i * 2 + 2] * fr, audio.samples[i * 2 + 1] * (1.0 - fr) + audio.samples[i * 2 + 3] * fr),
+            // 4-point cubic (Catmull-Rom) between frames: exact at whole positions, far less
+            // high-frequency loss than linear interpolation when the file's rate differs from
+            // the device's (e.g. 44.1 kHz files on a 48 kHz output).
+            _ => {
+                let at = |k: isize, c: usize| audio.samples[(k.clamp(0, frames as isize - 1) as usize) * 2 + c];
+                let ii = i as isize;
+                (cubic(at(ii - 1, 0), at(ii, 0), at(ii + 1, 0), at(ii + 2, 0), fr), cubic(at(ii - 1, 1), at(ii, 1), at(ii + 1, 1), at(ii + 2, 1), fr))
+            }
         };
         let mut click = 0.0f32;
-        if let Some(beats) = s.metronome.clone() {
+        if let Some(beats) = metro.as_ref() {
+            // The beat list can be replaced by a shorter one (another track, a grid edit).
+            if s.next_click > beats.len() {
+                s.next_click = 0;
+            }
             let t = p / audio.sr as f64;
             while s.next_click < beats.len() && beats[s.next_click] < t - 0.05 {
                 s.next_click += 1;
@@ -436,5 +519,38 @@ mod device_probe {
         let t = std::time::Instant::now();
         let d = super::Player::output_devices_within(std::time::Duration::from_secs(5));
         eprintln!("devices after {:?}: {d:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod damaged_probe {
+    /// Decode a file given in PREPDECK_DAMAGED and report skipped packets. --ignored.
+    #[test]
+    #[ignore]
+    fn reports_damaged_packets() {
+        let Ok(p) = std::env::var("PREPDECK_DAMAGED") else { return };
+        let d = super::decode_file(&p).unwrap();
+        println!("damaged packets: {}, truncated {}, duration {:.1}s", d.damaged, d.truncated, d.duration());
+        let (l, r) = d.samples.chunks_exact(2).fold((0f32, 0f32), |a, f| (a.0.max(f[0].abs()), a.1.max(f[1].abs())));
+        println!("peak left {l:.3}, right {r:.3}");
+    }
+}
+
+#[cfg(test)]
+mod interp_tests {
+    #[test]
+    fn cubic_is_exact_at_frames_and_better_than_linear() {
+        assert_eq!(super::cubic(0.1, 0.2, 0.7, 0.4, 0.0), 0.2);
+        assert!((super::cubic(0.1, 0.2, 0.7, 0.4, 1.0) - 0.7).abs() < 1e-6);
+        // A 10 kHz sine sampled at 44.1 kHz, read halfway between samples.
+        let f = |n: f64| (2.0 * std::f64::consts::PI * 10_000.0 * n / 44_100.0).sin() as f32;
+        let (mut e_lin, mut e_cub) = (0f32, 0f32);
+        for k in 1..400 {
+            let n = k as f64;
+            let truth = f(n + 0.5);
+            e_lin += (0.5 * (f(n) + f(n + 1.0)) - truth).abs();
+            e_cub += (super::cubic(f(n - 1.0), f(n), f(n + 1.0), f(n + 2.0), 0.5) - truth).abs();
+        }
+        assert!(e_cub < e_lin * 0.6, "cubic {e_cub} vs linear {e_lin}");
     }
 }

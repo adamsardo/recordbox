@@ -224,3 +224,41 @@ fn recover_given_drive() {
     let lib = read_device(std::path::Path::new(&p)).unwrap();
     println!("tracks {}, playlists {:?}", lib.tracks.len(), lib.nodes.iter().map(|n| (n.name.clone(), n.entries.len())).collect::<Vec<_>>());
 }
+
+/// A track whose file is missing on this computer keeps its entry in the drive's playlist on
+/// re-export when the drive still has its copy (it is not dropped from the playlist).
+#[test]
+fn missing_local_file_keeps_drive_copy_in_playlists() {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("export_test");
+    let work = base.join(format!("missing_{}", chrono::Local::now().format("%H%M%S%3f")));
+    let src = work.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Own copies of two demo files, so one can be removed.
+    let mut tracks = demo_tracks(&base.join("src"), 2);
+    for et in tracks.values_mut() {
+        let to = src.join(std::path::Path::new(&et.track.path).file_name().unwrap());
+        std::fs::copy(&et.track.path, &to).unwrap();
+        et.track.path = to.to_string_lossy().to_string();
+    }
+    let root = work.join("usb");
+    std::fs::create_dir_all(&root).unwrap();
+    let req = |tracks: &HashMap<i64, ExportTrack>| ExportRequest {
+        root: root.clone(),
+        nodes: vec![ExportNode { name: "Set".into(), folder: false, children: vec![], tracks: vec![1, 2] }],
+        tracks: tracks.clone(),
+        tag_categories: vec![],
+        skipped: vec![],
+        analysis: Default::default(),
+        settings: Default::default(),
+        browse: Default::default(),
+        phrases: false,
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    run_export(req(&tracks), &|_| {}, &cancel).unwrap();
+    std::fs::remove_file(&tracks[&1].track.path).unwrap();
+    let msg = run_export(req(&tracks), &|_| {}, &cancel).unwrap();
+    assert!(!msg.contains("not exported"), "{msg}");
+    let lib = read_device(&root).unwrap();
+    assert_eq!(lib.nodes.iter().find(|n| n.name == "Set").unwrap().entries.len(), 2);
+    let _ = std::fs::remove_dir_all(&work);
+}

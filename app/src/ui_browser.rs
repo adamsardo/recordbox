@@ -2352,12 +2352,7 @@ pub fn track_menu_items(app: &mut App, ui: &mut Ui, sel: &[i64]) {
     }
     if one && ui.button("Relocate…").on_hover_text("Point this track to a moved file").clicked() {
         if let Some(f) = rfd::FileDialog::new().pick_file() {
-            let p = f.to_string_lossy().to_string();
-            if let Some(t) = app.track_mut(sel[0]) {
-                t.path = p;
-                t.missing = false;
-            }
-            app.save_track(sel[0]);
+            app.relocate_track(sel[0], &f.to_string_lossy());
         }
         ui.close_menu();
     }

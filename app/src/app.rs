@@ -212,6 +212,8 @@ pub struct Prefs {
     pub keymap: std::collections::BTreeMap<String, String>,
     /// Column browser (Genre / Artist / Album) above the track list.
     pub column_browser: bool,
+    /// Auto gain never lifts a track's measured peak to full scale (rekordbox's optional cap).
+    pub auto_gain_peak_cap: bool,
     /// Quantize resolution: 1 = whole beats, 2 = half, 4 = quarter, 8 = eighth beats.
     pub quantize_div: u8,
     /// CUE Analysis: hot cue A ("1.1Bars") on the first downbeat when a track is first analysed.
@@ -541,6 +543,7 @@ impl Default for Prefs {
             stem_parts: 4,
             auto_first_downbeat_cue: true,
             quantize_div: 1,
+            auto_gain_peak_cap: false,
             other: Default::default(),
             sub_browser: false,
             browse_font: 0,
@@ -831,6 +834,8 @@ pub struct App {
     pub key_job: Option<(Receiver<(i64, i32)>, usize, usize)>,
     /// Last attempt to reopen a lost audio device, and whether the loss was reported.
     pub audio_retry: Option<(Instant, bool)>,
+    /// Folder scan for Relocate Missing Files: file names (folded) to paths.
+    pub relocate_rx: Option<Receiver<HashMap<String, Vec<std::path::PathBuf>>>>,
     /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
     pub key_requested: HashSet<i64>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
@@ -933,6 +938,7 @@ impl App {
             key_job: None,
             vocal_failed: HashSet::new(),
             key_requested: HashSet::new(),
+            relocate_rx: None,
             audio_retry: None,
             dialogs: Dialogs::default(),
             toasts: vec![],
@@ -1122,6 +1128,24 @@ impl App {
                         while app.export_job.is_some() && t0.elapsed() < std::time::Duration::from_secs(120) {
                             app.poll_export();
                             std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
+                    "relocate" => {
+                        // Check of Relocate Missing Files: move one track's file into a subfolder of
+                        // PREPDECK_SHOT_MOVED, then search that folder.
+                        let dest = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_MOVED").unwrap_or_default());
+                        if let Some(t) = app.tracks.iter().find(|t| !t.missing).cloned() {
+                            let to = dest.join("nested").join(std::path::Path::new(&t.path).file_name().unwrap());
+                            let _ = std::fs::create_dir_all(to.parent().unwrap());
+                            if std::fs::rename(&t.path, &to).is_ok() {
+                                app.reload_tracks();
+                                app.relocate_missing(&dest);
+                                let t0 = std::time::Instant::now();
+                                while app.relocate_rx.is_some() && t0.elapsed() < std::time::Duration::from_secs(30) {
+                                    app.poll_relocate();
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                }
+                            }
                         }
                     }
                     "subbrowser" => {
@@ -2577,6 +2601,7 @@ impl App {
                 t.sample_rate = res.sample_rate;
                 t.raw_samples = res.raw_samples;
                 t.gain_db = res.gain_db;
+                let measured_peak = res.peak;
                 // A locked grid, or one that came with an imported library, is kept as it is.
                 let keep_grid = t.grid_locked || existing_grid.is_some();
                 // A key the user set (or one from an imported library) is only replaced when the
@@ -2601,6 +2626,9 @@ impl App {
                 }
                 if let Ok(m) = std::fs::metadata(&t.path) {
                     let _ = self.db.set_media_stamp(id, media_stamp(&m));
+                }
+                if measured_peak > 0.0 {
+                    let _ = self.db.set_peak(id, measured_peak);
                 }
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
@@ -2694,7 +2722,17 @@ impl App {
             s.pos = 0.0;
             s.loop_range = None;
             s.metronome = None;
-            s.gain = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
+            let mut g = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
+            // rekordbox's optional peak cap (traced): when gain × peak reaches 1, the gain becomes
+            // 0.9999998807907104 / peak.
+            if self.prefs.auto_gain_peak_cap {
+                if let Some(pk) = self.db.peak(t.id).filter(|p| *p > 0.0) {
+                    if g * pk >= 1.0 {
+                        g = 0.999_999_88 / pk;
+                    }
+                }
+            }
+            s.gain = g;
             keep
         };
         let ctrl = self.deck.ctrl_tab;
@@ -2737,6 +2775,11 @@ impl App {
             match r {
                 Ok(a) => {
                     self.deck_backup = None;
+                    if a.damaged > 0 {
+                        self.toast_err(format!("This file is damaged: {} part(s) could not be decoded and are silent or skipped.", a.damaged));
+                    } else if a.truncated {
+                        self.toast_err("This file is incomplete: it ends before the length its header declares (cut short when copied or downloaded?).");
+                    }
                     self.deck.duration = a.duration();
                     let cp = self.deck.cue_point;
                     let mut s = self.player.state.lock();
@@ -3709,22 +3752,123 @@ impl App {
             out.reverse();
             (out, top)
         };
-        let mut tops: Vec<i64> = vec![];
+        // Only the matched playlists, each under copies of its folders, so the drive's
+        // structure is kept and nothing new is added.
+        fn insert(tree: &mut Vec<crate::export::usb::ExportNode>, path: &[String], tracks: Vec<i64>) {
+            if path.len() == 1 {
+                tree.push(crate::export::usb::ExportNode { name: path[0].clone(), folder: false, children: vec![], tracks });
+                return;
+            }
+            let i = match tree.iter().position(|n| n.folder && n.name == path[0]) {
+                Some(i) => i,
+                None => {
+                    tree.push(crate::export::usb::ExportNode { name: path[0].clone(), folder: true, children: vec![], tracks: vec![] });
+                    tree.len() - 1
+                }
+            };
+            insert(&mut tree[i].children, &path[1..], tracks);
+        }
+        let mut tree: Vec<crate::export::usb::ExportNode> = vec![];
         let mut matched = 0;
-        for n in self.nodes.iter().filter(|n| n.kind != NodeKind::Folder) {
-            let (path, top) = lib_path(self, n.id);
+        let playlists: Vec<(i64, NodeKind, Option<crate::smart::SmartRule>)> = self.nodes.iter().filter(|n| n.kind != NodeKind::Folder).map(|n| (n.id, n.kind.clone(), n.smart.clone())).collect();
+        for (id, kind, smart) in playlists {
+            let (path, _) = lib_path(self, id);
             if on_drive.contains(&path) {
                 matched += 1;
-                if !tops.contains(&top) {
-                    tops.push(top);
-                }
+                let tracks = if kind == NodeKind::Smart { smart.as_ref().map(|r| self.smart_tracks(r)).unwrap_or_default() } else { self.db.playlist_tracks(id).unwrap_or_default() };
+                insert(&mut tree, &path, tracks);
             }
         }
-        if tops.is_empty() {
+        if tree.is_empty() {
             return self.toast("None of this device's playlists are in your library under the same name.");
         }
         self.toast(format!("Updating {matched} playlist(s) on the device…"));
-        self.start_export(root, &tops, &[]);
+        self.start_export_nodes(root, tree, &[]);
+    }
+
+    /// Point a track at another file. Refused when another track already uses that file.
+    pub fn relocate_track(&mut self, id: i64, path: &str) -> bool {
+        if let Some(other) = self.db.track_by_path(path).filter(|o| *o != id) {
+            let name = self.track(other).map(|t| t.display_title()).unwrap_or_default();
+            self.toast_err(format!("That file already belongs to \"{name}\" in your collection."));
+            return false;
+        }
+        if let Some(t) = self.track_mut(id) {
+            t.path = path.to_string();
+            t.missing = false;
+        }
+        self.save_track(id);
+        true
+    }
+
+    /// File > Relocate Missing Files: look for each missing track's file name under `folder`
+    /// (all subfolders). A unique match is used; several files with that name are narrowed to
+    /// the one with the track's size, else left for the user (reported).
+    pub fn relocate_missing(&mut self, folder: &std::path::Path) {
+        if !self.tracks.iter().any(|t| t.missing) {
+            return self.toast("No tracks are missing.");
+        }
+        if self.relocate_rx.is_some() {
+            return self.toast_err("Already searching for missing files.");
+        }
+        // The folder is scanned off the window's thread (it can be large or on a network).
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let folder = folder.to_path_buf();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let mut by_name: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
+            for e in walkdir::WalkDir::new(&folder).into_iter().flatten() {
+                if e.file_type().is_file() {
+                    if let Some(n) = e.file_name().to_str() {
+                        by_name.entry(crate::smart::fold(n)).or_default().push(e.path().to_path_buf());
+                    }
+                }
+            }
+            let _ = tx.send(by_name);
+            ctx.request_repaint();
+        });
+        self.relocate_rx = Some(rx);
+        self.toast("Searching the folder for the missing files…");
+    }
+
+    pub fn poll_relocate(&mut self) {
+        let Some(rx) = &self.relocate_rx else { return };
+        let Ok(by_name) = rx.try_recv() else { return };
+        self.relocate_rx = None;
+        let missing: Vec<(i64, String, u64)> = self.tracks.iter().filter(|t| t.missing).map(|t| (t.id, t.file_name(), t.file_size)).collect();
+        let (mut moved, mut ambiguous, mut not_found) = (0, 0, 0);
+        for (id, name, size) in missing {
+            let cands = by_name.get(&crate::smart::fold(&name)).cloned().unwrap_or_default();
+            let cands: Vec<std::path::PathBuf> = cands.into_iter().filter(|p| self.db.track_by_path(&p.to_string_lossy()).is_none()).collect();
+            let size_ok = |p: &std::path::PathBuf| size == 0 || std::fs::metadata(p).map(|m| m.len() == size).unwrap_or(false);
+            let pick = match cands.len() {
+                0 => None,
+                // A lone file with that name but another size is a different recording.
+                1 => cands.into_iter().next().filter(|p| size_ok(p)),
+                _ => {
+                    let same: Vec<_> = cands.iter().filter(|p| size > 0 && std::fs::metadata(p).map(|m| m.len() == size).unwrap_or(false)).cloned().collect();
+                    if same.len() == 1 { same.into_iter().next() } else { None }
+                }
+            };
+            match pick {
+                Some(p) => {
+                    if self.relocate_track(id, &p.to_string_lossy()) {
+                        moved += 1;
+                    }
+                }
+                None if by_name.contains_key(&crate::smart::fold(&name)) => ambiguous += 1,
+                None => not_found += 1,
+            }
+        }
+        self.list_dirty = true;
+        let mut msg = format!("Relocated {moved} track(s).");
+        if ambiguous > 0 {
+            msg.push_str(&format!(" {ambiguous} had several files with the same name; relocate those one by one."));
+        }
+        if not_found > 0 {
+            msg.push_str(&format!(" {not_found} were not found in that folder."));
+        }
+        self.toast(msg);
     }
 
     pub fn start_export(&mut self, root: &str, playlist_ids: &[i64], extra_tracks: &[i64]) {
@@ -3765,6 +3909,15 @@ impl App {
                 }
             }
         }
+        self.start_export_nodes(root, nodes, extra_tracks);
+    }
+
+    /// Export a prepared playlist tree (and extra tracks) to the drive at `root`.
+    pub fn start_export_nodes(&mut self, root: &str, nodes: Vec<crate::export::usb::ExportNode>, extra_tracks: &[i64]) {
+        if self.export_job.is_some() {
+            self.toast_err("An export is already running.");
+            return;
+        }
         let mut track_ids: HashSet<i64> = extra_tracks.iter().copied().collect();
         fn collect(n: &crate::export::usb::ExportNode, out: &mut HashSet<i64>) {
             out.extend(n.tracks.iter().copied());
@@ -3784,11 +3937,9 @@ impl App {
         ids.sort();
         for id in &ids {
             let Some(t) = self.track(*id).cloned() else { continue };
-            if t.missing {
-                skipped.push(format!("{} (file not found)", t.display_title()));
-                continue;
-            }
-            if !crate::export::usb::player_supported(&t.file_type) {
+            // A missing track still goes to the export job: if the drive already has its file,
+            // the drive's copy is kept in the playlists; otherwise the job reports it skipped.
+            if !t.missing && !crate::export::usb::player_supported(&t.file_type) {
                 skipped.push(format!("{} (file type not supported by the players)", t.display_title()));
                 continue;
             }

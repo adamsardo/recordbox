@@ -46,6 +46,8 @@ pub struct AnalysisResult {
     pub key: i32,
     pub wave: Waveform,
     pub gain_db: f32,
+    /// Linear sample peak of the measured audio (0 when unavailable).
+    pub peak: f32,
 }
 
 pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> {
@@ -59,10 +61,10 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let wave = waveform(&mono, sr);
     let (bpm, grid) = if s.do_grid { tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max) } else { (0.0, None) };
     let key = if s.do_key { crate::key::detect_key(&mono, sr) } else { -1 };
-    let lufs = loudness(dec);
+    let (lufs, peak) = loudness_and_peak(dec);
     // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
-    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db }
+    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -727,10 +729,16 @@ pub fn detect_key(mono: &[f32], sr: f64) -> i32 {
 /// -70 LUFS, relative gate -10 LU, both inclusive). Negative infinity when there is too
 /// little audio.
 pub fn loudness(dec: &Decoded) -> f64 {
+    loudness_and_peak(dec).0
+}
+
+/// Loudness as [`loudness`] plus the linear sample peak of the same measured (16-bit
+/// truncated, block-sampled) samples, as rekordbox measures both together.
+pub fn loudness_and_peak(dec: &Decoded) -> (f64, f32) {
     let rate = dec.sr as usize;
     let frames = dec.frames();
     if rate == 0 || frames == 0 {
-        return f64::NEG_INFINITY;
+        return (f64::NEG_INFINITY, 0.0);
     }
     let e = frames - 1;
     let d = e / rate;
@@ -748,7 +756,8 @@ pub fn loudness(dec: &Decoded) -> f64 {
         start += n;
         ordinal += 1;
     }
-    r128_integrated(&fed, dec.sr as f64)
+    let peak = fed.iter().fold(0f32, |m, v| m.max(v.abs()));
+    (r128_integrated(&fed, dec.sr as f64), peak)
 }
 
 /// EBU R128 integrated loudness of interleaved stereo (libebur128's non-histogram mode).
@@ -800,7 +809,7 @@ mod loudness_tests {
             let v = amp * (2.0 * std::f32::consts::PI * 997.0 * i as f32 / sr as f32).sin();
             [v, v]
         }).collect();
-        Decoded { sr, samples, raw_frames: n }
+        Decoded { sr, samples, raw_frames: n, damaged: 0, truncated: false }
     }
 
     #[test]
@@ -812,6 +821,9 @@ mod loudness_tests {
         // 997 Hz at amplitude 0.1 in both channels: mean square 0.005 per channel, summed
         // -20 dB, minus 0.691, plus K-weighting's small gain near 1 kHz: about -20.3 LUFS.
         assert!(short > -20.8 && short < -19.8, "{short}");
+        // The sample peak comes with it (16-bit truncated, so just under 0.1).
+        let (_, pk) = loudness_and_peak(&tone(20.0, 44100, 0.1));
+        assert!(pk > 0.0995 && pk <= 0.1, "{pk}");
         // Silence and too-short audio have no loudness.
         assert!(loudness(&tone(10.0, 44100, 0.0)).is_infinite());
         assert!(loudness(&tone(0.2, 48000, 0.1)).is_infinite());
@@ -994,7 +1006,7 @@ mod edge_input_tests {
 
     fn dec(samples: Vec<f32>) -> Decoded {
         let n = samples.len() / 2;
-        Decoded { sr: 44100, samples, raw_frames: n }
+        Decoded { sr: 44100, samples, raw_frames: n, damaged: 0, truncated: false }
     }
 
     /// Silence, a single frame, an impulse and antiphase stereo analyse without panicking and

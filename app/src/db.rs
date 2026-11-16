@@ -85,6 +85,7 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS peaks(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, peak REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS media_stamps(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, size INTEGER NOT NULL, mtime INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS xml_extra(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, json TEXT NOT NULL);
@@ -321,7 +322,16 @@ impl Db {
         })
     }
 
-/// Size and modification time of each audio file when PrepDeck last analysed it.
+/// Sample peak measured with the track's loudness (for the optional auto-gain peak cap).
+    pub fn peak(&self, track: i64) -> Option<f32> {
+        self.conn.query_row("SELECT peak FROM peaks WHERE track_id=?1", [track], |r| r.get::<_, f64>(0)).optional().ok().flatten().map(|v| v as f32)
+    }
+    pub fn set_peak(&self, track: i64, peak: f32) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO peaks(track_id,peak) VALUES(?1,?2)", params![track, peak as f64])?;
+        Ok(())
+    }
+
+    /// Size and modification time of each audio file when PrepDeck last analysed it.
     pub fn media_stamps(&self) -> std::collections::HashMap<i64, (i64, i64)> {
         let mut m = std::collections::HashMap::new();
         if let Ok(mut st) = self.conn.prepare("SELECT track_id, size, mtime FROM media_stamps") {

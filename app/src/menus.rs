@@ -35,6 +35,7 @@ pub fn build() -> Option<Menu> {
         &item("export_xml", "Export Collection in xml format…", None),
         &PredefinedMenuItem::separator(),
         &item("missing", "Display All Missing Files", None),
+        &item("relocate_missing", "Relocate Missing Files…", None),
         &item("backup", "Backup Library…", None),
         &item("library_folder", "Show Library Folder in Finder", None),
     ])
@@ -120,6 +121,11 @@ pub fn handle(app: &mut App, id: &str) {
         "about" => app.dialogs.about = true,
         "undo" => app.undo_edit(),
         "trash" => app.dialogs.trash = Some(Default::default()),
+        "relocate_missing" => {
+            if let Some(d) = rfd::FileDialog::new().set_title("Folder to search for the missing files").pick_folder() {
+                app.relocate_missing(&d);
+            }
+        }
         "redo" => app.redo_edit(),
         "prefs" => app.dialogs.prefs_open = true,
         "import_track" => {

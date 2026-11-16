@@ -952,7 +952,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
 
     // Tracks without analysis are analysed first (as the original does when exporting),
     // here on the export thread so the window stays responsive.
-    let needs: Vec<i64> = req.tracks.values().filter(|t| t.wave.is_none() || t.grid.is_none()).map(|t| t.track.id).collect();
+    // (Tracks whose file is missing are not analysed: they can only keep a copy already on the drive.)
+    let needs: Vec<i64> = req.tracks.values().filter(|t| (t.wave.is_none() || t.grid.is_none()) && Path::new(&t.track.path).exists()).map(|t| t.track.id).collect();
     let n_needs = needs.len();
     for (i, id) in needs.into_iter().enumerate() {
         if cancel.load(Relaxed) {
@@ -1036,7 +1037,15 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         progress(Progress::Step { done: i, total, text: format!("Transferring {}", t.display_title()) });
         let src = Path::new(&t.path);
         if !src.exists() {
-            skipped.push(format!("{} (file not found)", t.display_title()));
+            // Missing here, but the drive may still hold its copy: keep that in the playlists
+            // (the drive's row, file and analysis stay as they are).
+            let on_drive = lib.tracks.values().find(|d| d.source == t.path && root.join(d.file_path.trim_start_matches('/')).exists()).map(|d| d.id);
+            match on_drive {
+                Some(dev_id) => {
+                    map.insert(t.id, dev_id);
+                }
+                None => skipped.push(format!("{} (file not found)", t.display_title())),
+            }
             continue;
         }
         let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();

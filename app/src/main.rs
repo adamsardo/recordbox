@@ -42,6 +42,7 @@ impl eframe::App for Gui {
         app.poll_vocal();
         app.poll_key_job();
         app.poll_audio_device();
+        app.poll_relocate();
         menus::poll(app);
         shortcuts(app, ctx);
 
