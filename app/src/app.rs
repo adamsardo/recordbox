@@ -1094,6 +1094,36 @@ impl App {
                             app.check_player_cue_edits(&r, true);
                         }
                     }
+                    "updatedevice" => {
+                        // Check of Update Playlists on This Device: the drive has "Update Check"
+                        // with one track; the library's "Update Check" has three.
+                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("prepdeck_shot_update").to_string_lossy().to_string()));
+                        let _ = std::fs::remove_dir_all(&root);
+                        let _ = std::fs::create_dir_all(&root);
+                        let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && t.analyzed == 1).take(3).map(|t| t.id).collect();
+                        let pl = app.nodes.iter().find(|n| n.name == "Update Check").map(|n| n.id).unwrap_or_else(|| app.db.create_node(0, "Update Check", NodeKind::Playlist, None).unwrap_or(0));
+                        let _ = app.db.set_playlist_tracks(pl, &ids);
+                        app.reload_playlists();
+                        let mut tracks = HashMap::new();
+                        if let Some(t) = ids.first().and_then(|id| app.track(*id).cloned()) {
+                            tracks.insert(t.id, crate::export::usb::ExportTrack { cues: vec![], grid: app.db.grid(t.id), wave: app.db.wave(t.id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+                        }
+                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { name: "Update Check".into(), folder: false, children: vec![], tracks: ids[..1].to_vec() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false };
+                        let cancel = std::sync::atomic::AtomicBool::new(false);
+                        let _ = crate::export::usb::run_export(req, &|_| {}, &cancel);
+                        let r = root.to_string_lossy().to_string();
+                        if !app.prefs.devices_extra.contains(&r) {
+                            app.prefs.devices_extra.push(r.clone());
+                        }
+                        app.scan_devices();
+                        app.update_device_playlists(&r);
+                        // Let the export finish before the screenshot (the app exits after it).
+                        let t0 = std::time::Instant::now();
+                        while app.export_job.is_some() && t0.elapsed() < std::time::Duration::from_secs(120) {
+                            app.poll_export();
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
                     "subbrowser" => {
                         app.prefs.sub_browser = true;
                         // The largest playlist.
@@ -1688,10 +1718,10 @@ impl App {
         if !stems_ok || self.key_job.is_some() {
             // Ordinary analysis with key detection on whatever the preference says; the key is
             // replaced only when detection succeeds (the old one stays otherwise).
-            for id in ids {
-                self.key_requested.insert(*id);
-            }
-            self.analyze_forcing_key(ids);
+            // Only tracks actually submitted get the request (missing or already queued ones
+            // would otherwise carry it to some later, unrelated analysis).
+            let submitted = self.analyze_forcing_key(ids);
+            self.key_requested.extend(submitted);
             return;
         }
         let jobs: Vec<(i64, String)> = ids.iter().filter_map(|id| self.track(*id).filter(|t| !t.missing).map(|t| (t.id, t.path.clone()))).collect();
@@ -2479,10 +2509,10 @@ impl App {
 
     // ------------------------------------------------------------------ analysis
     /// Re-analyse with key detection on, whatever Preferences > Analysis says.
-    pub fn analyze_forcing_key(&mut self, ids: &[i64]) {
+    pub fn analyze_forcing_key(&mut self, ids: &[i64]) -> Vec<i64> {
         let mut s = self.analysis_settings();
         s.do_key = true;
-        self.analyze_with(ids, true, s);
+        self.analyze_with(ids, true, s)
     }
 
     pub fn analyze(&mut self, ids: &[i64], force: bool) {
@@ -2490,7 +2520,9 @@ impl App {
         self.analyze_with(ids, force, s);
     }
 
-    fn analyze_with(&mut self, ids: &[i64], force: bool, s: crate::analysis::AnalysisSettings) {
+    /// Queue analysis jobs; returns the tracks actually submitted.
+    fn analyze_with(&mut self, ids: &[i64], force: bool, s: crate::analysis::AnalysisSettings) -> Vec<i64> {
+        let mut submitted = vec![];
         let mut n = 0;
         for id in ids {
             let Some(t) = self.track_mut(*id) else { continue };
@@ -2502,10 +2534,12 @@ impl App {
             t.analyzed = 3;
             let path = t.path.clone();
             n += 1;
+            submitted.push(*id);
             self.pool.submit(AnalysisJob { track_id: *id, path, settings: s.clone() });
         }
         self.analysis_total += n;
         self.list_dirty = true;
+        submitted
     }
 
     pub fn poll_analysis(&mut self) {
@@ -3562,10 +3596,12 @@ impl App {
         let devices: Vec<(String, String, crate::export::usb::DeviceLibrary)> = self.devices.iter().filter_map(|d| d.lib.clone().map(|l| (d.root.clone(), d.name.clone(), l))).collect();
         for (_root, dev_name, lib) in devices {
             for h in &lib.histories {
-                // A history is identified by the drive's name, its own name and the files of its
-                // first entries (default volume names and history names repeat across sticks).
-                let head: Vec<String> = h.entries.iter().take(3).filter_map(|e| lib.tracks.get(e).map(|t| t.file_path.clone())).collect();
-                let key = format!("{dev_name}\u{1f}{}\u{1f}{}", h.name, head.join("\u{1e}"));
+                // A history is identified by the drive's name, its own name and the file of its
+                // first entry (default volume names and history names repeat across sticks).
+                // The first entry's file: fixed from the history's first play on, so the key
+                // stays the same as the history grows.
+                let head = h.entries.first().and_then(|e| lib.tracks.get(e)).map(|t| t.file_path.clone()).unwrap_or_default();
+                let key = format!("{dev_name}\u{1f}{}\u{1f}{head}", h.name);
                 // An earlier version recorded the entries it imported; if they are the start of
                 // this history, only what came after them is new.
                 let legacy_prefix = format!("{dev_name}\u{1f}{}\u{1f}[", h.name);
@@ -3636,6 +3672,59 @@ impl App {
             "apfs" => "APFS (not readable by DJ players)",
             _ => "Folder",
         }
+    }
+
+    /// Device menu > Update Playlists on This Device: export again every playlist that is on the
+    /// drive and in the library (same folder path and name), so the drive catches up with edits.
+    /// Each is exported through its top-level folder, keeping the folder structure.
+    pub fn update_device_playlists(&mut self, root: &str) {
+        if self.export_job.is_some() {
+            return self.toast_err("An export is already running.");
+        }
+        let Some(lib) = self.devices.iter().find(|d| d.root == root).and_then(|d| d.lib.clone()) else {
+            return self.toast_err("This device has no library to update.");
+        };
+        let dev_path = |id: u32| -> Vec<String> {
+            let mut out = vec![];
+            let mut cur = Some(id);
+            while let Some(c) = cur.filter(|c| *c != 0) {
+                let Some(n) = lib.nodes.iter().find(|n| n.id == c) else { break };
+                out.push(n.name.clone());
+                cur = Some(n.parent);
+            }
+            out.reverse();
+            out
+        };
+        let on_drive: HashSet<Vec<String>> = lib.nodes.iter().filter(|n| !n.folder).map(|n| dev_path(n.id)).collect();
+        let lib_path = |app: &App, id: i64| -> (Vec<String>, i64) {
+            let mut out = vec![];
+            let mut top = id;
+            let mut cur = id;
+            while cur != 0 {
+                let Some(n) = app.node(cur) else { break };
+                out.push(n.name.clone());
+                top = n.id;
+                cur = n.parent;
+            }
+            out.reverse();
+            (out, top)
+        };
+        let mut tops: Vec<i64> = vec![];
+        let mut matched = 0;
+        for n in self.nodes.iter().filter(|n| n.kind != NodeKind::Folder) {
+            let (path, top) = lib_path(self, n.id);
+            if on_drive.contains(&path) {
+                matched += 1;
+                if !tops.contains(&top) {
+                    tops.push(top);
+                }
+            }
+        }
+        if tops.is_empty() {
+            return self.toast("None of this device's playlists are in your library under the same name.");
+        }
+        self.toast(format!("Updating {matched} playlist(s) on the device…"));
+        self.start_export(root, &tops, &[]);
     }
 
     pub fn start_export(&mut self, root: &str, playlist_ids: &[i64], extra_tracks: &[i64]) {

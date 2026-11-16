@@ -214,3 +214,13 @@ fn interrupted_export_recovers_to_before_or_after() {
 fn journal_exists(root: &std::path::Path) -> bool {
     root.join(".PrepDeck/journal").exists()
 }
+
+/// Run journal recovery on a drive given in PREPDECK_RECOVER (manual check). --ignored.
+#[test]
+#[ignore]
+fn recover_given_drive() {
+    let Ok(p) = std::env::var("PREPDECK_RECOVER") else { return };
+    println!("{:?}", recover_device(std::path::Path::new(&p)));
+    let lib = read_device(std::path::Path::new(&p)).unwrap();
+    println!("tracks {}, playlists {:?}", lib.tracks.len(), lib.nodes.iter().map(|n| (n.name.clone(), n.entries.len())).collect::<Vec<_>>());
+}

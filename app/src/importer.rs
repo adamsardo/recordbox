@@ -220,6 +220,9 @@ pub fn decode_location(loc: &str) -> String {
 
 pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
     use quick_xml::events::Event;
+    // quick-xml skips a byte-order mark without counting it in its positions; drop it first so
+    // positions index `text` (raw element capture slices by them).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut reader = quick_xml::Reader::from_str(text);
     let mut tracks: Vec<XmlTrack> = vec![];
     let mut stack: Vec<XmlNode> = vec![];
@@ -577,6 +580,9 @@ mod xml_extra_tests {
 <GROUPED Kind="x"><ITEM N="1">text &amp; more</ITEM><ITEM N="2"/></GROUPED>
 </TRACK></COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"></NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
         let lib = super::parse_rekordbox_xml(x).unwrap();
+        // The same document with a byte-order mark captures the same raw elements.
+        let with_bom = super::parse_rekordbox_xml(&format!("\u{feff}{x}")).unwrap();
+        assert_eq!(with_bom.tracks[0].extra.raw, lib.tracks[0].extra.raw);
         let t = &lib.tracks[0];
         assert_eq!(t.cues.len(), 1);
         assert_eq!(t.extra.attrs, vec![("Future".to_string(), "1.23456789".to_string())]);

@@ -903,6 +903,10 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 app.dialogs.export_root = Some(r2.clone());
                 ui.close_menu();
             }
+            if ui.button("Update Playlists on This Device").on_hover_text("Export again the playlists that are both on this device and in your library (same folder and name), so the device has your latest edits.").clicked() {
+                app.update_device_playlists(&r2);
+                ui.close_menu();
+            }
             if ui.button("Clean Up Unused Files…").on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
