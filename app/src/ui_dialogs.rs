@@ -224,6 +224,14 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             });
                             card(ui, "Quantize", |ui| {
                                 toggle(ui, &mut app.prefs.quantize, "Cues and loops snap to the beat grid");
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Resolution").size(13.0));
+                                    for (d, n) in [(1u8, "1 beat"), (2, "1/2"), (4, "1/4"), (8, "1/8")] {
+                                        if ui.radio(app.prefs.quantize_div.max(1) == d, n).clicked() {
+                                            app.prefs.quantize_div = d;
+                                        }
+                                    }
+                                });
                             });
                             card(ui, "Stems", |ui| {
                                 if ui.radio(app.prefs.stem_parts != 3, RichText::new("4 parts: Vocal, Inst, Bass, Drums").size(14.0)).clicked() {
@@ -607,9 +615,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
 
 fn info_window(app: &mut App, ctx: &Context) {
     let Some(mut t) = app.dialogs.info_track.clone() else { return };
-    // The track as it was when the window opened, so only fields edited here are saved.
-    let orig_id = egui::Id::new(("prop_orig", t.id));
-    let orig: Track = match ctx.data(|d| d.get_temp::<Track>(orig_id)) {
+    // The track as it was when the window opened (for this track), so only fields edited here
+    // are saved. One slot: switching the window to another track starts a new snapshot.
+    let orig_id = egui::Id::new("prop_orig");
+    let orig: Track = match ctx.data(|d| d.get_temp::<Track>(orig_id)).filter(|o| o.id == t.id) {
         Some(o) => o,
         None => {
             ctx.data_mut(|d| d.insert_temp(orig_id, t.clone()));
@@ -964,7 +973,7 @@ fn export_window(app: &mut App, ctx: &Context) {
         ui.label(RichText::new("Music files are copied to the device; your originals are only read. Tracks that are not analysed yet are analysed first.").size(10.5).color(DIM));
         ui.horizontal(|ui| {
             let can = app.dialogs.export_root.is_some() && (!app.dialogs.export_sel.is_empty() || !app.dialogs.export_tracks.is_empty());
-            if ui.add_enabled(can, egui::Button::new(RichText::new("Export").strong()).fill(BLUE)).clicked() {
+            if ui.add_enabled(can, egui::Button::new(RichText::new("Export").strong()).fill(BLUE)).on_disabled_hover_text("Choose a device and at least one playlist or track to export.").clicked() {
                 let root = app.dialogs.export_root.clone().unwrap();
                 let sel: Vec<i64> = app.dialogs.export_sel.iter().copied().collect();
                 let tracks = app.dialogs.export_tracks.clone();
@@ -1122,7 +1131,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!picked.is_empty(), egui::Button::new(format!("Restore {}", picked.len()))).clicked() {
+                if ui.add_enabled(!picked.is_empty(), egui::Button::new(format!("Restore {}", picked.len()))).on_disabled_hover_text("Tick the tracks to restore.").clicked() {
                     act = Some(true);
                 }
                 // Two clicks: the entries cannot be restored afterwards.
@@ -1179,7 +1188,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let n = pe.items.iter().filter(|i| i.pick).count();
-                if ui.add_enabled(n > 0, egui::Button::new(format!("Import {n}"))).clicked() {
+                if ui.add_enabled(n > 0, egui::Button::new(format!("Import {n}"))).on_disabled_hover_text("Tick the tracks whose cues to import.").clicked() {
                     close = Some(true);
                 }
                 if ui.button("Not now").on_hover_text("These changes are not offered again unless they change on the device.").clicked() {

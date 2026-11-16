@@ -321,6 +321,8 @@ pub fn extra_xml(e: &crate::importer::XmlExtra, pad: &str) -> (String, String) {
         .iter()
         .map(|(tag, a)| format!("{pad}<{tag}{}/>\n", a.iter().map(|(k, v)| format!(" {k}=\"{}\"", esc(v))).collect::<String>()))
         .collect();
+    // Elements with children or text go back exactly as they were written.
+    let nodes = nodes + &e.raw.iter().map(|r| format!("{pad}{r}\n")).collect::<String>();
     (attrs, nodes)
 }
 

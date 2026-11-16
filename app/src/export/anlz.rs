@@ -36,6 +36,26 @@ fn ppth(path: &str) -> Vec<u8> {
     section(b"PPTH", &(body.len() as u32).to_be_bytes(), &body)
 }
 
+/// The path in a PPTH section: header 16 bytes with the byte length of the UTF-16BE path
+/// (including its terminating NUL) at 12. None when the lengths disagree or the text is not
+/// NUL-terminated UTF-16.
+pub fn parse_ppth(sec: &[u8]) -> Option<String> {
+    if sec.get(..4)? != b"PPTH" {
+        return None;
+    }
+    let hl = u32::from_be_bytes(sec.get(4..8)?.try_into().ok()?) as usize;
+    let total = u32::from_be_bytes(sec.get(8..12)?.try_into().ok()?) as usize;
+    let n = u32::from_be_bytes(sec.get(12..16)?.try_into().ok()?) as usize;
+    if hl != 16 || total != hl + n || n < 2 || n % 2 != 0 || total > sec.len() {
+        return None;
+    }
+    let units: Vec<u16> = sec[16..16 + n].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    if *units.last()? != 0 {
+        return None;
+    }
+    String::from_utf16(&units[..units.len() - 1]).ok()
+}
+
 /// Seek index: 400 zero entries followed by the total sample count of the file's full decode
 /// (observed in the original's files for 108 local tracks).
 fn pvbr(raw_samples: u64) -> Vec<u8> {
@@ -397,6 +417,13 @@ pub fn validate(b: &[u8]) -> Result<(), String> {
     if total != b.len() {
         return Err(format!("declares {total} bytes, file has {}", b.len()));
     }
+    // The first section is the file's path.
+    if b.len() >= hl + 12 && &b[hl..hl + 4] == b"PPTH" {
+        let st = be32(hl + 8).unwrap_or(0);
+        if b.len() < hl + st || parse_ppth(&b[hl..hl + st]).is_none() {
+            return Err("the path section (PPTH) is malformed".into());
+        }
+    }
     let mut i = hl;
     while i < b.len() {
         let (Some(shl), Some(st)) = (be32(i + 4), be32(i + 8)) else { return Err(format!("section at {i} is cut short")) };
@@ -683,6 +710,11 @@ mod tests {
         let w = Waveform { frames: vec![[10; 8]; 50] };
         let f = build("/a.mp3", &[], &w, &[], 0, 44100);
         assert!(validate(&f.dat).is_ok() && validate(&f.ext).is_ok() && validate(&f.ex2).is_ok());
+        assert_eq!(parse_ppth(&ppth("/Contents/Ünï/a.mp3")).as_deref(), Some("/Contents/Ünï/a.mp3"));
+        let mut odd = ppth("/a.mp3");
+        let n = odd.len();
+        odd[n - 1] = 0x41; // not NUL-terminated
+        assert!(parse_ppth(&odd).is_none());
         assert!(validate(&f.dat[..f.dat.len() - 3]).is_err());
         let mut bad = f.ext.clone();
         bad[28 + 8..28 + 12].copy_from_slice(&9_999_999u32.to_be_bytes());

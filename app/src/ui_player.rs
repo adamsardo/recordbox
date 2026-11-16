@@ -757,6 +757,11 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         format!("Not separated yet. Model: {model}.")
     };
     p.text(pos2(sx(main, 770.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
+    // Where the model comes from and its licence, on hover over the status line.
+    if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
+        let sr = Rect::from_min_size(pos2(sx(main, 770.0), y - 9.0), vec2(360.0, 18.0));
+        ui.interact(sr, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
+    }
     let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
     if busy {
         if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {

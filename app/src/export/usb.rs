@@ -253,6 +253,13 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
     if journal_dir(root).join("journal.log").exists() || has_onelibrary(root) {
         return vec![];
     }
+    // Compared after Unicode normalisation and case folding: FAT/exFAT names are
+    // case-insensitive and macOS may hand back decomposed accents, so a name spelled
+    // differently in the database is still recognised as used.
+    fn norm(p: &Path) -> String {
+        use unicode_normalization::UnicodeNormalization;
+        p.to_string_lossy().nfc().collect::<String>().to_lowercase()
+    }
     let mut used: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for t in lib.tracks.values() {
         if !t.file_path.is_empty() {
@@ -272,6 +279,7 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
             used.insert(a);
         }
     }
+    let used_norm: std::collections::HashSet<String> = used.iter().map(|p| norm(p)).collect();
     let mut out = vec![];
     let mut stack: Vec<PathBuf> = [root.join("Contents"), root.join("PIONEER").join("USBANLZ"), root.join("PIONEER").join("Artwork")].into_iter().filter(|d| d.is_dir()).collect();
     while let Some(d) = stack.pop() {
@@ -281,7 +289,7 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
                 stack.push(p);
-            } else if ft.is_file() && !used.contains(&p) {
+            } else if ft.is_file() && !used_norm.contains(&norm(&p)) {
                 let name = e.file_name().to_string_lossy().to_string();
                 // macOS bookkeeping files are not the library's concern.
                 if name == ".DS_Store" || name.starts_with("._") {
@@ -2056,7 +2064,10 @@ mod tests {
         mk("PIONEER/Artwork/00001/a1.jpg");
         mk("PIONEER/Artwork/00001/a1_m.jpg");
         mk("Contents/A/.DS_Store");
+        // Spelled differently on the drive (decomposed accent, other case): still used.
+        mk("Contents/A/Cafe\u{301}.mp3");
         let mut lib = DeviceLibrary::default();
+        lib.tracks.insert(2, DevTrack { id: 2, file_path: "/Contents/A/CAFÉ.mp3".into(), ..Default::default() });
         lib.tracks.insert(1, DevTrack { id: 1, file_path: "/Contents/A/kept.mp3".into(), analyze_path: "/PIONEER/USBANLZ/P001/0000AAAA/ANLZ0000.DAT".into(), artwork_path: "/PIONEER/Artwork/00001/a1.jpg".into(), ..Default::default() });
         let found: Vec<PathBuf> = unused_files(&root, &lib).into_iter().map(|f| f.0).collect();
         assert_eq!(found, { let mut v = vec![orphan.clone(), orphan_anlz.clone()]; v.sort(); v });

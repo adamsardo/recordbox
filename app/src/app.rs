@@ -212,6 +212,8 @@ pub struct Prefs {
     pub keymap: std::collections::BTreeMap<String, String>,
     /// Column browser (Genre / Artist / Album) above the track list.
     pub column_browser: bool,
+    /// Quantize resolution: 1 = whole beats, 2 = half, 4 = quarter, 8 = eighth beats.
+    pub quantize_div: u8,
     /// CUE Analysis: hot cue A ("1.1Bars") on the first downbeat when a track is first analysed.
     pub auto_first_downbeat_cue: bool,
     /// Stem pads: 4 (vocal, inst, bass, drums) or 3 (vocal, inst with bass, drums).
@@ -376,6 +378,21 @@ mod prefs_tests {
 }
 
 #[cfg(test)]
+mod quantize_tests {
+    use crate::model::Beat;
+    #[test]
+    fn snaps_to_beat_divisions() {
+        let beats: Vec<Beat> = (0..8).map(|i| Beat { time: i as f64 * 0.5, bpm: 120.0, beat: (i % 4 + 1) as u8, index: i }).collect();
+        assert!((super::quantize_to(&beats, 1.12, 1) - 1.0).abs() < 1e-9);
+        assert!((super::quantize_to(&beats, 1.2, 2) - 1.25).abs() < 1e-9);
+        assert!((super::quantize_to(&beats, 1.06, 4) - 1.0).abs() < 1e-9);
+        assert!((super::quantize_to(&beats, 1.07, 8) - 1.0625).abs() < 1e-9);
+        // Past the last beat the last interval continues.
+        assert!((super::quantize_to(&beats, 3.8, 1) - 4.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
 mod grid_jump_tests {
     use crate::model::Beat;
     #[test]
@@ -523,6 +540,7 @@ impl Default for Prefs {
             audio_device: None,
             stem_parts: 4,
             auto_first_downbeat_cue: true,
+            quantize_div: 1,
             other: Default::default(),
             sub_browser: false,
             browse_font: 0,
@@ -813,6 +831,8 @@ pub struct App {
     pub key_job: Option<(Receiver<(i64, i32)>, usize, usize)>,
     /// Last attempt to reopen a lost audio device, and whether the loss was reported.
     pub audio_retry: Option<(Instant, bool)>,
+    /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
+    pub key_requested: HashSet<i64>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
@@ -912,6 +932,7 @@ impl App {
             edits_checked: HashSet::new(),
             key_job: None,
             vocal_failed: HashSet::new(),
+            key_requested: HashSet::new(),
             audio_retry: None,
             dialogs: Dialogs::default(),
             toasts: vec![],
@@ -1183,16 +1204,32 @@ impl App {
     pub fn reload_tracks(&mut self) {
         let queued: HashSet<i64> = self.tracks.iter().filter(|t| t.analyzed == 3).map(|t| t.id).collect();
         self.tracks = self.db.all_tracks().unwrap_or_default();
+        let mut replaced: Vec<i64> = vec![];
+        let stamps = self.db.media_stamps();
         for t in self.tracks.iter_mut() {
-            t.missing = !std::path::Path::new(&t.path).exists();
+            let meta = std::fs::metadata(&t.path).ok();
+            t.missing = meta.is_none();
             if queued.contains(&t.id) {
                 t.analyzed = 3;
             } else if t.analyzed == 3 {
                 t.analyzed = 0;
             }
+            // The audio file changed since PrepDeck analysed it (size or modification time differ
+            // from the stamp taken then): its waveform no longer fits.
+            if let (Some(m), Some(stamp)) = (meta, stamps.get(&t.id)) {
+                if t.analyzed == 1 && !t.grid_locked && media_stamp(&m) != *stamp {
+                    replaced.push(t.id);
+                }
+            }
         }
         self.index = self.tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
         self.list_dirty = true;
+        if !replaced.is_empty() {
+            // Waveform and gain are measured again; the grid (possibly edited by hand, and a tag
+            // edit in another program also changes the size) is kept for the user to check.
+            self.toast(format!("{} audio file(s) changed on disk since they were analysed. Their waveforms are being measured again; check their beat grids.", replaced.len()));
+            self.analyze(&replaced, true);
+        }
     }
     /// Move a playlist/folder before or after `target`, or into `target` when it is a folder.
     /// Refuses to put a folder inside itself or one of its own subfolders.
@@ -1645,19 +1682,16 @@ impl App {
     /// often; otherwise with the ordinary analysis.
     pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
         let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false);
-        // Asked for explicitly: the analysed key replaces even one the user chose.
-        for id in ids {
-            if let Some(t) = self.track_mut(*id) {
-                t.key_manual = false;
-            }
-        }
+        // Locked tracks keep their key (Analysis Lock).
+        let ids: Vec<i64> = ids.iter().copied().filter(|id| self.track(*id).map(|t| !(t.grid_locked && t.analyzed == 1)).unwrap_or(false)).collect();
+        let ids = &ids[..];
         if !stems_ok || self.key_job.is_some() {
+            // Ordinary analysis with key detection on whatever the preference says; the key is
+            // replaced only when detection succeeds (the old one stays otherwise).
             for id in ids {
-                if let Some(t) = self.track_mut(*id) {
-                    t.key = -1;
-                }
+                self.key_requested.insert(*id);
             }
-            self.analyze(ids, true);
+            self.analyze_forcing_key(ids);
             return;
         }
         let jobs: Vec<(i64, String)> = ids.iter().filter_map(|id| self.track(*id).filter(|t| !t.missing).map(|t| (t.id, t.path.clone()))).collect();
@@ -1694,9 +1728,10 @@ impl App {
         let finished = *done >= *n;
         let total = *n;
         for (id, key) in results {
-            if key >= 0 && self.track(id).map(|t| t.key != key).unwrap_or(false) {
+            if key >= 0 && self.track(id).map(|t| t.key != key || t.key_manual).unwrap_or(false) {
                 if let Some(t) = self.track_mut(id) {
                     t.key = key;
+                    t.key_manual = false;
                 }
                 self.save_track(id);
             }
@@ -2329,6 +2364,10 @@ impl App {
     }
 
     pub fn import_xml(&mut self, path: &std::path::Path) {
+        // Bounded size: a 100,000-track collection is a few hundred MB.
+        if std::fs::metadata(path).map(|m| m.len() > 1 << 30).unwrap_or(false) {
+            return self.toast_err("This file is larger than 1 GB, too large to be a collection file.");
+        }
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => return self.toast_err(format!("Could not read the file: {e}")),
@@ -2439,8 +2478,19 @@ impl App {
     }
 
     // ------------------------------------------------------------------ analysis
+    /// Re-analyse with key detection on, whatever Preferences > Analysis says.
+    pub fn analyze_forcing_key(&mut self, ids: &[i64]) {
+        let mut s = self.analysis_settings();
+        s.do_key = true;
+        self.analyze_with(ids, true, s);
+    }
+
     pub fn analyze(&mut self, ids: &[i64], force: bool) {
         let s = self.analysis_settings();
+        self.analyze_with(ids, force, s);
+    }
+
+    fn analyze_with(&mut self, ids: &[i64], force: bool, s: crate::analysis::AnalysisSettings) {
         let mut n = 0;
         for id in ids {
             let Some(t) = self.track_mut(*id) else { continue };
@@ -2471,7 +2521,9 @@ impl App {
 
     pub fn apply_analysis(&mut self, id: i64, r: Result<crate::analysis::AnalysisResult, String>) {
         let existing_grid = self.db.grid(id).filter(|g| !g.is_empty());
-        let had_analysis = existing_grid.is_some() || self.db.wave(id).is_some();
+        // Earlier analysis means a stored waveform (a grid alone can come from an import).
+        let had_analysis = self.db.wave(id).is_some();
+        let key_requested = self.key_requested.remove(&id);
         let Some(t) = self.track_mut(id) else { return };
         match r {
             Err(e) => {
@@ -2484,7 +2536,8 @@ impl App {
                 t.analyzed = 1;
             }
             Ok(res) => {
-                let first_analysis = t.analyzed != 1;
+                // The job's queued state can't tell this (analyze() marks every job queued).
+                let first_analysis = !had_analysis;
                 t.analyzed = 1;
                 t.duration = res.duration;
                 t.sample_rate = res.sample_rate;
@@ -2494,8 +2547,12 @@ impl App {
                 let keep_grid = t.grid_locked || existing_grid.is_some();
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
-                if res.key >= 0 && !t.key_manual && (t.key < 0 || (first_analysis && !keep_grid)) {
+                if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid)))) {
+                    // Analyze Key asked for it explicitly: replaces even a chosen key.
                     t.key = res.key;
+                    if key_requested {
+                        t.key_manual = false;
+                    }
                 }
                 let mut save_grid = None;
                 if !keep_grid {
@@ -2507,6 +2564,9 @@ impl App {
                     if g.first_bpm() > 0.0 {
                         t.bpm = g.first_bpm();
                     }
+                }
+                if let Ok(m) = std::fs::metadata(&t.path) {
+                    let _ = self.db.set_media_stamp(id, media_stamp(&m));
                 }
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
@@ -2696,7 +2756,7 @@ impl App {
 
     pub fn quantized(&self, t: f64) -> f64 {
         if self.prefs.quantize && !self.deck.beats.is_empty() {
-            nearest_beat(&self.deck.beats, t).map(|b| b.time).unwrap_or(t)
+            quantize_to(&self.deck.beats, t, self.prefs.quantize_div)
         } else {
             t
         }
@@ -3330,6 +3390,12 @@ impl App {
             fresh.gain_db = t.gain_db;
             fresh.play_count = t.play_count;
             fresh.missing = t.missing;
+            fresh.raw_samples = t.raw_samples;
+            // A key the user chose stays (tags never replace it).
+            fresh.key_manual = t.key_manual;
+            if t.key_manual {
+                fresh.key = t.key;
+            }
             if t.analyzed == 1 {
                 fresh.bpm = t.bpm;
                 fresh.key = t.key;
@@ -3496,8 +3562,21 @@ impl App {
         let devices: Vec<(String, String, crate::export::usb::DeviceLibrary)> = self.devices.iter().filter_map(|d| d.lib.clone().map(|l| (d.root.clone(), d.name.clone(), l))).collect();
         for (_root, dev_name, lib) in devices {
             for h in &lib.histories {
-                let key = format!("{dev_name}\u{1f}{}", h.name);
-                let done = counts.get(&key).copied().unwrap_or_else(|| if old.contains(&format!("{key}\u{1f}{:?}", h.entries)) { h.entries.len() } else { 0 });
+                // A history is identified by the drive's name, its own name and the files of its
+                // first entries (default volume names and history names repeat across sticks).
+                let head: Vec<String> = h.entries.iter().take(3).filter_map(|e| lib.tracks.get(e).map(|t| t.file_path.clone())).collect();
+                let key = format!("{dev_name}\u{1f}{}\u{1f}{}", h.name, head.join("\u{1e}"));
+                // An earlier version recorded the entries it imported; if they are the start of
+                // this history, only what came after them is new.
+                let legacy_prefix = format!("{dev_name}\u{1f}{}\u{1f}[", h.name);
+                let legacy = old
+                    .iter()
+                    .filter_map(|k| k.strip_prefix(&legacy_prefix[..legacy_prefix.len() - 1]))
+                    .filter_map(|list| serde_json::from_str::<Vec<u32>>(list).ok())
+                    .filter(|prev| h.entries.starts_with(prev))
+                    .map(|prev| prev.len())
+                    .max();
+                let done = counts.get(&key).copied().or(legacy).unwrap_or(0);
                 if h.entries.len() <= done {
                     counts.insert(key, done);
                     continue;
@@ -3692,6 +3771,27 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     } else {
         na == nb
     }
+}
+
+/// Snap `t` to the nearest 1/`div` of a beat along the grid's own beats (div 1 = whole
+/// beats). Beyond the grid's ends the nearest beat interval is extended.
+pub fn quantize_to(beats: &[Beat], t: f64, div: u8) -> f64 {
+    let div = div.max(1) as f64;
+    if beats.len() < 2 {
+        return nearest_beat(beats, t).map(|b| b.time).unwrap_or(t);
+    }
+    let n = beats.len();
+    let i = beats.partition_point(|b| b.time <= t).saturating_sub(1).min(n - 2);
+    let (a, b) = (beats[i].time, beats[i + 1].time);
+    let len = (b - a).max(1e-9);
+    let steps = ((t - a) / len * div).round();
+    (a + steps / div * len).max(0.0)
+}
+
+/// Size and modification time (seconds) of an audio file, taken when it is analysed.
+pub fn media_stamp(m: &std::fs::Metadata) -> (i64, i64) {
+    let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+    (m.len() as i64, mtime)
 }
 
 /// Jump a whole number of beats along the grid's own beats (so tempo changes are followed),

@@ -85,6 +85,7 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS media_stamps(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, size INTEGER NOT NULL, mtime INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS xml_extra(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL, path TEXT NOT NULL,
@@ -320,7 +321,22 @@ impl Db {
         })
     }
 
-/// PrepDeck's vocal detection: one level 0–4 per 2048 samples at 44.1 kHz (as PVDI).
+/// Size and modification time of each audio file when PrepDeck last analysed it.
+    pub fn media_stamps(&self) -> std::collections::HashMap<i64, (i64, i64)> {
+        let mut m = std::collections::HashMap::new();
+        if let Ok(mut st) = self.conn.prepare("SELECT track_id, size, mtime FROM media_stamps") {
+            if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))) {
+                m.extend(rows.flatten());
+            }
+        }
+        m
+    }
+    pub fn set_media_stamp(&self, track: i64, stamp: (i64, i64)) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO media_stamps(track_id,size,mtime) VALUES(?1,?2,?3)", params![track, stamp.0, stamp.1])?;
+        Ok(())
+    }
+
+    /// PrepDeck's vocal detection: one level 0–4 per 2048 samples at 44.1 kHz (as PVDI).
     pub fn vocal(&self, track: i64) -> Option<Vec<u8>> {
         self.conn.query_row("SELECT data FROM vocals WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten()
     }

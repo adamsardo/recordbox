@@ -152,6 +152,9 @@ pub struct XmlExtra {
     /// elsewhere keep referring to the same IDs).
     #[serde(default)]
     pub xml_id: String,
+    /// Unknown elements with children or text, exactly as written (including nested ones).
+    #[serde(default)]
+    pub raw: Vec<String>,
 }
 
 /// Fingerprint of a beat grid for "unchanged since import".
@@ -168,7 +171,7 @@ pub fn cues_fingerprint(cues: &[Cue]) -> String {
 
 impl XmlExtra {
     pub fn is_empty(&self) -> bool {
-        self.attrs.is_empty() && self.nodes.is_empty() && self.orig.is_empty() && self.tempo.is_empty() && self.marks.is_empty() && self.xml_id.is_empty()
+        self.attrs.is_empty() && self.nodes.is_empty() && self.orig.is_empty() && self.tempo.is_empty() && self.marks.is_empty() && self.xml_id.is_empty() && self.raw.is_empty()
     }
 }
 
@@ -225,9 +228,38 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
     let mut cur: Option<XmlTrack> = None;
     let mut tempos: Vec<(f64, f64, u8)> = vec![];
     let mut bad_attrs = 0usize;
+    let mut raw_capture: Option<(usize, usize)> = None;
     let mut declared: Option<usize> = None;
     loop {
+        let before = reader.buffer_position() as usize;
         let ev = reader.read_event()?;
+        // Inside an unknown element of a track: copy it whole (children and text included).
+        if let Some((depth, start)) = raw_capture.as_mut() {
+            match &ev {
+                Event::Start(_) => *depth += 1,
+                Event::End(_) => {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        let end = reader.buffer_position() as usize;
+                        let raw = text.get(*start..end).unwrap_or("").to_string();
+                        if let Some(t) = cur.as_mut() {
+                            t.extra.raw.push(raw);
+                        }
+                        raw_capture = None;
+                    }
+                }
+                Event::Eof => anyhow::bail!("the file ends inside an element (truncated?)"),
+                _ => {}
+            }
+            continue;
+        }
+        if let Event::Start(e) = &ev {
+            let n = e.name();
+            if cur.is_some() && in_collection && !matches!(n.as_ref(), b"TEMPO" | b"POSITION_MARK" | b"TRACK") {
+                raw_capture = Some((1usize, before));
+                continue;
+            }
+        }
         let (e, empty) = match &ev {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
@@ -401,6 +433,10 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                         roots.push(node);
                     }
                 } else {
+                    // Bounded nesting (a real collection is a few levels deep).
+                    if stack.len() >= 256 {
+                        anyhow::bail!("playlists are nested more than 256 levels deep");
+                    }
                     stack.push(node);
                 }
             }
@@ -538,6 +574,7 @@ mod xml_extra_tests {
 <POSITION_MARK Name="" Type="0" Start="1.000" Num="0" Red="40" Green="226" Blue="20"/>
 <POSITION_MARK Name="fade" Type="1" Start="2.5000004" Num="-1"/>
 <NEWTHING A="b"/>
+<GROUPED Kind="x"><ITEM N="1">text &amp; more</ITEM><ITEM N="2"/></GROUPED>
 </TRACK></COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="0"></NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
         let lib = super::parse_rekordbox_xml(x).unwrap();
         let t = &lib.tracks[0];
@@ -569,5 +606,6 @@ mod xml_extra_tests {
         assert_eq!(a, " Future=\"1.23456789\"");
         assert!(n.contains("<POSITION_MARK Name=\"fade\" Type=\"1\" Start=\"2.5000004\" Num=\"-1\"/>"));
         assert!(n.contains("<NEWTHING A=\"b\"/>"));
+        assert!(n.contains(r#"<GROUPED Kind="x"><ITEM N="1">text &amp; more</ITEM><ITEM N="2"/></GROUPED>"#), "{n}");
     }
 }
