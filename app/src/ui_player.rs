@@ -243,7 +243,9 @@ pub fn wave_bars(mode: u8, v: [u8; 4]) -> Vec<(f32, Color32)> {
             let c = Color32::from_rgb((255.0 * r / m) as u8, (255.0 * g / m) as u8, (255.0 * (b / m).min(1.0)) as u8);
             vec![(f(v[0]), c)]
         }
-        _ => vec![(f(v[1]).max(f(v[0]) * 0.55), WAVE_LOW), (f(v[2]), WAVE_MID), (f(v[3]) * 0.9, WAVE_HIGH)],
+        // 3Band from display levels (track-list previews): blue body as the envelope, then
+        // smaller orange and white layers, matching the original's balance of colours.
+        _ => vec![(f(v[0]), WAVE_LOW), (f(v[2]) * 0.6, WAVE_MID), (f(v[3]) * 0.35, WAVE_HIGH)],
     }
 }
 
@@ -268,10 +270,13 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 *v = (*v as f32 * norm).min(255.0) as u8;
             }
             let layers: Vec<(f32, Color32)> = if app.prefs.wave_color >= 2 {
-                // 3Band overview: a blue body with thin orange and white edges above it
-                let t = (d[0] as f32 / 255.0).max(d[1] as f32 / 255.0);
-                let hi = (d[3] as f32 / (d[0] as f32 + 1.0)).min(1.0);
-                vec![(t * (0.94 + 0.06 * hi), WAVE_HIGH), (t * 0.94, WAVE_MID), (t * 0.86, WAVE_LOW)]
+                // 3Band overview, as the original draws it: low (blue) from the baseline, mid
+                // (orange) stacked on it, high (white) on top. Heights per band unit were
+                // measured from the original's screen (0.25, 0.115, 0.085 pt) against its own
+                // overview values; the values come from the model fitted to its files.
+                let [lo, mi, hi] = crate::export::anlz::three_band_overview(c);
+                let (b, o, w) = (lo as f32 * 0.25 / full_h, mi as f32 * 0.115 / full_h, hi as f32 * 0.085 / full_h);
+                vec![(b + o + w, WAVE_HIGH), (b + o, WAVE_MID), (b, WAVE_LOW)]
             } else {
                 wave_bars(app.prefs.wave_color, d)
             };
@@ -387,11 +392,20 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 if a < n {
                     let mut m = [0u8; 8];
                     for f in &w.frames[a..b.max(a + 1).min(n)] {
-                        for k in 0..4 {
+                        for k in 0..8 {
                             m[k] = m[k].max(f[k]);
                         }
                     }
-                    for (h, col) in wave_bars(app.prefs.wave_color, Waveform::disp(&m)) {
+                    let bars = if app.prefs.wave_color >= 2 {
+                        // 3Band detail: each band centred at its own height, low, then mid, then
+                        // high drawn over it (the original's layering), from the fitted model.
+                        let [lo, mi, hi] = crate::export::anlz::three_band_detail(&m);
+                        let s = |v: u8| (v as f32 / 80.0).min(1.0);
+                        vec![(s(lo), WAVE_LOW), (s(mi), WAVE_MID), (s(hi), WAVE_HIGH)]
+                    } else {
+                        wave_bars(app.prefs.wave_color, Waveform::disp(&m))
+                    };
+                    for (h, col) in bars {
                         let hh = h * half;
                         p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0, col));
                     }

@@ -197,7 +197,62 @@ pub struct Prefs {
     pub rekordbox_sync: bool,
     /// Player settings written to every exported USB (Preferences > DJ System).
     pub usb_settings: crate::export::settings::UsbSettings,
+    /// Which field the track-list search looks in (0 = all; see SEARCH_SCOPES).
+    pub search_scope: u8,
+    pub related: RelatedRules,
 }
+
+/// Related Tracks rules (the original offers Same Key / Related Key 1–3, BPM range and more).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelatedRules {
+    /// 0 off, 1 Same Key, 2 Related Key 1, 3 Related Key 2, 4 Related Key 3.
+    pub key: u8,
+    pub bpm: bool,
+    /// Allowed BPM difference in percent (half and double tempo also count).
+    pub bpm_pct: f64,
+    pub genre: bool,
+    pub artist: bool,
+    pub label: bool,
+    pub color: bool,
+    pub rating: bool,
+}
+
+impl Default for RelatedRules {
+    fn default() -> Self {
+        RelatedRules { key: 2, bpm: true, bpm_pct: 6.0, genre: false, artist: false, label: false, color: false, rating: false }
+    }
+}
+
+/// Distance between two keys on the key wheel: steps around the wheel plus one when the
+/// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
+#[cfg(test)]
+mod related_tests {
+    #[test]
+    fn key_wheel_distance() {
+        // 8A (Am, index 7) vs 8A, 9A, 8B (C), 9B, 10A, 2A
+        assert_eq!(super::key_distance(7, 7), Some(0));
+        assert_eq!(super::key_distance(7, 8), Some(1));
+        assert_eq!(super::key_distance(7, 19), Some(1));
+        assert_eq!(super::key_distance(7, 20), Some(2));
+        assert_eq!(super::key_distance(7, 9), Some(2));
+        assert_eq!(super::key_distance(7, 1), Some(6));
+        // 12A and 1A are neighbours on the wheel
+        assert_eq!(super::key_distance(11, 0), Some(1));
+        assert_eq!(super::key_distance(-1, 3), None);
+    }
+}
+
+pub fn key_distance(a: i32, b: i32) -> Option<i32> {
+    if !(0..24).contains(&a) || !(0..24).contains(&b) {
+        return None;
+    }
+    let d = (a % 12 - b % 12).rem_euclid(12);
+    Some(d.min(12 - d) + i32::from(a / 12 != b / 12))
+}
+
+/// Search field choices, in the order of the search box's menu.
+pub const SEARCH_SCOPES: [&str; 8] = ["All", "Track Title", "Artist", "Album", "Genre", "Label", "Comments", "My Tag"];
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -219,6 +274,8 @@ impl Default for Prefs {
             sort_asc: false,
             rekordbox_sync: true,
             usb_settings: Default::default(),
+            search_scope: 0,
+            related: Default::default(),
             delete_device_tracks: false,
             target_lufs: -8.0,
             tooltips: true,
@@ -231,13 +288,24 @@ impl Default for Prefs {
     }
 }
 
-pub const ZOOMS: [f64; 6] = [4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+/// Seconds shown across the enlarged waveform; the default (index 2) matches the original's default
+/// zoom, measured at about 21 beats from the playhead to the right edge at 126 BPM.
+pub const ZOOMS: [f64; 6] = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum View {
     Collection,
     Playlist(i64),
     Device { root: String, node: Option<u32> },
+    /// A play history saved on a device by the players.
+    DeviceHistory { root: String, id: u32 },
+    /// Tracks related to the loaded (or selected) track by the Related Tracks rules.
+    Related,
+    /// Collection browsed by one field: 0 Date Added, 1 Genre, 2 Artist, 3 Album.
+    Category { field: u8, value: String },
+    /// A folder on disk (Explorer); its audio files are listed whether or not they are in the
+    /// collection.
+    Explorer(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +313,9 @@ pub enum SideMode {
     Collection,
     Playlists,
     Devices,
+    History,
+    Related,
+    Explorer,
 }
 
 pub struct Deck {
@@ -370,6 +441,12 @@ pub struct App {
     /// The deck as it was before the load in progress, with its playback position and gain;
     /// put back if the new file can't be decoded, so a failed load never empties the player.
     pub deck_backup: Option<(Deck, f64, f32)>,
+    /// Source track the Related Tracks list was last built for.
+    pub related_built_for: Option<i64>,
+    /// File to load into the player once the import in progress has added it.
+    pub load_after_import: Option<String>,
+    /// Playlist/folder being dragged in the tree.
+    pub node_drag: Option<i64>,
     pub pool: AnalysisPool,
     pub analysis_total: usize,
     pub analysis_done: usize,
@@ -420,6 +497,9 @@ impl App {
             anchor: None,
             anchor_id: None,
             deck_backup: None,
+            related_built_for: None,
+            load_after_import: None,
+            node_drag: None,
             search: String::new(),
             filter_open: false,
             filter_bpm: (0.0, 0.0),
@@ -480,6 +560,10 @@ impl App {
                 app.analyze(&ids, false);
             }
         }
+        // Test switch: open Preferences at launch.
+        if std::env::var("PREPDECK_OPEN_PREFS").is_ok() {
+            app.dialogs.prefs_open = true;
+        }
         if app.prefs.rekordbox_sync && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
             app.start_rekordbox_sync();
         }
@@ -510,7 +594,20 @@ impl App {
                             }
                         }
                     }
-                    "devices" => app.side = SideMode::Devices,
+                    "devices" => {
+                        app.side = SideMode::Devices;
+                        app.view = View::Device { root: String::new(), node: None };
+                    }
+                    "history" => app.side = SideMode::History,
+                    "explorer" => {
+                        app.side = SideMode::Explorer;
+                        let d = dirs::audio_dir().unwrap_or_default().to_string_lossy().to_string();
+                        app.view = View::Explorer(d);
+                    }
+                    "related" => {
+                        app.side = SideMode::Related;
+                        app.view = View::Related;
+                    }
                     "grid" => app.deck.ctrl_tab = 1,
                     "hotcue" => app.deck.panel_tab = 1,
                     "info" => app.deck.panel_tab = 2,
@@ -615,6 +712,43 @@ impl App {
         self.index = self.tracks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
         self.list_dirty = true;
     }
+    /// Move a playlist/folder before or after `target`, or into `target` when it is a folder.
+    /// Refuses to put a folder inside itself or one of its own subfolders.
+    pub fn drop_node(&mut self, id: i64, target: i64, zone: i8) {
+        if id == target {
+            return;
+        }
+        let Some(t) = self.node(target).cloned() else { return };
+        let (parent, seq) = if zone == 0 && t.kind == NodeKind::Folder {
+            (t.id, self.nodes.iter().filter(|n| n.parent == t.id).count() as i64)
+        } else if zone < 0 {
+            (t.parent, t.seq)
+        } else {
+            (t.parent, t.seq + 1)
+        };
+        let mut p = parent;
+        while p != 0 {
+            if p == id {
+                self.toast_err("A folder cannot be moved into itself.");
+                return;
+            }
+            p = self.node(p).map(|n| n.parent).unwrap_or(0);
+        }
+        let _ = self.db.move_node(id, parent, seq);
+        // Renumber the destination's children so their order stays contiguous.
+        if let Ok(all) = self.db.playlists() {
+            let mut kids: Vec<_> = all.into_iter().filter(|n| n.parent == parent).collect();
+            kids.sort_by_key(|n| (n.seq, n.id != id));
+            for (i, n) in kids.iter().enumerate() {
+                let _ = self.db.conn.execute("UPDATE playlists SET seq=?2 WHERE id=?1", rusqlite::params![n.id, i as i64]);
+            }
+        }
+        if zone == 0 && t.kind == NodeKind::Folder {
+            self.expanded.insert(t.id);
+        }
+        self.reload_playlists();
+    }
+
     pub fn reload_playlists(&mut self) {
         self.nodes = self.db.playlists().unwrap_or_default();
         self.node_counts = self.db.playlist_counts().unwrap_or_default();
@@ -673,8 +807,80 @@ impl App {
                 Some(_) => self.db.playlist_tracks(*id).unwrap_or_default().into_iter().filter(|t| self.index.contains_key(t)).collect(),
                 None => vec![],
             },
-            View::Device { .. } => vec![],
+            View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) => vec![],
+            View::Related => self.related_tracks(),
+            View::Category { field, value } => self
+                .tracks
+                .iter()
+                .filter(|t| &Self::category_value(t, *field) == value)
+                .map(|t| t.id)
+                .collect(),
         }
+    }
+
+    /// The value a track has for one Collection category (Date Added is grouped by day).
+    pub fn category_value(t: &Track, field: u8) -> String {
+        match field {
+            0 => t.date_added.get(..10).unwrap_or(&t.date_added).to_string(),
+            1 => t.genre.trim().to_string(),
+            2 => t.artist.trim().to_string(),
+            _ => t.album.trim().to_string(),
+        }
+    }
+
+    /// Track the Related Tracks list is built around: the loaded track, else the selection.
+    pub fn related_source(&self) -> Option<i64> {
+        self.deck.track.or_else(|| self.anchor_id).or_else(|| self.selected.iter().next().copied())
+    }
+
+    /// Tracks matching the Related Tracks rules for the source track, best matches first.
+    pub fn related_tracks(&self) -> Vec<i64> {
+        let Some(src) = self.related_source().and_then(|id| self.track(id)).cloned() else { return vec![] };
+        let r = &self.prefs.related;
+        let mut out: Vec<(i64, i64)> = self
+            .tracks
+            .iter()
+            .filter(|t| t.id != src.id && !t.missing)
+            .filter_map(|t| {
+                let mut score = 0i64;
+                if r.key > 0 {
+                    let d = key_distance(src.key, t.key)?;
+                    if d > r.key as i32 - 1 {
+                        return None;
+                    }
+                    score += (4 - d as i64) * 100;
+                }
+                if r.bpm {
+                    if src.bpm <= 0.0 || t.bpm <= 0.0 {
+                        return None;
+                    }
+                    let best = [t.bpm, t.bpm * 2.0, t.bpm / 2.0].iter().map(|b| ((b - src.bpm) / src.bpm * 100.0).abs()).fold(f64::MAX, f64::min);
+                    if best > r.bpm_pct {
+                        return None;
+                    }
+                    score += (100.0 - best * 10.0).max(0.0) as i64;
+                }
+                let same = |a: &str, b: &str| !a.trim().is_empty() && a.trim().eq_ignore_ascii_case(b.trim());
+                if r.genre && !same(&src.genre, &t.genre) {
+                    return None;
+                }
+                if r.artist && !same(&src.artist, &t.artist) {
+                    return None;
+                }
+                if r.label && !same(&src.label, &t.label) {
+                    return None;
+                }
+                if r.color && (src.color == 0 || src.color != t.color) {
+                    return None;
+                }
+                if r.rating && t.rating < src.rating {
+                    return None;
+                }
+                Some((t.id, score))
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.into_iter().map(|x| x.0).collect()
     }
 
     fn folder_tracks(&self, id: i64, out: &mut Vec<i64>, seen: &mut HashSet<i64>) {
@@ -714,6 +920,7 @@ impl App {
     }
 
     pub fn rebuild_list(&mut self) {
+        self.related_built_for = self.related_source();
         let base = self.view_tracks();
         let order: HashMap<i64, usize> = base.iter().enumerate().map(|(i, t)| (*t, i)).collect();
         let q = crate::smart::fold(self.search.trim());
@@ -723,7 +930,15 @@ impl App {
             .filter(|id| {
                 let Some(t) = self.track(*id) else { return false };
                 if !words.is_empty() {
-                    let hay = crate::smart::fold(&format!(
+                    let hay = match self.prefs.search_scope {
+                        1 => crate::smart::fold(&t.display_title()),
+                        2 => crate::smart::fold(&format!("{} {} {}", t.artist, t.remixer, t.original_artist)),
+                        3 => crate::smart::fold(&t.album),
+                        4 => crate::smart::fold(&t.genre),
+                        5 => crate::smart::fold(&t.label),
+                        6 => crate::smart::fold(&t.comment),
+                        7 => crate::smart::fold(&self.tag_text(t.id)),
+                        _ => crate::smart::fold(&format!(
                         "{} {} {} {} {} {} {} {} {} {} {}",
                         t.display_title(),
                         t.artist,
@@ -736,7 +951,8 @@ impl App {
                         t.mix_name,
                         key_name(t.key, self.prefs.key_alnum),
                         self.tag_text(t.id)
-                    ));
+                    )),
+                    };
                     if !words.iter().all(|w| hay.contains(w)) {
                         return false;
                     }
@@ -912,6 +1128,11 @@ impl App {
             self.importing = None;
             let n = self.import_count;
             self.toast(format!("{n} track(s) added to the collection"));
+            if let Some(p) = self.load_after_import.take() {
+                if let Some(id) = self.db.track_by_path(&p) {
+                    self.load_track(id);
+                }
+            }
         }
     }
 

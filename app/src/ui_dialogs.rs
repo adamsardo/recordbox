@@ -70,9 +70,34 @@ fn prefs_window(app: &mut App, ctx: &Context) {
     if !app.dialogs.prefs_open {
         return;
     }
+    // Preferences opens in its own window, like the original. Screenshot mode (and backends
+    // without multiple windows) draw it inside the main window instead.
+    if app.screenshot.is_some() {
+        prefs_embedded(app, ctx);
+        return;
+    }
+    let vid = egui::ViewportId::from_hash_of("prepdeck_preferences");
+    let builder = egui::ViewportBuilder::default().with_title("Preferences").with_inner_size([800.0, 828.0]).with_min_inner_size([640.0, 480.0]);
+    ctx.show_viewport_immediate(vid, builder, |vctx, class| {
+        if class == egui::ViewportClass::Embedded {
+            prefs_embedded(app, vctx);
+            return;
+        }
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(vctx, |ui| prefs_body(app, ui));
+        if vctx.input(|i| i.viewport().close_requested()) {
+            app.dialogs.prefs_open = false;
+        }
+    });
+}
+
+fn prefs_embedded(app: &mut App, ctx: &Context) {
     let mut open = true;
     let frame = egui::Frame::window(&ctx.style()).fill(BG).inner_margin(0.0);
-    egui::Window::new("Preferences").open(&mut open).default_size(vec2(800.0, 640.0)).collapsible(false).frame(frame).show(ctx, |ui| {
+    egui::Window::new("Preferences").open(&mut open).default_size(vec2(800.0, 640.0)).collapsible(false).frame(frame).show(ctx, |ui| prefs_body(app, ui));
+    app.dialogs.prefs_open = open;
+}
+
+fn prefs_body(app: &mut App, ui: &mut Ui) {
         ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
         ui.horizontal_top(|ui| {
             // Sidebar 160 pt, #1E1E1E: search field, then categories with icons.
@@ -312,8 +337,6 @@ fn prefs_window(app: &mut App, ctx: &Context) {
                 }
             });
         });
-    });
-    app.dialogs.prefs_open = open;
 }
 
 fn info_window(app: &mut App, ctx: &Context) {

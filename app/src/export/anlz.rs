@@ -79,6 +79,18 @@ mod model {
     ];
 }
 
+/// rekordbox-style 3-band detail values (low, mid, high; PWV7 scale) for one frame or column.
+pub fn three_band_detail(c: &[u8; 8]) -> [u8; 3] {
+    let f = feats(c);
+    [apply(&model::PWV7[0], &f, 255) as u8, apply(&model::PWV7[1], &f, 255) as u8, apply(&model::PWV7[2], &f, 255) as u8]
+}
+
+/// rekordbox-style 3-band overview values (low, mid, high; PWV6 scale) for one column.
+pub fn three_band_overview(c: &[u8; 8]) -> [u8; 3] {
+    let f = feats(c);
+    [apply(&model::PWV6[0], &f, 255) as u8, apply(&model::PWV6[1], &f, 255) as u8, apply(&model::PWV6[2], &f, 255) as u8]
+}
+
 fn feats(c: &[u8; 8]) -> [f64; 13] {
     let p = |k: usize| c[k] as f64 / 255.0;
     let r = |k: usize| c[4 + k] as f64 / 510.0;
