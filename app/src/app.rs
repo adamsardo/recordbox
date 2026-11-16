@@ -212,6 +212,8 @@ pub struct Prefs {
     pub keymap: std::collections::BTreeMap<String, String>,
     /// Column browser (Genre / Artist / Album) above the track list.
     pub column_browser: bool,
+    /// Audio output device by name; None follows the system's default output.
+    pub audio_device: Option<String>,
     /// Sub-browser: a second track list under the main one.
     pub sub_browser: bool,
     /// Preferences > View > Browse: font size and line space steps (0–4), bold text, and
@@ -480,6 +482,7 @@ impl Default for Prefs {
             import_device_history: true,
             keymap: Default::default(),
             column_browser: false,
+            audio_device: None,
             sub_browser: false,
             browse_font: 0,
             browse_line: 0,
@@ -809,6 +812,7 @@ impl App {
             }
             db.set_setting("lufs_default_migrated", "1");
         }
+        let audio_device = prefs.audio_device.clone();
         let pool = AnalysisPool::new(cc.egui_ctx.clone());
         let mut app = App {
             db,
@@ -850,7 +854,7 @@ impl App {
             filter_color: 0,
             filter_tags: HashSet::new(),
             filter_tags_all: false,
-            player: Player::new(),
+            player: Player::with_device(audio_device.as_deref()),
             deck: Deck::default(),
             pool,
             analysis_total: 0,
@@ -980,6 +984,50 @@ impl App {
                             app.remove_from_collection(&ids);
                         }
                         app.dialogs.trash = Some(app.db.trash_list().unwrap_or_default().first().map(|e| e.0).into_iter().collect());
+                    }
+                    "playeredits" => {
+                        // End-to-end check of player cue edits: export two tracks with hot cues to
+                        // a scratch folder device, move one cue in its analysis file as a player
+                        // would, then scan.
+                        let root = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("prepdeck_shot_device").to_string_lossy().to_string()));
+                        let _ = std::fs::remove_dir_all(&root);
+                        let _ = std::fs::create_dir_all(&root);
+                        let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && app.db.cues(t.id).map(|c| c.iter().any(|c| c.kind == CueKind::Hot)).unwrap_or(false)).take(2).map(|t| t.id).collect();
+                        let mut tracks = HashMap::new();
+                        for id in &ids {
+                            if let Some(t) = app.track(*id).cloned() {
+                                tracks.insert(*id, crate::export::usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+                            }
+                        }
+                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { name: "Check".into(), folder: false, children: vec![], tracks: ids.clone() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false };
+                        let cancel = std::sync::atomic::AtomicBool::new(false);
+                        match crate::export::usb::run_export(req, &|_| {}, &cancel) {
+                            Ok(m) => eprintln!("shot export: {m}"),
+                            Err(e) => eprintln!("shot export failed: {e}"),
+                        }
+                        if let Ok(lib) = crate::export::usb::read_device(&root) {
+                            if let Some(t) = lib.tracks.values().next() {
+                                let base = root.join(t.analyze_path.trim_start_matches('/')).with_extension("");
+                                let mut cues = crate::export::anlz::parse_cues(&crate::export::anlz::read_section_list(&base.with_extension("EXT")), &crate::export::anlz::read_section_list(&base.with_extension("DAT")));
+                                if let Some(c) = cues.iter_mut().find(|c| c.kind == CueKind::Hot) {
+                                    c.start += 2.0;
+                                }
+                                let f = crate::export::anlz::build(&t.file_path, &[], &Waveform::default(), &cues, 0, 44100);
+                                let _ = std::fs::write(base.with_extension("DAT"), &f.dat);
+                                let _ = std::fs::write(base.with_extension("EXT"), &f.ext);
+                                if let Ok(file) = std::fs::File::options().write(true).open(root.join(".PrepDeck/cues.json")) {
+                                    let _ = file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+                                }
+                            }
+                        }
+                        let r = root.to_string_lossy().to_string();
+                        if !app.prefs.devices_extra.contains(&r) {
+                            app.prefs.devices_extra.push(r.clone());
+                        }
+                        app.scan_devices();
+                        if app.dialogs.player_edits.is_none() {
+                            app.check_player_cue_edits(&r, true);
+                        }
                     }
                     "subbrowser" => {
                         app.prefs.sub_browser = true;

@@ -207,17 +207,42 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Player {
+        Self::with_device(None)
+    }
+
+    /// Open the named output device (None: the system's default output).
+    pub fn with_device(device: Option<&str>) -> Player {
         let state = Arc::new(Mutex::new(PlayState::default()));
-        match Self::open_stream(state.clone()) {
+        match Self::open_stream(state.clone(), device) {
             Ok((s, rate)) => Player { state, _stream: Some(s), device_rate: rate, error: None },
             Err(e) => Player { state, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
         }
     }
 
-    fn open_stream(state: Arc<Mutex<PlayState>>) -> Result<(cpal::Stream, u32)> {
+    /// Names of the output devices this Mac offers.
+    pub fn output_devices() -> Vec<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host().output_devices().map(|it| it.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+    }
+
+    /// Switch to another output device, keeping what is loaded and playing.
+    pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
+        let (s, rate) = Self::open_stream(self.state.clone(), device)?;
+        self._stream = Some(s);
+        self.device_rate = rate;
+        self.error = None;
+        Ok(())
+    }
+
+    fn open_stream(state: Arc<Mutex<PlayState>>, device: Option<&str>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
-        let dev = host.default_output_device().ok_or_else(|| anyhow!("no audio output device"))?;
+        let named = device.and_then(|want| host.output_devices().ok()?.find(|d| d.name().map(|n| n == want).unwrap_or(false)));
+        // A device that is no longer connected falls back to the default output.
+        let dev = match named {
+            Some(d) => d,
+            None => host.default_output_device().ok_or_else(|| anyhow!("no audio output device"))?,
+        };
         let cfg = dev.default_output_config()?;
         let rate = cfg.sample_rate().0;
         let channels = cfg.channels() as usize;

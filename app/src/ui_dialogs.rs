@@ -110,8 +110,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                 crate::icons::magnifier(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.min.x + 12.0, sr.center().y), vec2(16.0, 16.0)), DIM2, 0);
                 ui.add_space(14.0);
                 type Ic = fn(&egui::Painter, egui::Rect, egui::Color32);
-                let items: [(&str, Ic); 5] = [("View", crate::icons::info), ("Analysis", crate::icons::view_columns), ("DJ System", crate::icons::usb), ("Keyboard", crate::icons::list), ("Advanced", crate::icons::hamburger)];
-                for (i, (n, ic)) in items.iter().enumerate() {
+                // Listed in the original's order; the numbers are this app's section ids.
+                let items: [(u8, &str, Ic); 6] = [(0, "View", crate::icons::info), (5, "Audio", crate::icons::speech), (1, "Analysis", crate::icons::view_columns), (2, "DJ System", crate::icons::usb), (3, "Keyboard", crate::icons::list), (4, "Advanced", crate::icons::hamburger)];
+                for (i, n, ic) in items.iter() {
+                    let i = *i as usize;
                     let sel = app.dialogs.prefs_tab == i as u8;
                     let (r, resp) = ui.allocate_exact_size(vec2(144.0, 30.0), egui::Sense::click());
                     if sel {
@@ -134,6 +136,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                     1 => &["Track Analysis", "CUE Analysis"],
                     2 => &["General", "Category", "Sort", "Column", "My Settings", "Device"],
                     3 => &["Shortcuts"],
+                    5 => &["Audio"],
                     _ => &["Library"],
                 };
                 let key = format!("prefs_subtab_{}", app.dialogs.prefs_tab);
@@ -382,6 +385,37 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                     let dev = app.prefs.usb_settings.dev.clone();
                                     app.prefs.usb_settings = crate::export::settings::UsbSettings { dev, ..Default::default() };
                                 }
+                            });
+                        }
+                        (5, _) => {
+                            card(ui, "Audio", |ui| {
+                                sub(ui, "Output device");
+                                let devices = crate::audio::Player::output_devices();
+                                let current = app.prefs.audio_device.clone();
+                                let shown = current.clone().unwrap_or_else(|| "System default".to_string());
+                                let mut pick: Option<Option<String>> = None;
+                                egui::ComboBox::from_id_salt("audio_dev").width(360.0).selected_text(RichText::new(shown).font(bold(14.0))).show_ui(ui, |ui| {
+                                    if ui.selectable_label(current.is_none(), "System default").clicked() {
+                                        pick = Some(None);
+                                    }
+                                    for d in &devices {
+                                        if ui.selectable_label(current.as_deref() == Some(d.as_str()), d).clicked() {
+                                            pick = Some(Some(d.clone()));
+                                        }
+                                    }
+                                });
+                                if let Some(p) = pick {
+                                    match app.player.switch_device(p.as_deref()) {
+                                        Ok(()) => app.prefs.audio_device = p,
+                                        Err(e) => app.toast_err(format!("Could not open that audio device: {e}")),
+                                    }
+                                }
+                                if let Some(d) = &current {
+                                    if !devices.contains(d) {
+                                        ui.label(RichText::new(format!("\"{d}\" is not connected; the system's default output is used.")).size(11.0).color(CAUTION_TX));
+                                    }
+                                }
+                                ui.label(RichText::new(format!("Running at {} Hz.", app.player.device_rate)).size(11.0).color(DIM));
                             });
                         }
                         (3, _) => {
