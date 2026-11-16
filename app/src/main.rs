@@ -9,6 +9,7 @@ mod demo;
 mod export;
 mod importer;
 mod jobs;
+mod key;
 mod model;
 mod smart;
 mod theme;

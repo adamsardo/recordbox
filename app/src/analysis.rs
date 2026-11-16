@@ -55,7 +55,7 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let sr = dec.sr as f64;
     let wave = waveform(&mono, sr);
     let (bpm, grid) = if s.do_grid { tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max) } else { (0.0, None) };
-    let key = if s.do_key { detect_key(&mono, sr) } else { -1 };
+    let key = if s.do_key { crate::key::detect_key(&mono, sr) } else { -1 };
     let lufs = loudness(dec);
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { 0.0 };
     AnalysisResult { duration: dec.duration(), sample_rate: dec.sr, bpm, grid, key, wave, gain_db }
@@ -413,7 +413,7 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
         let fi = (t - o.t0) * fps;
         (-4..=4).map(|d| interp(&o.low, fi + d as f64)).fold(0f32, f32::max) > 0.25 * peak
     }) {
-        score[k0 % 4] += 1.2;
+        score[k0 % 4] += downbeat_start_bonus();
     }
     let down = (0..4).max_by(|a, b| score[*a].partial_cmp(&score[*b]).unwrap()).unwrap_or(0);
     // Beat number of the first beat so that beat index `down` is a "1".
@@ -423,6 +423,10 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
 
 /// Find the offset that best aligns predicted beats with the steepest rise of the
 /// low-passed amplitude envelope (median over the track).
+fn downbeat_start_bonus() -> f64 {
+    std::env::var("PREPDECK_DB_BONUS").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0)
+}
+
 /// Fraction of the steepest rise that marks the start of a kick's attack.
 const ATTACK_FRACTION: f32 = 0.7;
 
