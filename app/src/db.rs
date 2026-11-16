@@ -31,8 +31,30 @@ pub struct Db {
 
 const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples";
 
+/// Library schema version (SQLite user_version). Version 0 is a library from before
+/// versioning; 2 is the current layout.
+pub const SCHEMA_VERSION: i64 = 2;
+
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Db> {
+        // Refuse a library from a newer PrepDeck; back up an older one before upgrading it.
+        let existed = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if existed {
+            let probe = Connection::open(path)?;
+            let v: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let has_tables: bool = probe.query_row("SELECT count(*) FROM sqlite_master WHERE name='tracks'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+            drop(probe);
+            if v > SCHEMA_VERSION {
+                anyhow::bail!("This library was written by a newer version of PrepDeck (schema {v}); update PrepDeck to open it. It was not changed.");
+            }
+            if v < SCHEMA_VERSION && has_tables {
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let backup = path.with_file_name(format!("library.v{v}-{stamp}.bak.db"));
+                // VACUUM INTO writes a consistent copy that includes the write-ahead log.
+                let c = Connection::open(path)?;
+                c.execute("VACUUM INTO ?1", [backup.to_string_lossy().to_string()])?;
+            }
+        }
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -69,10 +91,14 @@ impl Db {
         if !has_raw {
             conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
         }
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         let db = Db { conn };
         db.seed_mytags()?;
         Ok(db)
     }
+
+    #[cfg(test)]
+    pub fn test_schema() {}
 
     fn seed_mytags(&self) -> Result<()> {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM mytags", [], |r| r.get(0))?;
@@ -357,16 +383,24 @@ impl Db {
         Ok(v)
     }
     pub fn set_playlist_tracks(&self, id: i64, tracks: &[i64]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id=?1", [id])?;
-        {
-            let mut st = tx.prepare("INSERT INTO playlist_tracks(playlist_id,track_id,seq) VALUES(?1,?2,?3)")?;
+        // Inside a caller's transaction (e.g. the rekordbox sync) write directly; otherwise
+        // make the replacement atomic on its own.
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        let r = (|| -> Result<()> {
+            self.conn.execute("DELETE FROM playlist_tracks WHERE playlist_id=?1", [id])?;
+            let mut st = self.conn.prepare("INSERT INTO playlist_tracks(playlist_id,track_id,seq) VALUES(?1,?2,?3)")?;
             for (i, t) in tracks.iter().enumerate() {
                 st.execute(params![id, t, i as i64])?;
             }
+            Ok(())
+        })();
+        if own {
+            self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
         }
-        tx.commit()?;
-        Ok(())
+        r
     }
     pub fn playlist_counts(&self) -> Result<std::collections::HashMap<i64, usize>> {
         let mut st = self.conn.prepare("SELECT playlist_id, COUNT(*) FROM playlist_tracks GROUP BY playlist_id")?;
@@ -419,5 +453,36 @@ impl Db {
             self.conn.execute("DELETE FROM track_tags WHERE track_id=?1 AND tag_id=?2", params![track, tag])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn upgrades_with_backup_and_refuses_newer() {
+        let dir = std::env::temp_dir().join(format!("prepdeck_schema_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("library.db");
+        // An old, unversioned library.
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("CREATE TABLE tracks(id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL);").unwrap();
+        }
+        let db = Db::open(&p).unwrap();
+        let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        drop(db);
+        let backups = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak.db")).count();
+        assert_eq!(backups, 1);
+        // Reopening the current version makes no new backup.
+        drop(Db::open(&p).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak.db")).count(), 1);
+        // A newer schema is refused.
+        Connection::open(&p).unwrap().execute_batch("PRAGMA user_version = 99;").unwrap();
+        assert!(Db::open(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

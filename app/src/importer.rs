@@ -127,7 +127,9 @@ pub struct XmlNode {
     pub name: String,
     pub folder: bool,
     pub children: Vec<XmlNode>,
+    /// Track references: TrackIDs, or (KeyType="1") decoded file locations.
     pub track_keys: Vec<String>,
+    pub by_location: bool,
 }
 
 pub struct XmlLibrary {
@@ -281,7 +283,7 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
             b"NODE" => {
                 let ty = get("Type");
                 let name = get("Name");
-                let node = XmlNode { name, folder: ty == "0", children: vec![], track_keys: vec![] };
+                let node = XmlNode { name, folder: ty == "0", children: vec![], track_keys: vec![], by_location: get("KeyType") == "1" };
                 if empty {
                     if let Some(p) = stack.last_mut() {
                         p.children.push(node);
@@ -294,7 +296,8 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
             }
             b"TRACK" if !in_collection => {
                 if let Some(n) = stack.last_mut() {
-                    n.track_keys.push(get("Key"));
+                    let k = get("Key");
+                    n.track_keys.push(if n.by_location { decode_location(&k) } else { k });
                 }
             }
             _ => {}
@@ -319,6 +322,22 @@ fn finish_grid(t: &mut XmlTrack, tempos: &[(f64, f64, u8)]) {
         anchors.push(GridAnchor { time: *time, bpm: *bpm, beat: (*beat).clamp(1, 4) });
     }
     t.grid = Some(BeatGrid { anchors });
+}
+
+#[cfg(test)]
+mod keytype_tests {
+    #[test]
+    fn location_keyed_playlist() {
+        let x = r#"<?xml version="1.0" encoding="UTF-8"?><DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="1">
+<TRACK TrackID="7" Name="A" Location="file://localhost/Users/x/My%20Song.mp3"/></COLLECTION>
+<PLAYLISTS><NODE Type="0" Name="ROOT" Count="1"><NODE Name="ByLoc" Type="1" KeyType="1" Entries="1">
+<TRACK Key="file://localhost/Users/x/My%20Song.mp3"/></NODE></NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
+        let lib = super::parse_rekordbox_xml(x).unwrap();
+        let n = &lib.playlists[0];
+        assert!(n.by_location);
+        assert_eq!(n.track_keys, vec!["/Users/x/My Song.mp3".to_string()]);
+        assert_eq!(lib.tracks[0].track.path, "/Users/x/My Song.mp3");
+    }
 }
 
 pub fn nearest_hot_color(rgb: [u8; 3]) -> u8 {

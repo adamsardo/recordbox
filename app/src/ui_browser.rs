@@ -815,11 +815,7 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
             });
             ui.separator();
             if ui.button(format!("Delete {what}")).clicked() {
-                let _ = app.db.delete_node(nn.id);
-                if app.view == View::Playlist(nn.id) {
-                    app.set_view(View::Collection);
-                }
-                app.reload_playlists();
+                app.dialogs.confirm_delete_node = Some((nn.id, nn.name.clone(), nn.kind == NodeKind::Folder));
                 ui.close_menu();
             }
         });
@@ -890,7 +886,19 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 ui.close_menu();
             }
             if fs != "folder" && ui.button("Disconnect USB Device").clicked() {
-                let _ = std::process::Command::new("/usr/sbin/diskutil").arg("eject").arg(&r2).spawn();
+                if app.export_job.is_some() {
+                    app.toast_err("Wait for the export to finish before disconnecting the device.");
+                } else {
+                    match std::process::Command::new("/usr/sbin/diskutil").arg("eject").arg(&r2).output() {
+                        Ok(o) if o.status.success() => {
+                            app.toast("The device can now be removed safely.");
+                            app.set_view(View::Device { root: String::new(), node: None });
+                            app.scan_devices();
+                        }
+                        Ok(o) => app.toast_err(format!("Could not disconnect the device: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                        Err(e) => app.toast_err(format!("Could not disconnect the device: {e}")),
+                    }
+                }
                 ui.close_menu();
             }
             if fs == "folder" && ui.button("Remove from list").clicked() {
@@ -993,9 +1001,22 @@ fn explorer_node(app: &mut App, ui: &mut Ui, name: &str, path: &std::path::Path,
         app.set_view(View::Explorer(ps));
     }
     if open && depth < 14 {
-        if let Ok(rd) = std::fs::read_dir(path) {
-            let mut dirs_: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(true)).collect();
-            dirs_.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        // Subfolder listings are cached for five seconds instead of read every frame.
+        let ck = egui::Id::new(("exp_dirs", path.to_string_lossy().to_string()));
+        let now = ui.input(|i| i.time);
+        let cached: Option<(f64, Vec<std::path::PathBuf>)> = ui.ctx().data(|d| d.get_temp(ck));
+        let dirs_ = match cached {
+            Some((t, v)) if now - t < 5.0 => v,
+            _ => {
+                let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+                    .map(|rd| rd.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).map(|e| e.path()).filter(|p| !p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(true)).collect())
+                    .unwrap_or_default();
+                v.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+                ui.ctx().data_mut(|d| d.insert_temp(ck, (now, v.clone())));
+                v
+            }
+        };
+        {
             for d in dirs_.iter().take(500) {
                 let n = d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 explorer_node(app, ui, &n, d, depth + 1);

@@ -38,6 +38,7 @@ impl eframe::App for Gui {
         app.poll_export();
         app.poll_rekordbox_sync();
         app.poll_stems();
+        app.poll_phrases();
         menus::poll(app);
         shortcuts(app, ctx);
 
@@ -96,6 +97,10 @@ impl eframe::App for Gui {
     }
 }
 
+fn prepdeck_actions() -> Vec<&'static str> {
+    app::ACTIONS.iter().map(|a| a.0).collect()
+}
+
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
     // Library edit Undo/Redo (text fields keep their own undo while they are being edited).
     if !ctx.wants_keyboard_input() {
@@ -108,45 +113,50 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
             }
         }
     }
+    // Key releases end cue/hot-cue previews even while a text field has focus, so a preview
+    // can never be left playing.
     if ctx.wants_keyboard_input() {
+        let rel = |p: &app::Prefs, a: &str| p.key_for(a).map(|k| ctx.input(|i| i.key_released(k))).unwrap_or(false);
+        let cue_rel = rel(&app.prefs, "cue");
+        let hot_rel = (1..=8).any(|n| rel(&app.prefs, &format!("hot{n}")));
+        if app.deck.cue_preview && cue_rel {
+            app.cue_up();
+        }
+        if app.deck.hot_preview.is_some() && hot_rel {
+            app.hot_cue_up();
+        }
         return;
     }
     use egui::Key;
     let fresh = |k: Key| ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } if *key == k && !modifiers.command)));
-    let (_s, _c, c_up, enter, up, down, cmd_a, del, _m, left, right, shift) = ctx.input(|i| {
-        (
-            false,
-            false,
-            i.key_released(Key::C),
-            i.key_pressed(Key::Enter),
-            i.key_pressed(Key::ArrowUp),
-            i.key_pressed(Key::ArrowDown),
-            i.modifiers.command && i.key_pressed(Key::A),
-            i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-            false,
-            i.key_pressed(Key::ArrowLeft),
-            i.key_pressed(Key::ArrowRight),
-            i.modifiers.shift,
-        )
-    });
-    let (space, c_down, m) = (fresh(Key::Space), fresh(Key::C), fresh(Key::M));
-    if space {
+    let keys: std::collections::HashMap<&str, Key> = prepdeck_actions().iter().filter_map(|a| app.prefs.key_for(a).map(|k| (*a, k))).collect();
+    let key = |a: &str| keys.get(a).copied();
+    let pressed = |a: &str| key(a).map(|k| ctx.input(|i| i.key_pressed(k) && !i.modifiers.command)).unwrap_or(false);
+    let released = |a: &str| key(a).map(|k| ctx.input(|i| i.key_released(k))).unwrap_or(false);
+    let first = |a: &str| key(a).map(fresh).unwrap_or(false);
+    let shift = ctx.input(|i| i.modifiers.shift);
+    let cmd_a = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A));
+    let (up, down, enter, left, right) = (pressed("list_up"), pressed("list_down"), pressed("load"), pressed("jump_back"), pressed("jump_fwd"));
+    // Delete also answers to Backspace when it is on its default key.
+    let del = pressed("remove") || (key("remove") == Some(Key::Delete) && ctx.input(|i| i.key_pressed(Key::Backspace)));
+    if first("play") {
         app.play_pause();
     }
-    if c_down {
+    if first("cue") {
         app.cue_down();
     }
-    if c_up {
+    if released("cue") {
         app.cue_up();
     }
-    if m {
+    if first("memory") {
         app.memory_set();
     }
-    for (k, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8].iter().enumerate() {
-        if fresh(*key) {
+    for k in 0..8 {
+        let id = format!("hot{}", k + 1);
+        if first(&id) {
             app.hot_cue_down(k as i32);
         }
-        if ctx.input(|i| i.key_released(*key)) {
+        if released(&id) {
             app.hot_cue_up();
         }
     }

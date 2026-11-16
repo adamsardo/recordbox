@@ -29,7 +29,7 @@ pub fn build(app: &App) -> String {
     for t in &app.tracks {
         let rating = [0, 51, 102, 153, 204, 255][t.rating.min(5) as usize];
         x.push_str(&format!(
-            "    <TRACK TrackID=\"{}\" Name=\"{}\" Artist=\"{}\" Composer=\"{}\" Album=\"{}\" Grouping=\"{}\" Genre=\"{}\" Kind=\"{} File\" Size=\"{}\" TotalTime=\"{}\" DiscNumber=\"{}\" TrackNumber=\"{}\" Year=\"{}\" AverageBpm=\"{:.2}\" DateAdded=\"{}\" BitRate=\"{}\" SampleRate=\"{}\" Comments=\"{}\" PlayCount=\"{}\" Rating=\"{}\" Location=\"{}\" Remixer=\"{}\" Tonality=\"{}\" Label=\"{}\" Mix=\"{}\">\n",
+            "    <TRACK TrackID=\"{}\" Name=\"{}\" Artist=\"{}\" Composer=\"{}\" Album=\"{}\" Grouping=\"{}\" Genre=\"{}\" Kind=\"{} File\" Size=\"{}\" TotalTime=\"{}\" DiscNumber=\"{}\" TrackNumber=\"{}\" Year=\"{}\" AverageBpm=\"{:.2}\" DateAdded=\"{}\" BitRate=\"{}\" SampleRate=\"{}\" Comments=\"{}\" PlayCount=\"{}\" Rating=\"{}\" Location=\"{}\" Remixer=\"{}\" Tonality=\"{}\" Label=\"{}\" Mix=\"{}\"{}>\n",
             t.id,
             esc(&t.display_title()),
             esc(&t.artist),
@@ -54,7 +54,19 @@ pub fn build(app: &App) -> String {
             esc(&t.remixer),
             esc(&key_name(t.key, false)),
             esc(&t.label),
-            esc(&t.mix_name)
+            esc(&t.mix_name),
+            // Track colour, as rekordbox writes it (0xRRGGBB of its eight track colours).
+            match t.color {
+                1 => " Colour=\"0xFF007F\"",
+                2 => " Colour=\"0xFF0000\"",
+                3 => " Colour=\"0xFFA500\"",
+                4 => " Colour=\"0xFFFF00\"",
+                5 => " Colour=\"0x00FF00\"",
+                6 => " Colour=\"0x25FDE9\"",
+                7 => " Colour=\"0x0000FF\"",
+                8 => " Colour=\"0x660099\"",
+                _ => "",
+            }
         ));
         if let Some(g) = app.db.grid(t.id) {
             for a in &g.anchors {
@@ -62,6 +74,10 @@ pub fn build(app: &App) -> String {
             }
         }
         for c in app.db.cues(t.id).unwrap_or_default() {
+            // rekordbox's XML writer emits numbered cues for slots A–H only (rekordbox-rea XML-003).
+            if c.kind == CueKind::Hot && !(0..8).contains(&c.slot) {
+                continue;
+            }
             let num = if c.kind == CueKind::Hot { c.slot } else { -1 };
             let ty = if c.is_loop() { 4 } else { 0 };
             let end = if c.is_loop() { format!(" End=\"{:.3}\"", c.end.unwrap()) } else { String::new() };

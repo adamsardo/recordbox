@@ -206,6 +206,39 @@ pub struct Prefs {
     pub stem_model: Option<String>,
     /// Download the chosen model in the background at launch.
     pub stems_auto_download: bool,
+    /// Import play histories from connected devices automatically.
+    pub import_device_history: bool,
+    /// Keyboard shortcuts changed from their defaults: action id -> key name.
+    pub keymap: std::collections::BTreeMap<String, String>,
+}
+
+/// Keyboard actions: (id, label, default key name as egui names it).
+pub const ACTIONS: [(&str, &str, &str); 17] = [
+    ("play", "Play / Pause", "Space"),
+    ("cue", "Cue", "C"),
+    ("memory", "Set Memory Cue", "M"),
+    ("hot1", "Hot Cue A", "1"),
+    ("hot2", "Hot Cue B", "2"),
+    ("hot3", "Hot Cue C", "3"),
+    ("hot4", "Hot Cue D", "4"),
+    ("hot5", "Hot Cue E", "5"),
+    ("hot6", "Hot Cue F", "6"),
+    ("hot7", "Hot Cue G", "7"),
+    ("hot8", "Hot Cue H", "8"),
+    ("jump_back", "Beat Jump back", "ArrowLeft"),
+    ("jump_fwd", "Beat Jump forward", "ArrowRight"),
+    ("list_up", "Select previous track", "ArrowUp"),
+    ("list_down", "Select next track", "ArrowDown"),
+    ("load", "Load selected track", "Enter"),
+    ("remove", "Remove from playlist", "Delete"),
+];
+
+impl Prefs {
+    /// The key assigned to an action (the user's choice, else the default).
+    pub fn key_for(&self, action: &str) -> Option<egui::Key> {
+        let name = self.keymap.get(action).cloned().or_else(|| ACTIONS.iter().find(|a| a.0 == action).map(|a| a.2.to_string()))?;
+        egui::Key::from_name(&name)
+    }
 }
 
 /// Related Tracks rules (the original offers Same Key / Related Key 1–3, BPM range and more).
@@ -232,6 +265,22 @@ impl Default for RelatedRules {
 
 /// Distance between two keys on the key wheel: steps around the wheel plus one when the
 /// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
+#[cfg(test)]
+mod keymap_tests {
+    #[test]
+    fn default_and_custom_keys() {
+        let mut p = super::Prefs::default();
+        for (id, _, _) in super::ACTIONS {
+            assert!(p.key_for(id).is_some(), "{id} has no default key");
+        }
+        assert_eq!(p.key_for("play"), Some(eframe::egui::Key::Space));
+        p.keymap.insert("play".into(), "P".into());
+        assert_eq!(p.key_for("play"), Some(eframe::egui::Key::P));
+        p.keymap.insert("cue".into(), String::new());
+        assert_eq!(p.key_for("cue"), None);
+    }
+}
+
 #[cfg(test)]
 mod related_tests {
     #[test]
@@ -290,6 +339,8 @@ impl Default for Prefs {
             usb_browse: Default::default(),
             stem_model: None,
             stems_auto_download: true,
+            import_device_history: true,
+            keymap: Default::default(),
             delete_device_tracks: false,
             target_lufs: -8.0,
             tooltips: true,
@@ -374,6 +425,8 @@ pub enum SideMode {
 pub struct Deck {
     /// Phrase structure shown under the overview (rekordbox's own, or PrepDeck's).
     pub phrases: Option<crate::phrase::Structure>,
+    /// Phrase analysis running in the background for (track id).
+    pub phrases_rx: Option<Receiver<(i64, Option<crate::phrase::Structure>)>>,
     /// rekordbox's own 3-band waveforms for this audio file (detail at 150 per second, and
     /// the 1200-column overview), when the track came from the rekordbox library.
     pub rb_wave: Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>>,
@@ -405,6 +458,7 @@ impl Default for Deck {
     fn default() -> Self {
         Deck {
             phrases: None,
+            phrases_rx: None,
             rb_wave: None,
             track: None,
             audio: None,
@@ -448,6 +502,8 @@ pub struct Dialogs {
     pub new_tag: Option<(i64, String)>,
     pub rename_tag: Option<(i64, String)>,
     pub confirm_remove: Option<Vec<i64>>,
+    /// Playlist/folder waiting for delete confirmation: (id, name, is folder).
+    pub confirm_delete_node: Option<(i64, String, bool)>,
     pub export_open: bool,
     pub export_root: Option<String>,
     pub export_sel: HashSet<i64>,
@@ -537,7 +593,18 @@ impl App {
         crate::theme::apply(&cc.egui_ctx);
         let db_path = crate::db::data_dir().join("library.db");
         let db = Db::open(&db_path).expect("open library database");
-        let prefs: Prefs = db.setting("prefs").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // Unreadable saved preferences are kept under another key (not silently replaced).
+        let raw_prefs = db.setting("prefs");
+        let prefs: Prefs = match raw_prefs.as_deref().map(serde_json::from_str::<Prefs>) {
+            Some(Ok(p)) => p,
+            Some(Err(_)) => {
+                let key = format!("prefs_unreadable_{}", chrono::Local::now().format("%Y%m%d%H%M%S"));
+                db.set_setting(&key, raw_prefs.as_deref().unwrap_or_default());
+                eprintln!("preferences could not be read; kept as {key}, using defaults");
+                Prefs::default()
+            }
+            None => Prefs::default(),
+        };
         let pool = AnalysisPool::new(cc.egui_ctx.clone());
         let mut app = App {
             db,
@@ -859,6 +926,18 @@ impl App {
         let i = *self.index.get(&id)?;
         Some(&mut self.tracks[i])
     }
+    /// Save a track without recording an undo step (analysis, sync and other system updates).
+    pub fn save_track_quiet(&mut self, id: i64) {
+        if let Some(t) = self.track(id).cloned() {
+            let mut t = t;
+            if t.analyzed == 3 {
+                t.analyzed = 0;
+            }
+            let _ = self.db.update_track(&t);
+        }
+        self.list_dirty = true;
+    }
+
     pub fn save_track(&mut self, id: i64) {
         // The database still holds the previous values: keep them for Undo.
         if let Some(before) = self.db.track(id) {
@@ -1147,24 +1226,40 @@ impl App {
         self.list_dirty = false;
     }
 
-    /// Phrases for the loaded track: rekordbox's own while its grid is unchanged, else analysed
-    /// from the decoded audio on the current grid.
-    fn phrases_for_deck(&self, a: &Decoded) -> Option<crate::phrase::Structure> {
-        let id = self.deck.track?;
-        let path = self.track(id)?.path.clone();
+    /// Phrases for the loaded track, worked out on a background thread: rekordbox's own while
+    /// its grid is unchanged, else analysed from the decoded audio on the current grid.
+    fn start_deck_phrases(&mut self, a: Arc<Decoded>) {
+        let Some(id) = self.deck.track else { return };
+        let Some(path) = self.track(id).map(|t| t.path.clone()) else { return };
         let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        if let Some(base) = map.get(&path).map(std::path::PathBuf::from) {
-            let same = crate::rbimport::read_pqtz_grid(&base.with_extension("DAT")).map(|r| grids_match(&r, &self.deck.grid)).unwrap_or(false);
-            if same {
-                if let Some(s) = crate::export::anlz::read_sections(&base.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s)) {
-                    return Some(s);
+        let base = map.get(&path).map(std::path::PathBuf::from);
+        let grid = self.deck.grid.clone();
+        let beats = self.deck.beats.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let from_rb = base.and_then(|b| {
+                let same = crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| grids_match(&r, &grid)).unwrap_or(false);
+                if !same {
+                    return None;
                 }
+                crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
+            });
+            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
+            let _ = tx.send((id, r));
+            ctx.request_repaint();
+        });
+        self.deck.phrases_rx = Some(rx);
+    }
+
+    pub fn poll_phrases(&mut self) {
+        let Some(rx) = &self.deck.phrases_rx else { return };
+        if let Ok((id, r)) = rx.try_recv() {
+            self.deck.phrases_rx = None;
+            if self.deck.track == Some(id) {
+                self.deck.phrases = r;
             }
         }
-        if self.deck.beats.is_empty() {
-            return None;
-        }
-        crate::phrase::analyze(&a.mono(), a.sr as f64, &self.deck.beats)
     }
 
     /// rekordbox's PWV7 (detail) and PWV6 (overview) 3-band waveforms for an audio file.
@@ -1305,6 +1400,7 @@ impl App {
         if self.stem.downloading.is_some() {
             return;
         }
+        self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stem.downloading = Some((0, 0));
         self.stem.error = None;
         let tx = self.stem.tx.clone();
@@ -1427,7 +1523,10 @@ impl App {
                                 }
                             }
                         }
-                        Err(e) if e == "stopped" => {}
+                        Err(e) if e == "stopped" => {
+                            self.stem.pending = None;
+                            self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                         Err(e) => {
                             self.stem.error = Some(format!("Model download failed: {e}"));
                             self.stem.pending = None;
@@ -1448,7 +1547,7 @@ impl App {
                                 self.player.state.lock().stems = Some(st);
                             }
                         }
-                        Err(e) if e == "stopped" => {}
+                        Err(e) if e == "stopped" => self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed),
                         Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
                     }
                 }
@@ -1520,9 +1619,18 @@ impl App {
             }
         }
         self.db.set_setting("rb_anlz", &serde_json::to_string(&rb_anlz).unwrap_or_default());
+        // Tracks the user removed from PrepDeck stay removed.
+        let removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let mut failed: Option<String> = None;
         for rt in lib.tracks {
-            let changed = seen.get(&rt.rb_id) != Some(&rt.fingerprint);
-            let id = match self.db.track_by_path(&rt.xt.track.path) {
+            if removed.contains(&rt.xt.track.path) {
+                continue;
+            }
+            // known: synced before; changed: rekordbox edited it since the last sync.
+            let known = seen.contains_key(&rt.rb_id);
+            let changed = known && seen.get(&rt.rb_id) != Some(&rt.fingerprint);
+            let existing = self.db.track_by_path(&rt.xt.track.path);
+            let (id, fresh) = match existing {
                 None => {
                     let mut t = rt.xt.track.clone();
                     if t.sample_rate == 0 || t.duration <= 0.0 {
@@ -1536,41 +1644,70 @@ impl App {
                             t.artwork = real.artwork;
                         }
                     }
-                    let Ok(id) = self.db.insert_track(&t) else { continue };
-                    added += 1;
-                    id
-                }
-                Some(id) if changed => {
-                    if let Some(cur) = self.track(id).cloned() {
-                        let r = &rt.xt.track;
-                        let t = Track {
-                            id,
-                            analyzed: cur.analyzed,
-                            grid_locked: cur.grid_locked,
-                            gain_db: cur.gain_db,
-                            raw_samples: cur.raw_samples,
-                            missing: cur.missing,
-                            artwork: if r.artwork.is_empty() { cur.artwork.clone() } else { r.artwork.clone() },
-                            sample_rate: if r.sample_rate > 0 { r.sample_rate } else { cur.sample_rate },
-                            bit_depth: if r.bit_depth > 0 { r.bit_depth } else { cur.bit_depth },
-                            duration: if r.duration > 0.0 { r.duration } else { cur.duration },
-                            ..r.clone()
-                        };
-                        let _ = self.db.update_track(&t);
-                        updated += 1;
+                    match self.db.insert_track(&t) {
+                        Ok(id) => {
+                            added += 1;
+                            (id, true)
+                        }
+                        Err(e) => {
+                            failed.get_or_insert(e.to_string());
+                            continue;
+                        }
                     }
-                    id
                 }
-                Some(id) => id,
+                Some(id) => (id, false),
             };
+            let cur = self.track(id).cloned();
+            let locked = cur.as_ref().map(|t| t.grid_locked).unwrap_or(false);
             if changed {
-                if let Some(g) = &rt.xt.grid {
-                    let _ = self.db.save_grid(id, g);
+                if let Some(cur) = &cur {
+                    let r = &rt.xt.track;
+                    let t = Track {
+                        id,
+                        analyzed: cur.analyzed,
+                        grid_locked: cur.grid_locked,
+                        gain_db: cur.gain_db,
+                        raw_samples: cur.raw_samples,
+                        missing: cur.missing,
+                        artwork: if r.artwork.is_empty() { cur.artwork.clone() } else { r.artwork.clone() },
+                        sample_rate: if r.sample_rate > 0 { r.sample_rate } else { cur.sample_rate },
+                        bit_depth: if r.bit_depth > 0 { r.bit_depth } else { cur.bit_depth },
+                        duration: if r.duration > 0.0 { r.duration } else { cur.duration },
+                        // A locked grid keeps its tempo.
+                        bpm: if locked { cur.bpm } else { r.bpm },
+                        ..r.clone()
+                    };
+                    if let Err(e) = self.db.update_track(&t) {
+                        failed.get_or_insert(e.to_string());
+                    }
+                    updated += 1;
                 }
-                let _ = self.db.replace_cues(id, &rt.xt.cues);
-                let mine: HashSet<i64> = rt.tags.iter().filter_map(|k| tag_id.get(k).copied()).collect();
-                for t in &rb_tag_ids {
-                    let _ = self.db.set_track_tag(id, *t, mine.contains(t));
+            }
+            let my_cues = if fresh { vec![] } else { self.db.cues(id).unwrap_or_default() };
+            let my_grid = if fresh { None } else { self.db.grid(id).filter(|g| !g.is_empty()) };
+            // Grid: new tracks and tracks without one get rekordbox's; a changed track gets it
+            // unless the grid is locked.
+            if let Some(g) = &rt.xt.grid {
+                if fresh || my_grid.is_none() || (changed && !locked) {
+                    if let Err(e) = self.db.save_grid(id, g) {
+                        failed.get_or_insert(e.to_string());
+                    }
+                }
+            }
+            // Cues: new tracks and tracks without cues get rekordbox's; a changed track gets
+            // them only when rekordbox has some (PrepDeck's are never wiped by an empty list).
+            if (fresh || my_cues.is_empty() || changed) && !(rt.xt.cues.is_empty() && !my_cues.is_empty()) {
+                if let Err(e) = self.db.replace_cues(id, &rt.xt.cues) {
+                    failed.get_or_insert(e.to_string());
+                }
+            }
+            // My Tags: rekordbox's are added; on a change in rekordbox, ones it removed are too.
+            let mine: HashSet<i64> = rt.tags.iter().filter_map(|k| tag_id.get(k).copied()).collect();
+            for t in &rb_tag_ids {
+                if mine.contains(t) {
+                    let _ = self.db.set_track_tag(id, *t, true);
+                } else if changed {
+                    let _ = self.db.set_track_tag(id, *t, false);
                 }
             }
             seen.insert(rt.rb_id.clone(), rt.fingerprint.clone());
@@ -1600,8 +1737,25 @@ impl App {
             self.db.set_setting("rb_folder_id", &root.to_string());
             add_nodes(self, root, &lib.playlists, &idmap);
         }
-        let _ = self.db.conn.execute_batch("COMMIT");
+        if let Some(e) = failed {
+            let _ = self.db.conn.execute_batch("ROLLBACK");
+            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
+            return;
+        }
+        if let Err(e) = self.db.conn.execute_batch("COMMIT") {
+            let _ = self.db.conn.execute_batch("ROLLBACK");
+            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
+            return;
+        }
         self.reload_all();
+        // The loaded track may have new cues or a new grid now.
+        if let Some(t) = self.deck.track {
+            self.deck.cues = self.db.cues(t).unwrap_or_default();
+            if let Some(g) = self.db.grid(t) {
+                self.set_deck_grid(g, false);
+            }
+            self.refresh_cue_counts(t);
+        }
         let mut msg = if first {
             format!("Loaded your rekordbox library: {added} tracks, with cues, grids, My Tags and playlists. rekordbox's own files were not changed.")
         } else if added + updated > 0 {
@@ -1677,7 +1831,8 @@ impl App {
                     add_nodes(app, id, &n.children, idmap);
                 } else {
                     let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
-                    let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| idmap.get(k).copied()).collect();
+                    // KeyType="1" playlists refer to tracks by file location.
+                    let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| if n.by_location { app.db.track_by_path(k) } else { idmap.get(k).copied() }).collect();
                     let _ = app.db.set_playlist_tracks(id, &tr);
                 }
             }
@@ -1778,7 +1933,8 @@ impl App {
                 }
             }
         }
-        self.save_track(id);
+        // Analysis results are not user edits: keep them off the undo stack.
+        self.save_track_quiet(id);
     }
 
     /// Re-analyse ignoring the stored grid (explicit "Analyze Track" from the menu).
@@ -1879,7 +2035,8 @@ impl App {
                     self.deck.audio = Some(a.clone());
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
-                    self.deck.phrases = self.phrases_for_deck(&a);
+                    self.deck.phrases = None;
+                    self.start_deck_phrases(a.clone());
                 }
                 Err(e) => {
                     if let Some((old, pos, gain)) = self.deck_backup.take() {
@@ -2056,6 +2213,12 @@ impl App {
                     self.deck.cues = self.db.cues(track).unwrap_or_default();
                 }
                 let cues = self.db.cues(track).unwrap_or_default();
+                let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
+                if hp.is_empty() {
+                    self.hot_positions.remove(&track);
+                } else {
+                    self.hot_positions.insert(track, hp);
+                }
                 let (h, m) = (cues.iter().filter(|c| c.kind == CueKind::Hot).count(), cues.iter().filter(|c| c.kind == CueKind::Memory).count());
                 if h + m == 0 {
                     self.cue_counts.remove(&track);
@@ -2437,6 +2600,14 @@ impl App {
     }
 
     pub fn remove_from_collection(&mut self, ids: &[i64]) {
+        // Remember removed files so a rekordbox sync does not add them back.
+        let mut removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        for id in ids {
+            if let Some(t) = self.track(*id) {
+                removed.insert(t.path.clone());
+            }
+        }
+        self.db.set_setting("rb_removed_paths", &serde_json::to_string(&removed).unwrap_or_default());
         for id in ids {
             let _ = self.db.delete_track(*id);
             if self.deck.track == Some(*id) {
@@ -2536,6 +2707,53 @@ impl App {
         }
         self.devices = devices;
         self.devices_scanned = Some(Instant::now());
+        if self.prefs.import_device_history && self.screenshot.is_none() {
+            self.import_device_histories();
+        }
+    }
+
+    /// Copy play histories saved on connected devices into the "Histories" folder as playlists
+    /// (once each). Device tracks are matched to the collection by the local file PrepDeck
+    /// exported, else by title and artist. The device itself is not changed.
+    pub fn import_device_histories(&mut self) -> usize {
+        let mut done: HashSet<String> = self.db.setting("imported_histories").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let mut imported = 0;
+        let devices: Vec<(String, String, crate::export::usb::DeviceLibrary)> = self.devices.iter().filter_map(|d| d.lib.clone().map(|l| (d.root.clone(), d.name.clone(), l))).collect();
+        for (_root, dev_name, lib) in devices {
+            for h in &lib.histories {
+                // Identify a history by the device name, its name and its contents.
+                let key = format!("{dev_name}\u{1f}{}\u{1f}{:?}", h.name, h.entries);
+                if done.contains(&key) || h.entries.is_empty() {
+                    continue;
+                }
+                let mut ids = vec![];
+                for e in &h.entries {
+                    let Some(dt) = lib.tracks.get(e) else { continue };
+                    let by_source = (!dt.source.is_empty()).then(|| self.db.track_by_path(&dt.source)).flatten();
+                    let found = by_source.or_else(|| {
+                        self.tracks.iter().find(|t| t.display_title().eq_ignore_ascii_case(&dt.title) && t.artist.eq_ignore_ascii_case(&dt.artist)).map(|t| t.id)
+                    });
+                    if let Some(id) = found {
+                        ids.push(id);
+                    }
+                }
+                let folder = match self.nodes.iter().find(|n| n.parent == 0 && n.name == "Histories" && n.kind == NodeKind::Folder) {
+                    Some(n) => n.id,
+                    None => self.db.create_node(0, "Histories", NodeKind::Folder, None).unwrap_or(0),
+                };
+                if let Ok(pl) = self.db.create_node(folder, &format!("{} ({dev_name})", h.name), NodeKind::Playlist, None) {
+                    let _ = self.db.set_playlist_tracks(pl, &ids);
+                    imported += 1;
+                }
+                done.insert(key);
+                self.reload_playlists();
+            }
+        }
+        if imported > 0 {
+            self.db.set_setting("imported_histories", &serde_json::to_string(&done).unwrap_or_default());
+            self.toast(format!("Imported {imported} play histor{} from your devices into the Histories folder.", if imported == 1 { "y" } else { "ies" }));
+        }
+        imported
     }
 
     pub fn fs_label(fs: &str) -> &'static str {
@@ -2621,11 +2839,8 @@ impl App {
             // rekordbox's own analysis of this file, when the library was synced from it.
             let grid = self.db.grid(*id);
             let rb_anlz = rb_anlz.get(&t.path).map(std::path::PathBuf::from).filter(|b| b.with_extension("DAT").is_file());
-            let grid_same = match (&rb_anlz, &grid) {
-                (Some(b), Some(g)) => crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| grids_match(&r, g)).unwrap_or(false),
-                _ => false,
-            };
-            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same });
+            // Whether the grid still matches rekordbox's is worked out on the export thread.
+            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same: false });
         }
         // Tracks without analysis are analysed by the export job itself (off the UI thread).
         let tag_categories: Vec<(String, Vec<String>)> = self

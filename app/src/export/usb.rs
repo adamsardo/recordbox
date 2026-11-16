@@ -483,6 +483,8 @@ pub struct ExportRequest {
 /// stopped or failed export leaves the drive as it was.
 struct Created {
     files: Vec<PathBuf>,
+    /// Existing files this export overwrote, with their previous bytes.
+    replaced: Vec<(PathBuf, Vec<u8>)>,
     committed: bool,
 }
 
@@ -492,8 +494,27 @@ impl Drop for Created {
             for f in self.files.iter().rev() {
                 let _ = std::fs::remove_file(f);
             }
+            for (p, old) in self.replaced.iter().rev() {
+                let _ = std::fs::write(p, old);
+            }
         }
     }
+}
+
+fn sha256_file(p: &Path) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().into())
 }
 
 /// rekordbox's analysis-file numbering: list the folder's files whose name starts with
@@ -585,6 +606,10 @@ fn copy_durable(src: &Path, dest: &Path, created: &mut Created) -> Result<()> {
     if n != want || std::fs::metadata(&tmp)?.len() != want {
         return Err(anyhow!("copy of {} is incomplete ({n} of {want} bytes)", src.display()));
     }
+    // Byte-for-byte check of what reached the drive.
+    if sha256_file(src)? != sha256_file(&tmp)? {
+        return Err(anyhow!("copy of {} does not match the original; the drive may be failing", src.display()));
+    }
     std::fs::rename(&tmp, dest)?;
     created.files.pop();
     created.files.push(dest.to_path_buf());
@@ -613,6 +638,12 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         Err(e) => return Err(anyhow!("Device library is corrupted ({e}). Nothing was changed.")),
     };
     let mut skipped: Vec<String> = std::mem::take(&mut req.skipped);
+    // Tracks whose grid is still the one rekordbox analysed can use its phrases/extended grid.
+    for et in req.tracks.values_mut() {
+        if let (Some(b), Some(g)) = (&et.rb_anlz, &et.grid) {
+            et.grid_same = crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| crate::app::grids_match(&r, g)).unwrap_or(false);
+        }
+    }
 
     // Tracks without analysis are analysed first (as the original does when exporting),
     // here on the export thread so the window stays responsive.
@@ -677,7 +708,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let total = req.tracks.len();
-    let mut created = Created { files: vec![], committed: false };
+    let mut created = Created { files: vec![], replaced: vec![], committed: false };
     let mut map: HashMap<i64, u32> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
     for t in lib.tracks.values() {
@@ -767,11 +798,11 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         std::fs::create_dir_all(base_fs.parent().unwrap())?;
         for (ext_name, data) in [("DAT", &files.dat), ("EXT", &files.ext), ("2EX", &files.ex2)] {
             let path = base_fs.with_extension(ext_name);
-            let fresh = !path.exists();
-            write_atomic(&path, data)?;
-            if fresh {
-                created.files.push(path);
+            match std::fs::read(&path) {
+                Ok(old) => created.replaced.push((path.clone(), old)),
+                Err(_) => created.files.push(path.clone()),
             }
+            write_atomic(&path, data)?;
         }
         // Artwork.
         let artwork_path = if !t.artwork.is_empty() && Path::new(&t.artwork).exists() {
@@ -839,7 +870,14 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     }
     lib.browse = Some(req.browse.clone());
     backup_device_db(&root);
-    write_device(&root, &lib)?;
+    {
+        let mut published = false;
+        let r = write_device_then(&root, &lib, &mut || published = true);
+        if published {
+            created.committed = true;
+        }
+        r?;
+    }
     created.committed = true;
     // Player settings, as rekordbox writes them with every export.
     for (name, bytes) in req.settings.files() {
@@ -1403,6 +1441,12 @@ pub fn build_export_ext(lib: &DeviceLibrary) -> Vec<u8> {
 }
 
 pub fn write_device(root: &Path, lib: &DeviceLibrary) -> Result<()> {
+    write_device_then(root, lib, &mut || {})
+}
+
+/// As write_device; `published` runs as soon as the new export.pdb is in place (from then on
+/// the drive's library refers to the files this export copied).
+pub fn write_device_then(root: &Path, lib: &DeviceLibrary, published: &mut dyn FnMut()) -> Result<()> {
     let dir = root.join("PIONEER").join("rekordbox");
     std::fs::create_dir_all(&dir)?;
     let main = build_export_pdb(lib);
@@ -1417,6 +1461,7 @@ pub fn write_device(root: &Path, lib: &DeviceLibrary) -> Result<()> {
     write_tmp(&dir.join("export.pdb"), &main)?;
     write_tmp(&dir.join("exportExt.pdb"), &ext)?;
     publish_tmp(&dir.join("export.pdb"))?;
+    published();
     publish_tmp(&dir.join("exportExt.pdb"))?;
     Ok(())
 }

@@ -110,7 +110,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                 crate::icons::magnifier(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.min.x + 12.0, sr.center().y), vec2(16.0, 16.0)), DIM2, 0);
                 ui.add_space(14.0);
                 type Ic = fn(&egui::Painter, egui::Rect, egui::Color32);
-                let items: [(&str, Ic); 4] = [("View", crate::icons::info), ("Analysis", crate::icons::view_columns), ("DJ System", crate::icons::usb), ("Advanced", crate::icons::hamburger)];
+                let items: [(&str, Ic); 5] = [("View", crate::icons::info), ("Analysis", crate::icons::view_columns), ("DJ System", crate::icons::usb), ("Keyboard", crate::icons::list), ("Advanced", crate::icons::hamburger)];
                 for (i, (n, ic)) in items.iter().enumerate() {
                     let sel = app.dialogs.prefs_tab == i as u8;
                     let (r, resp) = ui.allocate_exact_size(vec2(144.0, 30.0), egui::Sense::click());
@@ -133,6 +133,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                     0 => &["Display Type", "Color", "Player"],
                     1 => &["Track Analysis", "CUE Analysis"],
                     2 => &["General", "Category", "Sort", "Column", "My Settings", "Device"],
+                    3 => &["Shortcuts"],
                     _ => &["Library"],
                 };
                 let key = format!("prefs_subtab_{}", app.dialogs.prefs_tab);
@@ -232,16 +233,6 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             }
                         }
                         (2, 0) => {
-                            card(ui, "Waveform color", |ui| {
-                                sub(ui, "Waveform data written to the device");
-                                ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; the player's own setting chooses which one it shows.").size(12.0).color(DIM2));
-                            });
-                            card(ui, "Supported devices", |ui| {
-                                ui.label(RichText::new("Drive formats: FAT32, exFAT (some players), HFS+ (USB only).").size(13.0));
-                                ui.label(RichText::new("Files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(13.0));
-                            });
-                        }
-                        (2, 0) => {
                             use crate::export::settings::{SettingFile, DEV_WAVEFORM_COLOR, DEV_WAVEFORM_POSITION};
                             card(ui, "Waveform color", |ui| {
                                 sub(ui, "Waveform color displayed on CDJ/XDJ");
@@ -263,6 +254,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             });
                             card(ui, "Waveform data written to the device", |ui| {
                                 ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; the setting above chooses which one the players show.").size(12.0).color(DIM2));
+                            });
+                            card(ui, "Supported devices", |ui| {
+                                ui.label(RichText::new("Drive formats: FAT32, exFAT (some players), HFS+ (USB only).").size(13.0));
+                                ui.label(RichText::new("Files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(13.0));
                             });
                         }
                         (2, 1) | (2, 2) => {
@@ -354,9 +349,63 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                 }
                             });
                         }
+                        (3, _) => {
+                            card(ui, "Keyboard shortcuts", |ui| {
+                                ui.label(RichText::new("Click a key, then press the new key for that action (Esc cancels).").size(12.0).color(DIM2));
+                                let wait_id = egui::Id::new("key_wait");
+                                let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
+                                if let Some(action) = &waiting {
+                                    let got = ui.input(|i| i.events.iter().find_map(|e| match e { egui::Event::Key { key, pressed: true, .. } => Some(*key), _ => None }));
+                                    if let Some(k) = got {
+                                        if k != egui::Key::Escape {
+                                            // A key belongs to one action: take it away from any other.
+                                            let name = k.name().to_string();
+                                            let others: Vec<String> = crate::app::ACTIONS.iter().map(|a| a.0.to_string()).filter(|a| a != action && app.prefs.key_for(a) == Some(k)).collect();
+                                            for o in others {
+                                                app.prefs.keymap.insert(o, String::new());
+                                            }
+                                            app.prefs.keymap.insert(action.clone(), name);
+                                        }
+                                        ui.ctx().data_mut(|d| d.insert_temp::<Option<String>>(wait_id, None));
+                                    }
+                                }
+                                egui::Grid::new("keymap_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+                                    for (id, label, _) in crate::app::ACTIONS {
+                                        ui.label(RichText::new(label).size(13.0));
+                                        let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.key_for(id).map(|k| k.name().to_string()).unwrap_or_else(|| "—".into()) };
+                                        if ui.add(egui::Button::new(RichText::new(shown).size(13.0)).min_size(vec2(140.0, 22.0))).clicked() {
+                                            ui.ctx().data_mut(|d| d.insert_temp(wait_id, Some(id.to_string())));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Reset to defaults").clicked() {
+                                        app.prefs.keymap.clear();
+                                    }
+                                    if ui.button("Export…").clicked() {
+                                        if let Some(f) = rfd::FileDialog::new().set_file_name("prepdeck-shortcuts.json").save_file() {
+                                            let _ = std::fs::write(f, serde_json::to_vec_pretty(&app.prefs.keymap).unwrap_or_default());
+                                        }
+                                    }
+                                    if ui.button("Import…").clicked() {
+                                        if let Some(f) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                                            match std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&b).ok()) {
+                                                Some(m) => app.prefs.keymap = m.into_iter().filter(|(k, _)| crate::app::ACTIONS.iter().any(|a| a.0 == k)).collect(),
+                                                None => app.toast_err("That file is not a PrepDeck shortcut profile."),
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        }
                         (2, _) => {
                             card(ui, "Delete Tracks", |ui| {
                                 toggle(ui, &mut app.prefs.delete_device_tracks, "Delete playlist tracks from device if playlist is deleted");
+                            });
+                            card(ui, "History", |ui| {
+                                toggle(ui, &mut app.prefs.import_device_history, "Import the play history automatically");
+                                ui.label(RichText::new("Histories the players saved on a USB become playlists in the Histories folder. They are left on the device.").size(11.0).color(DIM));
                             });
                             card(ui, "Library", |ui| {
                                 sub(ui, "Device library format");
@@ -725,6 +774,9 @@ fn export_window(app: &mut App, ctx: &Context) {
             if d.fs == "apfs" {
                 ui.label(RichText::new("This drive is formatted as APFS, which DJ players cannot read. Use FAT32 or exFAT.").color(CAUTION_TX));
             }
+            if crate::export::usb::has_onelibrary(std::path::Path::new(&d.root)) {
+                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). PrepDeck updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
+            }
             if let Some(l) = &d.lib {
                 ui.label(RichText::new(format!("Already on the device: {} tracks, {} playlists. New items are added; existing ones are updated.", l.tracks.len(), l.nodes.iter().filter(|n| !n.folder).count())).size(11.0).color(DIM));
             }
@@ -793,6 +845,25 @@ fn export_window(app: &mut App, ctx: &Context) {
 }
 
 fn confirm_windows(app: &mut App, ctx: &Context) {
+    if let Some((id, name, folder)) = app.dialogs.confirm_delete_node.clone() {
+        egui::Window::new(if folder { "Delete Folder" } else { "Delete Playlist" }).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(format!("Delete \"{name}\"?"));
+            ui.label(RichText::new(if folder { "The folder and every playlist inside it are deleted. The tracks stay in the collection." } else { "The tracks stay in the collection." }).size(11.0).color(DIM));
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    let _ = app.db.delete_node(id);
+                    if app.view == View::Playlist(id) {
+                        app.set_view(View::Collection);
+                    }
+                    app.reload_playlists();
+                    app.dialogs.confirm_delete_node = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    app.dialogs.confirm_delete_node = None;
+                }
+            });
+        });
+    }
     if let Some(ids) = app.dialogs.confirm_remove.clone() {
         egui::Window::new("Remove from Collection").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("Remove {} track(s) from the collection?", ids.len()));

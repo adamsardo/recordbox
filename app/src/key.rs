@@ -20,6 +20,49 @@ pub struct KeyParams {
     pub minor_bias: f64,
 }
 
+/// Harmonic/percussive separation before the pitch profile: keep energy that is steady in
+/// time (notes, chords) and suppress energy that is spread across frequency (drums).
+fn hpss_enabled() -> bool {
+    std::env::var("PREPDECK_KEY_HPSS").map(|v| v != "0").unwrap_or(HPSS_DEFAULT)
+}
+const HPSS_DEFAULT: bool = false;
+
+fn median(v: &mut [f32]) -> f32 {
+    let mid = v.len() / 2;
+    *v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).1
+}
+
+/// Soft-mask each frame with H² / (H² + P²), H = median over ±k frames, P = median over ±k bins.
+fn hpss(frames: &mut [Vec<f32>], k: usize) {
+    let nf = frames.len();
+    if nf == 0 {
+        return;
+    }
+    let nb = frames[0].len();
+    let mut h = vec![vec![0f32; nb]; nf];
+    let mut buf = Vec::with_capacity(2 * k + 1);
+    for b in 0..nb {
+        for f in 0..nf {
+            buf.clear();
+            for g in f.saturating_sub(k)..(f + k + 1).min(nf) {
+                buf.push(frames[g][b]);
+            }
+            h[f][b] = median(&mut buf);
+        }
+    }
+    for f in 0..nf {
+        let row = frames[f].clone();
+        for b in 0..nb {
+            buf.clear();
+            buf.extend_from_slice(&row[b.saturating_sub(k)..(b + k + 1).min(nb)]);
+            let p = median(&mut buf);
+            let hh = h[f][b] * h[f][b];
+            let mask = hh / (hh + p * p + 1e-12);
+            frames[f][b] = row[b] * mask;
+        }
+    }
+}
+
 pub const DEFAULT: KeyParams = KeyParams { tuning: false, peaks: true, bass_weight: 0.45, profile: 2, power: 1.0, minor_bias: 0.15 };
 
 /// (name, major, minor) templates, index 0 = tonic.
@@ -95,6 +138,9 @@ pub fn features(mono: &[f32], sr: f64, p: &KeyParams) -> KeyFeatures {
         fft.process(&mut buf);
         frames.push((lo_bin..=hi_bin + 1).map(|b| buf[b].norm()).collect());
         start += hop;
+    }
+    if hpss_enabled() {
+        hpss(&mut frames, 8);
     }
     // Peak list per frame: (fractional bin, magnitude)
     let peaks_of = |m: &Vec<f32>| -> Vec<(f64, f64)> {

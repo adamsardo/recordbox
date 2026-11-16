@@ -71,6 +71,11 @@ pub fn open_snapshot(db: &Path) -> Result<rusqlite::Connection> {
     if n == 0 {
         return Err(anyhow!("the rekordbox library is empty or unreadable"));
     }
+    // A copy taken while rekordbox was writing could be inconsistent: check it first.
+    let check: String = c.query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_default();
+    if check != "ok" {
+        return Err(anyhow!("the copy of the rekordbox library failed its integrity check ({check}); try again with rekordbox closed"));
+    }
     Ok(c)
 }
 
@@ -333,7 +338,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
             }
             let mut keys = members.remove(&id).unwrap_or_default();
             keys.sort_by_key(|k| k.0);
-            out.push(XmlNode { name: text(r["Name"].clone()), folder, children: if folder { build(&id, pl, members, smart) } else { vec![] }, track_keys: keys.into_iter().map(|k| k.1).collect() });
+            out.push(XmlNode { name: text(r["Name"].clone()), folder, children: if folder { build(&id, pl, members, smart) } else { vec![] }, track_keys: keys.into_iter().map(|k| k.1).collect(), by_location: false });
         }
         out
     }

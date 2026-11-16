@@ -107,7 +107,8 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
         app.cue_down();
     }
-    if !cr.is_pointer_button_down_on() && app.deck.cue_preview && !ui.input(|i| i.key_down(egui::Key::C)) {
+    let cue_key_held = app.prefs.key_for("cue").map(|k| ui.input(|i| i.key_down(k))).unwrap_or(false);
+    if !cr.is_pointer_button_down_on() && app.deck.cue_preview && !cue_key_held {
         app.cue_up();
     }
     // PLAY
@@ -132,7 +133,9 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let det = Rect::from_min_max(pos2(main.min.x, my + 68.0), pos2(main.max.x, my + 204.0));
     draw_detail(app, ui, det, pos);
 
-    // ---------------- zoom column (overlaid on the left of the enlarged waveform)
+    // ---------------- zoom column (overlaid on the left of the enlarged waveform), on an opaque
+    // black strip so the waveform never shows through the buttons.
+    ui.painter().rect_filled(Rect::from_min_max(pos2(main.min.x, my + 98.0), pos2(main.min.x + 25.5, my + 176.0)), 0.0, Color32::BLACK);
     let zc = |y: f32| Rect::from_center_size(pos2(main.min.x + 12.7, my + y), vec2(22.0, 20.0));
     if tip(icon_button(ui, zc(112.0), "zin", None, |p, r, c| crate::icons::magnifier(p, r, c, 1)), app, "Zoom In").clicked() && app.prefs.zoom > 0 {
         app.prefs.zoom -= 1;
