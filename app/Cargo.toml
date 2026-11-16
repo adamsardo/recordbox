@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.31.1"
+winit = "0.30"
 rusqlite = { version = "0.40", features = ["bundled"] }
 symphonia = { version = "0.5.5", features = ["all"] }
 lofty = "0.22"

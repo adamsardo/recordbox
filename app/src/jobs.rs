@@ -1,5 +1,6 @@
 //! Background work: analysis workers, file import, player loading and device export.
 
+use eframe::egui;
 use crate::analysis::{analyze_file, AnalysisResult, AnalysisSettings};
 use crate::audio::{decode_file, Decoded};
 use crate::model::Track;

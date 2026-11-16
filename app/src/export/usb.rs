@@ -378,7 +378,6 @@ pub struct ExportRequest {
     pub nodes: Vec<ExportNode>,
     pub tracks: HashMap<i64, ExportTrack>,
     pub tag_categories: Vec<(String, Vec<String>)>,
-    pub key_alnum: bool,
 }
 
 pub fn run_export(req: ExportRequest, progress: &dyn Fn(Progress), cancel: &std::sync::atomic::AtomicBool) -> Result<String> {

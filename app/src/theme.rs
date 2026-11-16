@@ -1,5 +1,6 @@
 //! Colours and sizes measured from the original's skins and screenshots (sRGB).
 
+use eframe::egui;
 use egui::Color32;
 
 pub const fn hex(v: u32) -> Color32 {
