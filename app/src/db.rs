@@ -153,6 +153,10 @@ impl Db {
         Ok(v)
     }
 
+    pub fn track(&self, id: i64) -> Option<Track> {
+        self.conn.query_row(&format!("SELECT {TRACK_COLS} FROM tracks WHERE id=?1"), [id], Self::row_to_track).optional().ok().flatten()
+    }
+
     pub fn track_by_path(&self, path: &str) -> Option<i64> {
         self.conn.query_row("SELECT id FROM tracks WHERE path=?1", [path], |r| r.get(0)).optional().ok().flatten()
     }

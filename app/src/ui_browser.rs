@@ -903,6 +903,9 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         if let Some(e) = err {
             ui.label(RichText::new(e).size(10.5).color(CAUTION_TX));
         }
+        if fs != "folder" && crate::export::usb::has_onelibrary(std::path::Path::new(&root)) {
+            ui.label(RichText::new("Has a OneLibrary database that PrepDeck does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by PrepDeck.");
+        }
         if let Some(nodes) = nodes {
             fn rows(app: &mut App, ui: &mut Ui, root: &str, nodes: &[crate::export::usb::DevNode], parent: u32, depth: usize) {
                 let mut kids: Vec<&crate::export::usb::DevNode> = nodes.iter().filter(|n| n.parent == parent).collect();
@@ -1392,7 +1395,32 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         for c in &all_cols {
             let cw = col_width(app, *c);
             let cr = Rect::from_min_size(pos2(x, hr.min.y), vec2(cw, hr.height()));
-            let resp = ui.interact(cr, ui.id().with(("hdr", *c)), Sense::click());
+            let resp = ui.interact(cr, ui.id().with(("hdr", *c)), if *c == Col::Status { Sense::click() } else { Sense::click_and_drag() });
+            // Drag a column header to move the column (drop before/after the header under the
+            // pointer).
+            let drag_key = egui::Id::new("col_drag");
+            if resp.drag_started() && *c != Col::Status {
+                ui.ctx().data_mut(|d| d.insert_temp(drag_key, Some(*c)));
+            }
+            let dragging: Option<Col> = ui.ctx().data(|d| d.get_temp(drag_key)).flatten();
+            if let (Some(dc), Some(pp)) = (dragging, ui.ctx().pointer_latest_pos()) {
+                if dc != *c && *c != Col::Status && cr.contains(pp) {
+                    let after = pp.x > cr.center().x;
+                    let lx = if after { cr.max.x } else { cr.min.x };
+                    ui.painter().line_segment([pos2(lx, cr.min.y), pos2(lx, cr.max.y + 4.0)], Stroke::new(2.0, BLUE));
+                    if ui.input(|i| i.pointer.any_released()) {
+                        let cols = &mut app.prefs.columns;
+                        cols.retain(|x| *x != dc);
+                        let at = cols.iter().position(|x| x == c).map(|i| if after { i + 1 } else { i }).unwrap_or(cols.len());
+                        cols.insert(at.min(cols.len()), dc);
+                        app.save_prefs();
+                        ui.ctx().data_mut(|d| d.insert_temp::<Option<Col>>(drag_key, None));
+                    }
+                }
+            }
+            if dragging.is_some() && ui.input(|i| i.pointer.any_released()) {
+                ui.ctx().data_mut(|d| d.insert_temp::<Option<Col>>(drag_key, None));
+            }
             let sorted = app.prefs.sort_col == *c;
             if *c == Col::Status {
                 crate::icons::funnel(ui.painter(), Rect::from_center_size(pos2(cr.min.x + 15.0, cr.center().y), vec2(11.0, 11.0)), if app.filter_open { BLUE } else { DIM2 });

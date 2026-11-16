@@ -41,8 +41,8 @@ pub fn build() -> Option<Menu> {
     .ok()?;
     let edit = Submenu::new("Edit", true);
     edit.append_items(&[
-        &PredefinedMenuItem::undo(None),
-        &PredefinedMenuItem::redo(None),
+        &item("undo", "Undo", None),
+        &item("redo", "Redo", None),
         &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::cut(None),
         &PredefinedMenuItem::copy(None),
@@ -117,6 +117,8 @@ pub fn handle(app: &mut App, id: &str) {
     let sel = selected(app);
     match id {
         "about" => app.dialogs.about = true,
+        "undo" => app.undo_edit(),
+        "redo" => app.redo_edit(),
         "prefs" => app.dialogs.prefs_open = true,
         "import_track" => {
             if let Some(files) = rfd::FileDialog::new().add_filter("Audio", &["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "alac", "mp4"]).pick_files() {

@@ -274,7 +274,11 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 // (orange) stacked on it, high (white) on top. Heights per band unit were
                 // measured from the original's screen (0.25, 0.115, 0.085 pt) against its own
                 // overview values; the values come from the model fitted to its files.
-                let [lo, mi, hi] = crate::export::anlz::three_band_overview(c);
+                let [lo, mi, hi] = match &app.deck.rb_wave {
+                    // rekordbox's own overview values for this file, when available.
+                    Some(rw) if !rw.1.is_empty() => rw.1[(i * rw.1.len() / n.max(1)).min(rw.1.len() - 1)],
+                    _ => crate::export::anlz::three_band_overview(c),
+                };
                 let (b, o, w) = (lo as f32 * 0.25 / full_h, mi as f32 * 0.115 / full_h, hi as f32 * 0.085 / full_h);
                 vec![(b + o + w, WAVE_HIGH), (b + o, WAVE_MID), (b, WAVE_LOW)]
             } else {
@@ -287,6 +291,26 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         }
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
+    }
+    // Phrase bar (as rekordbox shows phrase analysis): one coloured block per phrase.
+    if let (Some(st), false) = (&app.deck.phrases, app.deck.beats.is_empty()) {
+        let y0 = r.min.y + 38.5;
+        let beat_t = |b: u16| app.deck.beats.get((b.max(1) - 1) as usize).map(|x| x.time).unwrap_or(dur);
+        for (k, ph) in st.phrases.iter().enumerate() {
+            let t0 = beat_t(ph.beat);
+            let t1 = st.phrases.get(k + 1).map(|n| beat_t(n.beat)).unwrap_or_else(|| beat_t(st.end_beat));
+            let x0 = r.min.x + (t0 / dur) as f32 * r.width();
+            let x1 = r.min.x + (t1 / dur) as f32 * r.width();
+            let col = match ph.kind {
+                crate::phrase::INTRO => hex(0x3E7BD6),
+                crate::phrase::UP => hex(0xD6A23E),
+                crate::phrase::DOWN => hex(0x5AA05A),
+                crate::phrase::CHORUS => hex(0xC8464B),
+                crate::phrase::OUTRO => hex(0x8A62C8),
+                _ => hex(0x606060),
+            };
+            p.rect_filled(Rect::from_min_max(pos2(x0 + 0.5, y0), pos2((x1 - 0.5).max(x0 + 1.0), y0 + 3.0)), 0.0, col);
+        }
     }
     // progress rule and minute ticks
     p.line_segment([pos2(r.min.x, r.min.y + 33.0), pos2(r.max.x, r.min.y + 33.0)], Stroke::new(1.0, hex(0x5A5A5A)));
@@ -399,8 +423,16 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                     let bars = if app.prefs.wave_color >= 2 {
                         // 3Band detail: each band centred at its own height, low, then mid, then
                         // high drawn over it (the original's layering), from the fitted model.
-                        let [lo, mi, hi] = crate::export::anlz::three_band_detail(&m);
-                        let s = |v: u8| (v as f32 / 80.0).min(1.0);
+                        let [lo, mi, hi] = match &app.deck.rb_wave {
+                            // rekordbox's own detail values (150 per second), when available.
+                            Some(rw) if !rw.0.is_empty() => {
+                                let ia = ((t0.max(0.0) * 150.0) as usize).min(rw.0.len() - 1);
+                                let ib = ((t1.max(0.0) * 150.0).ceil() as usize).clamp(ia + 1, rw.0.len());
+                                rw.0[ia..ib].iter().fold([0u8; 3], |acc, v| [acc[0].max(v[0]), acc[1].max(v[1]), acc[2].max(v[2])])
+                            }
+                            _ => crate::export::anlz::three_band_detail(&m),
+                        };
+                        let s = |v: u8| (v as f32 / 95.0).min(1.0);
                         vec![(s(lo), WAVE_LOW), (s(mi), WAVE_MID), (s(hi), WAVE_HIGH)]
                     } else {
                         wave_bars(app.prefs.wave_color, Waveform::disp(&m))
@@ -635,6 +667,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                 for h in hot {
                     if !app.deck.cues.iter().any(|c| c.kind == CueKind::Memory && (c.start - h.start).abs() < 0.001) {
                         let mut c = Cue { id: 0, kind: CueKind::Memory, slot: -1, color: 0, ..h };
+                        app.snapshot_cues();
                         if let Ok(id) = app.db.save_cue(&c) {
                             c.id = id;
                             app.deck.cues.push(c);

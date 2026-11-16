@@ -343,6 +343,8 @@ pub fn build(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue], raw_
 pub struct Overrides {
     pub sections: std::collections::HashMap<String, Vec<u8>>,
     pub grid_same: bool,
+    /// PrepDeck's own phrase section (unmasked), used when rekordbox's can't be.
+    pub pssi: Option<Vec<u8>>,
 }
 
 /// Every top-level section of an ANLZ file, by tag (first occurrence), as raw bytes.
@@ -391,7 +393,12 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
     }
     ext.push(or("PWV5", &|| pwv5(&frames)));
     ext.push(or("PWV4", &|| pwv4(wave)));
-    if let Some(s) = take_grid("PSSI") {
+    // Phrases: rekordbox's own when its grid still applies, else PrepDeck's. Written with the
+    // XOR mask rekordbox 6+ applies to exported files.
+    if let Some(mut s) = take_grid("PSSI").or_else(|| ov.and_then(|o| o.pssi.clone())) {
+        if !crate::phrase::is_masked(&s) {
+            crate::phrase::mask_section(&mut s);
+        }
         ext.push(s);
     }
     let mut ex2 = vec![ppth(usb_path), or("PWV7", &|| pwv7(&frames)), or("PWV6", &|| pwv6(wave)), or("PWVC", &pwvc)];

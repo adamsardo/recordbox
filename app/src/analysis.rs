@@ -409,8 +409,11 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
         [(a[0] - m) / sd, (a[1] - m) / sd, (a[2] - m) / sd, (a[3] - m) / sd]
     };
     let (zl, zh) = (z(sums), z(hsum));
+    // Section changes (drops, breakdowns, new parts) land on a bar's first beat.
+    let zs = z(structure_votes(mono, sr, &times));
+    let ws = structure_weight();
     // DJ edits usually start on a bar: favour the beat where the music starts.
-    let mut score: Vec<f64> = (0..4).map(|j| zl[j] * 0.6 + zh[j]).collect();
+    let mut score: Vec<f64> = (0..4).map(|j| zl[j] * 0.6 + zh[j] + zs[j] * ws).collect();
     let peak = o.low.iter().cloned().fold(0f32, f32::max).max(1e-6);
     if let Some(k0) = times.iter().position(|t| {
         let fi = (t - o.t0) * fps;
@@ -422,6 +425,77 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
     // Beat number of the first beat so that beat index `down` is a "1".
     let first_beat_no = ((4 - down) % 4) as u8 + 1;
     (bpm, Some(BeatGrid::constant(first, bpm, first_beat_no)))
+}
+
+fn structure_weight() -> f64 {
+    std::env::var("PREPDECK_STRUCT_W").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0)
+}
+
+/// Votes per beat position (mod 4) from the strongest section changes: per beat, log energy in
+/// three bands; novelty = distance between the means of the 8 beats after and the 8 before;
+/// the top peaks (at least 4 beats apart) vote for their position, weighted by strength.
+fn structure_votes(mono: &[f32], sr: f64, times: &[f64]) -> [f64; 4] {
+    let mut votes = [0f64; 4];
+    if times.len() < 40 {
+        return votes;
+    }
+    let mut lp = Biquad::new("lp", 200.0, 0.707, sr, 0.0);
+    let mut hp = Biquad::new("hp", 2500.0, 0.707, sr, 0.0);
+    let mut feats: Vec<[f64; 3]> = Vec::with_capacity(times.len());
+    let mut idx = 0usize;
+    let n = mono.len();
+    for (k, t) in times.iter().enumerate() {
+        let end = times.get(k + 1).map(|x| (x * sr) as usize).unwrap_or(n).min(n);
+        let start = ((*t * sr) as usize).min(n);
+        let mut e = [0f64; 3];
+        // keep the filters running continuously
+        while idx < start {
+            lp.run(mono[idx] as f64);
+            hp.run(mono[idx] as f64);
+            idx += 1;
+        }
+        let mut cnt = 0f64;
+        while idx < end {
+            let x = mono[idx] as f64;
+            let l = lp.run(x);
+            let h = hp.run(x);
+            e[0] += l * l;
+            e[1] += (x - l - h).powi(2);
+            e[2] += h * h;
+            cnt += 1.0;
+            idx += 1;
+        }
+        let c = cnt.max(1.0);
+        feats.push([(e[0] / c + 1e-9).ln(), (e[1] / c + 1e-9).ln(), (e[2] / c + 1e-9).ln()]);
+    }
+    let w: usize = std::env::var("PREPDECK_STRUCT_WIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let max_peaks: usize = std::env::var("PREPDECK_STRUCT_PEAKS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+    let mut nov = vec![0f64; feats.len()];
+    for i in w..feats.len().saturating_sub(w) {
+        let mut d = 0f64;
+        for b in 0..3 {
+            let after: f64 = feats[i..i + w].iter().map(|f| f[b]).sum::<f64>() / w as f64;
+            let before: f64 = feats[i - w..i].iter().map(|f| f[b]).sum::<f64>() / w as f64;
+            d += (after - before).powi(2);
+        }
+        nov[i] = d.sqrt();
+    }
+    // Strongest peaks, at least 4 beats apart.
+    let mut order: Vec<usize> = (0..nov.len()).collect();
+    order.sort_by(|a, b| nov[*b].partial_cmp(&nov[*a]).unwrap());
+    let mut picked: Vec<usize> = vec![];
+    for i in order {
+        if nov[i] <= 0.0 || picked.len() >= max_peaks {
+            break;
+        }
+        if picked.iter().all(|p| p.abs_diff(i) >= 4) {
+            picked.push(i);
+        }
+    }
+    for p in picked {
+        votes[p % 4] += nov[p];
+    }
+    votes
 }
 
 /// Find the offset that best aligns predicted beats with the steepest rise of the

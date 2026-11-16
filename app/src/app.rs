@@ -304,6 +304,14 @@ impl Default for Prefs {
 
 /// Seconds shown across the enlarged waveform; the default (index 2) matches the original's default
 /// zoom, measured at about 21 beats from the playhead to the right edge at 126 BPM.
+/// One undoable library edit: the state before it.
+#[derive(Clone)]
+pub enum Edit {
+    Cues { track: i64, before: Vec<Cue> },
+    Track { before: Track },
+    Grid { track: i64, before: BeatGrid },
+}
+
 pub enum StemMsg {
     Hardware(crate::stems::Hardware, String),
     Download(u64, u64),
@@ -364,6 +372,11 @@ pub enum SideMode {
 }
 
 pub struct Deck {
+    /// Phrase structure shown under the overview (rekordbox's own, or PrepDeck's).
+    pub phrases: Option<crate::phrase::Structure>,
+    /// rekordbox's own 3-band waveforms for this audio file (detail at 150 per second, and
+    /// the 1200-column overview), when the track came from the rekordbox library.
+    pub rb_wave: Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>>,
     pub track: Option<i64>,
     pub audio: Option<Arc<Decoded>>,
     pub loading: Option<Receiver<(i64, Result<Arc<Decoded>, String>)>>,
@@ -391,6 +404,8 @@ pub struct Deck {
 impl Default for Deck {
     fn default() -> Self {
         Deck {
+            phrases: None,
+            rb_wave: None,
             track: None,
             audio: None,
             loading: None,
@@ -493,6 +508,8 @@ pub struct App {
     /// Playlist/folder being dragged in the tree.
     pub node_drag: Option<i64>,
     pub stem: StemState,
+    pub undo: Vec<Edit>,
+    pub redo: Vec<Edit>,
     pub pool: AnalysisPool,
     pub analysis_total: usize,
     pub analysis_done: usize,
@@ -547,6 +564,8 @@ impl App {
             load_after_import: None,
             node_drag: None,
             stem: StemState::new(),
+            undo: vec![],
+            redo: vec![],
             search: String::new(),
             filter_open: false,
             filter_bpm: (0.0, 0.0),
@@ -841,6 +860,12 @@ impl App {
         Some(&mut self.tracks[i])
     }
     pub fn save_track(&mut self, id: i64) {
+        // The database still holds the previous values: keep them for Undo.
+        if let Some(before) = self.db.track(id) {
+            if self.track(id).map(|t| format!("{t:?}") != format!("{before:?}")).unwrap_or(false) {
+                self.record(Edit::Track { before });
+            }
+        }
         if let Some(t) = self.track(id).cloned() {
             let mut t = t;
             if t.analyzed == 3 {
@@ -1120,6 +1145,42 @@ impl App {
         self.selected.retain(|id| idx.contains_key(id));
         self.anchor = self.anchor_id.and_then(|id| self.list.iter().position(|x| *x == id));
         self.list_dirty = false;
+    }
+
+    /// Phrases for the loaded track: rekordbox's own while its grid is unchanged, else analysed
+    /// from the decoded audio on the current grid.
+    fn phrases_for_deck(&self, a: &Decoded) -> Option<crate::phrase::Structure> {
+        let id = self.deck.track?;
+        let path = self.track(id)?.path.clone();
+        let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if let Some(base) = map.get(&path).map(std::path::PathBuf::from) {
+            let same = crate::rbimport::read_pqtz_grid(&base.with_extension("DAT")).map(|r| grids_match(&r, &self.deck.grid)).unwrap_or(false);
+            if same {
+                if let Some(s) = crate::export::anlz::read_sections(&base.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s)) {
+                    return Some(s);
+                }
+            }
+        }
+        if self.deck.beats.is_empty() {
+            return None;
+        }
+        crate::phrase::analyze(&a.mono(), a.sr as f64, &self.deck.beats)
+    }
+
+    /// rekordbox's PWV7 (detail) and PWV6 (overview) 3-band waveforms for an audio file.
+    fn rb_waveforms(&self, path: &str) -> Option<std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>> {
+        let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok())?;
+        let base = std::path::PathBuf::from(map.get(path)?);
+        let sec = crate::export::anlz::read_sections(&base.with_extension("2EX"));
+        let triples = |s: &Vec<u8>| -> Option<Vec<[u8; 3]>> {
+            let hlen = u32::from_be_bytes(s.get(4..8)?.try_into().ok()?) as usize;
+            let n = u32::from_be_bytes(s.get(16..20)?.try_into().ok()?) as usize;
+            let body = s.get(hlen..hlen + n * 3)?;
+            Some(body.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+        };
+        let detail = triples(sec.get("PWV7")?)?;
+        let overview = triples(sec.get("PWV6")?)?;
+        Some(std::sync::Arc::new((detail, overview)))
     }
 
     /// Point the selection anchor at row `i` of the current list.
@@ -1780,6 +1841,7 @@ impl App {
         self.deck.track = Some(id);
         self.deck.duration = t.duration;
         self.deck.wave = self.db.wave(id);
+        self.deck.rb_wave = self.rb_waveforms(&t.path);
         self.deck.cues = self.db.cues(id).unwrap_or_default();
         let g = self.db.grid(id).unwrap_or_default();
         self.set_deck_grid(g, false);
@@ -1814,9 +1876,10 @@ impl App {
                     s.pos = cp * a.sr as f64;
                     s.audio = Some(a.clone());
                     drop(s);
-                    self.deck.audio = Some(a);
+                    self.deck.audio = Some(a.clone());
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
+                    self.deck.phrases = self.phrases_for_deck(&a);
                 }
                 Err(e) => {
                     if let Some((old, pos, gain)) = self.deck_backup.take() {
@@ -1946,6 +2009,7 @@ impl App {
                 None => (self.quantized(self.pos()), None, hotcue_default_color(slot, false)),
             };
             let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
+            self.snapshot_cues();
             if let Ok(id) = self.db.save_cue(&c) {
                 c.id = id;
                 self.deck.cues.push(c);
@@ -1960,7 +2024,79 @@ impl App {
             self.seek(start);
         }
     }
+    /// Remember the loaded track's cues before an edit (for Undo).
+    pub fn snapshot_cues(&mut self) {
+        if let Some(t) = self.deck.track {
+            self.record(Edit::Cues { track: t, before: self.deck.cues.clone() });
+        }
+    }
+
+    fn record(&mut self, e: Edit) {
+        self.undo.push(e);
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// The current state matching `e` (what Redo/Undo will need to go back to).
+    fn current_of(&self, e: &Edit) -> Option<Edit> {
+        match e {
+            Edit::Cues { track, .. } => Some(Edit::Cues { track: *track, before: self.db.cues(*track).unwrap_or_default() }),
+            Edit::Track { before } => self.db.track(before.id).map(|t| Edit::Track { before: t }),
+            Edit::Grid { track, .. } => Some(Edit::Grid { track: *track, before: self.db.grid(*track).unwrap_or_default() }),
+        }
+    }
+
+    fn restore(&mut self, e: Edit) {
+        match e {
+            Edit::Cues { track, before } => {
+                let _ = self.db.replace_cues(track, &before);
+                if self.deck.track == Some(track) {
+                    self.deck.cues = self.db.cues(track).unwrap_or_default();
+                }
+                let cues = self.db.cues(track).unwrap_or_default();
+                let (h, m) = (cues.iter().filter(|c| c.kind == CueKind::Hot).count(), cues.iter().filter(|c| c.kind == CueKind::Memory).count());
+                if h + m == 0 {
+                    self.cue_counts.remove(&track);
+                } else {
+                    self.cue_counts.insert(track, (h, m));
+                }
+            }
+            Edit::Track { before } => {
+                let _ = self.db.update_track(&before);
+                if let Some(t) = self.track_mut(before.id) {
+                    *t = before;
+                }
+                self.list_dirty = true;
+            }
+            Edit::Grid { track, before } => {
+                let _ = self.db.save_grid(track, &before);
+                if self.deck.track == Some(track) {
+                    self.set_deck_grid(before, false);
+                }
+            }
+        }
+    }
+
+    pub fn undo_edit(&mut self) {
+        let Some(e) = self.undo.pop() else { return };
+        if let Some(cur) = self.current_of(&e) {
+            self.redo.push(cur);
+        }
+        self.restore(e);
+    }
+
+    pub fn redo_edit(&mut self) {
+        let Some(e) = self.redo.pop() else { return };
+        if let Some(cur) = self.current_of(&e) {
+            self.undo.push(cur);
+        }
+        self.restore(e);
+    }
+
     pub fn delete_cue(&mut self, cue_id: i64) {
+        self.snapshot_cues();
         let _ = self.db.delete_cue(cue_id);
         self.deck.cues.retain(|c| c.id != cue_id);
         if let Some(t) = self.deck.track {
@@ -1968,6 +2104,7 @@ impl App {
         }
     }
     pub fn update_cue(&mut self, c: Cue) {
+        self.snapshot_cues();
         let _ = self.db.save_cue(&c);
         if let Some(x) = self.deck.cues.iter_mut().find(|x| x.id == c.id) {
             *x = c;
@@ -2000,6 +2137,7 @@ impl App {
             return;
         }
         let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Memory, slot: -1, start, end, color: 0, comment: String::new(), active_loop: false };
+        self.snapshot_cues();
         if let Ok(id) = self.db.save_cue(&c) {
             c.id = id;
             self.deck.cues.push(c);
@@ -2114,6 +2252,9 @@ impl App {
     }
     fn push_grid(&mut self, g: BeatGrid) {
         let old = self.deck.grid.clone();
+        if let Some(t) = self.deck.track {
+            self.record(Edit::Grid { track: t, before: old.clone() });
+        }
         self.deck.grid_undo.push(old);
         self.deck.grid_redo.clear();
         self.set_deck_grid(g, true);

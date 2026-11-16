@@ -163,6 +163,11 @@ pub fn player_supported(ext: &str) -> bool {
 // Reading an existing device library
 // ------------------------------------------------------------------------------------------
 
+/// The drive carries rekordbox's newer OneLibrary catalogue (exportLibrary.db).
+pub fn has_onelibrary(root: &Path) -> bool {
+    root.join("PIONEER").join("rekordbox").join("exportLibrary.db").exists()
+}
+
 pub fn pdb_path(root: &Path) -> PathBuf {
     root.join("PIONEER").join("rekordbox").join("export.pdb")
 }
@@ -436,6 +441,13 @@ pub struct ExportTrack {
     pub grid_same: bool,
 }
 
+impl ExportTrack {
+    /// rekordbox's own phrase section can be used (its grid is unchanged and it has one).
+    fn has_rb_phrases(&self) -> bool {
+        self.grid_same && self.rb_anlz.as_ref().map(|b| anlz::read_sections(&b.with_extension("EXT")).contains_key("PSSI")).unwrap_or(false)
+    }
+}
+
 /// A playlist (or folder) to create on the device, depth-first order.
 #[derive(Clone)]
 pub struct ExportNode {
@@ -632,6 +644,25 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         progress(Progress::Analyzed(id, Box::new(r)));
     }
 
+    // Phrases for tracks without rekordbox's own (computed on the track's grid).
+    let mut phrases: HashMap<i64, crate::phrase::Structure> = HashMap::new();
+    let todo: Vec<i64> = req.tracks.values().filter(|t| t.grid.is_some() && !t.has_rb_phrases()).map(|t| t.track.id).collect();
+    let n_todo = todo.len();
+    for (i, id) in todo.into_iter().enumerate() {
+        if cancel.load(Relaxed) {
+            return Err(anyhow!("Export was stopped. The device library was not changed."));
+        }
+        let Some(et) = req.tracks.get(&id) else { continue };
+        progress(Progress::Step { done: i, total: n_todo, text: format!("Analyzing phrases of {}", et.track.display_title()) });
+        if let Ok(d) = crate::audio::decode_file(&et.track.path) {
+            let full = d.duration();
+            let beats = et.grid.as_ref().map(|g| g.beats(full)).unwrap_or_default();
+            if let Some(st) = crate::phrase::analyze(&d.mono(), d.sr as f64, &beats) {
+                phrases.insert(id, st);
+            }
+        }
+    }
+
     // Space check.
     let need: u64 = req
         .tracks
@@ -713,13 +744,13 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         let full_len = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
         let beats = et.grid.as_ref().map(|g| g.beats(full_len.max(t.duration))).unwrap_or_default();
         let wave = et.wave.clone().unwrap_or_default();
-        let ov = et.rb_anlz.as_ref().map(|b| {
-            let mut sections = std::collections::HashMap::new();
+        let mut sections = std::collections::HashMap::new();
+        if let Some(b) = &et.rb_anlz {
             for e in ["2EX", "EXT", "DAT"] {
                 sections.extend(anlz::read_sections(&b.with_extension(e)));
             }
-            anlz::Overrides { sections, grid_same: et.grid_same }
-        });
+        }
+        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi) });
         let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let prev = lib.tracks.get(&dev_id).cloned().unwrap_or_default();
         let base = match anlz_base(&prev.analyze_path) {
@@ -818,6 +849,9 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
     let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources).unwrap_or_default());
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
+    if has_onelibrary(&root) {
+        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which PrepDeck does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
+    }
     if !skipped.is_empty() {
         msg.push_str(&format!(". {} track(s) were not exported: {}", skipped.len(), short_list(&skipped, 5)));
     }

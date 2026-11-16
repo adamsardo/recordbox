@@ -13,6 +13,7 @@ mod jobs;
 mod key;
 mod menus;
 mod model;
+mod phrase;
 mod rbimport;
 mod stems;
 mod smart;
@@ -96,6 +97,17 @@ impl eframe::App for Gui {
 }
 
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
+    // Library edit Undo/Redo (text fields keep their own undo while they are being edited).
+    if !ctx.wants_keyboard_input() {
+        let (z, shift) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::Z), i.modifiers.shift));
+        if z {
+            if shift {
+                app.redo_edit();
+            } else {
+                app.undo_edit();
+            }
+        }
+    }
     if ctx.wants_keyboard_input() {
         return;
     }
