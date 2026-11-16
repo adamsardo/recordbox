@@ -470,7 +470,7 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
         let sel = app.view == View::Playlist(n.id);
         let open = app.expanded.contains(&n.id);
         let (icon, count) = match n.kind {
-            NodeKind::Folder => (if open { "▼🗀" } else { "▸🗀" }, None),
+            NodeKind::Folder => (if open { "▼" } else { "▶" }, None),
             NodeKind::Smart => ("⚙", n.smart.as_ref().map(|r| app.smart_tracks(r).len())),
             NodeKind::Playlist => ("☰", Some(app.node_counts.get(&n.id).copied().unwrap_or(0))),
         };
@@ -638,7 +638,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 kids.sort_by_key(|n| n.seq);
                 for n in kids {
                     let sel = app.view == View::Device { root: root.to_string(), node: Some(n.id) };
-                    let resp = tree_row(ui, depth, &n.name, if n.folder { None } else { Some(n.entries.len()) }, sel, if n.folder { "🗀" } else { "☰" }, ui.id().with(("dn", root, n.id)));
+                    let resp = tree_row(ui, depth, &n.name, if n.folder { None } else { Some(n.entries.len()) }, sel, if n.folder { "▶" } else { "☰" }, ui.id().with(("dn", root, n.id)));
                     if resp.clicked() {
                         app.set_view(View::Device { root: root.to_string(), node: Some(n.id) });
                     }

@@ -266,7 +266,7 @@ fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 tri_up(&p, pos2(x, r.max.y + 1.0), 5.0, col);
             } else {
                 let col = hotcue_color(c.color);
-                let lr = Rect::from_min_size(pos2(x - 0.5, r.min.y - 10.0), vec2(10.0, 10.0));
+                let lr = Rect::from_min_size(pos2(x - 0.5, r.min.y), vec2(10.0, 10.0));
                 p.rect_filled(lr, 0.0, col);
                 p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(8.0), WHITE);
                 p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, col));
@@ -678,10 +678,10 @@ fn grid_strip(app: &mut App, ui: &mut Ui, s: Rect, x0: f32) {
         x += w + 4.0;
         tip(button(ui, r, id, label, if on { BLUE } else { BTN }, WHITE, 10.5), app, tipt).clicked()
     };
-    if b(ui, app, "gundo", "↶", 28.0, "Undo", false) {
+    if b(ui, app, "gundo", "UNDO", 44.0, "Undo", false) {
         app.grid_undo();
     }
-    if b(ui, app, "gredo", "↷", 28.0, "Redo", false) {
+    if b(ui, app, "gredo", "REDO", 44.0, "Redo", false) {
         app.grid_redo();
     }
     let fc = app.prefs.grid_from_current;

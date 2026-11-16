@@ -75,7 +75,9 @@ Sources used:
 | BPM limits for edits | 40 – 499 | binary message "BPM value should be between 40 and 499." |
 | Onset envelope | 1024-pt FFT, 200 frames/s, log spectral flux to 8 kHz + low band to 160 Hz | estimated |
 | Tempo | autocorrelation over the range, then phase-aligned comb on a 0.01 BPM grid; whole BPM preferred within 3% score | estimated |
-| Beat phase | kick-band check of half-beat, then median transient offset (±40 ms, 1 ms steps) | estimated |
+| Beat phase | kick-band check of half-beat, first-kick anchor, then median attack start (70% of steepest rise, ±40 ms, 1 ms steps) | calibrated against 105 rekordbox-made grids in the person's local analysis files |
+| MP3 start alignment | LAME-tagged: keep encoder lead-in; ffmpeg-tagged (Lavc/Lavf): remove delay from the tag (1105 samples typical); no tag: drop 1152 samples | measured: these three classes were offset by −27 / 0 / +26 ms against rekordbox's own grids before this rule |
+| Benchmark | 105 tracks: tempo identical on 104; beat offset mean −1.6 ms, median 6 ms, 47% within 5 ms, 90% within 37 ms; bar start agrees on 66 | reference grids from the original's analysis files (read-only) |
 | Downbeat | low-band attack per beat position + chroma change at bar starts | estimated |
 | Key | chroma 55–1760 Hz from 8192-pt FFT at ~11 kHz, Krumhansl–Kessler templates | estimated |
 | Key names | Classic: Abm Ebm Bbm Fm Cm Gm Dm Am Em Bm Gbm Dbm / B Gb Db Ab Eb Bb F C G D A E; Alphanumeric 1A–12A / 1B–12B | binary key table + screenshot spellings |

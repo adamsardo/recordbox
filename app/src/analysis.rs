@@ -353,6 +353,22 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
     if low_at(phase + period / 2.0) > low_at(phase) * 1.15 {
         phase += period / 2.0;
     }
+    // The first kick of a track is almost always on a beat: if it sits on the half-beat
+    // of the chosen phase, move the grid by half a beat.
+    let lpeak = o.low.iter().cloned().fold(0f32, f32::max).max(1e-6);
+    if let Some(f0) = o.low.iter().position(|v| *v > 0.35 * lpeak) {
+        // refine to the local maximum just after crossing
+        let mut fm = f0;
+        for k in f0..(f0 + 6).min(o.low.len()) {
+            if o.low[k] > o.low[fm] {
+                fm = k;
+            }
+        }
+        let rel = ((fm as f64 - phase) / period).rem_euclid(1.0);
+        if (rel - 0.5).abs() < 0.2 {
+            phase += period / 2.0;
+        }
+    }
 
     // 3) Sub-frame refinement against low-band transients in the time domain.
     let period_s = 60.0 / bpm;
@@ -390,7 +406,15 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
         [(a[0] - m) / sd, (a[1] - m) / sd, (a[2] - m) / sd, (a[3] - m) / sd]
     };
     let (zl, zh) = (z(sums), z(hsum));
-    let score: Vec<f64> = (0..4).map(|j| zl[j] * 0.6 + zh[j]).collect();
+    // DJ edits usually start on a bar: favour the beat where the music starts.
+    let mut score: Vec<f64> = (0..4).map(|j| zl[j] * 0.6 + zh[j]).collect();
+    let peak = o.low.iter().cloned().fold(0f32, f32::max).max(1e-6);
+    if let Some(k0) = times.iter().position(|t| {
+        let fi = (t - o.t0) * fps;
+        (-4..=4).map(|d| interp(&o.low, fi + d as f64)).fold(0f32, f32::max) > 0.25 * peak
+    }) {
+        score[k0 % 4] += 1.2;
+    }
     let down = (0..4).max_by(|a, b| score[*a].partial_cmp(&score[*b]).unwrap()).unwrap_or(0);
     // Beat number of the first beat so that beat index `down` is a "1".
     let first_beat_no = ((4 - down) % 4) as u8 + 1;
@@ -399,6 +423,9 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
 
 /// Find the offset that best aligns predicted beats with the steepest rise of the
 /// low-passed amplitude envelope (median over the track).
+/// Fraction of the steepest rise that marks the start of a kick's attack.
+const ATTACK_FRACTION: f32 = 0.7;
+
 fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
     let mut lp1 = Biquad::new("lp", 150.0, 0.707, sr, 0.0);
     let mut lp2 = Biquad::new("lp", 150.0, 0.707, sr, 0.0);
@@ -430,7 +457,22 @@ fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
             }
         }
         if best.1 > 0.02 {
-            offsets.push(best.0);
+            // Use where the attack starts, not where it is steepest.
+            let rise_at = |d: isize| -> f32 {
+                let i = c + d;
+                if i < 2 || i as usize + 1 >= env.len() {
+                    return 0.0;
+                }
+                env[i as usize + 1] - env[i as usize - 2]
+            };
+            let mut start = best.0;
+            for d in (best.0 - 12).max(-40)..best.0 {
+                if rise_at(d) >= ATTACK_FRACTION * best.1 {
+                    start = d;
+                    break;
+                }
+            }
+            offsets.push(start);
         }
         t += period;
     }
@@ -723,6 +765,69 @@ mod real_files {
                 }
                 Err(e) => eprintln!("ERR {e} :: {p}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ground_truth {
+    /// Compare analysis with reference grids: PREPDECK_GT = tsv of "path\tbeat,bpm100,ms;..."
+    #[test]
+    #[ignore]
+    fn compare_reference_grids() {
+        let Ok(f) = std::env::var("PREPDECK_GT") else { return };
+        let text = std::fs::read_to_string(f).unwrap();
+        let rows: Vec<(String, Vec<(u8, f64, f64)>)> = text
+            .lines()
+            .filter_map(|l| {
+                let (p, b) = l.split_once('\t')?;
+                let beats = b.split(';').filter_map(|x| {
+                    let v: Vec<f64> = x.split(',').filter_map(|n| n.parse().ok()).collect();
+                    (v.len() == 3).then(|| (v[0] as u8, v[1] / 100.0, v[2] / 1000.0))
+                }).collect();
+                Some((p.to_string(), beats))
+            })
+            .collect();
+        let results = std::sync::Mutex::new(vec![]);
+        let chunks: Vec<_> = rows.chunks((rows.len() / 8).max(1)).collect();
+        std::thread::scope(|s| {
+            for ch in chunks {
+                let results = &results;
+                s.spawn(move || {
+                    for (p, beats) in ch {
+                        let Ok(r) = super::analyze_file(p, &Default::default()) else { continue };
+                        let Some(g) = r.grid else { continue };
+                        let (rb, rbpm, rt) = beats[0];
+                        let period = 60.0 / rbpm;
+                        let mine = g.anchors[0].time;
+                        let mut d = (mine - rt) / period;
+                        d -= d.round();
+                        let phase_ms = d * period * 1000.0;
+                        // downbeat: reference time of a "1"
+                        let ref_one = rt + ((5 - rb as i32) % 4) as f64 * period;
+                        let mine_beats = g.beats(30.0);
+                        let near = crate::model::nearest_beat(&mine_beats, ref_one).map(|b| b.beat).unwrap_or(0);
+                        results.lock().unwrap().push((p.rsplit('/').next().unwrap().to_string(), rbpm, r.bpm, phase_ms, near == 1));
+                    }
+                });
+            }
+        });
+        let res = results.into_inner().unwrap();
+        let n = res.len() as f64;
+        let bpm_ok = res.iter().filter(|r| (r.1 - r.2).abs() < 0.02).count();
+        let bpm_oct = res.iter().filter(|r| (r.1 - r.2).abs() >= 0.02).collect::<Vec<_>>();
+        let ph: Vec<f64> = res.iter().filter(|r| (r.1 - r.2).abs() < 0.02).map(|r| r.3).collect();
+        let mut abs: Vec<f64> = ph.iter().map(|x| x.abs()).collect();
+        abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = ph.iter().sum::<f64>() / ph.len().max(1) as f64;
+        let down = res.iter().filter(|r| r.4).count();
+        eprintln!("tracks {n}  bpm exact {bpm_ok}  downbeat {down}");
+        eprintln!("phase mean {mean:.1} ms, median |err| {:.1} ms, 90% {:.1} ms, within 5ms {}", abs.get(abs.len() / 2).unwrap_or(&0.0), abs.get(abs.len() * 9 / 10).unwrap_or(&0.0), abs.iter().filter(|x| **x <= 5.0).count());
+        for r in bpm_oct {
+            eprintln!("  BPM ref {:.2} mine {:.2} :: {}", r.1, r.2, r.0);
+        }
+        for r in res.iter().filter(|r| (r.1 - r.2).abs() < 0.02 && r.3.abs() > 0.0) {
+            eprintln!("  phase {:.1} ms :: {}", r.3, r.0);
         }
     }
 }

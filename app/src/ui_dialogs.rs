@@ -467,7 +467,7 @@ fn export_window(app: &mut App, ctx: &Context) {
                             NodeKind::Playlist => format!(" ({})", app.node_counts.get(&n.id).copied().unwrap_or(0)),
                         };
                         let icon = match n.kind {
-                            NodeKind::Folder => "🗀",
+                            NodeKind::Folder => "▶",
                             NodeKind::Smart => "⚙",
                             NodeKind::Playlist => "☰",
                         };

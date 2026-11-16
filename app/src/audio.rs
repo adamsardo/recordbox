@@ -28,6 +28,58 @@ impl Decoded {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum Mp3Timing {
+    NotMp3,
+    Lame,
+    Ffmpeg,
+    Untagged,
+}
+
+/// Samples dropped from the start of MP3s without an encoder tag (one MPEG-1 Layer III frame).
+pub const MP3_UNTAGGED_SKIP: usize = 1152;
+
+/// Look at the first MP3 frame for a LAME-style info tag and its encoder name.
+pub fn mp3_timing_class(path: &str) -> Mp3Timing {
+    use std::io::Read;
+    if !path.to_ascii_lowercase().ends_with(".mp3") {
+        return Mp3Timing::NotMp3;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else { return Mp3Timing::NotMp3 };
+    let mut head = vec![0u8; 10];
+    if f.read_exact(&mut head).is_err() {
+        return Mp3Timing::Untagged;
+    }
+    let mut skip = 0u64;
+    if &head[..3] == b"ID3" {
+        skip = 10 + (((head[6] as u64 & 0x7f) << 21) | ((head[7] as u64 & 0x7f) << 14) | ((head[8] as u64 & 0x7f) << 7) | (head[9] as u64 & 0x7f));
+        if head[5] & 0x10 != 0 {
+            skip += 10;
+        }
+    }
+    use std::io::Seek;
+    if f.seek(std::io::SeekFrom::Start(skip)).is_err() {
+        return Mp3Timing::Untagged;
+    }
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let buf = &buf[..n];
+    // first frame sync
+    let Some(sync) = buf.windows(2).position(|w| w[0] == 0xff && (w[1] & 0xe0) == 0xe0) else { return Mp3Timing::Untagged };
+    let frame = &buf[sync..(sync + 2000).min(buf.len())];
+    let has = |pat: &[u8]| frame.windows(pat.len()).any(|w| w == pat);
+    if !(has(b"Xing") || has(b"Info")) {
+        return Mp3Timing::Untagged;
+    }
+    if has(b"LAME") || has(b"GOGO") {
+        Mp3Timing::Lame
+    } else if has(b"Lavc") || has(b"Lavf") {
+        Mp3Timing::Ffmpeg
+    } else {
+        Mp3Timing::Untagged
+    }
+}
+
 /// Decode a whole file. The source file is only read.
 pub fn decode_file(path: &str) -> Result<Decoded> {
     let file = std::fs::File::open(path)?;
@@ -36,7 +88,12 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions { enable_gapless: true, ..Default::default() }, &MetadataOptions::default())?;
+    // MP3 start alignment follows the original's timeline (measured against its own grids,
+    // see MECHANICS.md): LAME-tagged files keep the encoder lead-in, ffmpeg-tagged files have it
+    // removed, untagged files lose one frame.
+    let class = mp3_timing_class(path);
+    let gapless = class == Mp3Timing::Ffmpeg;
+    let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions { enable_gapless: gapless, ..Default::default() }, &MetadataOptions::default())?;
     let mut format = probed.format;
     let track = format
         .tracks()
@@ -87,6 +144,10 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
                 out.push(f[1]);
             }
         }
+    }
+    if class == Mp3Timing::Untagged {
+        let drop = (MP3_UNTAGGED_SKIP * 2).min(out.len());
+        out.drain(..drop);
     }
     if out.is_empty() {
         return Err(anyhow!("no audio decoded"));
@@ -242,4 +303,31 @@ pub fn has_audio_extension(p: &std::path::Path) -> bool {
         p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("mp3" | "m4a" | "aac" | "mp4" | "wav" | "aif" | "aiff" | "flac" | "alac" | "ogg")
     )
+}
+
+#[cfg(test)]
+mod gapless_probe {
+    #[test]
+    #[ignore]
+    fn trim_amounts() {
+        use symphonia::core::formats::FormatOptions;
+        for p in std::env::var("PREPDECK_AUDIO").unwrap_or_default().split('|').filter(|s| !s.is_empty()) {
+            let mut n = [0usize; 2];
+            for (k, g) in [false, true].iter().enumerate() {
+                let file = std::fs::File::open(p).unwrap();
+                let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+                let mut hint = symphonia::core::probe::Hint::new();
+                hint.with_extension("mp3");
+                let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions { enable_gapless: *g, ..Default::default() }, &Default::default()).unwrap();
+                let mut f = probed.format;
+                let tr = f.default_track().unwrap().clone();
+                if k == 1 { eprintln!("delay {:?} padding {:?}", tr.codec_params.delay, tr.codec_params.padding); }
+                let mut dec = symphonia::default::get_codecs().make(&tr.codec_params, &Default::default()).unwrap();
+                while let Ok(pk) = f.next_packet() {
+                    if let Ok(b) = dec.decode(&pk) { n[k] += b.frames(); }
+                }
+            }
+            eprintln!("raw {} gapless {} diff {} :: {}", n[0], n[1], n[0] as i64 - n[1] as i64, p.rsplit('/').next().unwrap());
+        }
+    }
 }

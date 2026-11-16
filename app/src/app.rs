@@ -458,6 +458,45 @@ impl App {
             }
         }
         if app.screenshot.is_some() {
+            // Optional state for checking other screens: PREPDECK_SHOT_VIEW=playlists|devices|grid|hotcue|prefs|mytag|smart|export|info
+            if let Ok(v) = std::env::var("PREPDECK_SHOT_VIEW") {
+                match v.as_str() {
+                    "playlists" | "smart" => {
+                        app.side = SideMode::Playlists;
+                        if app.nodes.is_empty() {
+                            let f = app.db.create_node(0, "Friday Set", NodeKind::Folder, None).unwrap_or(0);
+                            let p = app.db.create_node(f, "Warm Up", NodeKind::Playlist, None).unwrap_or(0);
+                            let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
+                            let _ = app.db.set_playlist_tracks(p, &ids);
+                            let mut rule = SmartRule::default();
+                            rule.conditions[0] = crate::smart::Condition { field: crate::smart::Field::Bpm, op: crate::smart::Op::InRange, value: "120".into(), value2: "128".into(), months: false };
+                            let _ = app.db.create_node(0, "120-128 BPM", NodeKind::Smart, Some(&rule));
+                            app.reload_playlists();
+                            app.expanded.insert(f);
+                            app.view = View::Playlist(p);
+                            app.set_view(View::Collection);
+                            app.set_view(View::Playlist(p));
+                        }
+                        if v == "smart" {
+                            let n = app.nodes.iter().find(|n| n.kind == NodeKind::Smart).cloned();
+                            if let Some(n) = n {
+                                app.dialogs.smart_edit = Some((Some(n.id), n.parent, n.name.clone(), n.smart.clone().unwrap_or_default()));
+                            }
+                        }
+                    }
+                    "devices" => app.side = SideMode::Devices,
+                    "grid" => app.deck.ctrl_tab = 1,
+                    "hotcue" => app.deck.panel_tab = 1,
+                    "info" => app.deck.panel_tab = 2,
+                    "prefs" => {
+                        app.dialogs.prefs_open = true;
+                        app.dialogs.prefs_tab = 1;
+                    }
+                    "mytag" => app.prefs.show_mytag = true,
+                    "export" => app.dialogs.export_open = true,
+                    _ => {}
+                }
+            }
             let first = app.tracks.iter().find(|t| t.analyzed == 1 && !t.missing).map(|t| t.id);
             if let Some(t) = first {
                 app.load_track(t);
@@ -469,6 +508,21 @@ impl App {
                         app.deck.loading = Some(rx2);
                         app.poll_load();
                     }
+                }
+                if std::env::var("PREPDECK_SHOT_VIEW").map(|v| v == "hotcue" || v == "grid").unwrap_or(false) && app.deck.cues.is_empty() {
+                    let beats = app.deck.beats.clone();
+                    for (slot, bi) in [(0, 16usize), (1, 48), (3, 80)] {
+                        if let Some(b) = beats.get(bi) {
+                            app.seek(b.time);
+                            app.hot_cue_down(slot);
+                        }
+                    }
+                    if let Some(b) = beats.get(32) {
+                        app.deck.cue_point = b.time;
+                        app.memory_set();
+                    }
+                    let c = app.deck.cue_point;
+                    app.seek(c + 2.0);
                 }
             }
         }
