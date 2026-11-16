@@ -210,6 +210,14 @@ pub struct Prefs {
     pub import_device_history: bool,
     /// Keyboard shortcuts changed from their defaults: action id -> key name.
     pub keymap: std::collections::BTreeMap<String, String>,
+    /// The column set and sort not in use: playlists and the collection each keep their own
+    /// (rekordbox shows # and fewer columns in playlists). `columns_for_playlist` says which
+    /// set `columns` currently holds.
+    pub columns_other: Vec<Col>,
+    pub sort_other: (Col, bool),
+    pub columns_for_playlist: bool,
+    /// Phrase analysis: shown in the player and written to USB exports.
+    pub phrase_analysis: bool,
 }
 
 /// Keyboard actions: (id, label, default key name as egui names it).
@@ -341,6 +349,10 @@ impl Default for Prefs {
             stems_auto_download: true,
             import_device_history: true,
             keymap: Default::default(),
+            columns_other: vec![Col::Num, Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Genre, Col::Bpm, Col::Time, Col::Key, Col::DateAdded],
+            sort_other: (Col::Num, true),
+            columns_for_playlist: false,
+            phrase_analysis: true,
             delete_device_tracks: false,
             target_lufs: -8.0,
             tooltips: true,
@@ -510,6 +522,24 @@ pub struct Dialogs {
     pub export_tracks: Vec<i64>,
     pub about: bool,
     pub device_remove: Option<(String, u32, String)>,
+    /// Restore Removed Tracks window: the ticked trash entries.
+    pub trash: Option<HashSet<i64>>,
+    /// Cue edits found on a connected drive, waiting for review.
+    pub player_edits: Option<PlayerEdits>,
+}
+
+pub struct PlayerEdits {
+    pub root: String,
+    pub device: String,
+    pub items: Vec<PlayerEditItem>,
+}
+
+pub struct PlayerEditItem {
+    pub track: i64,
+    pub edit: crate::export::usb::PlayerCueEdit,
+    /// The track's cues were also changed in PrepDeck since the export.
+    pub conflict: bool,
+    pub pick: bool,
 }
 
 pub struct DeviceInfo {
@@ -577,6 +607,8 @@ pub struct App {
     pub rb_job: Option<crossbeam_channel::Receiver<anyhow::Result<Option<crate::rbimport::RbLibrary>>>>,
     pub devices: Vec<DeviceInfo>,
     pub devices_scanned: Option<Instant>,
+    /// Drives already checked for player cue edits while connected.
+    pub edits_checked: HashSet<String>,
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
@@ -593,6 +625,9 @@ impl App {
         crate::theme::apply(&cc.egui_ctx);
         let db_path = crate::db::data_dir().join("library.db");
         let db = Db::open(&db_path).expect("open library database");
+        // Removed tracks stay restorable for 30 days.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let _ = db.purge_trash(Some(now - 30 * 86_400));
         // Unreadable saved preferences are kept under another key (not silently replaced).
         let raw_prefs = db.setting("prefs");
         let prefs: Prefs = match raw_prefs.as_deref().map(serde_json::from_str::<Prefs>) {
@@ -653,6 +688,7 @@ impl App {
             rb_job: None,
             devices: vec![],
             devices_scanned: None,
+            edits_checked: HashSet::new(),
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
@@ -1229,6 +1265,9 @@ impl App {
     /// Phrases for the loaded track, worked out on a background thread: rekordbox's own while
     /// its grid is unchanged, else analysed from the decoded audio on the current grid.
     fn start_deck_phrases(&mut self, a: Arc<Decoded>) {
+        if !self.prefs.phrase_analysis {
+            return;
+        }
         let Some(id) = self.deck.track else { return };
         let Some(path) = self.track(id).map(|t| t.path.clone()) else { return };
         let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -1288,17 +1327,24 @@ impl App {
         if self.view != v {
             self.view = v;
             let manual = matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
-            if manual {
-                self.prefs.sort_col = Col::Num;
-                self.prefs.sort_asc = true;
-                if !self.prefs.columns.contains(&Col::Num) {
-                    self.prefs.columns.insert(0, Col::Num);
+            // Switch to the other column set and sort when moving between playlists and the
+            // rest; each keeps the user's own choices.
+            if manual != self.prefs.columns_for_playlist {
+                let p = &mut self.prefs;
+                std::mem::swap(&mut p.columns, &mut p.columns_other);
+                let cur = (p.sort_col, p.sort_asc);
+                (p.sort_col, p.sort_asc) = p.sort_other;
+                p.sort_other = cur;
+                p.columns_for_playlist = manual;
+                if manual && !p.columns.contains(&Col::Num) {
+                    p.columns.insert(0, Col::Num);
                 }
-            } else {
-                self.prefs.columns.retain(|c| *c != Col::Num);
-                if self.prefs.sort_col == Col::Num {
-                    self.prefs.sort_col = Col::DateAdded;
-                    self.prefs.sort_asc = false;
+                if !manual {
+                    p.columns.retain(|c| *c != Col::Num);
+                    if p.sort_col == Col::Num {
+                        p.sort_col = Col::DateAdded;
+                        p.sort_asc = false;
+                    }
                 }
             }
             self.list_dirty = true;
@@ -1720,11 +1766,25 @@ impl App {
                 let _ = self.db.delete_node(old);
             }
         }
-        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>) {
+        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>, tag_id: &HashMap<(String, String), i64>) {
             for n in nodes {
                 if n.folder {
                     let id = app.db.create_node(parent, &n.name, NodeKind::Folder, None).unwrap_or(0);
-                    add_nodes(app, id, &n.children, idmap);
+                    add_nodes(app, id, &n.children, idmap, tag_id);
+                } else if let Some(rule) = &n.smart {
+                    // Intelligent playlist: My Tag conditions name their tag until now.
+                    let mut rule = rule.clone();
+                    let mut ok = true;
+                    for c in rule.conditions.iter_mut().filter(|c| c.field == crate::smart::Field::MyTag) {
+                        let found = c.value.strip_prefix('\u{1}').and_then(|v| v.split_once('\u{1f}')).and_then(|(cat, t)| tag_id.get(&(cat.to_string(), t.to_string())));
+                        match found {
+                            Some(id) => c.value = id.to_string(),
+                            None => ok = false,
+                        }
+                    }
+                    if ok {
+                        let _ = app.db.create_node(parent, &n.name, NodeKind::Smart, Some(&rule));
+                    }
                 } else {
                     let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
                     let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| idmap.get(k).copied()).collect();
@@ -1732,10 +1792,14 @@ impl App {
                 }
             }
         }
-        if !lib.playlists.is_empty() {
+        if !lib.playlists.is_empty() || !lib.histories.is_empty() {
             let root = self.db.create_node(0, "rekordbox", NodeKind::Folder, None).unwrap_or(0);
             self.db.set_setting("rb_folder_id", &root.to_string());
-            add_nodes(self, root, &lib.playlists, &idmap);
+            add_nodes(self, root, &lib.playlists, &idmap, &tag_id);
+            if !lib.histories.is_empty() {
+                let h = self.db.create_node(root, "Histories", NodeKind::Folder, None).unwrap_or(0);
+                add_nodes(self, h, &lib.histories, &idmap, &tag_id);
+            }
         }
         if let Some(e) = failed {
             let _ = self.db.conn.execute_batch("ROLLBACK");
@@ -1767,7 +1831,7 @@ impl App {
             msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
         }
         if first && lib.smart_lists > 0 {
-            msg.push_str(&format!(" {} intelligent playlist(s) were not copied.", lib.smart_lists));
+            msg.push_str(&format!(" {} intelligent playlist(s) use a condition PrepDeck doesn't have and were not copied.", lib.smart_lists));
         }
         if !msg.is_empty() {
             self.toast(msg);
@@ -2608,8 +2672,21 @@ impl App {
             }
         }
         self.db.set_setting("rb_removed_paths", &serde_json::to_string(&removed).unwrap_or_default());
+        let _ = self.db.conn.execute_batch("BEGIN");
+        let mut failed = None;
         for id in ids {
-            let _ = self.db.delete_track(*id);
+            if let Err(e) = self.db.trash_track(*id) {
+                failed = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            let _ = self.db.conn.execute_batch("ROLLBACK");
+            self.toast_err(format!("Could not remove the tracks ({e}). Nothing was changed."));
+            return;
+        }
+        let _ = self.db.conn.execute_batch("COMMIT");
+        for id in ids {
             if self.deck.track == Some(*id) {
                 let mut s = self.player.state.lock();
                 s.playing = false;
@@ -2620,7 +2697,35 @@ impl App {
         }
         self.selected.clear();
         self.reload_all();
-        self.toast(format!("Removed {} track(s) from the collection. The files were not deleted.", ids.len()));
+        self.toast(format!("Removed {} track(s) from the collection. The files were not deleted; Track > Restore Removed Tracks brings them back.", ids.len()));
+    }
+
+    /// Put trashed tracks back, with their cues, grids, tags and playlist positions.
+    pub fn restore_removed(&mut self, trash_ids: &[i64]) {
+        let list = self.db.trash_list().unwrap_or_default();
+        let mut removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let (mut ok, mut dup, mut err) = (0, 0, None);
+        for id in trash_ids {
+            match self.db.restore_trash(*id) {
+                Ok(Some(_)) => {
+                    ok += 1;
+                    if let Some(e) = list.iter().find(|e| e.0 == *id) {
+                        removed.remove(&e.3);
+                    }
+                }
+                Ok(None) => dup += 1,
+                Err(e) => err = Some(e),
+            }
+        }
+        self.db.set_setting("rb_removed_paths", &serde_json::to_string(&removed).unwrap_or_default());
+        self.reload_all();
+        if let Some(e) = err {
+            self.toast_err(format!("Restored {ok} track(s); some could not be restored ({e})."));
+        } else if dup > 0 {
+            self.toast(format!("Restored {ok} track(s). {dup} are in the collection again already and were left in the list."));
+        } else {
+            self.toast(format!("Restored {ok} track(s) to the collection."));
+        }
     }
 
     pub fn set_tag(&mut self, ids: &[i64], tag: i64, on: bool) {
@@ -2710,6 +2815,89 @@ impl App {
         if self.prefs.import_device_history && self.screenshot.is_none() {
             self.import_device_histories();
         }
+        // Look for player cue edits once per connection of each drive.
+        let roots: HashSet<String> = self.devices.iter().map(|d| d.root.clone()).collect();
+        self.edits_checked.retain(|r| roots.contains(r));
+        if self.screenshot.is_none() && self.dialogs.player_edits.is_none() {
+            let pending: Vec<String> = self.devices.iter().filter(|d| d.lib.is_some() && !self.edits_checked.contains(&d.root)).map(|d| d.root.clone()).collect();
+            for root in pending {
+                self.edits_checked.insert(root.clone());
+                if self.check_player_cue_edits(&root, false) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A device track's counterpart in the collection: the local file PrepDeck exported, else
+    /// the same title and artist.
+    pub fn match_device_track(&self, source: &str, title: &str, artist: &str) -> Option<i64> {
+        let by_source = (!source.is_empty()).then(|| self.db.track_by_path(source)).flatten();
+        by_source.or_else(|| self.tracks.iter().find(|t| t.display_title().eq_ignore_ascii_case(title) && t.artist.eq_ignore_ascii_case(artist)).map(|t| t.id))
+    }
+
+    /// Compare the cues on a drive with what PrepDeck last exported there and offer edits made
+    /// on players for import. `asked`: the user chose the menu item (report when nothing is
+    /// found, and include edits dismissed before). Returns whether the review dialog opened.
+    pub fn check_player_cue_edits(&mut self, root: &str, asked: bool) -> bool {
+        let Some(dev) = self.devices.iter().find(|d| d.root == root) else { return false };
+        let Some(lib) = dev.lib.clone() else { return false };
+        let device = dev.name.clone();
+        let dismissed: HashSet<String> = self.db.setting("dismissed_player_edits").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let mut items = vec![];
+        for edit in crate::export::usb::player_cue_edits(std::path::Path::new(root), &lib) {
+            if !asked && dismissed.contains(&format!("{}\u{1f}{}", edit.file_path, edit.now)) {
+                continue;
+            }
+            let Some(track) = self.match_device_track(&edit.source, &edit.title, &edit.artist) else { continue };
+            let local = crate::export::anlz::local_cue_fingerprint(&self.db.cues(track).unwrap_or_default());
+            if local == edit.now {
+                continue;
+            }
+            let conflict = local != edit.exported;
+            items.push(PlayerEditItem { track, edit, conflict, pick: !conflict });
+        }
+        if items.is_empty() {
+            if asked {
+                self.toast(format!("No cue changes made on players were found on {device}."));
+            }
+            return false;
+        }
+        self.dialogs.player_edits = Some(PlayerEdits { root: root.to_string(), device, items });
+        true
+    }
+
+    /// Replace the chosen tracks' cues with the ones on the drive.
+    pub fn apply_player_edits(&mut self, pe: &PlayerEdits) {
+        let root = std::path::Path::new(&pe.root);
+        let mut record = crate::export::usb::read_cue_record(root);
+        let mut n = 0;
+        for it in pe.items.iter().filter(|i| i.pick) {
+            if self.db.replace_cues(it.track, &it.edit.cues).is_ok() {
+                record.insert(it.edit.file_path.clone(), it.edit.now.clone());
+                n += 1;
+            }
+        }
+        let _ = crate::export::usb::write_cue_record(root, &record);
+        self.dismiss_player_edits(pe, false);
+        self.cue_counts = self.db.tracks_with_cues().unwrap_or_default();
+        self.hot_positions = self.db.hot_positions().unwrap_or_default();
+        if let Some(t) = self.deck.track {
+            if pe.items.iter().any(|i| i.pick && i.track == t) {
+                self.deck.cues = self.db.cues(t).unwrap_or_default();
+            }
+        }
+        self.list_dirty = true;
+        self.toast(format!("Imported cue changes for {n} track{} from {}.", if n == 1 { "" } else { "s" }, pe.device));
+    }
+
+    /// Don't offer these edits again (until the cues on the drive change once more).
+    pub fn dismiss_player_edits(&mut self, pe: &PlayerEdits, only_unpicked: bool) {
+        let mut dismissed: HashSet<String> = self.db.setting("dismissed_player_edits").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        for it in pe.items.iter().filter(|i| !only_unpicked || !i.pick) {
+            dismissed.insert(format!("{}\u{1f}{}", it.edit.file_path, it.edit.now));
+        }
+        self.db.set_setting("dismissed_player_edits", &serde_json::to_string(&dismissed).unwrap_or_default());
     }
 
     /// Copy play histories saved on connected devices into the "Histories" folder as playlists
@@ -2744,6 +2932,13 @@ impl App {
                 if let Ok(pl) = self.db.create_node(folder, &format!("{} ({dev_name})", h.name), NodeKind::Playlist, None) {
                     let _ = self.db.set_playlist_tracks(pl, &ids);
                     imported += 1;
+                    // Each play in an imported history counts towards the track's play count.
+                    for id in &ids {
+                        if let Some(t) = self.track_mut(*id) {
+                            t.play_count = t.play_count.saturating_add(1);
+                            self.save_track_quiet(*id);
+                        }
+                    }
                 }
                 done.insert(key);
                 self.reload_playlists();
@@ -2849,7 +3044,7 @@ impl App {
             .filter(|c| c.parent == 0)
             .map(|c| (c.name.clone(), self.mytags.iter().filter(|t| t.parent == c.id).map(|t| t.name.clone()).collect()))
             .collect();
-        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone(), browse: self.prefs.usb_browse.clone() };
+        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone(), browse: self.prefs.usb_browse.clone(), phrases: self.prefs.phrase_analysis };
         self.export_job = Some(spawn_export(req, self.ctx.clone()));
     }
 

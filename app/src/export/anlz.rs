@@ -345,6 +345,39 @@ pub struct Overrides {
     pub grid_same: bool,
     /// PrepDeck's own phrase section (unmasked), used when rekordbox's can't be.
     pub pssi: Option<Vec<u8>>,
+    /// The track's analysis files already on the drive, by extension ("DAT", "EXT", "2EX"), in
+    /// file order. Audio-derived sections fall back to these, and sections PrepDeck does not
+    /// know are carried over unchanged.
+    pub device: std::collections::HashMap<&'static str, Vec<(String, Vec<u8>)>>,
+}
+
+/// Section tags PrepDeck writes itself (or deliberately drops when the grid changed).
+const KNOWN_TAGS: [&str; 16] = ["PPTH", "PVBR", "PQTZ", "PWAV", "PWV2", "PCOB", "PWV3", "PCO2", "PQT2", "PWV5", "PWV4", "PSSI", "PWV7", "PWV6", "PWVC", "PVDI"];
+/// Sections that depend only on the audio, so a copy already on the drive stays valid.
+const AUDIO_TAGS: [&str; 10] = ["PVBR", "PWAV", "PWV2", "PWV3", "PWV4", "PWV5", "PWV6", "PWV7", "PWVC", "PVDI"];
+
+/// Every top-level section of an ANLZ file in order, including repeated tags.
+pub fn read_section_list(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    std::fs::read(path).map(|b| section_list(&b)).unwrap_or_default()
+}
+
+/// Every top-level section of ANLZ file bytes, in order.
+pub fn section_list(b: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    if b.len() < 12 || &b[..4] != b"PMAI" {
+        return out;
+    }
+    let be32 = |o: usize| -> Option<usize> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize) };
+    let mut i = be32(4).unwrap_or(b.len());
+    while i + 12 <= b.len() {
+        let Some(total) = be32(i + 8) else { break };
+        if total < 12 || i + total > b.len() {
+            break;
+        }
+        out.push((String::from_utf8_lossy(&b[i..i + 4]).to_string(), b[i..i + total].to_vec()));
+        i += total;
+    }
+    out
 }
 
 /// Every top-level section of an ANLZ file, by tag (first occurrence), as raw bytes.
@@ -368,13 +401,102 @@ pub fn read_sections(path: &std::path::Path) -> std::collections::HashMap<String
     out
 }
 
+/// Cues stored in a track's analysis files: the EXT file's PCO2 lists (names, colours) when
+/// present, else the DAT file's PCOB lists.
+pub fn parse_cues(ext: &[(String, Vec<u8>)], dat: &[(String, Vec<u8>)]) -> Vec<Cue> {
+    let be32 = |b: &[u8], o: usize| -> Option<u32> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    let mut out = vec![];
+    let mk = |hot: u32, kind: u8, start: u32, end: u32, color: u8, comment: String| Cue {
+        id: 0,
+        track_id: 0,
+        kind: if hot > 0 { CueKind::Hot } else { CueKind::Memory },
+        slot: if hot > 0 { hot as i32 - 1 } else { -1 },
+        start: start as f64 / 1000.0,
+        end: (kind == 2 && end != u32::MAX).then(|| end as f64 / 1000.0),
+        color,
+        comment,
+        active_loop: false,
+    };
+    let entries = |sec: &[u8]| -> Vec<Vec<u8>> {
+        let mut v = vec![];
+        let mut i = be32(sec, 4).unwrap_or(u32::MAX) as usize;
+        while i + 12 <= sec.len() {
+            let Some(total) = be32(sec, i + 8).map(|x| x as usize) else { break };
+            if total < 12 || i + total > sec.len() {
+                break;
+            }
+            v.push(sec[i..i + total].to_vec());
+            i += total;
+        }
+        v
+    };
+    let pco2: Vec<&Vec<u8>> = ext.iter().filter(|(t, _)| t == "PCO2").map(|(_, b)| b).collect();
+    if !pco2.is_empty() {
+        for sec in pco2 {
+            for e in entries(sec) {
+                if &e[..4] != b"PCP2" || e.len() < 44 {
+                    continue;
+                }
+                let hot = be32(&e, 12).unwrap_or(0);
+                let n = be32(&e, 40).unwrap_or(0) as usize;
+                let raw = e.get(44..44 + n).unwrap_or(&[]);
+                let comment = String::from_utf16_lossy(&raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect::<Vec<_>>());
+                let color = if hot > 0 { e.get(44 + n).copied().unwrap_or(0) } else { e[28] };
+                out.push(mk(hot, e[16], be32(&e, 20).unwrap_or(0), be32(&e, 24).unwrap_or(u32::MAX), color, comment));
+            }
+        }
+        return out;
+    }
+    for (_, sec) in dat.iter().filter(|(t, _)| t == "PCOB") {
+        for e in entries(sec) {
+            if &e[..4] != b"PCPT" || e.len() < 40 {
+                continue;
+            }
+            let hot = be32(&e, 12).unwrap_or(0);
+            let mut c = mk(hot, e[28], be32(&e, 32).unwrap_or(0), be32(&e, 36).unwrap_or(u32::MAX), 0, String::new());
+            c.active_loop = be32(&e, 16) == Some(4);
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A stable digest of a cue list as the drive stores it (millisecond positions, colour, name),
+/// so edits made on a player can be told apart from what PrepDeck exported.
+pub fn cue_fingerprint(cues: &[Cue]) -> String {
+    let mut rows: Vec<String> = cues
+        .iter()
+        .map(|c| format!("{}{}:{}:{}:{}:{}", if c.kind == CueKind::Hot { 'H' } else { 'M' }, c.slot, ms(c.start), c.end.map(ms).map(|x| x as i64).unwrap_or(-1), c.color, c.comment))
+        .collect();
+    rows.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in rows.join("\u{1f}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The fingerprint PrepDeck's own cues get once written to a drive (same normalisation as
+/// [`build_with`]: hot cues A–H, default colours filled in).
+pub fn local_cue_fingerprint(cues: &[Cue]) -> String {
+    let files = build("/x", &[], &Waveform::default(), cues, 0, 44100);
+    cue_fingerprint(&parse_cues(&section_list(&files.ext), &section_list(&files.dat)))
+}
+
 pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue], raw_samples: u64, sample_rate: u32, ov: Option<&Overrides>) -> AnlzFiles {
     let mut hot: Vec<&Cue> = cues.iter().filter(|c| c.kind == CueKind::Hot && (0..8).contains(&c.slot)).collect();
     hot.sort_by_key(|c| c.slot);
     let mut mem: Vec<&Cue> = cues.iter().filter(|c| c.kind == CueKind::Memory).collect();
     mem.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
     let frames = padded_frames(wave, raw_samples, sample_rate);
-    let take = |tag: &str| ov.and_then(|o| o.sections.get(tag).cloned());
+    let from_device = |tag: &str| -> Option<Vec<u8>> {
+        if !AUDIO_TAGS.contains(&tag) {
+            return None;
+        }
+        ov?.device.values().flatten().find(|(t, _)| t == tag).map(|(_, b)| b.clone())
+    };
+    let take = |tag: &str| ov.and_then(|o| o.sections.get(tag).cloned()).or_else(|| from_device(tag));
     let take_grid = |tag: &str| ov.filter(|o| o.grid_same).and_then(|o| o.sections.get(tag).cloned());
     let or = |tag: &str, f: &dyn Fn() -> Vec<u8>| take(tag).unwrap_or_else(f);
     let dat = vec![
@@ -405,6 +527,18 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
     if let Some(s) = take("PVDI") {
         ex2.push(s);
     }
+    let mut dat = dat;
+    // Sections a newer rekordbox (or another tool) wrote that PrepDeck doesn't know stay in
+    // their file, after PrepDeck's own.
+    if let Some(o) = ov {
+        for (ext_name, list) in [("DAT", &mut dat), ("EXT", &mut ext), ("2EX", &mut ex2)] {
+            for (tag, bytes) in o.device.get(ext_name).into_iter().flatten() {
+                if !KNOWN_TAGS.contains(&tag.as_str()) {
+                    list.push(bytes.clone());
+                }
+            }
+        }
+    }
     AnlzFiles { dat: file(dat), ext: file(ext), ex2: file(ex2) }
 }
 
@@ -427,6 +561,73 @@ pub fn anlz_folder(usb_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Unknown sections already on the drive survive a rewrite; audio sections are reused.
+    #[test]
+    fn rewrite_keeps_device_sections() {
+        let w = Waveform { frames: vec![[100, 80, 40, 20, 60, 50, 20, 10]; 1500] };
+        let g = crate::model::BeatGrid::constant(0.1, 120.0, 1).beats(10.0);
+        let first = build("/Contents/a.mp3", &g, &w, &[], 441_000, 44100);
+        let dir = std::env::temp_dir().join(format!("prepdeck_anlz_keep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A device file with an extra unknown section appended.
+        let mut ext_sections: Vec<Vec<u8>> = vec![];
+        {
+            let p = dir.join("A.EXT");
+            std::fs::write(&p, &first.ext).unwrap();
+            for (_, b) in read_section_list(&p) {
+                ext_sections.push(b);
+            }
+        }
+        let mut odd = b"PZZZ".to_vec();
+        odd.extend_from_slice(&12u32.to_be_bytes());
+        odd.extend_from_slice(&16u32.to_be_bytes());
+        odd.extend_from_slice(&[1, 2, 3, 4]);
+        ext_sections.push(odd.clone());
+        std::fs::write(dir.join("A.EXT"), file(ext_sections)).unwrap();
+        let mut marker = pwv4(&w);
+        let n = marker.len();
+        marker[n - 1] ^= 0x5a; // distinguishable from a freshly built PWV4
+        let mut device = std::collections::HashMap::new();
+        let mut list = read_section_list(&dir.join("A.EXT"));
+        for (t, b) in list.iter_mut() {
+            if t == "PWV4" {
+                *b = marker.clone();
+            }
+        }
+        device.insert("EXT", list);
+        let ov = Overrides { sections: Default::default(), grid_same: false, pssi: None, device };
+        let again = build_with("/Contents/a.mp3", &g, &w, &[], 441_000, 44100, Some(&ov));
+        std::fs::write(dir.join("B.EXT"), &again.ext).unwrap();
+        let out = read_section_list(&dir.join("B.EXT"));
+        assert_eq!(out.last().map(|(t, b)| (t.as_str(), b.clone())), Some(("PZZZ", odd)));
+        assert_eq!(out.iter().find(|(t, _)| t == "PWV4").map(|(_, b)| b.clone()), Some(marker));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cues read back from built sections match what was written.
+    #[test]
+    fn cues_round_trip() {
+        let w = Waveform { frames: vec![[100, 80, 40, 20, 60, 50, 20, 10]; 100] };
+        let cues = vec![
+            Cue { id: 1, track_id: 1, kind: CueKind::Hot, slot: 2, start: 1.234, end: Some(5.0), color: 9, comment: "Drop é".into(), active_loop: false },
+            Cue { id: 2, track_id: 1, kind: CueKind::Memory, slot: -1, start: 2.5, end: None, color: 3, comment: String::new(), active_loop: false },
+        ];
+        let f = build("/a.mp3", &[], &w, &cues, 0, 44100);
+        let back = parse_cues(&section_list(&f.ext), &section_list(&f.dat));
+        assert_eq!(back.len(), 2);
+        let h = back.iter().find(|c| c.kind == CueKind::Hot).unwrap();
+        assert_eq!((h.slot, h.start, h.end, h.color, h.comment.as_str()), (2, 1.234, Some(5.0), 9, "Drop é"));
+        let m = back.iter().find(|c| c.kind == CueKind::Memory).unwrap();
+        assert_eq!((m.start, m.end, m.color), (2.5, None, 3));
+        assert_eq!(cue_fingerprint(&back), local_cue_fingerprint(&cues));
+        // DAT-only fallback keeps positions.
+        let dat_only = parse_cues(&[], &section_list(&f.dat));
+        assert_eq!(dat_only.len(), 2);
+        let mut moved = cues.clone();
+        moved[1].start = 2.6;
+        assert_ne!(local_cue_fingerprint(&moved), local_cue_fingerprint(&cues));
+    }
+
     #[test]
     fn folder_hash_matches_real_exports() {
         assert_eq!(anlz_folder("/Contents/Loopmasters/UnknownAlbum/Demo Track 1.mp3"), "/PIONEER/USBANLZ/P016/0000875E");

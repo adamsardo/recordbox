@@ -218,6 +218,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             card(ui, "Track Analysis Setting", |ui| {
                                 ui.checkbox(&mut app.prefs.analyze_grid, RichText::new("BPM / Grid").size(14.0));
                                 ui.checkbox(&mut app.prefs.analyze_key, RichText::new("KEY").size(14.0));
+                                ui.checkbox(&mut app.prefs.phrase_analysis, RichText::new("Phrase").size(14.0)).on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
                                 ui.label(RichText::new("If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.").size(11.0).color(DIM));
                             });
                             card(ui, "Auto Analysis", |ui| {
@@ -867,7 +868,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     if let Some(ids) = app.dialogs.confirm_remove.clone() {
         egui::Window::new("Remove from Collection").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("Remove {} track(s) from the collection?", ids.len()));
-            ui.label(RichText::new("Their cues, grids and tags in this library are removed. The music files themselves are not deleted.").size(11.0).color(DIM));
+            ui.label(RichText::new("The music files are not deleted. For 30 days the tracks, with their cues, grids, tags and playlist positions, can be brought back with Track > Restore Removed Tracks.").size(11.0).color(DIM));
             ui.horizontal(|ui| {
                 if ui.button("Remove").clicked() {
                     app.remove_from_collection(&ids);
@@ -899,6 +900,112 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 }
             });
         });
+    }
+    if app.dialogs.trash.is_some() {
+        let mut open = true;
+        let mut act: Option<bool> = None;
+        let list = app.db.trash_list().unwrap_or_default();
+        let picked = app.dialogs.trash.as_mut().unwrap();
+        egui::Window::new("Restore Removed Tracks").open(&mut open).collapsible(false).resizable(true).default_width(520.0).show(ctx, |ui| {
+            if list.is_empty() {
+                ui.label("No removed tracks. Tracks removed from the collection stay here for 30 days.");
+                return;
+            }
+            ui.label(RichText::new("Tracks removed from the collection in the last 30 days. Restoring brings back their cues, grids, tags and playlist positions.").size(11.0).color(DIM));
+            ui.horizontal(|ui| {
+                if ui.small_button("Select All").clicked() {
+                    picked.extend(list.iter().map(|e| e.0));
+                }
+                if ui.small_button("Select None").clicked() {
+                    picked.clear();
+                }
+            });
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                for (id, title, artist, path, at) in &list {
+                    ui.horizontal(|ui| {
+                        let mut on = picked.contains(id);
+                        if ui.checkbox(&mut on, "").changed() {
+                            if on {
+                                picked.insert(*id);
+                            } else {
+                                picked.remove(id);
+                            }
+                        }
+                        ui.label(if artist.is_empty() { title.clone() } else { format!("{title} – {artist}") }).on_hover_text(path);
+                        let days = (now - at).max(0) / 86_400;
+                        ui.label(RichText::new(if days == 0 { "today".to_string() } else { format!("{days} day(s) ago") }).size(11.0).color(DIM));
+                    });
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!picked.is_empty(), egui::Button::new(format!("Restore {}", picked.len()))).clicked() {
+                    act = Some(true);
+                }
+                if ui.add_enabled(!picked.is_empty(), egui::Button::new("Delete Permanently")).on_hover_text("Forget these entries now. The music files are not affected.").clicked() {
+                    act = Some(false);
+                }
+            });
+        });
+        let ids: Vec<i64> = app.dialogs.trash.as_ref().map(|p| p.iter().copied().collect()).unwrap_or_default();
+        match act {
+            Some(true) => {
+                app.restore_removed(&ids);
+                app.dialogs.trash = Some(Default::default());
+            }
+            Some(false) => {
+                for id in &ids {
+                    let _ = app.db.conn.execute("DELETE FROM trash WHERE id=?1", [id]);
+                }
+                app.dialogs.trash = Some(Default::default());
+            }
+            None => {}
+        }
+        if !open {
+            app.dialogs.trash = None;
+        }
+    }
+    if app.dialogs.player_edits.is_some() {
+        let mut close = None;
+        let pe = app.dialogs.player_edits.as_mut().unwrap();
+        egui::Window::new("Cue changes made on players").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(format!("{} track(s) on {} have cues that were changed after the last export from PrepDeck.", pe.items.len(), pe.device));
+            ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in PrepDeck with the ones on the device. The device is not changed.").size(11.0).color(DIM));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for it in pe.items.iter_mut() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut it.pick, "");
+                        let hot = it.edit.cues.iter().filter(|c| c.kind == CueKind::Hot).count();
+                        let mem = it.edit.cues.len() - hot;
+                        ui.label(format!("{} – {}", it.edit.title, it.edit.artist));
+                        ui.label(RichText::new(format!("{hot} hot, {mem} memory")).size(11.0).color(DIM));
+                        if it.conflict {
+                            ui.label(RichText::new("also changed in PrepDeck").size(11.0).color(CAUTION_TX)).on_hover_text("The cues were edited in PrepDeck too since the export. Importing replaces those edits.");
+                        }
+                    });
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let n = pe.items.iter().filter(|i| i.pick).count();
+                if ui.add_enabled(n > 0, egui::Button::new(format!("Import {n}"))).clicked() {
+                    close = Some(true);
+                }
+                if ui.button("Not now").on_hover_text("These changes are not offered again unless they change on the device.").clicked() {
+                    close = Some(false);
+                }
+            });
+        });
+        if let Some(apply) = close {
+            let pe = app.dialogs.player_edits.take().unwrap();
+            if apply {
+                app.apply_player_edits(&pe);
+            } else {
+                app.dismiss_player_edits(&pe, false);
+            }
+        }
     }
     if app.dialogs.about {
         let mut open = true;

@@ -881,6 +881,10 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 app.dialogs.export_root = Some(r2.clone());
                 ui.close_menu();
             }
+            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from PrepDeck.").clicked() {
+                app.check_player_cue_edits(&r2, true);
+                ui.close_menu();
+            }
             if ui.button("Show in Finder").clicked() {
                 let _ = std::process::Command::new("/usr/bin/open").arg(&r2).spawn();
                 ui.close_menu();

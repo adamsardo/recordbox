@@ -82,6 +82,7 @@ pub fn build() -> Option<Menu> {
             &item("show_finder", "Show in Finder", None),
             &PredefinedMenuItem::separator(),
             &item("remove_collection", "Remove from Collection", None),
+            &item("trash", "Restore Removed Tracks…", None),
         ])
         .ok()?;
     let playlist = Submenu::new("Playlist", true);
@@ -118,6 +119,7 @@ pub fn handle(app: &mut App, id: &str) {
     match id {
         "about" => app.dialogs.about = true,
         "undo" => app.undo_edit(),
+        "trash" => app.dialogs.trash = Some(Default::default()),
         "redo" => app.redo_edit(),
         "prefs" => app.dialogs.prefs_open = true,
         "import_track" => {

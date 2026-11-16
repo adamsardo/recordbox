@@ -130,6 +130,9 @@ pub struct XmlNode {
     /// Track references: TrackIDs, or (KeyType="1") decoded file locations.
     pub track_keys: Vec<String>,
     pub by_location: bool,
+    /// Intelligent playlist rule (from a rekordbox library; My Tag values are still
+    /// "\u{1}category\u{1f}tag" names, resolved when the playlist is created).
+    pub smart: Option<crate::smart::SmartRule>,
 }
 
 pub struct XmlLibrary {
@@ -283,7 +286,7 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
             b"NODE" => {
                 let ty = get("Type");
                 let name = get("Name");
-                let node = XmlNode { name, folder: ty == "0", children: vec![], track_keys: vec![], by_location: get("KeyType") == "1" };
+                let node = XmlNode { name, folder: ty == "0", children: vec![], track_keys: vec![], by_location: get("KeyType") == "1", smart: None };
                 if empty {
                     if let Some(p) = stack.last_mut() {
                         p.children.push(node);

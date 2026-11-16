@@ -105,8 +105,124 @@ pub struct RbLibrary {
     pub tag_categories: Vec<(String, Vec<String>)>,
     /// Tracks without a local file (streaming services or moved files).
     pub not_local: usize,
-    /// Intelligent playlists, which are not converted.
+    /// Intelligent playlists that use a condition PrepDeck has no equivalent for (not copied).
     pub smart_lists: usize,
+    /// Play histories (rekordbox's Histories tree); `track_keys` are content IDs.
+    pub histories: Vec<XmlNode>,
+}
+
+/// The tag placeholder a translated My Tag condition carries until the sync knows PrepDeck's
+/// tag ids.
+pub fn tag_placeholder(cat: &str, tag: &str) -> String {
+    format!("\u{1}{cat}\u{1f}{tag}")
+}
+
+/// Translate a rekordbox intelligent playlist (djmdPlaylist.SmartList XML: a NODE with
+/// LogicalOperator 1 = all / 2 = any and CONDITION children). None when a condition has no
+/// PrepDeck equivalent, since dropping it would change what the list matches.
+pub fn translate_smartlist(xml: &str, tag_of: &HashMap<String, (String, String)>, keys: &HashMap<String, String>) -> Option<crate::smart::SmartRule> {
+    use crate::smart::{Condition, Field, Op, SmartRule};
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut rule = SmartRule { match_all: true, conditions: vec![], auto_update: true };
+    let mut saw_node = false;
+    loop {
+        let ev = reader.read_event().ok()?;
+        let e = match &ev {
+            Event::Start(e) | Event::Empty(e) => e.clone(),
+            Event::Eof => break,
+            _ => continue,
+        };
+        let mut a: HashMap<String, String> = HashMap::new();
+        for at in e.attributes().flatten() {
+            a.insert(String::from_utf8_lossy(at.key.as_ref()).to_string(), at.unescape_value().map(|v| v.to_string()).unwrap_or_default());
+        }
+        let get = |k: &str| a.get(k).cloned().unwrap_or_default();
+        match e.name().as_ref() {
+            b"NODE" => {
+                saw_node = true;
+                rule.match_all = get("LogicalOperator") != "2";
+                rule.auto_update = get("AutomaticUpdate") != "0";
+            }
+            b"CONDITION" => {
+                let field = match get("PropertyName").as_str() {
+                    "artist" => Field::Artist,
+                    "album" => Field::Album,
+                    "albumArtist" => Field::AlbumArtist,
+                    "originalArtist" => Field::OriginalArtist,
+                    "bpm" => Field::Bpm,
+                    // rekordbox's "grouping" property is the track colour (ColorID).
+                    "grouping" => Field::Color,
+                    "comments" => Field::Comments,
+                    "producer" => Field::Composer,
+                    "stockDate" => Field::DateAdded,
+                    "counter" => Field::PlayCount,
+                    "fileName" => Field::FileName,
+                    "genre" => Field::Genre,
+                    "key" => Field::Key,
+                    "label" => Field::Label,
+                    "mixName" => Field::MixName,
+                    "myTag" => Field::MyTag,
+                    "rating" => Field::Rating,
+                    "dateReleased" => Field::ReleaseDate,
+                    "remixedBy" => Field::Remixer,
+                    "duration" => Field::Time,
+                    "name" => Field::Title,
+                    "year" => Field::Year,
+                    _ => return None,
+                };
+                let op = match get("Operator").trim().parse::<u8>().ok()? {
+                    1 => Op::Is,
+                    2 => Op::IsNot,
+                    3 => Op::Greater,
+                    4 => Op::Less,
+                    5 => Op::InRange,
+                    6 => Op::InLast,
+                    7 => Op::NotInLast,
+                    8 => Op::Contains,
+                    9 => Op::NotContains,
+                    10 => Op::StartsWith,
+                    11 => Op::EndsWith,
+                    _ => return None,
+                };
+                if !Op::for_type(field.ftype()).contains(&op) {
+                    return None;
+                }
+                let (mut value, mut value2) = (get("ValueLeft"), get("ValueRight"));
+                match field {
+                    Field::MyTag => {
+                        // Tag IDs above 2^31 are stored sign-shifted.
+                        let id = value.trim().parse::<i64>().ok()?;
+                        let id = if id < 0 { id + (1i64 << 32) } else { id };
+                        let (c, t) = tag_of.get(&id.to_string())?;
+                        value = tag_placeholder(c, t);
+                    }
+                    Field::Key => {
+                        if let Some(name) = keys.get(value.trim()) {
+                            value = name.clone();
+                        }
+                        if crate::model::parse_key(&value) < 0 {
+                            return None;
+                        }
+                    }
+                    Field::Bpm => {
+                        // Stored as BPM, or ×100 like djmdContent.
+                        for v in [&mut value, &mut value2] {
+                            if let Ok(x) = v.trim().parse::<f64>() {
+                                if x > 1000.0 {
+                                    *v = format!("{}", x / 100.0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                rule.conditions.push(Condition { field, op, value, value2, months: get("ValueUnit") == "month" });
+            }
+            _ => {}
+        }
+    }
+    (saw_node && !rule.conditions.is_empty()).then_some(rule)
 }
 
 fn text(v: Value) -> String {
@@ -326,29 +442,51 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
         members.entry(text(r["PlaylistID"].clone())).or_default().push((int(&r["TrackNo"]), text(r["ContentID"].clone())));
     }
     let mut smart_lists = 0;
-    fn build(parent: &str, pl: &[HashMap<String, Value>], members: &mut HashMap<String, Vec<(i64, String)>>, smart: &mut usize) -> Vec<XmlNode> {
+    struct Ctx<'a> {
+        tag_of: &'a HashMap<String, (String, String)>,
+        keys: &'a HashMap<String, String>,
+        smart: usize,
+    }
+    fn build(parent: &str, pl: &[HashMap<String, Value>], members: &mut HashMap<String, Vec<(i64, String)>>, cx: &mut Ctx) -> Vec<XmlNode> {
         let mut out = vec![];
-        for r in pl.iter().filter(|r| text(r["ParentID"].clone()) == parent) {
+        for r in pl.iter().filter(|r| r.get("ParentID").map(|v| text(v.clone())).unwrap_or_default() == parent) {
             let id = text(r["ID"].clone());
             let folder = int(&r["Attribute"]) == 1;
-            let is_smart = !text(r["SmartList"].clone()).is_empty();
-            if is_smart {
-                *smart += 1;
-                continue;
-            }
+            let smart_xml = r.get("SmartList").map(|v| text(v.clone())).unwrap_or_default();
+            let smart = if smart_xml.is_empty() {
+                None
+            } else {
+                match translate_smartlist(&smart_xml, cx.tag_of, cx.keys) {
+                    Some(rule) => Some(rule),
+                    None => {
+                        cx.smart += 1;
+                        continue;
+                    }
+                }
+            };
             let mut keys = members.remove(&id).unwrap_or_default();
             keys.sort_by_key(|k| k.0);
-            out.push(XmlNode { name: text(r["Name"].clone()), folder, children: if folder { build(&id, pl, members, smart) } else { vec![] }, track_keys: keys.into_iter().map(|k| k.1).collect(), by_location: false });
+            out.push(XmlNode { name: text(r["Name"].clone()), folder, children: if folder { build(&id, pl, members, cx) } else { vec![] }, track_keys: keys.into_iter().map(|k| k.1).collect(), by_location: false, smart });
         }
         out
     }
-    let playlists = build("root", &pl, &mut members, &mut smart_lists);
+    let mut cx = Ctx { tag_of: &tag_of, keys: &keys, smart: 0 };
+    let playlists = build("root", &pl, &mut members, &mut cx);
+    // Histories: the same tree shape (year and month folders, one list per day).
+    let hist = rows(c, "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdHistory WHERE rb_local_deleted = 0 ORDER BY Seq").unwrap_or_default();
+    let mut hmembers: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for r in rows(c, "SELECT HistoryID, ContentID, TrackNo FROM djmdSongHistory WHERE rb_local_deleted = 0").unwrap_or_default() {
+        hmembers.entry(text(r["HistoryID"].clone())).or_default().push((int(&r["TrackNo"]), text(r["ContentID"].clone())));
+    }
+    let histories = build("root", &hist, &mut hmembers, &mut cx);
+    smart_lists += cx.smart;
     Ok(RbLibrary {
         tracks,
         playlists,
         tag_categories: tag_categories.into_iter().map(|(_, n, t)| (n, t)).collect(),
         not_local,
         smart_lists,
+        histories,
     })
 }
 
@@ -381,8 +519,56 @@ mod tests {
         let with_grid = lib.tracks.iter().filter(|t| t.xt.grid.is_some()).count();
         let hot = lib.tracks.iter().map(|t| t.xt.cues.iter().filter(|c| c.kind == CueKind::Hot).count()).sum::<usize>();
         println!("local tracks {}, not local {}, with grid {}, hot cues {}, playlists {}, smart {}, tag categories {}", lib.tracks.len(), lib.not_local, with_grid, hot, lib.playlists.len(), lib.smart_lists, lib.tag_categories.len());
+        fn walk(n: &[XmlNode], d: usize) {
+            for x in n {
+                println!("{}history node {:?} folder={} tracks={}", "  ".repeat(d), x.name, x.folder, x.track_keys.len());
+                walk(&x.children, d + 1);
+            }
+        }
+        walk(&lib.histories, 0);
         assert_eq!(before, stamp(&src.join("master.db")), "the original must not change");
+        let mut st = c.prepare("SELECT Name, SmartList FROM djmdPlaylist WHERE rb_local_deleted=0 AND SmartList IS NOT NULL AND SmartList != ''").unwrap();
+        for r in st.query_map([], |r| Ok(format!("{} => {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap().flatten() {
+            println!("smartlist: {r}");
+        }
+        for t in ["djmdHistory", "djmdSongHistory"] {
+            if let Ok(mut st) = c.prepare(&format!("PRAGMA table_info({t})")) {
+                let cols: Vec<String> = st.query_map([], |r| r.get::<_, String>(1)).unwrap().flatten().collect();
+                let n: i64 = c.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0)).unwrap_or(-1);
+                println!("{t} ({n} rows): {}", cols.join(","));
+            }
+        }
+        if let Ok(mut st) = c.prepare("SELECT ID, Seq, Name, Attribute, ParentID, DateCreated FROM djmdHistory WHERE rb_local_deleted=0 LIMIT 10") {
+            for r in st.query_map([], |r| Ok((0..6).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
+                println!("history: {r}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dest);
+    }
+}
+
+#[cfg(test)]
+mod smartlist_tests {
+    use super::*;
+    use crate::smart::{Field, Op};
+
+    #[test]
+    fn translates_rekordbox_smartlists() {
+        let tags = HashMap::from([("3937219461".to_string(), ("Mood".to_string(), "Dark".to_string()))]);
+        let keys = HashMap::from([("5".to_string(), "Am".to_string())]);
+        let xml = r#"<NODE Id="-12345" LogicalOperator="2" AutomaticUpdate="1"><CONDITION PropertyName="genre" Operator="8" ValueUnit="" ValueLeft="Techno &amp; House" ValueRight=""/><CONDITION PropertyName="bpm" Operator="5" ValueUnit="" ValueLeft="12000" ValueRight="128"/><CONDITION PropertyName="myTag" Operator="8" ValueUnit="" ValueLeft="-357747835" ValueRight=""/><CONDITION PropertyName="stockDate" Operator="6" ValueUnit="month" ValueLeft="3" ValueRight=""/><CONDITION PropertyName="key" Operator="1" ValueUnit="" ValueLeft="5" ValueRight=""/><CONDITION PropertyName="grouping" Operator="1" ValueUnit="" ValueLeft="2" ValueRight=""/></NODE>"#;
+        let r = translate_smartlist(xml, &tags, &keys).unwrap();
+        assert!(!r.match_all);
+        assert_eq!(r.conditions.len(), 6);
+        assert_eq!((r.conditions[0].field, r.conditions[0].op, r.conditions[0].value.as_str()), (Field::Genre, Op::Contains, "Techno & House"));
+        assert_eq!((r.conditions[1].value.as_str(), r.conditions[1].value2.as_str()), ("120", "128"));
+        assert_eq!(r.conditions[2].value, tag_placeholder("Mood", "Dark"));
+        assert!(r.conditions[3].months && r.conditions[3].op == Op::InLast);
+        assert_eq!(r.conditions[4].value, "Am");
+        assert_eq!(r.conditions[5].field, Field::Color);
+        // A condition with no equivalent keeps the whole list out.
+        let odd = r#"<NODE Id="1" LogicalOperator="1" AutomaticUpdate="1"><CONDITION PropertyName="dateCreated" Operator="6" ValueUnit="day" ValueLeft="7" ValueRight=""/></NODE>"#;
+        assert!(translate_smartlist(odd, &tags, &keys).is_none());
     }
 }
 
@@ -412,6 +598,22 @@ mod schema_dump {
         let mut st = c.prepare("SELECT ID, Seq, Name, Attribute, ParentID, SmartList IS NOT NULL AND SmartList != '' FROM djmdPlaylist WHERE rb_local_deleted=0").unwrap();
         for r in st.query_map([], |r| Ok((0..6).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
             println!("playlist: {r}");
+        }
+        let mut st = c.prepare("SELECT Name, SmartList FROM djmdPlaylist WHERE rb_local_deleted=0 AND SmartList IS NOT NULL AND SmartList != ''").unwrap();
+        for r in st.query_map([], |r| Ok(format!("{} => {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap().flatten() {
+            println!("smartlist: {r}");
+        }
+        for t in ["djmdHistory", "djmdSongHistory"] {
+            if let Ok(mut st) = c.prepare(&format!("PRAGMA table_info({t})")) {
+                let cols: Vec<String> = st.query_map([], |r| r.get::<_, String>(1)).unwrap().flatten().collect();
+                let n: i64 = c.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0)).unwrap_or(-1);
+                println!("{t} ({n} rows): {}", cols.join(","));
+            }
+        }
+        if let Ok(mut st) = c.prepare("SELECT ID, Seq, Name, Attribute, ParentID, DateCreated FROM djmdHistory WHERE rb_local_deleted=0 LIMIT 10") {
+            for r in st.query_map([], |r| Ok((0..6).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
+                println!("history: {r}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dest);
     }

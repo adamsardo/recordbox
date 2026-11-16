@@ -68,7 +68,7 @@ fn export_matches_collection_xml() {
     let root = base.join(chrono::Local::now().format("usb_%H%M%S").to_string());
     std::fs::create_dir_all(&root).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default() }, &|_| {}, &cancel).unwrap();
+    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true }, &|_| {}, &cancel).unwrap();
     eprintln!("{msg}");
     let dev = read_device(&root).unwrap();
     // Sections passed through from rekordbox's own analysis are byte-identical to its files.

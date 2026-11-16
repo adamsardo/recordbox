@@ -84,7 +84,9 @@ impl Db {
             CREATE TABLE IF NOT EXISTS mytags(id INTEGER PRIMARY KEY, parent INTEGER NOT NULL, name TEXT NOT NULL, seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL, path TEXT NOT NULL,
+                title TEXT NOT NULL, artist TEXT NOT NULL, removed_at INTEGER NOT NULL, json TEXT NOT NULL, wave BLOB, preview BLOB);",
         )?;
         // Columns added after the first release.
         let has_raw: bool = conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_ok();
@@ -215,6 +217,84 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+/// Move a track to the trash: its row, cues, grid, waveform, tags and playlist positions are
+    /// kept so it can be restored with [`Db::restore_trash`].
+    pub fn trash_track(&self, id: i64) -> Result<()> {
+        let Some(track) = self.track(id) else { return Ok(()) };
+        let mut st = self.conn.prepare("SELECT playlist_id, seq FROM playlist_tracks WHERE track_id=?1")?;
+        let playlists = st.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut st = self.conn.prepare("SELECT tag_id FROM track_tags WHERE track_id=?1")?;
+        let tags = st.query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let entry = TrashEntry { cues: self.cues(id)?, grid: self.grid(id), playlists, tags, track: track.clone() };
+        let wave: Option<(Vec<u8>, Vec<u8>)> = self.conn.query_row("SELECT data, preview FROM waves WHERE track_id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO trash(track_id,path,title,artist,removed_at,json,wave,preview) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, track.path, track.display_title(), track.artist, now, serde_json::to_string(&entry)?, wave.as_ref().map(|w| &w.0), wave.as_ref().map(|w| &w.1)],
+        )?;
+        self.delete_track(id)
+    }
+
+    /// Trashed tracks, newest first: (trash id, title, artist, path, removed at, unix seconds).
+    pub fn trash_list(&self) -> Result<Vec<(i64, String, String, String, i64)>> {
+        let mut st = self.conn.prepare("SELECT id, title, artist, path, removed_at FROM trash ORDER BY removed_at DESC, id DESC")?;
+        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(v)
+    }
+
+    /// Put a trashed track back with everything it had (same id when still free). Returns the
+    /// track id, or None when a track with the same file is in the collection again.
+    pub fn restore_trash(&self, trash_id: i64) -> Result<Option<i64>> {
+        let (json, wave, preview): (String, Option<Vec<u8>>, Option<Vec<u8>>) = self.conn.query_row("SELECT json, wave, preview FROM trash WHERE id=?1", [trash_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let e: TrashEntry = serde_json::from_str(&json)?;
+        if self.track_by_path(&e.track.path).is_some() {
+            return Ok(None);
+        }
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        let r = (|| -> Result<i64> {
+            let mut id = self.insert_track(&e.track)?;
+            if id != e.track.id && self.track(e.track.id).is_none() {
+                self.conn.execute("UPDATE tracks SET id=?1 WHERE id=?2", params![e.track.id, id])?;
+                id = e.track.id;
+            }
+            self.replace_cues(id, &e.cues)?;
+            if let Some(g) = &e.grid {
+                self.save_grid(id, g)?;
+            }
+            if let (Some(w), Some(p)) = (wave, preview) {
+                self.conn.execute("INSERT OR REPLACE INTO waves(track_id,data,preview) VALUES(?1,?2,?3)", params![id, w, p])?;
+            }
+            for tag in &e.tags {
+                self.conn.execute("INSERT OR IGNORE INTO track_tags(track_id,tag_id) SELECT ?1, id FROM mytags WHERE id=?2", params![id, tag])?;
+            }
+            for (pl, seq) in &e.playlists {
+                let exists: bool = self.conn.query_row("SELECT COUNT(*) FROM playlists WHERE id=?1", [pl], |r| r.get::<_, i64>(0))? > 0;
+                if exists {
+                    let mut list = self.playlist_tracks(*pl)?;
+                    list.insert((*seq as usize).min(list.len()), id);
+                    self.set_playlist_tracks(*pl, &list)?;
+                }
+            }
+            self.conn.execute("DELETE FROM trash WHERE id=?1", [trash_id])?;
+            Ok(id)
+        })();
+        if own {
+            self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+        }
+        r.map(Some)
+    }
+
+    /// Permanently drop trash entries removed before `before` (unix seconds); all when None.
+    pub fn purge_trash(&self, before: Option<i64>) -> Result<usize> {
+        Ok(match before {
+            Some(t) => self.conn.execute("DELETE FROM trash WHERE removed_at < ?1", [t])?,
+            None => self.conn.execute("DELETE FROM trash", [])?,
+        })
     }
 
     pub fn delete_track(&self, id: i64) -> Result<()> {
@@ -456,9 +536,56 @@ impl Db {
     }
 }
 
+/// What a trashed track had in the library.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TrashEntry {
+    track: Track,
+    cues: Vec<Cue>,
+    grid: Option<BeatGrid>,
+    /// (playlist id, position)
+    playlists: Vec<(i64, i64)>,
+    tags: Vec<i64>,
+}
+
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn trash_and_restore_keep_everything() {
+        let dir = std::env::temp_dir().join(format!("prepdeck_trash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("library.db")).unwrap();
+        let mk = |p: &str| Track { path: p.into(), title: p.into(), artist: "X".into(), ..Default::default() };
+        let a = db.insert_track(&mk("/a.mp3")).unwrap();
+        let b = db.insert_track(&mk("/b.mp3")).unwrap();
+        let c = db.insert_track(&mk("/c.mp3")).unwrap();
+        let pl = db.create_node(0, "Set", NodeKind::Playlist, None).unwrap();
+        db.set_playlist_tracks(pl, &[a, b, c]).unwrap();
+        let tag = db.add_mytag(0, "Peak").unwrap();
+        db.set_track_tag(b, tag, true).unwrap();
+        db.save_cue(&Cue { id: 0, track_id: b, kind: CueKind::Hot, slot: 1, start: 3.0, end: None, color: 5, comment: "in".into(), active_loop: false }).unwrap();
+        db.save_grid(b, &BeatGrid::constant(0.2, 124.0, 1)).unwrap();
+        db.trash_track(b).unwrap();
+        assert!(db.track(b).is_none());
+        assert_eq!(db.playlist_tracks(pl).unwrap(), vec![a, c]);
+        let list = db.trash_list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(db.restore_trash(list[0].0).unwrap(), Some(b));
+        assert_eq!(db.playlist_tracks(pl).unwrap(), vec![a, b, c]);
+        assert_eq!(db.cues(b).unwrap()[0].comment, "in");
+        assert!(db.grid(b).is_some());
+        assert!(db.track_tags().unwrap()[&b].contains(&tag));
+        assert!(db.trash_list().unwrap().is_empty());
+        // A track re-imported meanwhile is not duplicated.
+        db.trash_track(a).unwrap();
+        db.insert_track(&mk("/a.mp3")).unwrap();
+        let t = db.trash_list().unwrap()[0].0;
+        assert_eq!(db.restore_trash(t).unwrap(), None);
+        assert_eq!(db.purge_trash(None).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn upgrades_with_backup_and_refuses_newer() {

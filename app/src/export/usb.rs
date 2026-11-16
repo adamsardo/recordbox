@@ -52,6 +52,12 @@ pub struct DevTrack {
     pub source: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The row's original fixed header and 21 strings when it was read from a drive, so fields
+    /// PrepDeck does not manage (ISRC, unknown slots and constants) are written back unchanged.
+    #[serde(skip)]
+    pub raw_head: Vec<u8>,
+    #[serde(skip)]
+    pub raw_strings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -176,6 +182,59 @@ fn sidecar_path(root: &Path) -> PathBuf {
     root.join(".PrepDeck").join("device.json")
 }
 
+fn cue_record_path(root: &Path) -> PathBuf {
+    root.join(".PrepDeck").join("cues.json")
+}
+
+/// Cue fingerprints of the tracks PrepDeck last wrote to this drive, by media path.
+pub fn read_cue_record(root: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(cue_record_path(root)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Update the drive's cue record (PrepDeck's own folder; players never read it).
+pub fn write_cue_record(root: &Path, record: &HashMap<String, String>) -> Result<()> {
+    std::fs::create_dir_all(root.join(".PrepDeck"))?;
+    write_atomic(&cue_record_path(root), &serde_json::to_vec_pretty(record)?)
+}
+
+/// A track whose cues on the drive differ from what PrepDeck last wrote there: edited on a
+/// player (or by another program).
+#[derive(Clone, Debug)]
+pub struct PlayerCueEdit {
+    pub file_path: String,
+    pub source: String,
+    pub title: String,
+    pub artist: String,
+    pub cues: Vec<Cue>,
+    /// Fingerprint PrepDeck recorded at export.
+    pub exported: String,
+    /// Fingerprint of the cues now on the drive.
+    pub now: String,
+}
+
+/// Tracks on the drive whose cues changed since PrepDeck exported them.
+pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> {
+    let record = read_cue_record(root);
+    let mut out = vec![];
+    for t in lib.tracks.values() {
+        let Some(exported) = record.get(&t.file_path) else { continue };
+        let Some(base) = anlz_base(&t.analyze_path) else { continue };
+        let b = root.join(base.trim_start_matches('/'));
+        let ext = anlz::read_section_list(&b.with_extension("EXT"));
+        let dat = anlz::read_section_list(&b.with_extension("DAT"));
+        if ext.is_empty() && dat.is_empty() {
+            continue;
+        }
+        let cues = anlz::parse_cues(&ext, &dat);
+        let now = anlz::cue_fingerprint(&cues);
+        if &now != exported {
+            out.push(PlayerCueEdit { file_path: t.file_path.clone(), source: t.source.clone(), title: t.title.clone(), artist: t.artist.clone(), cues, exported: exported.clone(), now });
+        }
+    }
+    out.sort_by(|a, b| a.title.cmp(&b.title));
+    out
+}
+
 pub fn read_device(root: &Path) -> Result<DeviceLibrary> {
     let p = pdb_path(root);
     if !p.exists() {
@@ -244,7 +303,11 @@ pub fn parse_pdb(bytes: Vec<u8>) -> Result<DeviceLibrary> {
         let wide = pdb::rd_u16(r, 0) & 4 != 0;
         let s = |i: usize| pdb::row_string(r, 0x5c, i, wide);
         let album_id = pdb::rd_u32(r, 0x40);
+        let raw_head = r[..0x5c].to_vec();
+        let raw_strings: Vec<String> = (0..21).map(|i| s(i)).collect();
         let t = DevTrack {
+            raw_head,
+            raw_strings,
             id: pdb::rd_u32(r, 0x48),
             sample_rate: pdb::rd_u32(r, 0x08),
             composer: nm(2, pdb::rd_u32(r, 0x0c)),
@@ -477,6 +540,8 @@ pub struct ExportRequest {
     pub settings: super::settings::UsbSettings,
     /// Browse categories / sort options for the players' menus.
     pub browse: UsbBrowse,
+    /// Write phrase sections (PSSI) for tracks without rekordbox's own.
+    pub phrases: bool,
 }
 
 /// Files this export created. Unless the export commits, they are removed again, so a
@@ -677,7 +742,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
 
     // Phrases for tracks without rekordbox's own (computed on the track's grid).
     let mut phrases: HashMap<i64, crate::phrase::Structure> = HashMap::new();
-    let todo: Vec<i64> = req.tracks.values().filter(|t| t.grid.is_some() && !t.has_rb_phrases()).map(|t| t.track.id).collect();
+    let todo: Vec<i64> = if req.phrases { req.tracks.values().filter(|t| t.grid.is_some() && !t.has_rb_phrases()).map(|t| t.track.id).collect() } else { vec![] };
     let n_todo = todo.len();
     for (i, id) in todo.into_iter().enumerate() {
         if cancel.load(Relaxed) {
@@ -709,6 +774,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let total = req.tracks.len();
     let mut created = Created { files: vec![], replaced: vec![], committed: false };
+    let mut cue_record = read_cue_record(&root);
     let mut map: HashMap<i64, u32> = HashMap::new();
     let mut sources: HashMap<String, String> = HashMap::new();
     for t in lib.tracks.values() {
@@ -781,9 +847,16 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                 sections.extend(anlz::read_sections(&b.with_extension(e)));
             }
         }
-        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi) });
-        let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let prev = lib.tracks.get(&dev_id).cloned().unwrap_or_default();
+        let mut device = std::collections::HashMap::new();
+        if let Some(b) = anlz_base(&prev.analyze_path) {
+            let b = root.join(b.trim_start_matches('/'));
+            for e in ["DAT", "EXT", "2EX"] {
+                device.insert(e, anlz::read_section_list(&b.with_extension(e)));
+            }
+        }
+        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device });
+        let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let base = match anlz_base(&prev.analyze_path) {
             Some(b) => b,
             None => {
@@ -804,6 +877,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             }
             write_atomic(&path, data)?;
         }
+        cue_record.insert(usb_path.clone(), anlz::cue_fingerprint(&anlz::parse_cues(&anlz::section_list(&files.ext), &anlz::section_list(&files.dat))));
         // Artwork.
         let artwork_path = if !t.artwork.is_empty() && Path::new(&t.artwork).exists() {
             write_artwork(&root, dev_id, &t.artwork).unwrap_or_default()
@@ -848,6 +922,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             autoload: t.autoload_hotcue,
             source: t.path.clone(),
             tags: et.tags.iter().map(|(c, x)| tag_key(c, x)).collect(),
+            raw_head: prev.raw_head.clone(),
+            raw_strings: prev.raw_strings.clone(),
         };
         lib.tracks.insert(dev_id, dt);
         map.insert(t.id, dev_id);
@@ -886,6 +962,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     // Sidecar with local sources (never read by players).
     let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
     let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources).unwrap_or_default());
+    cue_record.retain(|path, _| lib.tracks.values().any(|t| &t.file_path == path));
+    let _ = write_cue_record(&root, &cue_record);
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
     if has_onelibrary(&root) {
         msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which PrepDeck does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
@@ -1166,27 +1244,38 @@ pub fn build_export_pdb(lib: &DeviceLibrary) -> Vec<u8> {
         f.push(t.rating);
         f.extend_from_slice(&t.file_type.to_le_bytes());
         debug_assert_eq!(f.len(), 0x5c);
+        // A row read from the drive keeps the bytes PrepDeck does not manage: the row header
+        // bitmask (0x04..0x08; 0x02 is the positional index shift), the 0x14 value, the 0x18/0x1a values and the 0x56 constant.
+        if t.raw_head.len() == 0x5c {
+            for range in [0x04..0x08, 0x14..0x1c, 0x56..0x58] {
+                f[range.clone()].copy_from_slice(&t.raw_head[range]);
+            }
+        }
         let fname = Path::new(&t.file_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        // String slots PrepDeck does not manage keep the drive's value (ISRC, slots 2–4, 6,
+        // 8, 9, 13, 18).
+        let keep = |i: usize, default: &str| -> String { t.raw_strings.get(i).cloned().unwrap_or_else(|| default.to_string()) };
+        let (s0, s2, s3, s4, s6, s8, s9, s13, s18) = (keep(0, ""), keep(2, "3"), keep(3, "3"), keep(4, ""), keep(6, ""), keep(8, ""), keep(9, ""), keep(13, ""), keep(18, ""));
         let strings = vec![
-            dstr(""),
+            dstr(&s0),
             dstr(&t.lyricist),
-            dstr("3"),
-            dstr("3"),
-            dstr(""),
+            dstr(&s2),
+            dstr(&s3),
+            dstr(&s4),
             dstr(&t.message),
-            dstr(""),
+            dstr(&s6),
             dstr(if t.autoload { "ON" } else { "" }),
-            dstr(""),
-            dstr(""),
+            dstr(&s8),
+            dstr(&s9),
             dstr(&t.date_added),
             dstr(&t.release_date),
             dstr(&t.mix_name),
-            dstr(""),
+            dstr(&s13),
             dstr(&t.analyze_path),
             dstr(&t.analyze_date),
             dstr(&t.comment),
             dstr(&t.title),
-            dstr(""),
+            dstr(&s18),
             dstr(&fname),
             dstr(&t.file_path),
         ];
@@ -1468,6 +1557,28 @@ pub fn write_device_then(root: &Path, lib: &DeviceLibrary, published: &mut dyn F
 
 #[cfg(test)]
 mod tests {
+    /// Rewriting a rekordbox-made export.pdb keeps every track's unmanaged bytes and strings.
+    #[test]
+    fn rewrite_keeps_unmanaged_track_fields() {
+        let p = dirs::home_dir().unwrap().join("Developer/rekordbox-rea/analysis/format-oracles/Holzhaus__rekordcrate/data/complete_export/demo_tracks/PIONEER/rekordbox/export.pdb");
+        let Ok(bytes) = std::fs::read(&p) else { return };
+        let a = parse_pdb(bytes).unwrap();
+        assert!(!a.tracks.is_empty());
+        let b = parse_pdb(build_export_pdb(&a)).unwrap();
+        assert_eq!(a.tracks.len(), b.tracks.len());
+        for (id, ta) in &a.tracks {
+            let tb = &b.tracks[id];
+            assert_eq!(ta.raw_strings, tb.raw_strings, "strings of track {id}");
+            for range in [0x04..0x08, 0x14..0x1c, 0x56..0x58] {
+                assert_eq!(ta.raw_head[range.clone()], tb.raw_head[range.clone()], "header bytes {range:?} of track {id}");
+            }
+            let ids = [0x0c, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x3c, 0x40, 0x44, 0x48];
+            let diff: Vec<usize> = (0..0x5c).filter(|&i| i != 2 && i != 3 && !ids.iter().any(|&o| i >= o && i < o + 4) && ta.raw_head[i] != tb.raw_head[i]).collect();
+            assert!(diff.is_empty(), "track {id}: header bytes {diff:x?} changed");
+            assert_eq!((ta.title.clone(), ta.artist.clone(), ta.album.clone(), ta.genre.clone(), ta.bpm100, ta.key_name.clone()), (tb.title.clone(), tb.artist.clone(), tb.album.clone(), tb.genre.clone(), tb.bpm100, tb.key_name.clone()));
+        }
+    }
+
     #[test]
     fn default_browse_matches_original_tables() {
         let d = UsbBrowse::default();
@@ -1562,6 +1673,37 @@ mod tests {
         read_ext_tags(ext, &mut l2).unwrap();
         assert_eq!(l2.tag_categories[0].1, vec!["Techno".to_string()]);
         assert_eq!(l2.tracks[&1].tags, vec![tag_key("Genre", "Techno")]);
+    }
+
+    /// A cue moved on a player (the drive's analysis file rewritten) is found; an untouched one is not.
+    #[test]
+    fn finds_cues_changed_on_players() {
+        let root = std::env::temp_dir().join(format!("prepdeck_player_edits_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let base = "/PIONEER/USBANLZ/P000/00000001/ANLZ0000";
+        let dir = root.join(base.trim_start_matches('/')).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = Waveform { frames: vec![[10; 8]; 50] };
+        let cue = |start: f64| Cue { id: 0, track_id: 0, kind: CueKind::Hot, slot: 0, start, end: None, color: 0, comment: String::new(), active_loop: false };
+        let write = |cues: &[Cue]| {
+            let f = anlz::build("/Contents/a.mp3", &[], &w, cues, 0, 44100);
+            let b = root.join(base.trim_start_matches('/'));
+            std::fs::write(b.with_extension("DAT"), &f.dat).unwrap();
+            std::fs::write(b.with_extension("EXT"), &f.ext).unwrap();
+            anlz::cue_fingerprint(&anlz::parse_cues(&anlz::section_list(&f.ext), &anlz::section_list(&f.dat)))
+        };
+        let fp = write(&[cue(1.0)]);
+        let mut lib = DeviceLibrary::default();
+        lib.tracks.insert(1, DevTrack { id: 1, title: "A".into(), file_path: "/Contents/a.mp3".into(), analyze_path: format!("{base}.DAT"), ..Default::default() });
+        write_cue_record(&root, &HashMap::from([("/Contents/a.mp3".to_string(), fp.clone())])).unwrap();
+        assert!(player_cue_edits(&root, &lib).is_empty());
+        assert_eq!(fp, anlz::local_cue_fingerprint(&[cue(1.0)]));
+        write(&[cue(2.0)]);
+        let edits = player_cue_edits(&root, &lib);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].exported, fp);
+        assert_eq!(edits[0].cues[0].start, 2.0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
