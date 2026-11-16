@@ -736,6 +736,12 @@ pub struct Deck {
     pub ctrl_tab: u8,
     pub panel_tab: u8,
     pub drag_origin: Option<(f32, f64)>,
+    /// A cue marker being dragged on the zoomed waveform: its id, the cues before the drag
+    /// (for Undo and Esc) and where on the marker it was grabbed (seconds after its start).
+    pub cue_drag: Option<(i64, Vec<Cue>, f64)>,
+    /// Where the zoomed waveform was last drawn (rect, playhead time, pixels per second), so
+    /// the scripted screenshot check (PREPDECK_SHOT_DRAG) can aim at a marker.
+    pub detail_map: Option<(egui::Rect, f64, f64)>,
     pub editing_comment: Option<i64>,
     pub metronome: bool,
     pub bpm_text: String,
@@ -768,6 +774,8 @@ impl Default for Deck {
             ctrl_tab: 0,
             panel_tab: 0,
             drag_origin: None,
+            cue_drag: None,
+            detail_map: None,
             editing_comment: None,
             metronome: false,
             bpm_text: String::new(),
@@ -3075,6 +3083,10 @@ impl App {
         }
     }
 
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn undo_edit(&mut self) {
         let Some(e) = self.undo.pop() else { return };
         if let Some(cur) = self.current_of(&e) {
@@ -3104,6 +3116,21 @@ impl App {
         let _ = self.db.save_cue(&c);
         if let Some(x) = self.deck.cues.iter_mut().find(|x| x.id == c.id) {
             *x = c;
+        }
+    }
+    /// Finish dragging a cue marker: one Undo step for the whole drag, saved once.
+    pub fn commit_cue_drag(&mut self, cancel: bool) {
+        let Some((id, before, _)) = self.deck.cue_drag.take() else { return };
+        let Some(tid) = self.deck.track else { return };
+        let moved = self.deck.cues.iter().find(|c| c.id == id).cloned();
+        let orig = before.iter().find(|c| c.id == id).cloned();
+        match (moved, orig) {
+            (Some(m), Some(o)) if !cancel && (m.start - o.start).abs() > 1e-6 => {
+                self.record(Edit::Cues { track: tid, before });
+                let _ = self.db.save_cue(&m);
+                self.refresh_cue_counts(tid);
+            }
+            _ => self.deck.cues = before,
         }
     }
     pub fn refresh_cue_counts(&mut self, tid: i64) {

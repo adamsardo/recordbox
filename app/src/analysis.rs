@@ -568,52 +568,7 @@ fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
     }
     offsets.sort();
     let med = offsets[offsets.len() / 2];
-    match std::env::var("PREPDECK_PHASE_MODE").as_deref() {
-        Ok("mode") => {
-            // Densest offset (2 ms Gaussian kernel) instead of the median.
-            let sig = std::env::var("PREPDECK_PHASE_SIG").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64);
-            let mut best = (med as f64, -1.0);
-            let mut x = -40.0;
-            while x <= 40.0 {
-                let d: f64 = offsets.iter().map(|o| (-0.5 * ((*o as f64 - x) / sig).powi(2)).exp()).sum();
-                if d > best.1 {
-                    best = (x, d);
-                }
-                x += 0.25;
-            }
-            first + best.0 * ms as f64 / sr
-        }
-        Ok("sum") => {
-            // Offset whose summed low-band rise over all beats is largest, then its attack start.
-            let rise = |i: isize| -> f32 {
-                if i < 2 || i as usize + 1 >= env.len() {
-                    return 0.0;
-                }
-                (env[i as usize + 1] - env[i as usize - 2]).max(0.0)
-            };
-            let beats: Vec<isize> = {
-                let mut v = vec![];
-                let mut t = first;
-                while t < dur - 0.1 {
-                    v.push((t * sr / ms as f64) as isize);
-                    t += period;
-                }
-                v
-            };
-            let total = |d: isize| -> f32 { beats.iter().map(|c| rise(c + d)).sum() };
-            let scores: Vec<f32> = (-40..=40).map(total).collect();
-            let (bi, bs) = scores.iter().enumerate().fold((0usize, 0f32), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
-            let mut start = bi as isize - 40;
-            for d in (start - 12).max(-40)..start {
-                if scores[(d + 40) as usize] >= attack_fraction() * bs {
-                    start = d;
-                    break;
-                }
-            }
-            first + start as f64 * ms as f64 / sr
-        }
-        _ => first + med as f64 * ms as f64 / sr,
-    }
+    first + med as f64 * ms as f64 / sr
 }
 
 /// Cosine distance between the pitch-class profile of each beat and the previous beat.

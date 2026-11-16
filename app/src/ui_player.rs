@@ -410,6 +410,7 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     let px_per_s = r.width() as f64 / span;
     let cx = r.center().x;
     let t_of = |x: f32| pos + (x - cx) as f64 / px_per_s;
+    app.deck.detail_map = Some((r, pos, px_per_s));
     let x_of = |t: f64| cx + ((t - pos) * px_per_s) as f32;
     let mid = r.center().y;
     let half = r.height() / 2.0 - 10.0;
@@ -512,19 +513,52 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         let label = bars_label(&app.deck.beats, pos);
         p.text(pos2(cx - 6.0, r.min.y + 10.0), Align2::RIGHT_CENTER, label, FontId::proportional(15.0), BEAT_BLUE);
     }
-    // interaction: drag to scrub, scroll to move, ctrl/cmd + scroll to zoom
+    // interaction: drag a cue marker to move it, drag elsewhere to scrub, scroll to move,
+    // ctrl/cmd + scroll to zoom
     let resp = ui.interact(r, ui.id().with("detail"), Sense::click_and_drag());
+    let dur = app.deck.duration;
     if app.deck.audio.is_some() {
-        if resp.drag_started() {
-            app.deck.drag_origin = Some((resp.interact_pointer_pos().map(|p| p.x).unwrap_or(cx), pos));
+        if app.deck.cue_drag.is_none() {
+            if let Some(hp) = resp.hover_pos() {
+                if cue_marker_hit(&app.deck.cues, hp, r, x_of).is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+            }
         }
-        if resp.dragged() {
+        if resp.drag_started() {
+            // Where the button went down: a drag is only recognised after the pointer has
+            // moved a few pixels, and the marker under the press is the one being dragged.
+            let pp = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            match pp.and_then(|pp| cue_marker_hit(&app.deck.cues, pp, r, x_of).map(|id| (id, pp))) {
+                Some((id, pp)) => {
+                    let start = app.deck.cues.iter().find(|c| c.id == id).map(|c| c.start).unwrap_or(0.0);
+                    app.deck.cue_drag = Some((id, app.deck.cues.clone(), t_of(pp.x) - start));
+                }
+                None => app.deck.drag_origin = Some((pp.map(|p| p.x).unwrap_or(cx), pos)),
+            }
+        }
+        if let Some((id, _, grab)) = app.deck.cue_drag.clone() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                app.commit_cue_drag(true);
+            } else if resp.dragged() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let t = app.quantized(t_of(pp.x) - grab);
+                    if let Some(c) = app.deck.cues.iter_mut().find(|c| c.id == id) {
+                        *c = moved_cue(c, t, dur);
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                app.commit_cue_drag(false);
+            }
+        } else if resp.dragged() {
             if let (Some((x0, p0)), Some(pp)) = (app.deck.drag_origin, resp.interact_pointer_pos()) {
                 let t = p0 - (pp.x - x0) as f64 / px_per_s;
                 app.seek(t);
             }
         }
-        if resp.drag_stopped() {
+        if resp.drag_stopped() && app.deck.drag_origin.is_some() {
             app.deck.drag_origin = None;
             if !app.playing() {
                 let q = app.quantized(app.pos());
@@ -547,6 +581,31 @@ fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             }
         }
     }
+}
+
+/// The cue whose marker is under `p` on the zoomed waveform `r`: a hot cue by its letter box
+/// along the top, a memory cue by its triangle along the bottom (the waveform body scrubs).
+pub fn cue_marker_hit(cues: &[Cue], p: Pos2, r: Rect, x_of: impl Fn(f64) -> f32) -> Option<i64> {
+    let mut best: Option<(f32, i64)> = None;
+    for c in cues {
+        let x = x_of(c.start);
+        let (hit, d) = match c.kind {
+            CueKind::Hot => (p.y >= r.min.y && p.y <= r.min.y + 14.0 && p.x >= x - 3.0 && p.x <= x + 14.0, (p.x - (x + 6.5)).abs()),
+            _ => (p.y >= r.max.y - 18.0 && p.y <= r.max.y && (p.x - x).abs() <= 7.0, (p.x - x).abs()),
+        };
+        if hit && best.map(|b| d < b.0).unwrap_or(true) {
+            best = Some((d, c.id));
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// `c` moved to start at `t`: a loop keeps its length, and the cue stays inside the track.
+pub fn moved_cue(c: &Cue, t: f64, duration: f64) -> Cue {
+    let len = c.end.map(|e| e - c.start).filter(|l| *l > 0.0);
+    let max = if duration > 0.0 { (duration - len.unwrap_or(0.0)).max(0.0) } else { f64::MAX };
+    let start = t.clamp(0.0, max);
+    Cue { start, end: match len { Some(l) => Some(start + l), None => c.end.map(|_| start) }, ..c.clone() }
 }
 
 fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
@@ -1153,4 +1212,44 @@ pub fn star(p: &egui::Painter, c: Pos2, r: f32, col: Color32, filled: bool) {
 fn cue_time(t: f64) -> String {
     let ms = (t * 1000.0).round() as u64;
     format!("{:02}:{:02}:{:03}", ms / 60000, (ms / 1000) % 60, ms % 1000)
+}
+
+#[cfg(test)]
+mod marker_drag_tests {
+    use super::*;
+
+    fn cue(id: i64, kind: CueKind, start: f64, end: Option<f64>) -> Cue {
+        Cue { id, track_id: 1, kind, slot: if kind == CueKind::Hot { 0 } else { -1 }, start, end, color: 0, comment: String::new(), active_loop: false }
+    }
+
+    #[test]
+    fn markers_are_grabbed_by_their_handles_only() {
+        let r = Rect::from_min_max(pos2(0.0, 100.0), pos2(1000.0, 200.0));
+        // 100 px per second, 0 s at x = 0.
+        let x_of = |t: f64| (t * 100.0) as f32;
+        let cues = vec![cue(1, CueKind::Hot, 2.0, None), cue(2, CueKind::Memory, 5.0, None), cue(3, CueKind::Hot, 2.1, None)];
+        // Hot cue letter box (top strip): the nearer box wins.
+        assert_eq!(cue_marker_hit(&cues, pos2(205.0, 105.0), r, x_of), Some(1));
+        assert_eq!(cue_marker_hit(&cues, pos2(218.0, 105.0), r, x_of), Some(3));
+        // Memory cue triangle (bottom strip).
+        assert_eq!(cue_marker_hit(&cues, pos2(503.0, 195.0), r, x_of), Some(2));
+        // The waveform body scrubs, it never grabs a marker.
+        assert_eq!(cue_marker_hit(&cues, pos2(205.0, 150.0), r, x_of), None);
+        assert_eq!(cue_marker_hit(&cues, pos2(503.0, 150.0), r, x_of), None);
+        assert_eq!(cue_marker_hit(&cues, pos2(800.0, 105.0), r, x_of), None);
+    }
+
+    #[test]
+    fn moved_cues_keep_loop_length_and_stay_in_the_track() {
+        let l = cue(1, CueKind::Hot, 10.0, Some(14.0));
+        let m = moved_cue(&l, 20.0, 100.0);
+        assert_eq!((m.start, m.end), (20.0, Some(24.0)));
+        // A loop can't run past the end, and nothing goes before 0.
+        assert_eq!(moved_cue(&l, 99.0, 100.0).start, 96.0);
+        assert_eq!(moved_cue(&l, -3.0, 100.0).start, 0.0);
+        let p = cue(2, CueKind::Memory, 5.0, None);
+        assert_eq!(moved_cue(&p, 7.5, 100.0).end, None);
+        let z = cue(3, CueKind::Hot, 5.0, Some(5.0));
+        assert_eq!(moved_cue(&z, 8.0, 100.0).end, Some(8.0));
+    }
 }

@@ -30,6 +30,57 @@ struct Gui {
 }
 
 impl eframe::App for Gui {
+    /// PREPDECK_SHOT_DRAG (with --screenshot): drag hot cue A 100 px to the right with real
+    /// pointer events, to check marker dragging end to end; the result goes to stderr.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let Some((_, frame)) = self.app.screenshot.clone() else { return };
+        if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
+            return;
+        }
+        let Some((r, pos, pps)) = self.app.deck.detail_map else { return };
+        let Some(a) = self.app.deck.cues.iter().find(|c| c.kind == model::CueKind::Hot && c.slot == 0).cloned() else { return };
+        let ax = r.center().x + ((a.start - pos) * pps) as f32 + 6.0;
+        let y = r.min.y + 6.0;
+        static START: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let press = |down: bool, x: f32| egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+        let mv = |x: f32| egui::Event::PointerMoved(egui::pos2(x, y));
+        match frame {
+            80 => {
+                let x0 = *START.get_or_init(|| ax);
+                eprintln!("drag: hot cue A at {:.3} s, grabbing at x {x0:.1}", a.start);
+                raw.events.push(mv(x0));
+            }
+            81 => raw.events.push(press(true, *START.get().unwrap_or(&ax))),
+            82..=91 => {
+                let x0 = *START.get().unwrap_or(&ax);
+                raw.events.push(mv(x0 + 10.0 * (frame - 81) as f32));
+            }
+            92 => raw.events.push(press(false, START.get().copied().unwrap_or(ax) + 100.0)),
+            100 => {
+                let saved = self.app.db.cues(a.track_id).unwrap_or_default().into_iter().find(|c| c.kind == model::CueKind::Hot && c.slot == 0);
+                eprintln!("drag: after: deck {:.3} s, saved {:?}, undo steps {}, 100 px = {:.3} s", a.start, saved.map(|c| c.start), self.app.undo_len(), 100.0 / pps);
+            }
+            101 => {
+                self.app.undo_edit();
+                let saved = self.app.db.cues(a.track_id).unwrap_or_default().into_iter().find(|c| c.kind == model::CueKind::Hot && c.slot == 0);
+                eprintln!("drag: after Undo: deck {:.3} s, saved {:?}", self.app.deck.cues.iter().find(|c| c.id == a.id).map(|c| c.start).unwrap_or(-1.0), saved.map(|c| c.start));
+            }
+            // Second drag, cancelled with Esc while the button is still down.
+            102 => raw.events.push(mv(ax)),
+            103 => raw.events.push(press(true, ax)),
+            104..=108 => raw.events.push(mv(ax + 15.0 * (frame - 103) as f32)),
+            109 => eprintln!("drag: during second drag: deck {:.3} s", a.start),
+            110 => raw.events.push(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }),
+            111 => raw.events.push(mv(ax + 120.0)),
+            112 => raw.events.push(press(false, ax + 120.0)),
+            114 => {
+                let saved = self.app.db.cues(a.track_id).unwrap_or_default().into_iter().find(|c| c.kind == model::CueKind::Hot && c.slot == 0);
+                eprintln!("drag: after Esc: deck {:.3} s, saved {:?}, undo steps {}", a.start, saved.map(|c| c.start), self.app.undo_len());
+            }
+            _ => {}
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let app = &mut self.app;
         app.poll_import();
