@@ -8,7 +8,7 @@ use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
 pub fn build() -> Option<Menu> {
     let menu = Menu::new();
-    let item = |id: &str, text: &str, acc: Option<(Modifiers, Code)>| MenuItem::with_id(id, text, true, acc.map(|(m, c)| Accelerator::new(Some(m), c)));
+    let item = |id: &str, text: &str, acc: Option<(Modifiers, Code)>| MenuItem::with_id(id, text, true, acc.map(|(m, c)| Accelerator::new(m, c)));
     let cmd = Modifiers::META;
     let app_menu = Submenu::new("PrepDeck", true);
     app_menu

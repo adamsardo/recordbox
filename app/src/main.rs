@@ -7,9 +7,11 @@ mod audio;
 mod db;
 mod demo;
 mod export;
+mod icons;
 mod importer;
 mod jobs;
 mod key;
+mod menus;
 mod model;
 mod smart;
 mod theme;
@@ -31,16 +33,17 @@ impl eframe::App for Gui {
         app.poll_analysis();
         app.poll_load();
         app.poll_export();
+        menus::poll(app);
         shortcuts(app, ctx);
 
-        egui::TopBottomPanel::top("header").exact_height(30.0).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
+        egui::TopBottomPanel::top("header").exact_height(29.0).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
             ui_browser::header_bar(app, ui);
         });
-        egui::TopBottomPanel::bottom("footer").exact_height(26.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("footer").exact_height(28.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
         if !app.prefs.browser_only {
-            egui::TopBottomPanel::top("player").exact_height(262.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+            egui::TopBottomPanel::top("player").exact_height(255.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
                 ui_player::player_panel(app, ui);
             });
         }

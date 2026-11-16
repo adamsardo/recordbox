@@ -221,6 +221,16 @@ impl Db {
         }
         Ok(m)
     }
+    /// Hot cue (start, slot, colour) per track, for the track list previews.
+    pub fn hot_positions(&self) -> Result<std::collections::HashMap<i64, Vec<(f64, i32, u8)>>> {
+        let mut st = self.conn.prepare("SELECT track_id, start, slot, color FROM cues WHERE kind=1 ORDER BY track_id, slot")?;
+        let mut m: std::collections::HashMap<i64, Vec<(f64, i32, u8)>> = std::collections::HashMap::new();
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, i32>(2)?, r.get::<_, u8>(3)?)))?;
+        for r in rows.flatten() {
+            m.entry(r.0).or_default().push((r.1, r.2, r.3));
+        }
+        Ok(m)
+    }
     pub fn save_cue(&self, c: &Cue) -> Result<i64> {
         let kind = if c.kind == CueKind::Hot { 1 } else { 0 };
         if c.id > 0 {

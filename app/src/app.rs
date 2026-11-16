@@ -144,18 +144,17 @@ impl Col {
     }
     pub fn width(self) -> f32 {
         match self {
-            Col::Num => 34.0,
-            Col::Status => 40.0,
+            // Default widths measured on the original's Collection view (pt).
+            Col::Num => 60.0,
+            Col::Status => 60.0,
             Col::Preview => 140.0,
-            Col::Artwork => 60.0,
-            Col::Title => 190.0,
-            Col::Artist | Col::Album => 150.0,
-            Col::Genre => 110.0,
-            Col::Bpm => 60.0,
-            Col::Rating => 80.0,
-            Col::Time => 56.0,
-            Col::Key => 48.0,
-            Col::DateAdded | Col::ReleaseDate => 84.0,
+            Col::Artwork => 79.0,
+            Col::Title | Col::Artist | Col::Album | Col::Genre => 128.5,
+            Col::Bpm => 79.0,
+            Col::Rating => 87.0,
+            Col::Time => 83.0,
+            Col::Key => 128.5,
+            Col::DateAdded | Col::ReleaseDate => 82.0,
             Col::Color => 46.0,
             Col::Location => 260.0,
             Col::Comments | Col::MyTag => 160.0,
@@ -337,6 +336,7 @@ pub struct App {
     pub index: HashMap<i64, usize>,
     pub previews: HashMap<i64, Vec<u8>>,
     pub cue_counts: HashMap<i64, (usize, usize)>,
+    pub hot_positions: HashMap<i64, Vec<(f64, i32, u8)>>,
     pub nodes: Vec<PlaylistNode>,
     pub node_counts: HashMap<i64, usize>,
     pub mytags: Vec<MyTag>,
@@ -374,6 +374,8 @@ pub struct App {
     pub ctx: egui::Context,
     pub screenshot: Option<(String, u32)>,
     pub scroll_to_selected: bool,
+    /// Native menu bar (kept alive for the app's lifetime).
+    pub menu: Option<muda::Menu>,
 }
 
 impl App {
@@ -390,6 +392,7 @@ impl App {
             index: HashMap::new(),
             previews: HashMap::new(),
             cue_counts: HashMap::new(),
+            hot_positions: HashMap::new(),
             nodes: vec![],
             node_counts: HashMap::new(),
             mytags: vec![],
@@ -427,7 +430,9 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             screenshot: screenshot.map(|s| (s, 0)),
             scroll_to_selected: false,
+            menu: None,
         };
+        app.menu = crate::menus::build();
         app.reload_all();
         if let Some(e) = app.player.error.clone() {
             app.toast_err(format!("Audio output unavailable: {e}"));
@@ -552,6 +557,7 @@ impl App {
         self.reload_tracks();
         self.previews = self.db.previews().unwrap_or_default();
         self.cue_counts = self.db.tracks_with_cues().unwrap_or_default();
+        self.hot_positions = self.db.hot_positions().unwrap_or_default();
         self.reload_playlists();
         self.reload_tags();
     }
@@ -1239,6 +1245,12 @@ impl App {
         }
     }
     pub fn refresh_cue_counts(&mut self, tid: i64) {
+        let hp: Vec<(f64, i32, u8)> = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
+        if hp.is_empty() {
+            self.hot_positions.remove(&tid);
+        } else {
+            self.hot_positions.insert(tid, hp);
+        }
         let h = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).count();
         let m = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).count();
         if h + m == 0 {

@@ -47,7 +47,7 @@ Sources used:
 
 | File | Sections (in order) |
 |---|---|
-| .DAT | PPTH, PVBR (zeros, as for CBR in fixtures), PQTZ, PWAV (400), PWV2 (100), PCOB hot, PCOB memory |
+| .DAT | PPTH, PVBR (400 zero entries then the decoded sample count, as in the person's own rekordbox files), PQTZ, PWAV (400), PWV2 (100), PCOB hot, PCOB memory |
 | .EXT | PPTH, PWV3 (150/s), PCOB ×2 empty, PCO2 hot, PCO2 memory, PWV5 (150/s), PWV4 (1200×6) |
 | .2EX | PPTH, PWV7 (150/s ×3), PWV6 (1200×3), PWVC |
 
@@ -56,6 +56,8 @@ Sources used:
 - PCPT (56 bytes): hot cue number (A=1), status 4 for active loop, `0x00100000`, prev/next order, type 1 point / 2 loop, `0x03e8`, start ms, end ms or `0xffffffff`. (rekordcrate)
 - PCP2 (88 bytes + comment): hot cue no., type, `0x03e8`, times, memory colour id, loop size 0/0, UTF-16BE comment, hot cue colour index + RGB. (public populated record)
 - Waveform value ranges matched to real files: PWAV height ≤31, PWV2 ≤15, PWV3/PWV5 height ≤31, PWV6 bands ≤43, PWV7 ≤127. (fixture statistics)
+- Waveform values come from linear models of peak and RMS per band, fitted against rekordbox's own analysis files for ~100 of the person's tracks (read-only); frame counts match exactly (ceil(samples ÷ (rate/150)) for detail, fixed 400/100/1200 for previews). Shapes correlate well with the original for the full/low bands; PWV7 mid/high correlate only about 0.6. (measured)
+- Not written: PQT2 (extended grid), PSSI (phrases), PVDI, the .3EX file and MYSETTING files. (absent from export)
 - PWVC values `0x005b 0x008a 0x018c` copied from a real file (meaning unknown).
 
 ## Cue / XML behaviour (for import and export)
@@ -75,13 +77,13 @@ Sources used:
 | BPM limits for edits | 40 – 499 | binary message "BPM value should be between 40 and 499." |
 | Onset envelope | 1024-pt FFT, 200 frames/s, log spectral flux to 8 kHz + low band to 160 Hz | estimated |
 | Tempo | autocorrelation over the range, then phase-aligned comb on a 0.01 BPM grid; whole BPM preferred within 3% score | estimated |
-| Beat phase | kick-band check of half-beat, first-kick anchor, then median attack start (70% of steepest rise, ±40 ms, 1 ms steps) | calibrated against 105 rekordbox-made grids in the person's local analysis files |
+| Beat phase | kick-band check of half-beat, first-kick anchor, then median attack start (85% of steepest rise, ±40 ms, 1 ms steps) | calibrated against 105 rekordbox-made grids in the person's local analysis files |
 | MP3 start alignment | LAME-tagged: keep encoder lead-in; ffmpeg-tagged (Lavc/Lavf): remove delay from the tag (1105 samples typical); no tag: drop 1152 samples | measured: these three classes were offset by −27 / 0 / +26 ms against rekordbox's own grids before this rule |
-| Benchmark | 105 tracks: tempo identical on 104; beat offset mean −1.6 ms, median 6 ms, 47% within 5 ms, 90% within 37 ms; bar start agrees on 66 | reference grids from the original's analysis files (read-only) |
-| Downbeat | low-band attack per beat position + chroma change at bar starts | estimated |
-| Key | chroma 55–1760 Hz from 8192-pt FFT at ~11 kHz, Krumhansl–Kessler templates | estimated |
+| Benchmark | 105 tracks: tempo identical on 104 (one half-tempo miss); beat offset mean 0.5 ms, median 6 ms, 90% within 32 ms; bar start agrees on 81 | reference grids from the original's analysis files and collection XML (read-only) |
+| Downbeat | low-band attack per beat position + chroma novelty at bar starts + bonus 3.0 for the bar position of the first beat of music | calibrated (66 → 81 of 105 bar starts) |
+| Key | chroma 55–1760 Hz from 8192-pt FFT at ~11 kHz, spectral peaks only, bass weight 0.45, diatonic-triad templates, minor bias 0.15 | calibrated: 69 of 100 identical to rekordbox's key in the XML, 11 more a neighbour (relative/fifth); 28 of 37 against screenshot keys |
 | Key names | Classic: Abm Ebm Bbm Fm Cm Gm Dm Am Em Bm Gbm Dbm / B Gb Db Ab Eb Bb F C G D A E; Alphanumeric 1A–12A / 1B–12B | binary key table + screenshot spellings |
-| Waveform | 150 frames/s; peak of full, low (<200 Hz), mid (200–2500 Hz), high (>2500 Hz) | 150/s from PWV3 header `0x0096` (fixtures); band edges estimated |
+| Waveform | 150 frames/s; peak and RMS of full, low (<200 Hz), mid (200–2500 Hz), high (>2500 Hz) | 150/s from PWV3 header `0x0096` (fixtures); band edges and model fitted to the original's files |
 | Waveform colours (3Band) | low #0055E1, mid #FFA202, high #F4EAD5 | screenshot |
 | Loudness | BS.1770 K-weighting, 400 ms blocks, −70 LUFS absolute and −10 LU relative gates | estimated (prior research has loudness cases; target not established) |
 | Auto gain reference | −8 LUFS | estimated |

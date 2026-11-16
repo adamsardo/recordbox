@@ -42,6 +42,11 @@ pub fn hotcue_color(i: u8) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// Bold system font at `size` pt.
+pub fn bold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("bold".into()))
+}
+
 pub fn apply(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, path, idx) in [
@@ -60,6 +65,18 @@ pub fn apply(ctx: &egui::Context) {
                 fam.insert(0, name.to_owned());
             }
         }
+    }
+    // Bold face (Helvetica Neue Bold, face 1 of the system collection) for titles and caps labels.
+    if let Ok(b) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc") {
+        let mut fd = egui::FontData::from_owned(b);
+        fd.index = 1;
+        fonts.font_data.insert("helv-bold".to_owned(), std::sync::Arc::new(fd));
+        let mut fam = vec!["helv-bold".to_owned()];
+        fam.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
+        fonts.families.insert(egui::FontFamily::Name("bold".into()), fam);
+    } else {
+        let fam = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+        fonts.families.insert(egui::FontFamily::Name("bold".into()), fam);
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();

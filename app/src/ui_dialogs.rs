@@ -27,113 +27,214 @@ pub fn dialogs(app: &mut App, ctx: &Context) {
     confirm_windows(app, ctx);
 }
 
+/// Card with a 17 pt bold heading on #1E1E1E, as in the original's Preferences.
+fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::default().fill(BG2).inner_margin(egui::Margin { left: 25, right: 18, top: 18, bottom: 18 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).font(bold(17.0)).color(WHITE));
+        ui.add_space(8.0);
+        ui.indent(title, |ui| add(ui));
+    });
+    ui.add_space(4.0);
+}
+
+fn sub(ui: &mut Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(text).font(bold(15.0)).color(WHITE));
+    ui.add_space(4.0);
+}
+
+/// Blue pill switch with a white knob (off: grey).
+fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let (r, resp) = ui.allocate_exact_size(vec2(32.0, 17.0), egui::Sense::click());
+        if resp.clicked() {
+            *on = !*on;
+            changed = true;
+        }
+        let p = ui.painter();
+        p.rect_filled(r, 8.5, if *on { BLUE } else { DIM });
+        let kx = if *on { r.max.x - 8.5 } else { r.min.x + 8.5 };
+        p.circle_filled(egui::pos2(kx, r.center().y), 6.5, WHITE);
+        ui.add_space(4.0);
+        if ui.add(egui::Label::new(RichText::new(label).size(14.0).color(WHITE)).sense(egui::Sense::click())).clicked() {
+            *on = !*on;
+            changed = true;
+        }
+    });
+    changed
+}
+
 fn prefs_window(app: &mut App, ctx: &Context) {
     if !app.dialogs.prefs_open {
         return;
     }
     let mut open = true;
-    egui::Window::new("Preferences").open(&mut open).default_size(vec2(760.0, 520.0)).collapsible(false).show(ctx, |ui| {
+    let frame = egui::Frame::window(&ctx.style()).fill(BG).inner_margin(0.0);
+    egui::Window::new("Preferences").open(&mut open).default_size(vec2(800.0, 640.0)).collapsible(false).frame(frame).show(ctx, |ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
         ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(140.0);
-                for (i, n) in ["View", "Analysis", "DJ System", "Advanced"].iter().enumerate() {
+            // Sidebar 160 pt, #1E1E1E: search field, then categories with icons.
+            egui::Frame::default().fill(BG2).inner_margin(8.0).show(ui, |ui| ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 3.0);
+                ui.set_width(144.0);
+                ui.set_min_height(600.0);
+                let (sr, _) = ui.allocate_exact_size(vec2(144.0, 24.0), egui::Sense::hover());
+                ui.painter().rect_filled(sr, 0.0, BG);
+                crate::icons::magnifier(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.min.x + 12.0, sr.center().y), vec2(16.0, 16.0)), DIM2, 0);
+                ui.add_space(14.0);
+                type Ic = fn(&egui::Painter, egui::Rect, egui::Color32);
+                let items: [(&str, Ic); 4] = [("View", crate::icons::info), ("Analysis", crate::icons::view_columns), ("DJ System", crate::icons::usb), ("Advanced", crate::icons::hamburger)];
+                for (i, (n, ic)) in items.iter().enumerate() {
                     let sel = app.dialogs.prefs_tab == i as u8;
-                    let b = ui.add_sized(vec2(136.0, 26.0), egui::Button::new(RichText::new(*n).size(13.0)).fill(if sel { BLUE } else { BG2 }));
-                    if b.clicked() {
+                    let (r, resp) = ui.allocate_exact_size(vec2(144.0, 30.0), egui::Sense::click());
+                    if sel {
+                        ui.painter().rect_filled(r, 0.0, BLUE);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r, 0.0, hex(0x2A2A2A));
+                    }
+                    ic(ui.painter(), egui::Rect::from_center_size(egui::pos2(r.min.x + 15.0, r.center().y), vec2(18.0, 18.0)), if sel { WHITE } else { DIM });
+                    ui.painter().text(egui::pos2(r.min.x + 40.0, r.center().y), egui::Align2::LEFT_CENTER, *n, egui::FontId::proportional(14.0), if sel { WHITE } else { DIM2 });
+                    if resp.clicked() {
                         app.dialogs.prefs_tab = i as u8;
                     }
                 }
-            });
-            ui.separator();
+            }));
             ui.vertical(|ui| {
-                egui::ScrollArea::vertical().max_height(470.0).show(ui, |ui| {
+                ui.set_width(620.0);
+                // Tab strip (black): active tab blue, inactive #1E1E1E with #AAAAAA text.
+                let tabs: &[&str] = match app.dialogs.prefs_tab {
+                    0 => &["Display Type", "Color", "Player"],
+                    1 => &["Track Analysis", "CUE Analysis"],
+                    2 => &["General", "Device"],
+                    _ => &["Library"],
+                };
+                let key = format!("prefs_subtab_{}", app.dialogs.prefs_tab);
+                let mut sub_tab: usize = ui.ctx().data_mut(|d| *d.get_temp_mut_or(egui::Id::new(&key), 0usize));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.add_space(4.0);
+                    for (i, t) in tabs.iter().enumerate() {
+                        let disabled = app.dialogs.prefs_tab == 1 && i == 1;
+                        let sel = sub_tab == i;
+                        let b = egui::Button::new(RichText::new(*t).size(14.0).color(if sel { WHITE } else if disabled { OFF } else { DIM2 })).fill(if sel { BLUE } else { BG2 }).corner_radius(0.0).min_size(vec2(0.0, 30.0));
+                        let r = ui.add(b);
+                        let r = if disabled { r.on_hover_text("Automatic cue analysis is not part of this app.") } else { r };
+                        if r.clicked() && !disabled {
+                            sub_tab = i;
+                        }
+                    }
+                });
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(&key), sub_tab));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
                     let before = format!("{:?}", app.prefs);
-                    match app.dialogs.prefs_tab {
-                        0 => {
-                            section(ui, "Key display format", |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui.radio(!app.prefs.key_alnum, "Classic").clicked() {
-                                        app.prefs.key_alnum = false;
-                                        app.list_dirty = true;
-                                    }
-                                    if ui.radio(app.prefs.key_alnum, "Alphanumeric").clicked() {
-                                        app.prefs.key_alnum = true;
-                                        app.list_dirty = true;
-                                    }
-                                });
+                    match (app.dialogs.prefs_tab, sub_tab) {
+                        (0, 0) => {
+                            card(ui, "Key display format", |ui| {
+                                if ui.radio(!app.prefs.key_alnum, RichText::new("Classic").size(14.0)).clicked() {
+                                    app.prefs.key_alnum = false;
+                                    app.list_dirty = true;
+                                }
+                                if ui.radio(app.prefs.key_alnum, RichText::new("Alphanumeric").size(14.0)).clicked() {
+                                    app.prefs.key_alnum = true;
+                                    app.list_dirty = true;
+                                }
                             });
-                            section(ui, "Tooltips", |ui| {
-                                ui.checkbox(&mut app.prefs.tooltips, "Show Tooltips");
-                            });
-                            section(ui, "Waveform color", |ui| {
-                                ui.horizontal(|ui| {
-                                    for (i, n) in ["BLUE", "RGB", "3Band"].iter().enumerate() {
-                                        if ui.radio(app.prefs.wave_color == i as u8, *n).clicked() {
-                                            app.prefs.wave_color = i as u8;
-                                        }
-                                    }
-                                });
-                            });
-                            section(ui, "Player", |ui| {
-                                ui.checkbox(&mut app.prefs.time_remain, "Time Mode: Remaining (off: Elapsed)");
-                                ui.checkbox(&mut app.prefs.quantize, "Quantize (cues and loops snap to the beat grid)");
+                            card(ui, "Tooltips", |ui| {
+                                toggle(ui, &mut app.prefs.tooltips, "Show Tooltips");
                             });
                         }
-                        1 => {
-                            section(ui, "Track Analysis Mode", |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Analysis Mode");
-                                    ui.add_enabled(false, egui::Button::new("Normal")).on_disabled_hover_text("Optimized for tracks which have a constant BPM");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("BPM Range");
+                        (0, 1) => {
+                            card(ui, "Waveform color", |ui| {
+                                sub(ui, "Waveform color displayed in this app");
+                                for (i, n) in ["BLUE", "RGB", "3Band"].iter().enumerate() {
+                                    if ui.radio(app.prefs.wave_color == i as u8, RichText::new(*n).size(14.0)).clicked() {
+                                        app.prefs.wave_color = i as u8;
+                                    }
+                                }
+                            });
+                        }
+                        (0, _) => {
+                            card(ui, "Time Mode", |ui| {
+                                if ui.radio(!app.prefs.time_remain, RichText::new("Elapsed").size(14.0)).clicked() {
+                                    app.prefs.time_remain = false;
+                                }
+                                if ui.radio(app.prefs.time_remain, RichText::new("Remaining").size(14.0)).clicked() {
+                                    app.prefs.time_remain = true;
+                                }
+                            });
+                            card(ui, "Quantize", |ui| {
+                                toggle(ui, &mut app.prefs.quantize, "Cues and loops snap to the beat grid");
+                            });
+                        }
+                        (1, _) => {
+                            card(ui, "Track Analysis Mode", |ui| {
+                                egui::Grid::new("tam").num_columns(2).spacing(vec2(40.0, 10.0)).show(ui, |ui| {
+                                    ui.label(RichText::new("Analysis Mode").size(14.0));
+                                    egui::ComboBox::from_id_salt("amode").width(330.0).selected_text(RichText::new("Normal").font(bold(14.0))).show_ui(ui, |ui| {
+                                        let _ = ui.selectable_label(true, "Normal").on_hover_text("Optimized for tracks which have a constant BPM");
+                                    });
+                                    ui.end_row();
+                                    ui.label(RichText::new("BPM Range").size(14.0));
                                     let (lo, hi) = BPM_RANGES[app.prefs.bpm_range.min(9)];
-                                    egui::ComboBox::from_id_salt("bpmrange").selected_text(format!("{lo:.0}-{hi:.0}")).show_ui(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("bpmrange").width(330.0).selected_text(RichText::new(format!("{lo:.0}-{hi:.0}")).font(bold(14.0))).show_ui(ui, |ui| {
                                         for (i, (a, b)) in BPM_RANGES.iter().enumerate() {
                                             ui.selectable_value(&mut app.prefs.bpm_range, i, format!("{a:.0}-{b:.0}"));
                                         }
                                     });
+                                    ui.end_row();
                                 });
                             });
-                            section(ui, "Track Analysis Setting", |ui| {
-                                ui.checkbox(&mut app.prefs.analyze_grid, "BPM / Grid");
-                                ui.checkbox(&mut app.prefs.analyze_key, "KEY");
-                                ui.label(RichText::new("If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks.").size(11.0).color(DIM));
+                            card(ui, "Track Analysis Setting", |ui| {
+                                ui.checkbox(&mut app.prefs.analyze_grid, RichText::new("BPM / Grid").size(14.0));
+                                ui.checkbox(&mut app.prefs.analyze_key, RichText::new("KEY").size(14.0));
+                                ui.label(RichText::new("If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.").size(11.0).color(DIM));
                             });
-                            section(ui, "Auto Analysis", |ui| {
-                                ui.checkbox(&mut app.prefs.auto_analysis, "Enable");
+                            card(ui, "Auto Analysis", |ui| {
+                                toggle(ui, &mut app.prefs.auto_analysis, "Enable");
                             });
-                            section(ui, "Auto Gain", |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Reference loudness");
-                                    ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS"));
-                                });
-                                ui.label(RichText::new("Used for the player's gain and stored per track when analysing.").size(11.0).color(DIM));
+                            card(ui, "Auto Gain", |ui| {
+                                ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));
+                                ui.label(RichText::new("Used for the preview player's gain and stored per track when analysing.").size(11.0).color(DIM));
                             });
                             if ui.button("Re-analyze all tracks now").clicked() {
                                 let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
                                 app.reanalyze(&ids);
                             }
                         }
-                        2 => {
-                            section(ui, "Device", |ui| {
-                                ui.checkbox(&mut app.prefs.delete_device_tracks, "Delete playlist tracks from device if playlist is deleted");
+                        (2, 0) => {
+                            card(ui, "Waveform color", |ui| {
+                                sub(ui, "Waveform data written to the device");
+                                ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; the player's own setting chooses which one it shows.").size(12.0).color(DIM2));
                             });
-                            section(ui, "USB export format", |ui| {
-                                ui.label("Exports write the standard device library (export.pdb + exportExt.pdb) with analysis files (DAT / EXT / 2EX) and copies of the music in /Contents.");
-                                ui.label(RichText::new("Supported drive formats: FAT32, exFAT (some players), HFS+ (USB only). Supported files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(11.0).color(DIM));
+                            card(ui, "Supported devices", |ui| {
+                                ui.label(RichText::new("Drive formats: FAT32, exFAT (some players), HFS+ (USB only).").size(13.0));
+                                ui.label(RichText::new("Files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(13.0));
+                            });
+                        }
+                        (2, _) => {
+                            card(ui, "Delete Tracks", |ui| {
+                                toggle(ui, &mut app.prefs.delete_device_tracks, "Delete playlist tracks from device if playlist is deleted");
+                            });
+                            card(ui, "Library", |ui| {
+                                sub(ui, "Device library format");
+                                ui.label(RichText::new("Standard device library (export.pdb + exportExt.pdb) with analysis files (DAT / EXT / 2EX) and the music in /Contents.").size(12.0).color(DIM2));
                             });
                         }
                         _ => {
-                            section(ui, "Library", |ui| {
-                                ui.label(format!("Library location: {}", crate::db::data_dir().display()));
+                            card(ui, "Library", |ui| {
+                                ui.label(RichText::new(format!("Library location: {}", crate::db::data_dir().display())).size(13.0));
                                 ui.label(RichText::new("Your music files are only read. Edits (tags, cues, grids) are kept in this private library.").size(11.0).color(DIM));
                                 if ui.button("Show in Finder").clicked() {
                                     let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
                                 }
                             });
-                            section(ui, "rekordbox xml", |ui| {
-                                ui.label("Import a collection exported from rekordbox (File > Export Collection in xml format). The rekordbox library itself is never opened or changed.");
+                            card(ui, "rekordbox xml", |ui| {
+                                ui.label(RichText::new("Import a collection exported from rekordbox (File > Export Collection in xml format). The rekordbox library itself is never opened or changed.").size(13.0));
                                 if ui.button("Import xml…").clicked() {
                                     if let Some(f) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
                                         app.import_xml(&f);
@@ -145,15 +246,15 @@ fn prefs_window(app: &mut App, ctx: &Context) {
                     if format!("{:?}", app.prefs) != before {
                         app.save_prefs();
                     }
-                    ui.add_space(6.0);
-                    if ui.button("Reset to defaults").clicked() {
-                        let extra = app.prefs.devices_extra.clone();
-                        app.prefs = Prefs::default();
-                        app.prefs.devices_extra = extra;
-                        app.save_prefs();
-                        app.list_dirty = true;
-                    }
                 });
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new(RichText::new("Reset to defaults").size(14.0)).fill(hex(0x1E1E20)).min_size(vec2(250.0, 30.0))).clicked() {
+                    let extra = app.prefs.devices_extra.clone();
+                    app.prefs = Prefs::default();
+                    app.prefs.devices_extra = extra;
+                    app.save_prefs();
+                    app.list_dirty = true;
+                }
             });
         });
     });
