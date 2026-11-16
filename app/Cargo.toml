@@ -12,7 +12,7 @@ path = "src/main.rs"
 eframe = "0.31.1"
 winit = "0.30"
 muda = "0.21"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 symphonia = { version = "0.5.5", features = ["all"] }
 lofty = "0.22"
 cpal = "0.15"

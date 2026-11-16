@@ -32,7 +32,7 @@ fn full_export_to_folder() {
         tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())] });
     }
     let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1] }], tracks: vec![] }];
-    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default() };
+    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default() };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let msg = run_export(req, &|_| {}, &cancel).unwrap();
     assert!(msg.contains("2 tracks"), "{msg}");
@@ -49,11 +49,19 @@ fn full_export_to_folder() {
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/Album_ One_/")));
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/UnknownAlbum/")));
     // Exporting the same playlist again updates in place instead of duplicating.
-    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default() };
+    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default() };
     run_export(req2, &|_| {}, &cancel).unwrap();
     let lib2 = read_device(&root).unwrap();
     assert_eq!(lib2.tracks.len(), 2);
     assert_eq!(lib2.nodes.len(), 2);
+    // Player settings files are written with valid checksums.
+    for name in ["MYSETTING.DAT", "MYSETTING2.DAT", "DEVSETTING.DAT", "DJMMYSETTING.DAT"] {
+        let b = std::fs::read(root.join("PIONEER").join(name)).unwrap();
+        let n = u32::from_le_bytes(b[100..104].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(b[104 + n..108 + n].try_into().unwrap()) as u16;
+        let covered = if name == "DJMMYSETTING.DAT" { &b[..104 + n] } else { &b[104..104 + n] };
+        assert_eq!(crc, super::settings::crc16_xmodem(covered), "{name}");
+    }
     // Re-export keeps each track's analysis path and the My Tag IDs, and backs up the old DB.
     for (id, t) in &lib.tracks {
         assert_eq!(lib2.tracks[id].analyze_path, t.analyze_path);

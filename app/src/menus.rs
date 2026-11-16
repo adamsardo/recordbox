@@ -30,6 +30,7 @@ pub fn build() -> Option<Menu> {
         &item("import_folder", "Import Folder…", Some((cmd | Modifiers::SHIFT, Code::KeyO))),
         &item("import_playlist", "Import Playlist…", None),
         &PredefinedMenuItem::separator(),
+        &item("sync_rekordbox", "Sync rekordbox Library Now", None),
         &item("import_xml", "Import Collection from rekordbox xml…", None),
         &item("export_xml", "Export Collection in xml format…", None),
         &PredefinedMenuItem::separator(),
@@ -132,6 +133,13 @@ pub fn handle(app: &mut App, id: &str) {
         "import_playlist" => {
             if let Some(f) = rfd::FileDialog::new().add_filter("Playlist", &["m3u", "m3u8"]).pick_file() {
                 crate::ui_browser::import_m3u(app, &f);
+            }
+        }
+        "sync_rekordbox" => {
+            if crate::rbimport::library_dir().is_some() {
+                app.start_rekordbox_sync();
+            } else {
+                app.toast_err("No rekordbox library was found on this computer.");
             }
         }
         "import_xml" => {

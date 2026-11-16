@@ -13,6 +13,7 @@ mod jobs;
 mod key;
 mod menus;
 mod model;
+mod rbimport;
 mod smart;
 mod theme;
 mod ui_browser;
@@ -33,6 +34,7 @@ impl eframe::App for Gui {
         app.poll_analysis();
         app.poll_load();
         app.poll_export();
+        app.poll_rekordbox_sync();
         menus::poll(app);
         shortcuts(app, ctx);
 

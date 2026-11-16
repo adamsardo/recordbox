@@ -193,6 +193,10 @@ pub struct Prefs {
     pub devices_extra: Vec<String>,
     pub widths: HashMap<String, f32>,
     pub browser_only: bool,
+    /// Copy and sync the installed rekordbox library (master.db) every time PrepDeck starts.
+    pub rekordbox_sync: bool,
+    /// Player settings written to every exported USB (Preferences > DJ System).
+    pub usb_settings: crate::export::settings::UsbSettings,
 }
 
 impl Default for Prefs {
@@ -213,6 +217,8 @@ impl Default for Prefs {
             columns: vec![Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Album, Col::Genre, Col::Bpm, Col::Rating, Col::Time, Col::Key, Col::DateAdded],
             sort_col: Col::DateAdded,
             sort_asc: false,
+            rekordbox_sync: true,
+            usb_settings: Default::default(),
             delete_device_tracks: false,
             target_lufs: -8.0,
             tooltips: true,
@@ -371,6 +377,8 @@ pub struct App {
     pub import_count: usize,
     pub import_to_playlist: Option<i64>,
     pub export_job: Option<ExportJob>,
+    /// Background snapshot + read of the rekordbox library, started at launch.
+    pub rb_job: Option<crossbeam_channel::Receiver<anyhow::Result<Option<crate::rbimport::RbLibrary>>>>,
     pub devices: Vec<DeviceInfo>,
     pub devices_scanned: Option<Instant>,
     pub dialogs: Dialogs,
@@ -429,6 +437,7 @@ impl App {
             import_count: 0,
             import_to_playlist: None,
             export_job: None,
+            rb_job: None,
             devices: vec![],
             devices_scanned: None,
             dialogs: Dialogs::default(),
@@ -446,7 +455,8 @@ impl App {
             app.toast_err(format!("Audio output unavailable: {e}"));
         }
         // First start: add original demo loops (like the bundled demo tracks of the original).
-        if app.tracks.is_empty() && app.db.setting("demo_added").is_none() {
+        let rb_library = app.prefs.rekordbox_sync && crate::rbimport::library_dir().is_some();
+        if app.tracks.is_empty() && app.db.setting("demo_added").is_none() && (!rb_library || (app.screenshot.is_some() && std::env::var("PREPDECK_SHOT_SYNC").is_err())) {
             app.db.set_setting("demo_added", "1");
             let files = crate::demo::ensure_demo_files();
             for f in files {
@@ -469,6 +479,9 @@ impl App {
                 let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
                 app.analyze(&ids, false);
             }
+        }
+        if app.prefs.rekordbox_sync && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
+            app.start_rekordbox_sync();
         }
         if app.screenshot.is_some() {
             // Optional state for checking other screens: PREPDECK_SHOT_VIEW=playlists|devices|grid|hotcue|prefs|mytag|smart|export|info
@@ -503,14 +516,33 @@ impl App {
                     "info" => app.deck.panel_tab = 2,
                     "prefs" => {
                         app.dialogs.prefs_open = true;
-                        app.dialogs.prefs_tab = 1;
+                        // PREPDECK_SHOT_PREFS=<tab>,<subtab> (default 1,0).
+                        let (t, st) = std::env::var("PREPDECK_SHOT_PREFS").ok().and_then(|v| {
+                            let mut it = v.split(',').map(|x| x.trim().parse::<usize>().ok());
+                            Some((it.next()??, it.next().flatten().unwrap_or(0)))
+                        }).unwrap_or((1, 0));
+                        app.dialogs.prefs_tab = t as u8;
+                        cc.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(format!("prefs_subtab_{t}")), st));
                     }
                     "mytag" => app.prefs.show_mytag = true,
                     "export" => app.dialogs.export_open = true,
                     _ => {}
                 }
             }
-            let first = app.tracks.iter().find(|t| t.analyzed == 1 && !t.missing).map(|t| t.id);
+            // PREPDECK_SHOT_TRACK=<part of a title>: load that track (analysed first if needed).
+            let wanted = std::env::var("PREPDECK_SHOT_TRACK").ok().map(|w| w.to_lowercase());
+            let first = match &wanted {
+                Some(w) => app.tracks.iter().find(|t| t.title.to_lowercase().contains(w) && !t.missing).map(|t| t.id),
+                None => app.tracks.iter().find(|t| t.analyzed == 1 && !t.missing).map(|t| t.id),
+            };
+            if let Some(id) = first.filter(|id| app.track(*id).map(|t| t.analyzed != 1).unwrap_or(false)) {
+                let s = app.analysis_settings();
+                if let Some(p) = app.track(id).map(|t| t.path.clone()) {
+                    if let Ok(r) = crate::analysis::analyze_file(&p, &s) {
+                        app.apply_analysis(id, Ok(r));
+                    }
+                }
+            }
             if let Some(t) = first {
                 app.load_track(t);
                 app.selected.insert(t);
@@ -880,6 +912,167 @@ impl App {
             self.importing = None;
             let n = self.import_count;
             self.toast(format!("{n} track(s) added to the collection"));
+        }
+    }
+
+    /// Copy rekordbox's library into PrepDeck's data folder and read the copy, off the UI thread.
+    /// rekordbox's own files are only read (byte copy), never opened by a database or written.
+    pub fn start_rekordbox_sync(&mut self) {
+        if self.rb_job.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = self.ctx.clone();
+        let dest = crate::db::data_dir().join("rekordbox-copy");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::rbimport::load_installed(&dest));
+            ctx.request_repaint();
+        });
+        self.rb_job = Some(rx);
+    }
+
+    pub fn poll_rekordbox_sync(&mut self) {
+        let Some(rx) = &self.rb_job else { return };
+        let Ok(r) = rx.try_recv() else { return };
+        self.rb_job = None;
+        match r {
+            Ok(Some(lib)) => self.apply_rekordbox(lib),
+            Ok(None) => {}
+            Err(e) => self.toast_err(format!("Could not read the rekordbox library: {e}. It was not changed.")),
+        }
+    }
+
+    /// Merge a rekordbox library read from a snapshot. New tracks are added; a track that
+    /// rekordbox changed since the last sync gets rekordbox's metadata, grid, cues and My Tags;
+    /// one it did not change keeps any edits made in PrepDeck. The playlist tree is mirrored
+    /// into the "rekordbox" folder, which is rebuilt on every sync.
+    pub fn apply_rekordbox(&mut self, lib: crate::rbimport::RbLibrary) {
+        // One transaction for the whole sync (much faster, and all-or-nothing).
+        let _ = self.db.conn.execute_batch("BEGIN");
+        let mut seen: HashMap<String, String> = self.db.setting("rb_sync_fingerprints").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let first = seen.is_empty();
+        // My Tag categories and tags, matched by name.
+        let mut tag_id: HashMap<(String, String), i64> = HashMap::new();
+        let mut rb_tag_ids: HashSet<i64> = HashSet::new();
+        let existing = self.db.mytags().unwrap_or_default();
+        for (cat, tags) in &lib.tag_categories {
+            let cid = match existing.iter().find(|t| t.parent == 0 && &t.name == cat) {
+                Some(t) => t.id,
+                None => self.db.add_mytag(0, cat).unwrap_or(0),
+            };
+            for tg in tags {
+                let tid = match existing.iter().find(|t| t.parent == cid && &t.name == tg) {
+                    Some(t) => t.id,
+                    None => self.db.add_mytag(cid, tg).unwrap_or(0),
+                };
+                tag_id.insert((cat.clone(), tg.clone()), tid);
+                rb_tag_ids.insert(tid);
+            }
+        }
+        let (mut added, mut updated) = (0, 0);
+        let mut idmap: HashMap<String, i64> = HashMap::new();
+        for rt in lib.tracks {
+            let changed = seen.get(&rt.rb_id) != Some(&rt.fingerprint);
+            let id = match self.db.track_by_path(&rt.xt.track.path) {
+                None => {
+                    let mut t = rt.xt.track.clone();
+                    if t.sample_rate == 0 || t.duration <= 0.0 {
+                        let real = crate::importer::read_track(std::path::Path::new(&t.path));
+                        t.sample_rate = real.sample_rate;
+                        t.bit_depth = real.bit_depth;
+                        if t.duration <= 0.0 {
+                            t.duration = real.duration;
+                        }
+                        if t.artwork.is_empty() {
+                            t.artwork = real.artwork;
+                        }
+                    }
+                    let Ok(id) = self.db.insert_track(&t) else { continue };
+                    added += 1;
+                    id
+                }
+                Some(id) if changed => {
+                    if let Some(cur) = self.track(id).cloned() {
+                        let r = &rt.xt.track;
+                        let t = Track {
+                            id,
+                            analyzed: cur.analyzed,
+                            grid_locked: cur.grid_locked,
+                            gain_db: cur.gain_db,
+                            raw_samples: cur.raw_samples,
+                            missing: cur.missing,
+                            artwork: if r.artwork.is_empty() { cur.artwork.clone() } else { r.artwork.clone() },
+                            sample_rate: if r.sample_rate > 0 { r.sample_rate } else { cur.sample_rate },
+                            bit_depth: if r.bit_depth > 0 { r.bit_depth } else { cur.bit_depth },
+                            duration: if r.duration > 0.0 { r.duration } else { cur.duration },
+                            ..r.clone()
+                        };
+                        let _ = self.db.update_track(&t);
+                        updated += 1;
+                    }
+                    id
+                }
+                Some(id) => id,
+            };
+            if changed {
+                if let Some(g) = &rt.xt.grid {
+                    let _ = self.db.save_grid(id, g);
+                }
+                let _ = self.db.replace_cues(id, &rt.xt.cues);
+                let mine: HashSet<i64> = rt.tags.iter().filter_map(|k| tag_id.get(k).copied()).collect();
+                for t in &rb_tag_ids {
+                    let _ = self.db.set_track_tag(id, *t, mine.contains(t));
+                }
+            }
+            seen.insert(rt.rb_id.clone(), rt.fingerprint.clone());
+            idmap.insert(rt.rb_id, id);
+        }
+        self.db.set_setting("rb_sync_fingerprints", &serde_json::to_string(&seen).unwrap_or_default());
+        // Playlists: rebuild the mirrored folder.
+        if let Some(old) = self.db.setting("rb_folder_id").and_then(|s| s.parse::<i64>().ok()) {
+            if self.db.playlists().map(|v| v.iter().any(|n| n.id == old)).unwrap_or(false) {
+                let _ = self.db.delete_node(old);
+            }
+        }
+        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>) {
+            for n in nodes {
+                if n.folder {
+                    let id = app.db.create_node(parent, &n.name, NodeKind::Folder, None).unwrap_or(0);
+                    add_nodes(app, id, &n.children, idmap);
+                } else {
+                    let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
+                    let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| idmap.get(k).copied()).collect();
+                    let _ = app.db.set_playlist_tracks(id, &tr);
+                }
+            }
+        }
+        if !lib.playlists.is_empty() {
+            let root = self.db.create_node(0, "rekordbox", NodeKind::Folder, None).unwrap_or(0);
+            self.db.set_setting("rb_folder_id", &root.to_string());
+            add_nodes(self, root, &lib.playlists, &idmap);
+        }
+        let _ = self.db.conn.execute_batch("COMMIT");
+        self.reload_all();
+        let mut msg = if first {
+            format!("Loaded your rekordbox library: {added} tracks, with cues, grids, My Tags and playlists. rekordbox's own files were not changed.")
+        } else if added + updated > 0 {
+            format!("Synced from rekordbox: {added} new, {updated} updated.")
+        } else {
+            String::new()
+        };
+        if first && lib.not_local > 0 {
+            msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
+        }
+        if first && lib.smart_lists > 0 {
+            msg.push_str(&format!(" {} intelligent playlist(s) were not copied.", lib.smart_lists));
+        }
+        if !msg.is_empty() {
+            self.toast(msg);
+        }
+        if added > 0 && self.prefs.auto_analysis {
+            // Waveforms and loudness are PrepDeck's own; grids and keys from rekordbox are kept.
+            let todo: Vec<i64> = self.tracks.iter().filter(|t| t.analyzed == 0 && !t.missing).map(|t| t.id).collect();
+            self.analyze(&todo, false);
         }
     }
 
@@ -1255,8 +1448,8 @@ impl App {
         } else {
             let lr = self.player.state.lock().loop_range;
             let (start, end, color) = match lr {
-                Some((a, b)) => (a, Some(b), HOTCUE_LOOP_DEFAULT),
-                None => (self.quantized(self.pos()), None, HOTCUE_DEFAULT),
+                Some((a, b)) => (a, Some(b), hotcue_default_color(slot, true)),
+                None => (self.quantized(self.pos()), None, hotcue_default_color(slot, false)),
             };
             let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
             if let Ok(id) = self.db.save_cue(&c) {
@@ -1798,7 +1991,7 @@ impl App {
             .filter(|c| c.parent == 0)
             .map(|c| (c.name.clone(), self.mytags.iter().filter(|t| t.parent == c.id).map(|t| t.name.clone()).collect()))
             .collect();
-        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings };
+        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone() };
         self.export_job = Some(spawn_export(req, self.ctx.clone()));
     }
 

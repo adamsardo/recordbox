@@ -238,9 +238,12 @@ fn pcob(hot: bool, cues: &[&Cue]) -> Vec<u8> {
         let mut e = vec![];
         e.extend_from_slice(&(if hot { (c.slot + 1) as u32 } else { 0 }).to_be_bytes());
         e.extend_from_slice(&(if c.active_loop { 4u32 } else { 0 }).to_be_bytes());
-        e.extend_from_slice(&0x0010_0000u32.to_be_bytes());
-        e.extend_from_slice(&(if i == 0 { 0xffff } else { (i - 1) as u16 }).to_be_bytes());
-        e.extend_from_slice(&(if i + 1 == n { 0xffff } else { (i + 1) as u16 }).to_be_bytes());
+        // Offsets 20/22 are 1/0 (RF-07). Offsets 24/26 link memory records to their
+        // neighbours in destination order; hot cues keep 0xffff in both.
+        e.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        let (prev, next) = if hot { (0xffff, 0xffff) } else { (if i == 0 { 0xffff } else { (i - 1) as u16 }, if i + 1 == n { 0xffff } else { (i + 1) as u16 }) };
+        e.extend_from_slice(&prev.to_be_bytes());
+        e.extend_from_slice(&next.to_be_bytes());
         let mut rest = vec![];
         rest.push(if c.is_loop() { 2 } else { 1 });
         rest.push(0);
@@ -271,8 +274,9 @@ fn pco2(hot: bool, cues: &[&Cue]) -> Vec<u8> {
         r.extend_from_slice(&ms(c.start).to_be_bytes());
         r.extend_from_slice(&(if c.is_loop() { ms(c.end.unwrap()) } else { 0xffff_ffff }).to_be_bytes());
         // Memory cue colour (track colour ids 0..8); hot cues use the fields further on.
+        // Byte 29 is always 1 in the original's converter.
         r.push(if hot { 0 } else { c.color });
-        r.extend_from_slice(&[0, 0, 0]);
+        r.extend_from_slice(&[1, 0, 0]);
         r.extend_from_slice(&0u32.to_be_bytes());
         // Quantized loop size (numerator / denominator) unknown here: 0/0.
         r.extend_from_slice(&0u16.to_be_bytes());
@@ -287,8 +291,10 @@ fn pco2(hot: bool, cues: &[&Cue]) -> Vec<u8> {
         r.extend_from_slice(&(cm.len() as u32).to_be_bytes());
         r.extend_from_slice(&cm);
         if hot {
-            let rgb = crate::model::hotcue_rgb(c.color);
-            r.push(c.color);
+            // Explicit palette indices 1–64 keep their index; RGB comes from the device palette.
+            let idx = if (1..=64).contains(&c.color) { c.color } else { crate::model::hotcue_default_color(c.slot, c.is_loop()) };
+            let rgb = crate::model::device_rgb(idx);
+            r.push(idx);
             r.extend_from_slice(&rgb);
         } else {
             r.extend_from_slice(&[0, 0, 0, 0]);

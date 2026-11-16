@@ -402,6 +402,8 @@ pub struct ExportRequest {
     pub skipped: Vec<String>,
     /// Settings for analysing tracks that have no grid or waveform yet.
     pub analysis: crate::analysis::AnalysisSettings,
+    /// Player settings files written to /PIONEER (MYSETTING.DAT etc.).
+    pub settings: super::settings::UsbSettings,
 }
 
 /// Files this export created. Unless the export commits, they are removed again, so a
@@ -739,6 +741,10 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     backup_device_db(&root);
     write_device(&root, &lib)?;
     created.committed = true;
+    // Player settings, as rekordbox writes them with every export.
+    for (name, bytes) in req.settings.files() {
+        let _ = write_atomic(&root.join("PIONEER").join(name), &bytes);
+    }
     // Sidecar with local sources (never read by players).
     let _ = std::fs::create_dir_all(root.join(".PrepDeck"));
     let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources).unwrap_or_default());

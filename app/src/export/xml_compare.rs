@@ -57,7 +57,7 @@ fn export_matches_collection_xml() {
     let root = base.join(chrono::Local::now().format("usb_%H%M%S").to_string());
     std::fs::create_dir_all(&root).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default() }, &|_| {}, &cancel).unwrap();
+    let msg = run_export(ExportRequest { root: root.clone(), nodes: enodes, tracks: tracks.clone(), tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default() }, &|_| {}, &cancel).unwrap();
     eprintln!("{msg}");
     let dev = read_device(&root).unwrap();
 
@@ -123,7 +123,7 @@ fn export_matches_collection_xml() {
             .map(|(_, h, b)| (u32::from_be_bytes([h[0], h[1], h[2], h[3]]), u32::from_be_bytes([b[4], b[5], b[6], b[7]])))
             .filter(|(n, _)| *n > 0)
             .collect();
-        let pcp2: Vec<(u32, u32, [u8; 3], String)> = es
+        let pcp2: Vec<(u32, u32, [u8; 3], String, u8)> = es
             .iter()
             .filter(|s| &s.0 == b"PCO2")
             .flat_map(|s| sections_flat(&s.2))
@@ -135,7 +135,8 @@ fn export_matches_collection_xml() {
                 let cm: Vec<u16> = b[0x1c..0x1c + clen].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 let comment = String::from_utf16_lossy(&cm).trim_end_matches('\0').to_string();
                 let rgb = [b[0x1d + clen], b[0x1e + clen], b[0x1f + clen]];
-                (n, time, rgb, comment)
+                let idx = b[0x1c + clen];
+                (n, time, rgb, comment, idx)
             })
             .filter(|x| x.0 > 0)
             .collect();
@@ -146,8 +147,10 @@ fn export_matches_collection_xml() {
             let p2 = pcp2.iter().find(|x| x.0 == n);
             bump("hot cue in EXT (number, ms)", p2.map(|x| x.1 == ms).unwrap_or(false), &mut checks);
             bump("hot cue name", p2.map(|x| x.3 == c.comment).unwrap_or(false), &mut checks);
-            let want = hotcue_rgb(c.color);
-            bump("hot cue colour (palette RGB)", p2.map(|x| x.2 == want).unwrap_or(false), &mut checks);
+            // The XML carries the desktop RGB; the players' file carries the same palette index
+            // with the device palette's RGB (rekordbox-rea RF-05).
+            bump("hot cue colour (palette index)", p2.map(|x| x.4 == c.color).unwrap_or(false), &mut checks);
+            bump("hot cue colour (device palette RGB)", p2.map(|x| x.2 == crate::model::device_rgb(c.color)).unwrap_or(false), &mut checks);
         }
         let _ = id;
     }

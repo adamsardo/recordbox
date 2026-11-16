@@ -1,5 +1,7 @@
 pub mod anlz;
 pub mod pdb;
+pub mod settings;
+pub mod settings_fields;
 pub mod usb;
 #[cfg(test)]
 mod usb_test;

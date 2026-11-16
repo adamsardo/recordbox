@@ -114,7 +114,7 @@ pub const COLOR_RGB: [[u8; 3]; 9] = [
 ];
 
 /// Hot cue palette (index 1..62) as read from the original's hot cue swatch image.
-pub const HOTCUE_PALETTE: [u32; 62] = [
+pub const HOTCUE_PALETTE: [u32; 64] = [
     0x305AFF, 0x5073FF, 0x508CFF, 0x50A0FF, 0x50B4FF, 0x50B0F2, 0x50AEE8, 0x45ACDB, //
     0x00E0FF, 0x19DAF0, 0x32D2E6, 0x21B4B9, 0x20AAA0, 0x1FA392, 0x19A08C, 0x14A584, //
     0x14AA7D, 0x10B176, 0x30D26E, 0x37DE5A, 0x3CEB50, 0x28E214, 0x7DC13D, 0x8CC832, //
@@ -122,13 +122,38 @@ pub const HOTCUE_PALETTE: [u32; 62] = [
     0xE1AA00, 0xFFA000, 0xFF9600, 0xFF8C00, 0xFF7500, 0xE0641B, 0xE0461E, 0xE0301E, //
     0xE02823, 0xE62828, 0xFF376F, 0xFF2D6F, 0xFF127B, 0xF51E8C, 0xEB2DA0, 0xE637B4, //
     0xDE44CF, 0xDE448D, 0xE630B4, 0xE619DC, 0xE600FF, 0xDC00FF, 0xCC00FF, 0xB432FF, //
-    0xB93CFF, 0xC542FF, 0xAA5AFF, 0xAA72FF, 0x8272FF, 0x6473FF,
+    0xB93CFF, 0xC542FF, 0xAA5AFF, 0xAA72FF, 0x8272FF, 0x6473FF, 0x000000, 0xFFFFFF,
 ];
 /// The 16 colours offered in the hot cue colour picker (palette indices).
 pub const HOTCUE_PICKER: [u8; 16] = [1, 5, 9, 14, 18, 22, 26, 30, 32, 38, 42, 45, 48, 56, 60, 62];
-/// Default colour for a new hot cue (A observed as #FF376F = index 43; others estimated).
+/// Default colour for a new hot cue A (style 4, the original's default setting).
 pub const HOTCUE_DEFAULT: u8 = 43;
-pub const HOTCUE_LOOP_DEFAULT: u8 = 35; // orange, estimated
+/// Fallback for loops without a valid colour (index 36, RGB 255,140,0 on the desktop).
+pub const HOTCUE_LOOP_DEFAULT: u8 = 36;
+/// Per-pad default colours for hot cues 1–8 (repeated for 9–16) in the original's default
+/// colour style 4 (rekordbox-rea RF-05, CAnalyzerIF::getHotCueDefaultColor).
+pub const HOTCUE_STYLE4: [u8; 8] = [43, 8, 23, 60, 19, 38, 1, 32];
+
+/// The original's default colour for hot cue `slot` (0-based) when it has no valid colour.
+pub fn hotcue_default_color(slot: i32, is_loop: bool) -> u8 {
+    if is_loop {
+        return HOTCUE_LOOP_DEFAULT;
+    }
+    if (0..16).contains(&slot) {
+        HOTCUE_STYLE4[slot as usize % 8]
+    } else {
+        22
+    }
+}
+
+/// Device (CDJ/XDJ) palette used for hot cue RGB in exported analysis files; it differs from
+/// the desktop palette above (rekordbox-rea RF-05, device slot +0x170).
+pub const DEVICE_PALETTE: [u32; 64] = [0x0000FF, 0x001CFF, 0x0038FF, 0x0054FF, 0x0070FF, 0x008CFF, 0x00A8FF, 0x00C4FF, 0x00E0FF, 0x00FFFF, 0x00FFE8, 0x00FFD1, 0x00FFBA, 0x00FFA3, 0x00FF8C, 0x00FF75, 0x00FF5E, 0x00FF47, 0x00FF30, 0x00FF1A, 0x00FF00, 0x1AFF00, 0x33FF00, 0x4DFF00, 0x66FF00, 0x80FF00, 0x99FF00, 0xB3FF00, 0xCCFF00, 0xE6FF00, 0xFFFF00, 0xFFE800, 0xFFD100, 0xFFBA00, 0xFFA300, 0xFF8C00, 0xFF7500, 0xFF5E00, 0xFF4700, 0xFF3000, 0xFF1A00, 0xFF0000, 0xFF0017, 0xFF002E, 0xFF0045, 0xFF005C, 0xFF0073, 0xFF008A, 0xFF00A1, 0xFF00B8, 0xFF00CF, 0xFF00E6, 0xFF00FF, 0xE600FF, 0xCC00FF, 0xB300FF, 0x9900FF, 0x8000FF, 0x6600FF, 0x4D00FF, 0x3300FF, 0x1A00FF, 0x000000, 0xFFFFFF];
+
+pub fn device_rgb(idx: u8) -> [u8; 3] {
+    let v = if (1..=64).contains(&idx) { DEVICE_PALETTE[idx as usize - 1] } else { DEVICE_PALETTE[21] };
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
 
 pub fn hotcue_rgb(idx: u8) -> [u8; 3] {
     if idx == 0 || idx as usize > HOTCUE_PALETTE.len() {

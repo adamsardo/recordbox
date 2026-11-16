@@ -107,7 +107,7 @@ fn prefs_window(app: &mut App, ctx: &Context) {
                 let tabs: &[&str] = match app.dialogs.prefs_tab {
                     0 => &["Display Type", "Color", "Player"],
                     1 => &["Track Analysis", "CUE Analysis"],
-                    2 => &["General", "Device"],
+                    2 => &["General", "My Settings", "Device"],
                     _ => &["Library"],
                 };
                 let key = format!("prefs_subtab_{}", app.dialogs.prefs_tab);
@@ -216,6 +216,54 @@ fn prefs_window(app: &mut App, ctx: &Context) {
                                 ui.label(RichText::new("Files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(13.0));
                             });
                         }
+                        (2, 0) => {
+                            use crate::export::settings::{SettingFile, DEV_WAVEFORM_COLOR, DEV_WAVEFORM_POSITION};
+                            card(ui, "Waveform color", |ui| {
+                                sub(ui, "Waveform color displayed on CDJ/XDJ");
+                                let cur = app.prefs.usb_settings.get(SettingFile::Dev, DEV_WAVEFORM_COLOR);
+                                for (label, v) in [("BLUE", 1u8), ("RGB", 3), ("3Band", 4)] {
+                                    if ui.radio(cur == v, RichText::new(label).size(14.0)).clicked() {
+                                        app.prefs.usb_settings.set(SettingFile::Dev, DEV_WAVEFORM_COLOR, v);
+                                    }
+                                }
+                            });
+                            card(ui, "Waveform Current Position", |ui| {
+                                sub(ui, "Waveform Current Position displayed on CDJ/XDJ");
+                                let cur = app.prefs.usb_settings.get(SettingFile::Dev, DEV_WAVEFORM_POSITION);
+                                for (label, v) in [("LEFT", 2u8), ("CENTER", 1)] {
+                                    if ui.radio(cur == v, RichText::new(label).size(14.0)).clicked() {
+                                        app.prefs.usb_settings.set(SettingFile::Dev, DEV_WAVEFORM_POSITION, v);
+                                    }
+                                }
+                            });
+                            card(ui, "Waveform data written to the device", |ui| {
+                                ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; the setting above chooses which one the players show.").size(12.0).color(DIM2));
+                            });
+                        }
+                        (2, 1) => {
+                            card(ui, "My Settings", |ui| {
+                                ui.label(RichText::new("Player settings written to every USB you export (MYSETTING.DAT). CDJ/XDJ players apply them when the USB is loaded.").size(12.0).color(DIM2));
+                                egui::Grid::new("my_settings_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+                                    for f in crate::export::settings_fields::MY_SETTINGS {
+                                        ui.label(RichText::new(f.name).size(13.0));
+                                        let cur = app.prefs.usb_settings.get(f.file, f.offset);
+                                        let shown = f.options.iter().find(|o| o.1 == cur).map(|o| o.0).unwrap_or("—");
+                                        egui::ComboBox::from_id_salt(("myset", f.offset, f.file == crate::export::settings::SettingFile::My2)).selected_text(shown).width(180.0).show_ui(ui, |ui| {
+                                            for (label, v) in f.options {
+                                                if ui.selectable_label(cur == *v, *label).clicked() {
+                                                    app.prefs.usb_settings.set(f.file, f.offset, *v);
+                                                }
+                                            }
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                                if ui.button("Reset to rekordbox defaults").clicked() {
+                                    let dev = app.prefs.usb_settings.dev.clone();
+                                    app.prefs.usb_settings = crate::export::settings::UsbSettings { dev, ..Default::default() };
+                                }
+                            });
+                        }
                         (2, _) => {
                             card(ui, "Delete Tracks", |ui| {
                                 toggle(ui, &mut app.prefs.delete_device_tracks, "Delete playlist tracks from device if playlist is deleted");
@@ -233,8 +281,15 @@ fn prefs_window(app: &mut App, ctx: &Context) {
                                     let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
                                 }
                             });
+                            card(ui, "rekordbox Library", |ui| {
+                                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when PrepDeck starts");
+                                ui.label(RichText::new("PrepDeck copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.").size(11.0).color(DIM));
+                                if ui.button("Sync now").clicked() {
+                                    app.start_rekordbox_sync();
+                                }
+                            });
                             card(ui, "rekordbox xml", |ui| {
-                                ui.label(RichText::new("Import a collection exported from rekordbox (File > Export Collection in xml format). The rekordbox library itself is never opened or changed.").size(13.0));
+                                ui.label(RichText::new("Import a collection exported from rekordbox (File > Export Collection in xml format).").size(13.0));
                                 if ui.button("Import xml…").clicked() {
                                     if let Some(f) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
                                         app.import_xml(&f);
