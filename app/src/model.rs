@@ -210,6 +210,9 @@ pub struct Track {
     pub missing: bool,
     #[serde(default)]
     pub raw_samples: u64,
+    /// The user chose this key: analysis never replaces it (Analyze Key does, when asked).
+    #[serde(default)]
+    pub key_manual: bool,
 }
 
 impl Track {

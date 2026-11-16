@@ -102,7 +102,7 @@ pub fn build(app: &App) -> String {
             // The per-beat records PrepDeck writes to PQTZ, filtered as rekordbox does.
             let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
             let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
-            for i in tempo_keep(&recs) {
+            for i in tempo_select(&recs, BRIDGE_EXPORT_BEAT_GRID) {
                 let (beat, bpm, ms) = recs[i];
                 x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", ms as f64 * 0.001, bpm as f64 * 0.01, beat));
             }
@@ -113,8 +113,11 @@ pub fn build(app: &App) -> String {
                 continue;
             }
             let num = if c.kind == CueKind::Hot { c.slot } else { -1 };
-            let ty = if c.is_loop() { 4 } else { 0 };
-            let end = if c.is_loop() { format!(" End=\"{:.3}\"", c.end.unwrap()) } else { String::new() };
+            // As rekordbox's writer: Type 4 and End whenever End is non-zero (rekordbox-rea XML-003;
+            // the colour helper alone uses end > start).
+            let end_ms = c.end.map(|e| (e * 1000.0).round() as i64).unwrap_or(0);
+            let ty = if end_ms != 0 { 4 } else { 0 };
+            let end = if end_ms != 0 { format!(" End=\"{:.3}\"", c.end.unwrap()) } else { String::new() };
             let rgb = if c.kind == CueKind::Hot {
                 let [r, g, b] = hotcue_rgb(c.color);
                 format!(" Red=\"{r}\" Green=\"{g}\" Blue=\"{b}\"")
@@ -160,6 +163,22 @@ pub fn build(app: &App) -> String {
 /// a beat is kept when its BPM changes or its time (ms) matches neither the running
 /// prediction nor the prediction from the previous beat, each truncated with and without
 /// +0.5. Records are (beat in bar, BPM × 100, time in ms), as in PQTZ.
+/// rekordbox's `bridgeExportBeatGrid` setting; its default is 1.
+pub const BRIDGE_EXPORT_BEAT_GRID: i64 = 1;
+
+/// TEMPO nodes for a mode of `bridgeExportBeatGrid` as traced: below 1 none, 1 the filtered
+/// beats ([`tempo_keep`]), 2 every beat, above 2 none (nodes are built and discarded).
+pub fn tempo_select(records: &[(u16, u16, u32)], mode: i64) -> Vec<usize> {
+    if records.is_empty() {
+        return vec![];
+    }
+    match mode {
+        1 => tempo_keep(records),
+        2 => (0..records.len()).collect(),
+        _ => vec![],
+    }
+}
+
 pub fn tempo_keep(records: &[(u16, u16, u32)]) -> Vec<usize> {
     let trunc = |x: f64| x as u32;
     let (mut prev_bpm, mut expected, mut from_prev) = (0u16, 0.0f64, 0.0f64);
@@ -196,6 +215,10 @@ mod tempo_tests {
             r.2 += 7;
         }
         assert_eq!(tempo_keep(&v), vec![0, 32]);
+        // Modes: 2 keeps every beat; below 1 and above 2 keep none.
+        assert_eq!(super::tempo_select(&recs, 2).len(), 64);
+        assert!(super::tempo_select(&recs, 0).is_empty() && super::tempo_select(&recs, 3).is_empty());
+        assert_eq!(super::tempo_select(&recs, 1), vec![0]);
     }
 
     /// rekordbox's own XML export against its own PQTZ for the same tracks. Run with

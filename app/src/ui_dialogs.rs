@@ -228,6 +228,14 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                             card(ui, "Quantize", |ui| {
                                 toggle(ui, &mut app.prefs.quantize, "Cues and loops snap to the beat grid");
                             });
+                            card(ui, "Stems", |ui| {
+                                if ui.radio(app.prefs.stem_parts != 3, RichText::new("4 parts: Vocal, Inst, Bass, Drums").size(14.0)).clicked() {
+                                    app.prefs.stem_parts = 4;
+                                }
+                                if ui.radio(app.prefs.stem_parts == 3, RichText::new("3 parts: Vocal, Inst (with bass), Drums").size(14.0)).clicked() {
+                                    app.prefs.stem_parts = 3;
+                                }
+                            });
                             card(ui, "Vocal", |ui| {
                                 toggle(ui, &mut app.prefs.show_vocal, "Show vocal positions above the overview waveform");
                                 ui.label(RichText::new("From rekordbox's vocal detection, for tracks it analysed.").size(11.0).color(DIM));
@@ -390,7 +398,38 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                         (5, _) => {
                             card(ui, "Audio", |ui| {
                                 sub(ui, "Output device");
-                                let devices = crate::audio::Player::output_devices();
+                                // Listing devices can block, so it runs in the background (once per
+                                // opening, or on Refresh); None while waiting, Some(None) if it gave up.
+                                type Slot = std::sync::Arc<parking_lot::Mutex<Option<Option<Vec<String>>>>>;
+                                let list_id = egui::Id::new("audio_devices");
+                                let slot: Slot = match ui.ctx().data(|d| d.get_temp::<Slot>(list_id)) {
+                                    Some(s) => s,
+                                    None => {
+                                        let s: Slot = Default::default();
+                                        let s2 = s.clone();
+                                        let ctx = ui.ctx().clone();
+                                        std::thread::spawn(move || {
+                                            *s2.lock() = Some(crate::audio::Player::output_devices_within(std::time::Duration::from_secs(5)));
+                                            ctx.request_repaint();
+                                        });
+                                        ui.ctx().data_mut(|m| m.insert_temp(list_id, s.clone()));
+                                        s
+                                    }
+                                };
+                                let state = slot.lock().clone();
+                                let devices: Vec<String> = match &state {
+                                    Some(Some(d)) => d.clone(),
+                                    _ => vec![],
+                                };
+                                match &state {
+                                    None => {
+                                        ui.label(RichText::new("Looking for audio devices…").size(11.0).color(DIM));
+                                    }
+                                    Some(None) => {
+                                        ui.label(RichText::new("macOS did not answer with the list of audio devices. The system's default output is used; try Refresh.").size(11.0).color(CAUTION_TX));
+                                    }
+                                    _ => {}
+                                }
                                 let current = app.prefs.audio_device.clone();
                                 let shown = current.clone().unwrap_or_else(|| "System default".to_string());
                                 let mut pick: Option<Option<String>> = None;
@@ -410,12 +449,17 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
                                         Err(e) => app.toast_err(format!("Could not open that audio device: {e}")),
                                     }
                                 }
-                                if let Some(d) = &current {
+                                if let (Some(d), Some(Some(_))) = (&current, &state) {
                                     if !devices.contains(d) {
                                         ui.label(RichText::new(format!("\"{d}\" is not connected; the system's default output is used.")).size(11.0).color(CAUTION_TX));
                                     }
                                 }
-                                ui.label(RichText::new(format!("Running at {} Hz.", app.player.device_rate)).size(11.0).color(DIM));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("Running at {} Hz.", app.player.device_rate)).size(11.0).color(DIM));
+                                    if ui.small_button("Refresh list").clicked() {
+                                        ui.ctx().data_mut(|m| m.remove::<Slot>(list_id));
+                                    }
+                                });
                             });
                         }
                         (3, _) => {
@@ -560,6 +604,15 @@ fn prefs_body(app: &mut App, ui: &mut Ui) {
 
 fn info_window(app: &mut App, ctx: &Context) {
     let Some(mut t) = app.dialogs.info_track.clone() else { return };
+    // The track as it was when the window opened, so only fields edited here are saved.
+    let orig_id = egui::Id::new(("prop_orig", t.id));
+    let orig: Track = match ctx.data(|d| d.get_temp::<Track>(orig_id)) {
+        Some(o) => o,
+        None => {
+            ctx.data_mut(|d| d.insert_temp(orig_id, t.clone()));
+            t.clone()
+        }
+    };
     let mut open = true;
     let mut save = false;
     egui::Window::new("Property").open(&mut open).default_width(460.0).collapsible(false).show(ctx, |ui| {
@@ -630,14 +683,25 @@ fn info_window(app: &mut App, ctx: &Context) {
     });
     if save {
         let id = t.id;
-        if let Some(slot) = app.track_mut(id) {
-            *slot = t;
+        if let Some(cur) = app.track_mut(id) {
+            // Apply only what was edited in this window onto the track as it is now (analysis
+            // or a sync may have changed other fields meanwhile).
+            macro_rules! take {
+                ($($f:ident),*) => { $( if t.$f != orig.$f { cur.$f = t.$f.clone(); } )* };
+            }
+            take!(title, artist, album, album_artist, genre, label, remixer, original_artist, composer, lyricist, mix_name, grouping, comment, message, release_date, year, track_no, disc_no, rating, color);
+            if t.key != orig.key {
+                cur.key = t.key;
+                cur.key_manual = t.key >= 0;
+            }
         }
         app.save_track(id);
         app.dialogs.info_track = None;
-    } else if !open {
+        ctx.data_mut(|d| d.remove::<Track>(orig_id));
+    } else if !open || app.dialogs.info_track.is_none() {
         app.dialogs.info_track = None;
-    } else if app.dialogs.info_track.is_some() {
+        ctx.data_mut(|d| d.remove::<Track>(orig_id));
+    } else {
         app.dialogs.info_track = Some(t);
     }
 }

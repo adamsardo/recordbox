@@ -104,6 +104,23 @@ fn prepdeck_actions() -> Vec<&'static str> {
 }
 
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
+    // Previews never outlive what holds them: losing the window's focus ends them (key-up
+    // events are not delivered then), and a hot-cue preview ends once neither a hot-cue key nor
+    // a mouse button is held.
+    if !ctx.input(|i| i.focused) {
+        if app.deck.cue_preview {
+            app.cue_up();
+        }
+        if app.deck.hot_preview.is_some() {
+            app.hot_cue_up();
+        }
+    }
+    if app.deck.hot_preview.is_some() {
+        let hot_held = (1..=8).any(|n| app.prefs.key_for(&format!("hot{n}")).map(|k| ctx.input(|i| i.key_down(k))).unwrap_or(false));
+        if !hot_held && !ctx.input(|i| i.pointer.any_down()) {
+            app.hot_cue_up();
+        }
+    }
     // Library edit Undo/Redo (text fields keep their own undo while they are being edited).
     if !ctx.wants_keyboard_input() {
         let (z, shift) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::Z), i.modifiers.shift));

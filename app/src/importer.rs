@@ -224,7 +224,14 @@ pub fn parse_rekordbox_xml(text: &str) -> anyhow::Result<XmlLibrary> {
                 }
                 (None, false)
             }
-            Event::Eof => break,
+            Event::Eof => {
+                // A document cut short (unclosed collection, track or playlist) is refused
+                // rather than imported in part.
+                if in_collection || cur.is_some() || !stack.is_empty() {
+                    anyhow::bail!("the file ends before its collection or playlists are complete (truncated?)");
+                }
+                break;
+            }
             _ => (None, false),
         };
         let Some(e) = e else { continue };
@@ -470,6 +477,9 @@ mod xml_extra_tests {
         edited.rating = 4;
         let line2 = crate::xmlexport::track_line(&edited, &t.extra);
         assert!(line2.contains(" Rating=\"204\"") && line2.contains(" Tonality=\"1d\""), "{line2}");
+        // A truncated document is refused.
+        let cut = &x[..x.find("</TRACK>").unwrap()];
+        assert!(super::parse_rekordbox_xml(cut).is_err());
         // Written back unchanged.
         let (a, n) = crate::xmlexport::extra_xml(&t.extra, "      ");
         assert_eq!(a, " Future=\"1.23456789\"");

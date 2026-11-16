@@ -1199,13 +1199,18 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     cue_record.retain(|path, _| lib.tracks.values().any(|t| &t.file_path == path));
     created.will_replace(&cue_record_path(&root))?;
     let _ = write_cue_record(&root, &cue_record);
+    // Player settings, as rekordbox writes them with every export: part of the journaled
+    // export, and a failure to write them fails it.
+    std::fs::create_dir_all(root.join("PIONEER"))?;
+    for (name, bytes) in req.settings.files() {
+        let p = root.join("PIONEER").join(name);
+        created.will_replace(&p)?;
+        write_atomic(&p, &bytes).map_err(|e| anyhow!("writing the player settings file {name}: {e}"))?;
+    }
     backup_device_db(&root);
     write_device_journaled(&root, &lib, &mut created)?;
     created.finish();
-    // Player settings, as rekordbox writes them with every export.
-    for (name, bytes) in req.settings.files() {
-        let _ = write_atomic(&root.join("PIONEER").join(name), &bytes);
-    }
+
 
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
     if has_onelibrary(&root) {

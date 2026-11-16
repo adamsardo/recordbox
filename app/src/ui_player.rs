@@ -715,18 +715,28 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let have = app.player.state.lock().stems.is_some();
     let on = app.player.state.lock().stem_on;
     let loaded = app.deck.track.is_some();
-    // (label, source index, colour)
-    let parts: [(&str, usize, Color32); 4] = [("VOCAL", 3, hex(0x3CC85A)), ("INST", 2, hex(0xA05AE6)), ("BASS", 1, hex(0xF08C28)), ("DRUMS", 0, hex(0x2E7DF0))];
-    for (i, (label, src, col)) in parts.iter().enumerate() {
+    // (label, source indices, colour). Three parts put bass with the instruments.
+    let parts: Vec<(&str, Vec<usize>, Color32)> = if app.prefs.stem_parts == 3 {
+        vec![("VOCAL", vec![3], hex(0x3CC85A)), ("INST", vec![2, 1], hex(0xA05AE6)), ("DRUMS", vec![0], hex(0x2E7DF0))]
+    } else {
+        vec![("VOCAL", vec![3], hex(0x3CC85A)), ("INST", vec![2], hex(0xA05AE6)), ("BASS", vec![1], hex(0xF08C28)), ("DRUMS", vec![0], hex(0x2E7DF0))]
+    };
+    for (i, (label, srcs, col)) in parts.iter().enumerate() {
         let r = at(452.0 + i as f32 * 78.0, 70.0);
         let resp = ui.interact(r, ui.id().with(("stem", i)), Sense::click());
-        let lit = have && on[*src];
+        let lit = have && srcs.iter().all(|s| on[*s]);
         p.rect_filled(r, 3.0, if lit { col.gamma_multiply(0.85) } else if resp.hovered() { hex(0x2A2A2A) } else { hex(0x161616) });
         p.rect_stroke(r, 3.0, Stroke::new(1.0, if have { *col } else { hex(0x3C3C3C) }), egui::StrokeKind::Inside);
         p.text(r.center(), Align2::CENTER_CENTER, *label, bold(10.5), if have { WHITE } else { DIM });
         let resp = resp.on_hover_text(if have { "Switch this part on or off" } else { "Separate this track into parts first" });
         if resp.clicked() && loaded {
-            app.toggle_stem(*src);
+            // Every source of the part goes to the same new state.
+            let target = !srcs.iter().all(|s| on[*s]);
+            for s in srcs {
+                if on[*s] != target {
+                    app.toggle_stem(*s);
+                }
+            }
         }
     }
     // Status and actions.

@@ -29,7 +29,7 @@ pub struct Db {
     pub conn: Connection,
 }
 
-const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples";
+const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples,key_manual";
 
 /// Library schema version (SQLite user_version). Version 0 is a library from before
 /// versioning; 2 is the current layout.
@@ -94,6 +94,10 @@ impl Db {
         let has_raw: bool = conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_ok();
         if !has_raw {
             conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
+        }
+        // Set when the user chose the key; analysis then never replaces it.
+        if conn.prepare("SELECT key_manual FROM tracks LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE tracks ADD COLUMN key_manual INTEGER DEFAULT 0;")?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         let db = Db { conn };
@@ -173,6 +177,7 @@ impl Db {
             gain_db: r.get::<_, Option<f32>>(36)?.unwrap_or(f32::NAN),
             artwork: r.get(37)?,
             raw_samples: r.get::<_, i64>(38)? as u64,
+            key_manual: r.get::<_, Option<i64>>(39)?.unwrap_or(0) != 0,
             missing: false,
         })
     }
@@ -194,14 +199,14 @@ impl Db {
     /// Insert a track; returns its new id.
     pub fn insert_track(&self, t: &Track) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO tracks(path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38)",
+            "INSERT INTO tracks(path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples,key_manual)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39)",
             params![
                 t.path, t.title, t.artist, t.album, t.album_artist, t.genre, t.label, t.remixer, t.original_artist, t.composer,
                 t.lyricist, t.mix_name, t.comment, t.grouping, t.message, t.year, t.track_no, t.disc_no, t.release_date,
                 t.duration, t.sample_rate, t.bitrate, t.bit_depth, t.file_size as i64, t.file_type, t.bpm, t.key, t.rating,
                 t.color, t.date_added, t.date_created, t.play_count, t.analyzed, t.grid_locked as i64,
-                t.autoload_hotcue as i64, t.gain_db, t.artwork, t.raw_samples as i64
+                t.autoload_hotcue as i64, t.gain_db, t.artwork, t.raw_samples as i64, t.key_manual as i64
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -209,13 +214,13 @@ impl Db {
 
     pub fn update_track(&self, t: &Track) -> Result<()> {
         self.conn.execute(
-            "UPDATE tracks SET title=?2,artist=?3,album=?4,album_artist=?5,genre=?6,label=?7,remixer=?8,original_artist=?9,composer=?10,lyricist=?11,mix_name=?12,comment=?13,grouping=?14,message=?15,year=?16,track_no=?17,disc_no=?18,release_date=?19,duration=?20,sample_rate=?21,bitrate=?22,bit_depth=?23,file_size=?24,file_type=?25,bpm=?26,key=?27,rating=?28,color=?29,date_added=?30,date_created=?31,play_count=?32,analyzed=?33,grid_locked=?34,autoload_hotcue=?35,gain_db=?36,artwork=?37,path=?38,raw_samples=?39 WHERE id=?1",
+            "UPDATE tracks SET title=?2,artist=?3,album=?4,album_artist=?5,genre=?6,label=?7,remixer=?8,original_artist=?9,composer=?10,lyricist=?11,mix_name=?12,comment=?13,grouping=?14,message=?15,year=?16,track_no=?17,disc_no=?18,release_date=?19,duration=?20,sample_rate=?21,bitrate=?22,bit_depth=?23,file_size=?24,file_type=?25,bpm=?26,key=?27,rating=?28,color=?29,date_added=?30,date_created=?31,play_count=?32,analyzed=?33,grid_locked=?34,autoload_hotcue=?35,gain_db=?36,artwork=?37,path=?38,raw_samples=?39,key_manual=?40 WHERE id=?1",
             params![
                 t.id, t.title, t.artist, t.album, t.album_artist, t.genre, t.label, t.remixer, t.original_artist, t.composer,
                 t.lyricist, t.mix_name, t.comment, t.grouping, t.message, t.year, t.track_no, t.disc_no, t.release_date,
                 t.duration, t.sample_rate, t.bitrate, t.bit_depth, t.file_size as i64, t.file_type, t.bpm, t.key, t.rating,
                 t.color, t.date_added, t.date_created, t.play_count, t.analyzed, t.grid_locked as i64,
-                t.autoload_hotcue as i64, t.gain_db, t.artwork, t.path, t.raw_samples as i64
+                t.autoload_hotcue as i64, t.gain_db, t.artwork, t.path, t.raw_samples as i64, t.key_manual as i64
             ],
         )?;
         Ok(())

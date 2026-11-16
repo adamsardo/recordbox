@@ -71,6 +71,11 @@ pub struct ModelSpec {
     pub min_ram_gb: f64,
     pub needs_gpu: bool,
     pub about: &'static str,
+    /// Full SHA-256 of each file when pinned (checked after download); otherwise the
+    /// 8-digit prefix in the file name is checked.
+    pub sha256: &'static [Option<&'static str>],
+    pub licence: &'static str,
+    pub source: &'static str,
 }
 
 pub const ROOT_URL: &str = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/";
@@ -85,6 +90,15 @@ pub const CATALOG: [ModelSpec; 2] = [
         min_ram_gb: 15.0,
         needs_gpu: true,
         about: "Four models, each fine-tuned for one stem: the best quality, about 4× the work.",
+        // Hashes of the published files (their name prefixes match), pinned on 2026-11-17.
+        sha256: &[
+            Some("ba3fe64ae8ef66ac9a4857222ce48efbdc5eb3ad375cb79dd13debee5aaa4066"),
+            Some("e57c48e6b0e38af4f7118d7bd08c49f0a0c0edf7d09143bdd902ea0d237303e6"),
+            Some("ef3bcb9c8b40d14ae5d51b6db2587339cc12c6b77c0be151ce6d69002e087bf2"),
+            Some("f3cf25b222c4eed7cd49dd8b2c9597d50c18bd154090f7b919cfa5f93cf22c49"),
+        ],
+        licence: "MIT",
+        source: "facebookresearch/demucs (Hybrid Transformer Demucs, fine-tuned)",
     },
     ModelSpec {
         id: "htdemucs",
@@ -94,6 +108,9 @@ pub const CATALOG: [ModelSpec; 2] = [
         min_ram_gb: 4.0,
         needs_gpu: false,
         about: "One model for all four stems: good quality, runs on any computer.",
+        sha256: &[None],
+        licence: "MIT",
+        source: "facebookresearch/demucs (Hybrid Transformer Demucs)",
     },
 ];
 
@@ -124,6 +141,11 @@ pub fn model_ready(m: &ModelSpec) -> bool {
 
 fn sha_prefix_ok(path: &Path, file_name: &str) -> Result<bool> {
     let want = file_name.split('-').nth(1).and_then(|s| s.split('.').next()).unwrap_or("");
+    let got = sha_hex(path)?;
+    Ok(!want.is_empty() && got.starts_with(want))
+}
+
+fn sha_hex(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -134,14 +156,13 @@ fn sha_prefix_ok(path: &Path, file_name: &str) -> Result<bool> {
         }
         h.update(&buf[..n]);
     }
-    let got = format!("{:x}", h.finalize());
-    Ok(!want.is_empty() && got.starts_with(want))
+    Ok(format!("{:x}", h.finalize()))
 }
 
 /// Download any missing checkpoint of `m` into the models folder. Each file is written to a
 /// temporary name, checked against its SHA-256 prefix and only then renamed into place.
 pub fn download(m: &ModelSpec, progress: &mut dyn FnMut(u64, u64, &str), cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
-    for f in m.files {
+    for (k, f) in m.files.iter().enumerate() {
         let dest = models_dir().join(f);
         if dest.exists() {
             continue;
@@ -170,7 +191,11 @@ pub fn download(m: &ModelSpec, progress: &mut dyn FnMut(u64, u64, &str), cancel:
         }
         out.sync_all()?;
         drop(out);
-        if !sha_prefix_ok(&tmp, f)? {
+        let ok = match m.sha256.get(k).copied().flatten() {
+            Some(full) => sha_hex(&tmp)? == full,
+            None => sha_prefix_ok(&tmp, f)?,
+        };
+        if !ok {
             let _ = std::fs::remove_file(&tmp);
             return Err(anyhow!("{f} did not match its published checksum; it was not used"));
         }
@@ -300,6 +325,22 @@ pub fn vocal_levels(vocal: &[f32], mix: &[f32]) -> Vec<u8> {
     let m = moving_mean(&frame_db(mix), 21);
     let f: Vec<f32> = v.iter().enumerate().map(|(i, x)| 0.5 * x + 0.5 * (x - m.get(i).copied().unwrap_or(*x))).collect();
     moving_mean(&f, VOCAL_SMOOTH).iter().map(|x| VOCAL_THRESHOLDS.iter().filter(|t| x >= *t).count() as u8).collect()
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    #[test]
+    fn pinned_hashes_match_file_names() {
+        for m in super::CATALOG {
+            assert_eq!(m.sha256.len(), m.files.len(), "{}", m.id);
+            for (f, h) in m.files.iter().zip(m.sha256) {
+                if let Some(h) = h {
+                    let prefix = f.split('-').nth(1).and_then(|s| s.split('.').next()).unwrap();
+                    assert!(h.starts_with(prefix) && h.len() == 64, "{f}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

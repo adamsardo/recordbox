@@ -219,10 +219,29 @@ impl Player {
         }
     }
 
-    /// Names of the output devices this Mac offers.
-    pub fn output_devices() -> Vec<String> {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        cpal::default_host().output_devices().map(|it| it.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+    /// Names of the output devices this Mac offers. Listing devices can block indefinitely on
+    /// some systems (seen with a CoreAudio device on the development Mac), so it runs on its
+    /// own thread and gives up after `timeout`: None then.
+    pub fn output_devices_within(timeout: std::time::Duration) -> Option<Vec<String>> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let names: Vec<String> = cpal::default_host().output_devices().map(|it| it.filter_map(|d| d.name().ok()).collect()).unwrap_or_default();
+            let _ = tx.send(names);
+        });
+        rx.recv_timeout(timeout).ok()
+    }
+
+    /// The named output device, searched on its own thread (see `output_devices_within`).
+    fn find_device(want: &str, timeout: std::time::Duration) -> Option<cpal::Device> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let want = want.to_string();
+        std::thread::spawn(move || {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let d = cpal::default_host().output_devices().ok().and_then(|mut it| it.find(|d| d.name().map(|n| n == want).unwrap_or(false)));
+            let _ = tx.send(d);
+        });
+        rx.recv_timeout(timeout).ok().flatten()
     }
 
     /// Switch to another output device, keeping what is loaded and playing.
@@ -237,7 +256,7 @@ impl Player {
     fn open_stream(state: Arc<Mutex<PlayState>>, device: Option<&str>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
-        let named = device.and_then(|want| host.output_devices().ok()?.find(|d| d.name().map(|n| n == want).unwrap_or(false)));
+        let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
         // A device that is no longer connected falls back to the default output.
         let dev = match named {
             Some(d) => d,
@@ -386,5 +405,16 @@ mod gapless_probe {
             }
             eprintln!("raw {} gapless {} diff {} :: {}", n[0], n[1], n[0] as i64 - n[1] as i64, p.rsplit('/').next().unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod device_probe {
+    #[test]
+    #[ignore]
+    fn lists_output_devices() {
+        let t = std::time::Instant::now();
+        let d = super::Player::output_devices_within(std::time::Duration::from_secs(5));
+        eprintln!("devices after {:?}: {d:?}", t.elapsed());
     }
 }

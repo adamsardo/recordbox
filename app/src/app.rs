@@ -212,6 +212,8 @@ pub struct Prefs {
     pub keymap: std::collections::BTreeMap<String, String>,
     /// Column browser (Genre / Artist / Album) above the track list.
     pub column_browser: bool,
+    /// Stem pads: 4 (vocal, inst, bass, drums) or 3 (vocal, inst with bass, drums).
+    pub stem_parts: u8,
     /// Audio output device by name; None follows the system's default output.
     pub audio_device: Option<String>,
     /// Sub-browser: a second track list under the main one.
@@ -483,6 +485,7 @@ impl Default for Prefs {
             keymap: Default::default(),
             column_browser: false,
             audio_device: None,
+            stem_parts: 4,
             sub_browser: false,
             browse_font: 0,
             browse_line: 0,
@@ -1601,6 +1604,12 @@ impl App {
     /// often; otherwise with the ordinary analysis.
     pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
         let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false);
+        // Asked for explicitly: the analysed key replaces even one the user chose.
+        for id in ids {
+            if let Some(t) = self.track_mut(*id) {
+                t.key_manual = false;
+            }
+        }
         if !stems_ok || self.key_job.is_some() {
             for id in ids {
                 if let Some(t) = self.track_mut(*id) {
@@ -2259,6 +2268,14 @@ impl App {
         };
         let mut idmap: HashMap<String, i64> = HashMap::new();
         let mut added = 0;
+        // All or nothing: one transaction, rolled back on the first database error.
+        let _ = self.db.conn.execute_batch("BEGIN");
+        let mut failed: Option<String> = None;
+        let mut note = |r: anyhow::Result<()>| {
+            if let Err(e) = r {
+                failed.get_or_insert(e.to_string());
+            }
+        };
         for xt in lib.tracks {
             let id = match self.db.track_by_path(&xt.track.path) {
                 Some(id) => id,
@@ -2281,18 +2298,26 @@ impl App {
                             added += 1;
                             id
                         }
-                        Err(_) => continue,
+                        Err(e) => {
+                            note(Err(e));
+                            continue;
+                        }
                     }
                 }
             };
             if let Some(g) = &xt.grid {
-                let _ = self.db.save_grid(id, g);
+                note(self.db.save_grid(id, g));
             }
-            let _ = self.db.set_xml_extra(id, &xt.extra);
+            note(self.db.set_xml_extra(id, &xt.extra));
             if !xt.cues.is_empty() {
-                let _ = self.db.replace_cues(id, &xt.cues);
+                note(self.db.replace_cues(id, &xt.cues));
             }
             idmap.insert(xt.xml_id.clone(), id);
+        }
+        if let Some(e) = failed {
+            let _ = self.db.conn.execute_batch("ROLLBACK");
+            self.reload_all();
+            return self.toast_err(format!("The collection could not be imported ({e}). Nothing was changed."));
         }
         fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>) {
             for n in nodes {
@@ -2310,6 +2335,11 @@ impl App {
         if !lib.playlists.is_empty() {
             let root = self.db.create_node(0, "Imported collection", NodeKind::Folder, None).unwrap_or(0);
             add_nodes(self, root, &lib.playlists, &idmap);
+        }
+        if let Err(e) = self.db.conn.execute_batch("COMMIT") {
+            let _ = self.db.conn.execute_batch("ROLLBACK");
+            self.reload_all();
+            return self.toast_err(format!("The collection could not be imported ({e}). Nothing was changed."));
         }
         self.reload_all();
         self.toast(format!("Imported {added} new track(s) with their cues, grids and playlists. Original files were not changed."));
@@ -2352,14 +2382,17 @@ impl App {
 
     pub fn apply_analysis(&mut self, id: i64, r: Result<crate::analysis::AnalysisResult, String>) {
         let existing_grid = self.db.grid(id).filter(|g| !g.is_empty());
+        let had_analysis = existing_grid.is_some() || self.db.wave(id).is_some();
         let Some(t) = self.track_mut(id) else { return };
         match r {
             Err(e) => {
                 t.analyzed = if e == "stopped" { 0 } else { 2 };
             }
-            Ok(res) if t.grid_locked && t.analyzed == 1 => {
-                // Locked while the job was running: keep everything that was there.
+            Ok(res) if t.grid_locked && had_analysis => {
+                // Analysis Lock: a locked track keeps its grid, key, waveform and gain, whatever
+                // the job's queued state (the lock is checked here, when results arrive).
                 let _ = res;
+                t.analyzed = 1;
             }
             Ok(res) => {
                 let first_analysis = t.analyzed != 1;
@@ -2372,7 +2405,7 @@ impl App {
                 let keep_grid = t.grid_locked || existing_grid.is_some();
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
-                if res.key >= 0 && (t.key < 0 || (first_analysis && !keep_grid)) {
+                if res.key >= 0 && !t.key_manual && (t.key < 0 || (first_analysis && !keep_grid)) {
                     t.key = res.key;
                 }
                 let mut save_grid = None;
@@ -2706,6 +2739,11 @@ impl App {
                 self.list_dirty = true;
             }
             Edit::Grid { track, before } => {
+                // Analysis Lock also holds against Undo/Redo.
+                if self.track(track).map(|t| t.grid_locked).unwrap_or(false) {
+                    self.toast_err("This track's analysis is locked; unlock it to change its grid.");
+                    return;
+                }
                 let _ = self.db.save_grid(track, &before);
                 if self.deck.track == Some(track) {
                     self.set_deck_grid(before, false);
@@ -3005,6 +3043,9 @@ impl App {
         }
     }
     pub fn grid_undo(&mut self) {
+        if !self.grid_editable() {
+            return;
+        }
         if let Some(g) = self.deck.grid_undo.pop() {
             let cur = self.deck.grid.clone();
             self.deck.grid_redo.push(cur);
@@ -3012,6 +3053,9 @@ impl App {
         }
     }
     pub fn grid_redo(&mut self) {
+        if !self.grid_editable() {
+            return;
+        }
         if let Some(g) = self.deck.grid_redo.pop() {
             let cur = self.deck.grid.clone();
             self.deck.grid_undo.push(cur);
@@ -3329,20 +3373,32 @@ impl App {
     /// (once each). Device tracks are matched to the collection by the local file PrepDeck
     /// exported, else by title and artist. The device itself is not changed.
     pub fn import_device_histories(&mut self) -> usize {
-        let mut done: HashSet<String> = self.db.setting("imported_histories").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // How many entries of each device history (device + name) were imported already. A
+        // history that grew on a player since only adds its new entries (and plays).
+        let mut counts: HashMap<String, usize> = self.db.setting("imported_history_counts").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // Histories imported by an earlier version (keyed with their entries) count as done.
+        let old: HashSet<String> = self.db.setting("imported_histories").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let mut imported = 0;
         let devices: Vec<(String, String, crate::export::usb::DeviceLibrary)> = self.devices.iter().filter_map(|d| d.lib.clone().map(|l| (d.root.clone(), d.name.clone(), l))).collect();
         for (_root, dev_name, lib) in devices {
             for h in &lib.histories {
-                // Identify a history by the device name, its name and its contents.
-                let key = format!("{dev_name}\u{1f}{}\u{1f}{:?}", h.name, h.entries);
-                if done.contains(&key) || h.entries.is_empty() {
+                let key = format!("{dev_name}\u{1f}{}", h.name);
+                let done = counts.get(&key).copied().unwrap_or_else(|| if old.contains(&format!("{key}\u{1f}{:?}", h.entries)) { h.entries.len() } else { 0 });
+                if h.entries.len() <= done {
+                    counts.insert(key, done);
                     continue;
                 }
                 let mut ids = vec![];
-                for e in &h.entries {
+                let mut plays = vec![];
+                for e in &h.entries[done..] {
                     let Some(dt) = lib.tracks.get(e) else { continue };
-                    if let Some(id) = self.match_device_track(&dt.source, &dt.title, &dt.artist) {
+                    // Play counts only for the exact file PrepDeck exported; the history list
+                    // itself also takes title/artist matches.
+                    let exact = (!dt.source.is_empty()).then(|| self.db.track_by_path(&dt.source)).flatten();
+                    if let Some(id) = exact {
+                        plays.push(id);
+                    }
+                    if let Some(id) = exact.or_else(|| self.match_device_track("", &dt.title, &dt.artist)) {
                         ids.push(id);
                     }
                 }
@@ -3350,23 +3406,30 @@ impl App {
                     Some(n) => n.id,
                     None => self.db.create_node(0, "Histories", NodeKind::Folder, None).unwrap_or(0),
                 };
-                if let Ok(pl) = self.db.create_node(folder, &format!("{} ({dev_name})", h.name), NodeKind::Playlist, None) {
-                    let _ = self.db.set_playlist_tracks(pl, &ids);
+                let name = format!("{} ({dev_name})", h.name);
+                let existing = self.db.playlists().unwrap_or_default().into_iter().find(|n| n.parent == folder && n.name == name && n.kind == NodeKind::Playlist).map(|n| n.id);
+                let pl = match existing {
+                    Some(pl) => Some(pl),
+                    None => self.db.create_node(folder, &name, NodeKind::Playlist, None).ok(),
+                };
+                if let Some(pl) = pl {
+                    let mut all = self.db.playlist_tracks(pl).unwrap_or_default();
+                    all.extend(ids);
+                    let _ = self.db.set_playlist_tracks(pl, &all);
                     imported += 1;
-                    // Each play in an imported history counts towards the track's play count.
-                    for id in &ids {
+                    for id in &plays {
                         if let Some(t) = self.track_mut(*id) {
                             t.play_count = t.play_count.saturating_add(1);
                             self.save_track_quiet(*id);
                         }
                     }
+                    counts.insert(key, h.entries.len());
                 }
-                done.insert(key);
                 self.reload_playlists();
             }
         }
+        self.db.set_setting("imported_history_counts", &serde_json::to_string(&counts).unwrap_or_default());
         if imported > 0 {
-            self.db.set_setting("imported_histories", &serde_json::to_string(&done).unwrap_or_default());
             self.toast(format!("Imported {imported} play histor{} from your devices into the Histories folder.", if imported == 1 { "y" } else { "ies" }));
         }
         imported
