@@ -505,7 +505,7 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             }
             if s.click_phase < click_len {
                 let env = 1.0 - s.click_phase as f32 / click_len as f32;
-                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * 1500.0 / rate as f32).sin() * env * s.metronome_vol * if s.muted { 0.0 } else { 1.0 };
+                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * crate::prefs_ext::click_hz() / rate as f32).sin() * env * s.metronome_vol * if s.muted { 0.0 } else { 1.0 };
                 s.click_phase += 1;
             }
         }

@@ -392,7 +392,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
     }
     let track_view = !matches!(app.view, View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. });
     // Playlist Palette: a 26 pt strip of four slots under the track list.
-    let list = if app.prefs.palette_open && track_view {
+    let list = if app.prefs.palette_open && app.prefs.palette_enabled && track_view {
         let pr = Rect::from_min_max(pos2(list.min.x, list.max.y - 26.0), list.max);
         crate::ui_library_ext::palette_bar(app, ui, pr, &mut drop_targets);
         Rect::from_min_max(list.min, pos2(list.max.x, pr.min.y - 2.0))
@@ -787,14 +787,23 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
             let st = Rect::from_min_max(pos2(row.min.x + 0.5, row.min.y), pos2(row.min.x + 22.5, row.min.y + 23.0));
             // The search tile opens a field that narrows the tree to matching names.
-            let sresp = ui.interact(st, ui.id().with("tree_search_tile"), Sense::click());
-            if app.ext.tree_search_open {
+            // Preferences > View > Layout: "Playlist search filter" (off: no tile, no field).
+            let filter_on = app.prefs.playlist_search_filter;
+            if !filter_on && app.ext.tree_search_open {
+                app.ext.tree_search_open = false;
+                app.ext.tree_search.clear();
+            }
+            let sresp = ui.interact(st, ui.id().with("tree_search_tile"), if filter_on { Sense::click() } else { Sense::hover() });
+            if !filter_on {
+            } else if app.ext.tree_search_open {
                 ui.painter().rect_filled(st, 1.5, TILE_ON);
                 ui.painter().rect_stroke(st, 1.5, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
             } else {
                 ui.painter().rect_stroke(st, 1.5, Stroke::new(1.0, if sresp.hovered() { hex(0x8C8C8C) } else { OFF }), egui::StrokeKind::Inside);
             }
-            crate::icons_src::playlist_search(ui.painter(), st, if app.ext.tree_search_open { WHITE } else { hex(0xC7C7C7) }, if app.ext.tree_search_open { TILE_ON } else { BG2 });
+            if filter_on {
+                crate::icons_src::playlist_search(ui.painter(), st, if app.ext.tree_search_open { WHITE } else { hex(0xC7C7C7) }, if app.ext.tree_search_open { TILE_ON } else { BG2 });
+            }
             if sresp.clicked() {
                 app.ext.tree_search_open = !app.ext.tree_search_open;
                 if app.ext.tree_search_open {
@@ -818,11 +827,14 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let all_sel = app.view == View::Collection;
-                let all = tree_row(ui, 0, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0);
-                if all.clicked() {
-                    app.set_view(View::Collection);
+                // Preferences > View > Layout: "Display All Tracks in the Playlists".
+                if app.prefs.all_tracks_in_playlists {
+                    let all = tree_row(ui, 0, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0);
+                    if all.clicked() {
+                        app.set_view(View::Collection);
+                    }
+                    all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
                 }
-                all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
                 crate::ui_library_ext::tree_top_rows(app, ui, drop);
                 let root = tree_row(ui, 0, "Playlists", None, false, TreeIcon::Open, 15.0);
                 root.context_menu(|ui| {
@@ -901,7 +913,8 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
                 continue;
             }
         }
-        let resp = tree_row(ui, depth, &n.name, count, sel, icon, 15.0);
+        // Preferences > View > Layout: "Display the number of tracks in a playlist on the Tree View".
+        let resp = tree_row(ui, depth, &n.name, count.filter(|_| app.prefs.playlist_track_counts), sel, icon, 15.0);
         if n.kind == NodeKind::Playlist {
             drop.push((resp.rect, n.id));
         }
@@ -1553,8 +1566,8 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new("PLAYER B is available in the 2 Players layout.").size(11.0).color(DIM));
         }
     });
-    // Playlist Palette switch, left of PLAYER A.
-    {
+    // Playlist Palette switch, left of PLAYER A (Preferences > View > Layout: "Playlist Palette").
+    if app.prefs.palette_enabled {
         let pr = Rect::from_center_size(pos2(rx - 522.0, bar.center().y), vec2(18.0, 18.0));
         let presp = ui.interact(pr, ui.id().with("palette_toggle"), Sense::click());
         if app.prefs.palette_open {

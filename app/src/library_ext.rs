@@ -323,6 +323,17 @@ pub struct LibExt {
     pub related_rename: Option<(usize, String)>,
     pub criteria_open: bool,
     pub palette_pick: Option<usize>,
+    /// [Start] of the CUE Analysis Playlist is waiting for track analysis to finish.
+    pub cue_wait: bool,
+    /// The sub-browser's own browser state (ui_browser_ext.rs).
+    pub sub: Option<Box<crate::ui_browser_ext::SubState>>,
+    /// Right-hand panels shown last frame (a panel switched on closes the others).
+    pub right_prev: [bool; 5],
+    /// Cached rows of the Related Tracks and Track Suggestion windows: (key, time, rows).
+    pub panel_cache: [Option<(String, f64, std::sync::Arc<Vec<(i64, f64)>>)>; 2],
+    pub panel_sel: [Option<i64>; 2],
+    /// New My Tag being typed in the My Tag window: (category, text).
+    pub cv_scroll_end: bool,
 }
 
 impl Default for LibExt {
@@ -357,6 +368,12 @@ impl Default for LibExt {
             related_rename: None,
             criteria_open: false,
             palette_pick: None,
+            cue_wait: false,
+            sub: None,
+            right_prev: [false; 5],
+            panel_cache: [None, None],
+            panel_sel: [None, None],
+            cv_scroll_end: false,
         }
     }
 }
@@ -472,6 +489,7 @@ impl App {
     /// Once per frame: play-time credit (history and DJ Play Count), preview housekeeping and
     /// background results.
     pub fn poll_library_ext(&mut self) {
+        self.poll_cue_analysis();
         let now = std::time::Instant::now();
         let dt = self.ext.last_tick.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0);
         self.ext.last_tick = Some(now);
@@ -482,7 +500,8 @@ impl App {
         }
         // The preview follows the master volume and ends with the window's focus.
         let vol = self.player.state.lock().volume;
-        self.ext.preview.set_volume(vol);
+        // Preferences > Audio > Preview Volume: the middle of the slider is the master volume.
+        self.ext.preview.set_volume(vol * (self.prefs.preview_volume * 2.0).clamp(0.0, 2.0));
         if self.ext.preview.state.lock().track.is_some() {
             if !self.ctx.input(|i| i.focused) && self.screenshot.is_none() {
                 self.ext.preview.stop();

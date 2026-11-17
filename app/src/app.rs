@@ -299,6 +299,8 @@ pub struct Prefs {
     /// Saved "Related Tracks" lists; `related` holds the criteria of the selected one.
     pub related_lists: Vec<crate::library_ext::RelatedList>,
     pub related_sel: usize,
+    /// Browser layout and right-hand panels (browser_ext.rs).
+    pub bx: crate::browser_ext::BrowserPrefs,
     /// Player (see player_ext.rs). Beat Count Display above the enlarged waveform: 0 Current
     /// Position (Bars), 1 Count to the next MEMORY CUE (Bars), 2 the same in Beats.
     pub beat_count_mode: u8,
@@ -319,6 +321,33 @@ pub struct Prefs {
     /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
     /// track is first analysed; Analyze Key still replaces it.
     pub keep_tag_key: bool,
+    // ---- Preferences pages added from the rekordbox 7.2.19 references (ui_prefs.rs) ----
+    /// View > Layout > Browser panel: "Playlist Palette" (the palette and its switch exist at all;
+    /// `palette_open` is whether it is showing).
+    pub palette_enabled: bool,
+    /// View > Layout > Browser panel: "Playlist search filter" (the search tile of the playlist tree).
+    pub playlist_search_filter: bool,
+    /// View > Layout > Browser panel: "Display All Tracks in the Playlists".
+    pub all_tracks_in_playlists: bool,
+    /// View > Layout > Browser panel: "Display the number of tracks in a playlist on the Tree View".
+    pub playlist_track_counts: bool,
+    /// View > Layout > Phrases: "Phrase (Enlarged Waveform)" and "Always show types of phrases"
+    /// ("Phrase (Full Waveform)" is `show_phrase_bar`).
+    pub phrase_enlarged: bool,
+    pub phrase_types_always: bool,
+    /// View > Layout > Vocal: "Vocal (Enlarged Waveform)" ("Vocal (Full Waveform)" is `show_vocal`).
+    pub vocal_enlarged: bool,
+    /// Audio > Metronome: click sound 0–2 ("Click Sound 01".."03").
+    pub metronome_sound: u8,
+    /// Audio > Preview Volume, 0..1; the middle (0.5) plays previews at the master volume.
+    pub preview_volume: f32,
+    /// STEMS > ACTIVE STEM Setting: false = MUTE (a part button mutes its part), true = SOLO
+    /// (a part button plays that part alone). See `prefs_ext::stem_part_click`.
+    pub stem_solo: bool,
+    /// STEMS: "Reset the MUTE/SOLO state while loading".
+    pub stem_reset_on_load: bool,
+    /// STEMS > STEM Waveform Display: the waveform shows only the parts that sound.
+    pub stem_waveform: bool,
 }
 
 /// Keyboard actions: (id, label, default shortcut in stored form or "" for none, category).
@@ -707,15 +736,29 @@ impl Default for Prefs {
             info_panel: false,
             related_lists: vec![],
             related_sel: 0,
+            bx: Default::default(),
             beat_count_mode: 0,
             wave_click_play_cue: false,
             player_layout: 0,
             metronome_vol: 2,
             beat_jump_bars: false,
             show_stems: true,
-            show_phrase_bar: true,
+            // As rekordbox: "Phrase (Full Waveform)" is not ticked until the user ticks it.
+            show_phrase_bar: false,
             analysis_mode: 0,
             keep_tag_key: true,
+            palette_enabled: true,
+            playlist_search_filter: true,
+            all_tracks_in_playlists: true,
+            playlist_track_counts: true,
+            phrase_enlarged: false,
+            phrase_types_always: true,
+            vocal_enlarged: false,
+            metronome_sound: 0,
+            preview_volume: 0.5,
+            stem_solo: false,
+            stem_reset_on_load: true,
+            stem_waveform: true,
             delete_device_tracks: false,
             // rekordbox's standard: gain = -10 - integrated loudness.
             target_lufs: -10.0,
@@ -1205,7 +1248,8 @@ impl App {
         }
         if app.screenshot.is_some() {
             // Optional state for checking other screens: PREPDECK_SHOT_VIEW=playlists|devices|grid|hotcue|prefs|mytag|smart|export|info
-            if let Ok(v) = std::env::var("PREPDECK_SHOT_VIEW") {
+            // Several states can be combined with commas (PREPDECK_SHOT_VIEW=playlists,mytag).
+            for v in std::env::var("PREPDECK_SHOT_VIEW").unwrap_or_default().split(',').filter(|v| !v.is_empty()).map(|v| v.to_string()) {
                 match v.as_str() {
                     "playlists" | "smart" => {
                         app.side = SideMode::Playlists;
@@ -1684,7 +1728,12 @@ impl App {
 
     /// Tracks matching the Related Tracks rules for the source track, best matches first.
     pub fn related_tracks(&self) -> Vec<i64> {
-        let Some(src) = self.related_source().and_then(|id| self.track(id)).cloned() else { return vec![] };
+        self.related_source().map(|s| self.related_tracks_of(s)).unwrap_or_default()
+    }
+
+    /// The same for any source track.
+    pub fn related_tracks_of(&self, src: i64) -> Vec<i64> {
+        let Some(src) = self.track(src).cloned() else { return vec![] };
         let r = &self.prefs.related;
         let mut out: Vec<(i64, i64)> = self
             .tracks
@@ -2899,6 +2948,12 @@ impl App {
                 if let Some(g) = save_grid {
                     let _ = self.db.save_grid(id, &g);
                 }
+                // CUE Analysis Playlist: cues of the personal CUE tendency (browser_ext.rs).
+                if first_analysis {
+                    if let Some(g) = &new_grid {
+                        self.apply_cue_tendency(id, g);
+                    }
+                }
                 // rekordbox sets hot cue A, named "1.1Bars", on the first downbeat when it first
                 // analyses a track (seen on every analysed track of the user's library, created
                 // during analysis). Only on a fresh grid and for a track with no cues yet.
@@ -3036,7 +3091,10 @@ impl App {
         {
             let mut st = self.player.state.lock();
             st.stems = None;
-            st.stem_on = [true; 4];
+            // Preferences > STEMS: "Reset the MUTE/SOLO state while loading".
+            if self.prefs.stem_reset_on_load {
+                st.stem_on = [true; 4];
+            }
         }
         self.load_cached_stems(id);
         if t.analyzed == 0 {
