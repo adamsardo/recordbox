@@ -156,7 +156,10 @@ pub fn html(prefs: &Prefs) -> String {
     s.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Recordbox Manual</title><style>");
     s.push_str(":root{--bg:#141414;--fg:#e6e6e6;--dim:#a0a0a0;--card:#1e1e1e;--line:#333;--blue:#3d7be6}@media(prefers-color-scheme:light){:root{--bg:#fafafa;--fg:#1a1a1a;--dim:#555;--card:#fff;--line:#ddd;--blue:#1f5fd0}}");
     s.push_str("body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif}main{max-width:820px;margin:0 auto;padding:24px 16px 80px}h1{font-size:28px;margin:8px 0 4px}h2{font-size:21px;margin:40px 0 8px;padding-top:12px;border-top:1px solid var(--line)}h3{font-size:16px;margin:20px 0 4px}a{color:var(--blue)}nav{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 18px;columns:2}nav a{display:block;text-decoration:none;padding:2px 0}code,kbd{font:13px ui-monospace,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:4px;padding:1px 5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:600}.dim{color:var(--dim)}li{margin:3px 0}@media(max-width:600px){nav{columns:1}}");
-    s.push_str("</style></head><body><main><h1>Recordbox Manual</h1>");
+    // The logo heads the page (it follows the text colour, light or dark), with the mark as the
+    // page icon.
+    s.push_str(&format!("</style><link rel=\"icon\" href=\"data:image/svg+xml;utf8,{}\"></head><body><main>", crate::brand::MARK_SVG.replace('"', "'").replace('#', "%23").replace('\n', "")));
+    s.push_str(&format!("<h1 class=\"logo\" aria-label=\"recordbox Manual\"><span style=\"display:block;width:280px;max-width:70vw\">{}</span><span style=\"font-size:21px;font-weight:600\">Manual</span></h1>", crate::brand::LOGO_SVG.replace("<svg ", "<svg style=\"width:100%;height:auto;color:var(--fg)\" ")));
     s.push_str(&format!("<p class=\"dim\">Version {}. This page was written by Recordbox on this computer; the keyboard shortcuts below are your current ones.</p><nav>", env!("CARGO_PKG_VERSION")));
     for (a, t, _) in CHAPTERS {
         s.push_str(&format!("<a href=\"#{a}\">{}</a>", esc(t)));

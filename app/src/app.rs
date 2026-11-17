@@ -1107,6 +1107,8 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>) -> App {
         crate::theme::apply(&cc.egui_ctx);
+        // SVG images (the recordbox logo).
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let db_path = crate::db::data_dir().join("library.db");
         let db = Db::open(&db_path).expect("open library database");
         // Removed tracks stay restorable for 30 days.

@@ -652,7 +652,10 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
         kit::dialog(ctx, "About Recordbox").open(&mut open).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
             kit::apply_style(ui);
             ui.set_width(380.0);
-            ui.label(RichText::new("Recordbox").font(kit::inter_bold(17.0)).color(WHITE));
+            // The logo (mark and wordmark) instead of the name in text.
+            ui.add(crate::brand::logo_image(WHITE, 22.0));
+            ui.add_space(2.0);
+            ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM));
             ui.add_space(6.0);
             kit::message(ui, "Library management, track analysis, set preparation and USB export for CDJ/XDJ players.");
             kit::message_note(ui, "Everything stays on this Mac. Your music files and any existing rekordbox library are never modified.");

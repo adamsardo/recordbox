@@ -282,13 +282,10 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     let r = ui.max_rect();
     let p = ui.painter().clone();
     p.rect_filled(r, 0.0, BG);
-    // App mark (own design) and name, where the original shows its wordmark.
-    // Sized and placed like the reference's footer mark: an 11.5 pt mark from 10 pt, the name
-    // from 25 pt in a regular weight with 11 pt ascenders.
-    let mc = pos2(r.min.x + 15.75, r.center().y + 0.25);
-    p.circle_stroke(mc, 4.9, Stroke::new(1.6, WHITE));
-    p.circle_filled(mc, 1.9, WHITE);
-    p.text(pos2(r.min.x + 25.0, r.center().y - 0.5), Align2::LEFT_CENTER, "Recordbox", FontId::proportional(17.0), WHITE);
+    // The recordbox logo where the original shows its wordmark, at the same size and place
+    // (references 01/02): the mark starts 10 pt from the left, the letters' x-height is 8.5 pt
+    // and their baseline 8 pt above the window's foot (0.169 pt per logo unit).
+    crate::brand::paint_logo(ui, Rect::from_min_size(pos2(r.min.x + 9.66, r.max.y - 19.7), vec2(104.1, 14.0)), WHITE);
     // totals
     let (n, secs, bytes) = if let View::Device { .. } = app.view {
         (0usize, 0.0, 0u64)

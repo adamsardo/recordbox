@@ -5,6 +5,7 @@ mod analysis;
 mod app;
 mod audio;
 mod backup;
+mod brand;
 mod browser_ext;
 mod db;
 mod demo;
@@ -372,6 +373,10 @@ fn main() -> eframe::Result<()> {
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
     let shot_mode = screenshot.is_some();
     let mut viewport = egui::ViewportBuilder::default().with_title("Recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
+    // The recordbox mark as the window and Dock icon.
+    if let Some(icon) = brand::mark_icon(512) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     if shot_mode {
         viewport = viewport.with_active(false);
         #[cfg(target_os = "windows")]

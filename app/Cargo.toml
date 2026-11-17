@@ -40,6 +40,7 @@ arboard = { version = "3", default-features = false }
 # Library backup archives (stored entries only: the database is small and audio/artwork
 # are compressed already).
 zip = { version = "7", default-features = false }
+egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.9", features = ["metal"] }
