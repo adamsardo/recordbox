@@ -29,7 +29,7 @@ pub fn tree_item_available(name: &str) -> bool {
     matches!(name, "Collection" | "Playlists" | "Related Tracks" | "Explorer" | "Devices" | "Histories") || TREE_ITEMS_EXTRA.contains(&name)
 }
 /// Sources added by the library code since (kept apart so adding one is a one-word edit).
-pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekordbox xml"];
+pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekordbox xml", "Hot Cue Bank List"];
 
 impl Prefs {
     /// Whether a Tree View source is shown. Collection always is.

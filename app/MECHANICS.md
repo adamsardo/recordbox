@@ -60,6 +60,26 @@ Sources used:
 - Not written: PQT2 (extended grid), PSSI (phrases), PVDI, the .3EX file and MYSETTING files. (absent from export)
 - PWVC values `0x005b 0x008a 0x018c` copied from a real file (meaning unknown).
 
+### USB evidence notes, 2026-11-17 device pass (tests: `export::usb_fix_test`, `export::device_feature_test`)
+
+Fixtures: rekordcrate `demo_tracks` (2022) and `num_rows` (2024, 3,886 tracks), fragmede `bigger-export`/`one-song` (2024), 100 local rekordbox 7 analysis sets (`oracle/anlzpairs.tsv`).
+
+- **Strings.** Longest string in 3,886 real track rows is a 255-character comment; Recordbox cuts every database string at 255 characters and halves the longest free-text slots if a track row would still exceed a page (4,050 bytes). rekordbox's own limit is not established beyond that observation. Long forms (0x40 and 0x90) both start on a 4-byte boundary (50/50 and 1,225/1,225 in num_rows). Short form up to 126 characters, long ASCII from 128 (127 unobserved).
+- **ISRC** (track string 0): `90 <len=text+6, u16> 00 03 <ASCII> 00`, e.g. `90 12 00 00 03 "DEOQ91710032" 00`. Round trip of all ISRCs in num_rows is byte-identical.
+- **Track string slots 2/3/6.** Slots 2 and 3 are counters starting at "1" (num_rows: slot 2 = 1 in 3,008 rows, up to 6+; slot 3 = 1 in 3,885); slot 6 is "ON" in every 2024 row. New rows get "1"/"1"/"ON"; slot 2 is incremented when Recordbox exports a row again. The 2022 demo's "3"/"3"/"" is an older version's thrice-exported drive.
+- **Key names** are the stored spelling, mixed on one drive ("Emin", "Fmaj", "2d", "7m", "Bbm"): `key_text` when set, else the classic name. **Dates** are 10 characters or empty. **Duration**: whole seconds; the only two rows with known audio (172.43 s -> 172, 128.05 s -> 128) do not separate cutting from rounding. Recordbox cuts (unverified). **Tempo** of a multi-anchor grid: beats / time (no real multi-tempo export was available).
+- **Table 19** (sync history): one 40-byte row per export (48 with an 11-character label), earlier rows flagged deleted but kept, page flags 0x34 once rows are deleted, second flag word = rows touched (old + new). Third string is a device label ("ZAKS BACKUP" in num_rows); this is where "Device Name" is written. What rekordbox does when the page is full is unknown; Recordbox starts a new page.
+- **Tables 9, 10, 14, 15** are empty in every fixture; layouts unknown. Their pages are written back unchanged. No Hot Cue Bank List layout for export.pdb could be established (OneLibrary has `hotCueBankList`/`hotCueBankList_cue`, not written).
+- **Colour table (6)**: `u32 0, u8 id, u8 id, u16 0, name`; the user's Color Comments are written as the names (rekordcrate documents the name as user-defined; no fixture with renamed colours).
+- **Artwork**: `a<N>.jpg` in folder `N/20+1` (five digits); all 2,178 real rows follow it. Numbers are not reused. One file per distinct picture (2,178 rows for 3,886 tracks); Recordbox recognises a picture by SHA-256 of the local artwork file (`/.Recordbox/artwork.json`).
+- **Background Color / device name on players**: DEVSETTING.DAT has no field for either (payload 9/10/13/14/15/16 = WaveDispStyle, WaveFormColor, WaveCurrentPos, WaveFormDivisions, ImageOnJogDisplay, DispUsrnameOnScreen). rekordbox keeps `deviceName` and `backGroundColorType` in OneLibrary's `property` table. No `djprofile.nxs` evidence found. Background Color is kept only in `/.Recordbox/props.json`.
+- **PQT2** (EXT): header 56 bytes: 0, 0x01000002, 0, first PQTZ entry, last PQTZ entry, beat count, sum over all PQTZ entries of beat+tempo+ms, 8 zero bytes; body one u16 per beat = microseconds within the millisecond. PQTZ milliseconds are cut, not rounded. Reproduced byte for byte for 102/102 real files. Multi-tempo files not observed.
+- **PCP2**: 30/32 = microseconds within the millisecond of start/end, 36/38 = beat-loop size numerator/denominator (both or neither), tail after palette+RGB = seek data (4 x u64, 2 x u32: sample position, byte offset, frame length per end). Seek data is written as zeros (rekordbox does the same without decoder data). No real loop record was available; num/den = loop length in beats as a fraction is rekordcrate's description. No local file has PCP2 entries (rekordbox keeps cues in master.db).
+- **.3EX** (rekordbox 7): not PMAI but MessagePack: map `{"embedding": {11 keys such as "d4": f64, "d5": [64 floats], ...}}`, about 6.4 KB. Not derivable; passed through unchanged for tracks synced from rekordbox. Whether rekordbox itself copies it to a USB is not established (no rekordbox 7 device export at hand).
+- **Paths**: decomposed (Apple NFD) on HFS+, precomposed elsewhere; the 48-character caps are counted on the precomposed text. 4 GB limit and folder-entry check (65,536 entries) on FAT32 only.
+- **Journal**: "D" lines list files to delete after publication; recovery after "P" carries them out.
+- Recordbox's own files on a drive: `/.Recordbox/device.json` (sources), `cues.json`, `nodes.json` (library playlist ID -> device node), `artwork.json`, `sync.json` (Sync Manager), `props.json`.
+
 ## Cue / XML behaviour (for import and export)
 
 - XML `POSITION_MARK`: Start/End seconds with 3 decimals; Type 0 point, 4 loop; Num 0–7 hot cues, −1 memory. (`addPositionMarkNode` 0x1010574b0, REA)

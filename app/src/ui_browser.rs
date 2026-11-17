@@ -336,29 +336,48 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
 /// track list 253..1485.5, right icon strip 1488..1512; top row of the tree area 20 pt high.
 pub fn browser(app: &mut App, ui: &mut Ui) {
     app.poll_library_ext();
-    let full = ui.max_rect();
-    let strip = Rect::from_min_size(full.min, vec2(26.5, full.height()));
-    let tree = Rect::from_min_max(pos2(strip.max.x, full.min.y), pos2(full.min.x + 247.0, full.max.y));
-    let right_strip = Rect::from_min_max(pos2(full.max.x - 24.0, full.min.y), full.max);
+    // rekordbox's browser starts 283 pt below the window top: one point above this panel (the
+    // player's last point is empty), so the browser is drawn from there.
+    let mut full = ui.max_rect();
+    if !app.prefs.browser_only {
+        full.min.y -= 1.0;
+        let mut clip = ui.clip_rect();
+        clip.min.y = clip.min.y.min(full.min.y);
+        ui.set_clip_rect(clip);
+    }
+    // Measured in reference 01/04/05 (pt from the window's left edge): 2 pt black margin, icon
+    // strip to 37, tree pane to 248, track list 253..1475 with its scroll bar to 1487, right
+    // icon strip 1487..1512. The top row of the tree area is 21 pt high with a 1 pt line under it.
+    let strip = Rect::from_min_size(full.min, vec2(37.0, full.height()));
+    let tree = Rect::from_min_max(pos2(strip.max.x, full.min.y), pos2(full.min.x + 248.0, full.max.y));
+    let right_strip = Rect::from_min_max(pos2(full.max.x - 25.0, full.min.y), full.max);
     // Information window (268 pt) at the far right, My Tag (230 pt) to its left.
     let info_w = if app.prefs.info_panel { 268.0 } else { 0.0 };
     let info = Rect::from_min_max(pos2(right_strip.min.x - info_w - 2.5, full.min.y), pos2(right_strip.min.x - 2.5, full.max.y));
     let mytag_w = if app.prefs.show_mytag { 230.0 } else { 0.0 };
-    let mytag_right = if app.prefs.info_panel { info.min.x - 2.5 } else { right_strip.min.x - 2.5 };
+    let mytag_right = if app.prefs.info_panel { info.min.x - 2.5 } else { right_strip.min.x };
     let mytag = Rect::from_min_max(pos2(mytag_right - mytag_w, full.min.y), pos2(mytag_right, full.max.y));
     let list = Rect::from_min_max(pos2(full.min.x + 253.0, full.min.y), pos2(mytag.min.x, full.max.y));
     let p = ui.painter().clone();
     p.rect_filled(full, 0.0, BG);
-    p.rect_filled(Rect::from_min_max(full.min, tree.max), 0.0, BG2);
+    p.rect_filled(Rect::from_min_max(pos2(full.min.x + 2.0, full.min.y), tree.max), 0.0, BG2);
     p.rect_filled(right_strip, 0.0, BG2);
-    // Top row of the tree area: collapse chevron and sub-window icon.
-    crate::icons::chevron_right(&p, Rect::from_center_size(pos2(full.min.x + 13.6, full.min.y + 12.0), vec2(14.0, 14.0)), OFF);
-    crate::icons::window_icon(&p, Rect::from_center_size(pos2(full.min.x + 58.0, full.min.y + 13.0), vec2(18.0, 16.0)), WHITE);
-    p.line_segment([pos2(full.min.x, full.min.y + 22.0), pos2(tree.max.x, full.min.y + 22.0)], Stroke::new(1.0, BG));
+    // Top row of the tree area: collapse chevron and sub-window tile.
+    crate::icons_src::chevron(&p, Rect::from_min_size(pos2(full.min.x + 12.0, full.min.y + 5.0), vec2(6.0, 10.0)), OFF);
+    let wt = Rect::from_min_size(pos2(full.min.x + 50.0, full.min.y + 2.5), vec2(16.0, 16.0));
+    p.rect_stroke(wt, 1.5, Stroke::new(1.0, OFF), egui::StrokeKind::Inside);
+    crate::icons_src::window_split(&p, wt, WHITE, BG2);
+    p.rect_filled(Rect::from_min_max(pos2(full.min.x, full.min.y + 21.0), pos2(full.min.x + 253.0, full.min.y + 22.0)), 0.0, BG);
 
     icon_strip(app, ui, strip);
     let mut drop_targets: Vec<(Rect, i64)> = vec![];
-    let tree_inner = Rect::from_min_max(pos2(tree.min.x + 11.0, full.min.y + 24.0), pos2(tree.max.x - 3.0, full.max.y - 4.0));
+    // Tree rows span 37..236 pt (the Collection pane 38..245) from 22 pt below the top.
+    let tree_inner = if app.side == SideMode::Collection {
+        p.rect_filled(Rect::from_min_max(pos2(full.min.x + 246.0, full.min.y + 22.0), tree.max), 0.0, BG);
+        Rect::from_min_max(pos2(full.min.x + 37.0, full.min.y + 22.0), pos2(full.min.x + 246.0, full.max.y - 4.0))
+    } else {
+        Rect::from_min_max(pos2(full.min.x + 37.0, full.min.y + 22.0), pos2(full.min.x + 236.0, full.max.y - 4.0))
+    };
     let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(tree_inner));
     tui.spacing_mut().item_spacing.y = 0.0;
     tree_pane(app, &mut tui, &mut drop_targets);
@@ -457,77 +476,120 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
 
 type IconFn = fn(&egui::Painter, Rect, Color32);
 
-/// Left icon strip: icons on a 19.9 pt pitch from 37.6 pt below the browser top, centred at
-/// x = 16 pt, each in a thin outlined square; the selected one filled blue.
+/// What a source tile opens.
+#[derive(Clone, Copy, PartialEq)]
+enum Tile {
+    Side(SideMode),
+    Matching,
+    TagList,
+    HotCueBank,
+    Off,
+}
+
+/// Left icon strip (skins/MediaSelect): 18 pt tiles on a 20 pt pitch, centred at x = 16 pt,
+/// the first one centred 34 pt below the browser top. The selected tile has a white border on
+/// the selection colour, a 21 pt band behind it and a 2 pt bar at the window edge.
 fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
-    let bm: IconFn = |p, r, c| crate::icons::bookmark(p, r, c, true);
-    let items: [(IconFn, Option<SideMode>, &str); 9] = [
-        (bm, Some(SideMode::Collection), "Collection"),
-        (crate::icons::list, Some(SideMode::Playlists), "Playlists"),
-        (crate::icons::link, Some(SideMode::Related), "Related Tracks"),
-        (crate::ui_library_ext::icon_itunes, Some(SideMode::Itunes), "iTunes"),
-        (crate::ui_library_ext::icon_xml, Some(SideMode::RekordboxXml), "rekordbox xml"),
-        (crate::icons::monitor, Some(SideMode::Explorer), "Explorer"),
-        (crate::icons::usb, Some(SideMode::Devices), "Devices"),
-        (crate::icons::history, Some(SideMode::History), "Histories"),
-        (crate::icons::record, None, "Recordings (not available in this app)"),
+    use crate::icons_src as src;
+    let items: [(src::SrcIcon, Tile, &str); 12] = [
+        (src::collection, Tile::Side(SideMode::Collection), "Collection"),
+        (src::playlist, Tile::Side(SideMode::Playlists), "Playlists"),
+        (src::related, Tile::Side(SideMode::Related), "Related Tracks"),
+        (src::matching, Tile::Matching, "Matching"),
+        (src::tag_list, Tile::TagList, "Tag List"),
+        (src::hot_cue_bank, Tile::HotCueBank, "Hot Cue Bank List"),
+        (src::itunes, Tile::Side(SideMode::Itunes), "iTunes"),
+        (src::xml, Tile::Side(SideMode::RekordboxXml), "rekordbox xml"),
+        (src::explorer, Tile::Side(SideMode::Explorer), "Explorer"),
+        (src::device, Tile::Side(SideMode::Devices), "Devices"),
+        (src::history, Tile::Side(SideMode::History), "Histories"),
+        (src::recording, Tile::Off, "Recordings (not available in this app)"),
     ];
-    for (i, (draw, mode, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2)).collect::<Vec<_>>().into_iter().enumerate() {
-        // Reference 04: 18 pt tiles on a 20 pt pitch, centred at x 15.75 pt; a 1 pt #646464
-        // rounded border and a white glyph; the selected one blue with a white inner border.
-        let c = pos2(r.min.x + 15.75, r.min.y + 36.85 + i as f32 * 20.0);
+    // The highlight is bright while a track row holds the selection, muted otherwise (01 / 04).
+    let hi = if app.selected.is_empty() { ROW_SEL } else { TILE_ON };
+    for (i, (draw, tile, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2)).collect::<Vec<_>>().into_iter().enumerate() {
+        let c = pos2(r.min.x + 16.0, r.min.y + 34.0 + i as f32 * 20.0);
         let rr = Rect::from_center_size(c, vec2(18.0, 18.0));
-        let on = mode.map(|m| app.side == m).unwrap_or(false);
+        let on = match tile {
+            Tile::Side(SideMode::Related) => app.side == SideMode::Related && app.view != View::Matching,
+            Tile::Side(SideMode::Playlists) => app.side == SideMode::Playlists && app.view != View::TagList,
+            Tile::Side(m) => app.side == *m,
+            Tile::Matching => app.view == View::Matching,
+            Tile::TagList => app.view == View::TagList,
+            Tile::HotCueBank | Tile::Off => false,
+        };
         let resp = ui.interact(rr.expand(1.0), ui.id().with(("side", i)), Sense::click());
         let p = ui.painter();
-        if on {
-            p.rect_filled(rr, 3.0, BLUE);
-            p.rect_stroke(rr.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
+        let bg = if on {
+            p.rect_filled(Rect::from_min_max(pos2(r.min.x + 2.0, rr.min.y), pos2(r.min.x + 4.0, rr.max.y)), 0.0, hi);
+            p.rect_filled(Rect::from_min_max(pos2(r.min.x + 6.0, rr.min.y), pos2(r.min.x + 27.0, rr.max.y)), 0.0, hi);
+            p.rect_stroke(rr, 1.5, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
+            hi
         } else {
-            let edge = if mode.is_none() { hex(0x3A3A3A) } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) };
-            p.rect_stroke(rr, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-        }
-        let col = if mode.is_none() { hex(0x4A4A4A) } else { WHITE };
-        draw(p, rr.expand(0.5), col);
+            src::tile(p, rr, false, resp.hovered(), *tile != Tile::Off, BG2)
+        };
+        let col = if *tile == Tile::Off { hex(0x4A4A4A) } else { WHITE };
+        draw(p, rr, col, bg);
         let resp = if app.prefs.tooltips { resp.on_hover_text(*name) } else { resp };
-        if let (true, Some(m)) = (resp.clicked(), mode) {
-            app.side = *m;
-            match m {
-                SideMode::Collection => app.set_view(View::Collection),
-                SideMode::Devices => {
-                    app.scan_devices();
-                    app.set_view(View::Device { root: String::new(), node: None });
+        if resp.clicked() {
+            match *tile {
+                Tile::Off => {}
+                Tile::Matching => {
+                    app.side = SideMode::Related;
+                    app.set_view(View::Matching);
                 }
-                SideMode::Related => app.set_view(View::Related),
-                SideMode::Explorer => {}
-                SideMode::History => {
-                    app.scan_devices();
-                    app.set_view(View::History(0));
+                Tile::TagList => {
+                    app.side = SideMode::Playlists;
+                    app.set_view(View::TagList);
                 }
-                SideMode::Itunes => app.set_view(View::Source { kind: crate::library_ext::SRC_ITUNES, node: String::new() }),
-                SideMode::RekordboxXml => app.set_view(View::Source { kind: crate::library_ext::SRC_RBXML, node: String::new() }),
-                SideMode::Playlists => {}
+                Tile::HotCueBank => app.side = SideMode::Playlists,
+                Tile::Side(m) => {
+                    app.side = m;
+                    match m {
+                        SideMode::Collection => app.set_view(View::Collection),
+                        SideMode::Devices => {
+                            app.scan_devices();
+                            app.set_view(View::Device { root: String::new(), node: None });
+                        }
+                        SideMode::Related => app.set_view(View::Related),
+                        SideMode::Explorer => {}
+                        SideMode::History => {
+                            app.scan_devices();
+                            app.set_view(View::History(0));
+                        }
+                        SideMode::Itunes => app.set_view(View::Source { kind: crate::library_ext::SRC_ITUNES, node: String::new() }),
+                        SideMode::RekordboxXml => app.set_view(View::Source { kind: crate::library_ext::SRC_RBXML, node: String::new() }),
+                        SideMode::Playlists => {}
+                    }
+                }
             }
         }
     }
-    // Bottom: sync icon (status of background work).
-    let sr = Rect::from_center_size(pos2(r.min.x + 19.0, r.max.y - 20.0), vec2(18.0, 18.0));
-    crate::icons::sync(ui.painter(), sr, DIM2);
+    // Bottom of the strip: the library sync mark ("Sync rekordbox Library Now"), lit while a
+    // sync is running. (rekordbox's link-status mark above it has no counterpart here.)
+    let sr = Rect::from_center_size(pos2(r.min.x + 20.0, r.max.y - 20.0), vec2(18.0, 12.0));
+    let busy = app.rb_sync_busy();
+    let resp = ui.interact(sr.expand(3.0), ui.id().with("strip_sync"), Sense::click());
+    src::sync_arrows(ui.painter(), sr, if busy { BLUE } else if resp.hovered() { WHITE } else { DIM2 });
+    let resp = if app.prefs.tooltips { resp.on_hover_text("Sync rekordbox Library Now") } else { resp };
+    if resp.clicked() && !busy {
+        app.start_rekordbox_sync();
+    }
 }
 
 /// Right icon strip: My Tag, Related, Matching, Information, Sub-browser at 193/227/261/294/328 pt.
 fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
-    let items: [(IconFn, &str); 5] = [
-        (crate::icons::tag, "Display My Tag configuration window."),
-        (crate::icons::link, "Display related track list window."),
-        (crate::ui_library_ext::icon_matching, "Set a good match combination of tracks.\nSee also Related Track List window.(Matching)"),
-        (crate::icons::info, "Display information window."),
-        (crate::icons::split_panes, "Sub-browser"),
+    use crate::icons_src as src;
+    let items: [(src::SrcIcon, &str); 5] = [
+        (src::mytag, "Display My Tag configuration window."),
+        (src::related, "Display related track list window."),
+        (src::matching, "Set a good match combination of tracks.\nSee also Related Track List window.(Matching)"),
+        (src::info, "Display information window."),
+        (src::sub_browser, "Sub-browser"),
     ];
     for (i, (draw, tipt)) in items.iter().enumerate() {
         let y = [193.0, 227.0, 261.0, 294.0, 328.0][i];
-        let rr = Rect::from_center_size(pos2(r.center().x, r.min.y + y), vec2(19.0, 19.0));
-        let enabled = true;
+        let rr = Rect::from_center_size(pos2(r.center().x, r.min.y + y), vec2(18.0, 18.0));
         let on = match i {
             0 => app.prefs.show_mytag,
             1 => app.view == View::Related,
@@ -537,15 +599,9 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
             _ => false,
         };
         let resp = ui.interact(rr, ui.id().with(("ricon", i)), Sense::click());
-        // Same tiles as the left strip (reference 04).
-        if on {
-            ui.painter().rect_filled(rr, 3.0, BLUE);
-            ui.painter().rect_stroke(rr.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
-        } else {
-            let edge = if !enabled { hex(0x3A3A3A) } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) };
-            ui.painter().rect_stroke(rr, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-        }
-        draw(ui.painter(), rr.shrink(1.0), if !enabled { hex(0x4A4A4A) } else { WHITE });
+        // Same tiles as the source strip (skins: mytag, relatedTrack, trackInfo, subBrowse).
+        let bg = src::tile(ui.painter(), rr, on, resp.hovered(), true, BG2);
+        draw(ui.painter(), rr, WHITE, bg);
         let resp = if app.prefs.tooltips { resp.on_hover_text(*tipt) } else { resp };
         if resp.clicked() {
             match i {
@@ -600,50 +656,70 @@ pub enum TreeIcon {
     Device,
 }
 
-/// One tree row: 15 pt high (rows sit on an 18 pt pitch in the Collection list, 15 pt in the
-/// playlist tree), 15 pt indentation per level, selection #294C6A.
+/// One tree row, measured in reference 04 (pt from the row's left edge, 37 pt from the window's):
+/// rows 15 pt high, 20 pt of indentation per level; a root row has its triangle at 15 and its
+/// text at 28; a row with a glyph has it centred at 31 and its text at 43, a folder's triangle
+/// 23.5 pt left of its glyph; counts end 30.5 pt from the right; selection #314B67.
 pub(crate) fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usize>, selected: bool, icon: TreeIcon, pitch: f32) -> egui::Response {
+    use crate::icons_src as src;
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click_and_drag());
     let p = ui.painter();
-    let bar = Rect::from_center_size(rr.center(), vec2(rr.width(), 15.0));
+    let bg = if selected { ROW_SEL } else if resp.hovered() { hex(0x262626) } else { BG2 };
+    if selected || resp.hovered() {
+        p.rect_filled(rr, 0.0, bg);
+    }
+    let d = depth as f32 * 20.0;
+    let cy = rr.center().y;
+    let ic = pos2(rr.min.x + 31.0 + d, cy);
+    let col = if selected { WHITE } else { TREE_ICON };
+    let mut tx = rr.min.x + 43.0 + d;
+    match icon {
+        TreeIcon::None => tx = rr.min.x + 28.0 + d,
+        TreeIcon::Open | TreeIcon::Closed => {
+            src::tree_arrow(p, pos2(rr.min.x + 15.0 + d, cy), icon == TreeIcon::Open, WHITE);
+            tx = rr.min.x + 28.0 + d;
+        }
+        TreeIcon::FolderOpen | TreeIcon::FolderClosed => {
+            src::tree_arrow(p, pos2(ic.x - 23.5, cy), icon == TreeIcon::FolderOpen, WHITE);
+            src::tree_folder(p, ic, col);
+        }
+        TreeIcon::Lock => src::tree_lock(p, ic, col, bg),
+        TreeIcon::Note => src::tree_note(p, ic, col),
+        TreeIcon::Playlist => src::tree_list(p, ic, col, bg),
+        TreeIcon::Smart => src::tree_smart(p, ic + vec2(2.5, 2.5), col, bg),
+        TreeIcon::Device => src::tree_device(p, ic, col, bg),
+    }
+    let right = if count.is_some() { rr.max.x - 62.0 } else { rr.max.x - 4.0 };
+    let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, rr.min.y), pos2(right.max(tx + 20.0), rr.max.y)));
+    clip.text(pos2(tx, cy), Align2::LEFT_CENTER, text, FontId::proportional(TREE_FONT), if icon == TreeIcon::Lock && !selected { DIM } else { WHITE });
+    if let Some(c) = count {
+        p.text(pos2(rr.max.x - 30.5, cy), Align2::RIGHT_CENTER, c.to_string(), FontId::proportional(TREE_FONT), WHITE);
+    }
+    resp
+}
+
+/// Text size of tree rows.
+pub const TREE_FONT: f32 = 11.5;
+
+/// A row of the Collection pane (reference 01): the selection spans 1 pt in from the left to
+/// the pane's edge, the triangle is centred 9 pt in and the text starts 20 pt in (+`indent`).
+fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool, pitch: f32) -> egui::Response {
+    let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
+    let p = ui.painter();
+    let bar = Rect::from_min_max(pos2(rr.min.x + 1.0, rr.min.y), pos2(rr.max.x - 1.0, rr.max.y));
     if selected {
-        p.rect_filled(bar, 0.0, SELECT);
+        p.rect_filled(bar, 0.0, ROW_SEL);
     } else if resp.hovered() {
         p.rect_filled(bar, 0.0, hex(0x262626));
     }
-    let x = rr.min.x + 4.0 + depth as f32 * 15.0;
-    let cy = rr.center().y;
-    let ir = Rect::from_center_size(pos2(x + 5.0, cy), vec2(11.0, 11.0));
-    let mut tx = x + 16.0;
-    match icon {
-        TreeIcon::None => tx = x + 2.0,
-        TreeIcon::Lock => crate::icons::lock(p, ir, DIM),
-        TreeIcon::Note => {
-            p.circle_filled(pos2(ir.center().x - 2.0, ir.center().y + 3.0), 2.6, DIM2);
-            p.line_segment([pos2(ir.center().x + 0.5, ir.center().y + 3.0), pos2(ir.center().x + 0.5, ir.min.y)], Stroke::new(1.3, DIM2));
-            p.line_segment([pos2(ir.center().x + 0.5, ir.min.y), pos2(ir.center().x + 4.5, ir.min.y + 2.5)], Stroke::new(1.3, DIM2));
-        }
-        TreeIcon::Open | TreeIcon::FolderOpen => {
-            p.add(egui::Shape::convex_polygon(vec![pos2(ir.min.x + 1.0, cy - 3.0), pos2(ir.max.x - 1.0, cy - 3.0), pos2(ir.center().x, cy + 3.5)], WHITE, Stroke::NONE));
-        }
-        TreeIcon::Closed | TreeIcon::FolderClosed => {
-            p.add(egui::Shape::convex_polygon(vec![pos2(ir.center().x - 2.5, cy - 4.5), pos2(ir.center().x + 3.5, cy), pos2(ir.center().x - 2.5, cy + 4.5)], WHITE, Stroke::NONE));
-        }
-        TreeIcon::Playlist => crate::icons::list(p, ir.expand(2.0), DIM2),
-        TreeIcon::Smart => crate::icons::gear(p, ir.expand(1.0), DIM2),
-        TreeIcon::Device => crate::icons::usb(p, ir.expand(2.0), DIM2),
+    if let Some(open) = arrow {
+        crate::icons_src::tree_arrow(p, pos2(rr.min.x + 9.0 + indent, rr.center().y), open, WHITE);
     }
-    if matches!(icon, TreeIcon::FolderOpen | TreeIcon::FolderClosed) {
-        // folder glyph after the disclosure triangle
-        let fr = Rect::from_center_size(pos2(x + 23.0, cy), vec2(13.0, 10.0));
-        p.rect_filled(fr, 1.0, DIM2);
-        p.rect_filled(Rect::from_min_size(fr.min - vec2(0.0, 2.0), vec2(6.0, 3.0)), 1.0, DIM2);
-        tx = x + 34.0;
-    }
-    let clip = p.with_clip_rect(Rect::from_min_max(pos2(tx, rr.min.y), pos2(rr.max.x - 30.0, rr.max.y)));
-    clip.text(pos2(tx, cy), Align2::LEFT_CENTER, text, FontId::proportional(11.5), if selected { WHITE } else if icon == TreeIcon::Lock { DIM } else { TEXT });
+    let tx = rr.min.x + 20.0 + indent;
+    let right = if count.is_some() { rr.max.x - 40.0 } else { rr.max.x - 4.0 };
+    p.with_clip_rect(Rect::from_min_max(pos2(tx, rr.min.y), pos2(right, rr.max.y))).text(pos2(tx, rr.center().y), Align2::LEFT_CENTER, text, FontId::proportional(TREE_FONT), WHITE);
     if let Some(c) = count {
-        p.text(pos2(rr.max.x - 10.0, cy), Align2::RIGHT_CENTER, c.to_string(), FontId::proportional(11.0), WHITE);
+        p.text(pos2(rr.max.x - 10.0, rr.center().y), Align2::RIGHT_CENTER, c.to_string(), FontId::proportional(TREE_FONT), WHITE);
     }
     resp
 }
@@ -651,56 +727,61 @@ pub(crate) fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usiz
 fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
     match app.side {
         SideMode::Collection => {
-            // "Collection" heading at 31 pt, "All" at 47 pt, locked filters on an 18 pt pitch.
-            let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
-            ui.painter().text(pos2(hr.min.x + 4.0, hr.center().y), Align2::LEFT_CENTER, "Collection", FontId::proportional(12.0), WHITE);
-            let sel = app.view == View::Collection;
-            let all = tree_row(ui, 0, "All", None, sel, TreeIcon::None, 17.0);
-            if all.clicked() {
-                app.set_view(View::Collection);
-            }
-            all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
-            for (fi, f) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
-                let key = egui::Id::new(("cat_open", fi));
-                let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
-                let r = tree_row(ui, 1, f, None, false, if open { TreeIcon::Open } else { TreeIcon::Closed }, 18.0);
-                if r.clicked() {
-                    ui.ctx().data_mut(|d| d.insert_temp(key, !open));
+            // Reference 01: "Collection" heading in a 12 pt band, a 1 pt line under it, "All"
+            // 17 pt high, then the categories on an 18 pt pitch.
+            let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 12.0), Sense::hover());
+            ui.painter().text(pos2(hr.min.x + 5.0, hr.center().y), Align2::LEFT_CENTER, "Collection", FontId::proportional(TREE_FONT), WHITE);
+            let (lr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().rect_filled(Rect::from_min_max(lr.min, pos2(lr.max.x + 7.0, lr.max.y)), 0.0, BG);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let sel = app.view == View::Collection;
+                let all = collection_row(ui, "All", None, 0.0, None, sel, 17.0);
+                if all.clicked() {
+                    app.set_view(View::Collection);
                 }
-                if open {
-                    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-                    for t in &app.tracks {
-                        *counts.entry(App::category_value(t, fi as u8)).or_default() += 1;
+                all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
+                for (fi, f) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
+                    let key = egui::Id::new(("cat_open", fi));
+                    let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+                    let r = collection_row(ui, f, Some(open), 0.0, None, false, 18.0);
+                    if r.clicked() {
+                        ui.ctx().data_mut(|d| d.insert_temp(key, !open));
                     }
-                    let mut items: Vec<(String, usize)> = counts.into_iter().collect();
-                    if fi == 0 {
-                        items.reverse(); // newest first
-                    }
-                    for (v, n) in items {
-                        let sel = app.view == View::Category { field: fi as u8, value: v.clone() };
-                        let label = if v.is_empty() { "(none)".to_string() } else { v.clone() };
-                        if tree_row(ui, 2, &label, Some(n), sel, TreeIcon::None, 16.0).clicked() {
-                            app.set_view(View::Category { field: fi as u8, value: v });
+                    if open {
+                        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                        for t in &app.tracks {
+                            *counts.entry(App::category_value(t, fi as u8)).or_default() += 1;
+                        }
+                        let mut items: Vec<(String, usize)> = counts.into_iter().collect();
+                        if fi == 0 {
+                            items.reverse(); // newest first
+                        }
+                        for (v, n) in items {
+                            let sel = app.view == View::Category { field: fi as u8, value: v.clone() };
+                            let label = if v.is_empty() { "(none)".to_string() } else { v.clone() };
+                            if collection_row(ui, &label, None, 14.0, Some(n), sel, 16.0).clicked() {
+                                app.set_view(View::Category { field: fi as u8, value: v });
+                            }
                         }
                     }
                 }
-            }
+            });
         }
         SideMode::Playlists => {
-            // Tree View / Column View segmented toggle at 27..48 pt.
-            // Reference 04: the search glyph sits in an 18 pt bordered tile; the tree's first row
-            // starts 24 pt below the top.
+            // Reference 04: a 22 x 23 pt search tile, then the Tree View / Column View toggle
+            // (100 pt and the rest, 23 pt high), a 1 pt line, and the tree's rows.
             let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-            let st = Rect::from_center_size(pos2(row.min.x + 11.0, row.min.y + 12.5), vec2(18.0, 18.0));
+            let st = Rect::from_min_max(pos2(row.min.x + 0.5, row.min.y), pos2(row.min.x + 22.5, row.min.y + 23.0));
             // The search tile opens a field that narrows the tree to matching names.
             let sresp = ui.interact(st, ui.id().with("tree_search_tile"), Sense::click());
             if app.ext.tree_search_open {
-                ui.painter().rect_filled(st, 3.0, BLUE);
-                ui.painter().rect_stroke(st.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
+                ui.painter().rect_filled(st, 1.5, TILE_ON);
+                ui.painter().rect_stroke(st, 1.5, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
             } else {
-                ui.painter().rect_stroke(st, 3.0, Stroke::new(1.0, if sresp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) }), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(st, 1.5, Stroke::new(1.0, if sresp.hovered() { hex(0x8C8C8C) } else { OFF }), egui::StrokeKind::Inside);
             }
-            crate::icons::magnifier(ui.painter(), st.shrink(2.0), if app.ext.tree_search_open { WHITE } else { DIM2 }, 0);
+            crate::icons_src::playlist_search(ui.painter(), st, if app.ext.tree_search_open { WHITE } else { hex(0xC7C7C7) }, if app.ext.tree_search_open { TILE_ON } else { BG2 });
             if sresp.clicked() {
                 app.ext.tree_search_open = !app.ext.tree_search_open;
                 if app.ext.tree_search_open {
@@ -709,20 +790,22 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
                     app.ext.tree_search.clear();
                 }
             }
-            let tv = Rect::from_min_max(pos2(row.min.x + 26.0, row.min.y + 2.0), pos2(row.min.x + 124.0, row.min.y + 23.0));
-            ui.painter().rect_filled(tv, 0.0, BLUE);
-            ui.painter().text(tv.center(), Align2::CENTER_CENTER, "Tree View", FontId::proportional(12.5), WHITE);
-            let cv = Rect::from_min_max(pos2(tv.max.x + 4.0, tv.min.y), pos2(row.max.x, tv.max.y));
-            ui.painter().rect_filled(cv, 0.0, hex(0x323232));
-            crate::icons::lock(ui.painter(), Rect::from_center_size(pos2(cv.min.x + 9.0, cv.center().y), vec2(10.0, 10.0)), DIM);
-            ui.painter().with_clip_rect(cv).text(pos2(cv.min.x + 18.0, cv.center().y), Align2::LEFT_CENTER, "Column View", FontId::proportional(12.0), DIM);
+            let tv = Rect::from_min_max(pos2(row.min.x + 26.0, row.min.y), pos2(row.min.x + 126.0, row.min.y + 23.0));
+            ui.painter().rect_filled(tv, 0.0, TILE_ON);
+            ui.painter().text(tv.center(), Align2::CENTER_CENTER, "Tree View", FontId::proportional(12.0), WHITE);
+            let cv = Rect::from_min_max(pos2(tv.max.x, tv.min.y), pos2(row.max.x + 12.0, tv.max.y));
+            let wide = ui.painter().with_clip_rect(cv);
+            wide.rect_filled(cv, 0.0, hex(0x323232));
+            crate::icons_src::tree_lock(&wide, pos2(cv.min.x + 11.0, cv.center().y - 0.5), DIM, hex(0x323232));
+            wide.text(pos2(cv.min.x + 19.5, cv.center().y), Align2::LEFT_CENTER, "Column View", FontId::proportional(12.0), DIM);
+            ui.painter().with_clip_rect(Rect::from_min_max(row.min, pos2(cv.max.x, row.max.y))).rect_filled(Rect::from_min_max(pos2(row.min.x - 37.0, row.min.y + 23.0), pos2(cv.max.x, row.max.y)), 0.0, BG);
             if app.ext.tree_search_open {
                 crate::ui_library_ext::tree_search_field(app, ui);
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let all_sel = app.view == View::Collection;
-                let all = tree_row(ui, 1, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0);
+                let all = tree_row(ui, 0, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0);
                 if all.clicked() {
                     app.set_view(View::Collection);
                 }
@@ -745,6 +828,7 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
                     crate::ui_library_ext::root_menu_extra(app, ui);
                 });
                 node_rows(app, ui, 0, 1, drop);
+                crate::export::hotcue_bank::hot_cue_bank_tree(app, ui);
             });
         }
         SideMode::Devices => devices_tree(app, ui),
@@ -927,7 +1011,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
     }
     let on_root = matches!(&app.view, View::Device { root, .. } if root.is_empty());
     ui.add_space(1.0);
-    let dr = tree_row(ui, 1, "Devices", None, on_root, TreeIcon::Open, 17.0);
+    let dr = tree_row(ui, 0, "Devices", None, on_root, TreeIcon::Open, 15.0);
     if dr.clicked() {
         app.set_view(View::Device { root: String::new(), node: None });
     }
@@ -957,7 +1041,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         .collect();
     for (root, name, fs, nodes, err, ntracks) in devs {
         let sel = app.view == View::Device { root: root.clone(), node: None };
-        let resp = tree_row(ui, 2, &format!("{name}  ({})", App::fs_label(&fs)), if fs == "folder" { Some(ntracks) } else { None }, sel, TreeIcon::Device, 17.0);
+        let resp = tree_row(ui, 1, &format!("{name}  ({})", App::fs_label(&fs)), if fs == "folder" { Some(ntracks) } else { None }, sel, TreeIcon::Device, 15.0);
         // Eject button at the right end of a removable device's row (as in the original).
         let mut ejected = false;
         if fs != "folder" {
@@ -1104,7 +1188,7 @@ fn is_audio(p: &std::path::Path) -> bool {
 /// Explorer: folders on this computer (Music, home, mounted drives), opened one level at a time.
 fn explorer_tree(app: &mut App, ui: &mut Ui) {
     ui.add_space(1.0);
-    tree_row(ui, 1, "Explorer", None, false, TreeIcon::Open, 17.0);
+    tree_row(ui, 0, "Explorer", None, false, TreeIcon::Open, 15.0);
     let mut roots: Vec<(String, std::path::PathBuf)> = vec![];
     if let Some(m) = dirs::audio_dir() {
         roots.push(("Music".into(), m));
@@ -1121,7 +1205,7 @@ fn explorer_tree(app: &mut App, ui: &mut Ui) {
     }
     egui::ScrollArea::vertical().id_salt("explorer_tree").auto_shrink([false, false]).show(ui, |ui| {
         for (name, path) in roots {
-            explorer_node(app, ui, &name, &path, 2);
+            explorer_node(app, ui, &name, &path, 1);
         }
     });
 }
@@ -1131,7 +1215,7 @@ fn explorer_node(app: &mut App, ui: &mut Ui, name: &str, path: &std::path::Path,
     let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
     let ps = path.to_string_lossy().to_string();
     let sel = app.view == View::Explorer(ps.clone());
-    let r = tree_row(ui, depth, name, None, sel, if open { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0);
+    let r = tree_row(ui, depth, name, None, sel, if open { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 15.0);
     if r.clicked() {
         ui.ctx().data_mut(|d| d.insert_temp(key, !open || !sel));
         app.set_view(View::Explorer(ps));

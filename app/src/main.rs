@@ -10,6 +10,7 @@ mod demo;
 mod device_ext;
 mod export;
 mod icons;
+mod icons_src;
 mod importer;
 mod itunes;
 mod jobs;
@@ -29,6 +30,7 @@ mod smart;
 mod theme;
 mod ui_browser;
 mod ui_dialogs;
+mod ui_kit;
 mod ui_library_ext;
 mod ui_player;
 mod ui_prefs;
@@ -122,13 +124,13 @@ impl eframe::App for Gui {
         egui::TopBottomPanel::top("header").exact_height(29.0).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
             ui_browser::header_bar(app, ui);
         });
-        egui::TopBottomPanel::bottom("footer").exact_height(28.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
         if !app.prefs.browser_only {
             // 1 Player and 2 Players are 255 pt tall; the Simple Player is one 58 pt row.
             let h = if app.prefs.player_layout == 2 { ui_player2::SIMPLE_HEIGHT } else { 255.0 };
-            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(2)))).exact_height(h).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(2)))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
                 1 => ui_player2::two_players(app, ui),
                 2 => ui_player2::simple_player(app, ui),
                 _ => ui_player::player_panel(app, ui),

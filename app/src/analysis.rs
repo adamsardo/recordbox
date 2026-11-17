@@ -68,7 +68,7 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
         (true, false) => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
         (true, true) => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
     };
-    let key = if s.do_key { crate::key::detect_key(&mono, sr) } else { -1 };
+    let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
     let (lufs, peak) = loudness_and_peak(dec);
     // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };

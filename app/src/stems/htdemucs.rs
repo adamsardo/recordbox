@@ -4,6 +4,13 @@
 //! reports/htdemucs-candle-graph.md and htdemucs-whole-track-contract.md): batch 1, stereo f32
 //! at 44.1 kHz, sources drums/bass/other/vocals, 343,980-frame segments with 25 % overlap and
 //! a triangular transition (power 1), no shifts. Research tracing/comparison code is removed.
+//!
+//! There are two implementations of the same network. `Graph::forward` is the reference,
+//! written with Candle's own operations; it runs on any device and is what the CPU uses. On
+//! Metal, `separate` uses the fused kernels in `metal_fast.rs` instead (about 7× faster on
+//! an M5 Pro; outputs agree with the reference to better than 100 dB, which the test
+//! `metal_kernels_match_reference_graph` guards) and overlaps the transforms on the CPU
+//! with the network on the GPU.
 
 #[cfg(target_os = "macos")]
 #[path = "metal_fast.rs"]
@@ -213,7 +220,9 @@ impl Graph {
         Self::load_as(path, device, device.is_metal())
     }
 
-    /// As `load`, but always the reference graph built from Candle's own operations.
+    /// As `load`, but always the reference graph built from Candle's own operations (for
+    /// comparing the two on a real checkpoint).
+    #[allow(dead_code)]
     pub fn load_reference(path: &Path, device: &Device) -> Result<Self> {
         Self::load_as(path, device, false)
     }

@@ -1,5 +1,6 @@
 pub mod anlz;
 pub mod device_import;
+pub mod hotcue_bank;
 pub mod pdb;
 pub mod settings;
 pub mod settings_fields;

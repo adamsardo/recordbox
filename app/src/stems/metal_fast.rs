@@ -154,14 +154,12 @@ kernel void ln_rows(device const float *x [[buffer(0)]], device const float *cst
     if (ones != 0) { out[ob + C] = 1.0; }
 }
 
-// Attention heads: src (L, W), columns [off, off + H*D) -> dst (H, L, D), or (H, D, L) when
-// transposed.
+// Attention heads: src (L, W), columns [off, off + H*D) -> dst (H, L, D).
 kernel void split_heads(device const float *src [[buffer(0)]], device float *dst [[buffer(1)]], constant uint *p [[buffer(2)]],
                         uint3 gid [[thread_position_in_grid]]) {
-    uint L = p[0], W = p[1], off = p[2], D = p[4], tr = p[5];
+    uint L = p[0], W = p[1], off = p[2], D = p[3];
     uint d = gid.x, l = gid.y, h = gid.z;
-    float v = src[l * W + off + h * D + d];
-    dst[tr != 0 ? (h * D + d) * L + l : (h * L + l) * D + d] = v;
+    dst[(h * L + l) * D + d] = src[l * W + off + h * D + d];
 }
 
 // src (H, L, D) -> dst (L, H*D + 1); the last column is ones.
@@ -225,21 +223,24 @@ fn pipeline(dev: &MetalDevice, name: &'static str) -> Result<Arc<ComputePipeline
 
 /// Output buffers of this module's operations. Candle's own pool releases every unused
 /// buffer each time it commits a command buffer (every 50 operations), so the large
-/// intermediates of a segment would be freed and allocated again several times per segment;
-/// keeping them here until `release_buffers` makes a segment about 20 % faster.
-static POOL: Mutex<Vec<Arc<Buffer>>> = Mutex::new(Vec::new());
+/// intermediates of a segment would be freed and allocated again several times per segment
+/// (measured: about 15 % of a segment's time). They are kept here until `release_buffers`.
+/// Buffers are only reused on the device (command queue) that made them, since that is
+/// what keeps the order of use.
+static POOL: Mutex<Vec<(candle_core::metal_backend::DeviceId, Arc<Buffer>)>> = Mutex::new(Vec::new());
 
 fn alloc(dev: &MetalDevice, elements: usize) -> Result<Arc<Buffer>> {
     let bytes = elements.max(1) * 4;
     let mut pool = POOL.lock().map_err(msg)?;
     // A buffer nobody else holds is free: commands already encoded against it run before
     // anything encoded later.
-    let free = pool.iter().filter(|b| Arc::strong_count(b) == 1 && b.length() >= bytes && b.length() <= bytes + bytes / 4 + 4096).min_by_key(|b| b.length());
-    if let Some(b) = free {
+    let id = dev.id();
+    let free = pool.iter().filter(|(d, b)| *d == id && Arc::strong_count(b) == 1 && b.length() >= bytes && b.length() <= bytes + bytes / 4 + 4096).min_by_key(|(_, b)| b.length());
+    if let Some((_, b)) = free {
         return Ok(b.clone());
     }
     let buffer = Arc::new(dev.metal_device().new_buffer(bytes, MTLResourceOptions::StorageModeShared).map_err(msg)?);
-    pool.push(buffer.clone());
+    pool.push((id, buffer.clone()));
     Ok(buffer)
 }
 
@@ -284,32 +285,6 @@ impl CustomOp2 for Gemm {
 
 fn mm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     a.apply_op2_no_bwd(b, &Gemm)
-}
-
-/// Candle's softmax-over-the-last-dimension kernel, writing into a pooled buffer.
-struct Softmax;
-
-impl CustomOp1 for Softmax {
-    fn name(&self) -> &'static str {
-        "softmax"
-    }
-    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("softmax runs on Metal only")
-    }
-    fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
-        if !layout.is_contiguous() {
-            candle_core::bail!("softmax: input must be contiguous")
-        }
-        let dev = storage.device().clone();
-        let count = layout.shape().elem_count();
-        let last = *layout.dims().last().unwrap_or(&1);
-        let out = alloc(&dev, count)?;
-        let enc = dev.command_encoder()?;
-        enc.set_label("softmax");
-        candle_metal_kernels::call_last_softmax(dev.metal_device(), &enc, dev.kernels(), "softmax_f32", count, last, storage.buffer(), layout.start_offset() * 4, &out).map_err(msg)?;
-        drop(enc);
-        Ok((MetalStorage::new(out, dev, count, DType::F32), layout.shape().clone()))
-    }
 }
 
 /// a + b for contiguous tensors of the same shape.
@@ -490,11 +465,11 @@ fn ln_rows(x: &Tensor, cst: &Tensor, ones: bool) -> Result<Tensor> {
     run("ln_rows", x, &[cst], vec![c as u32, ones as u32, 1e-5f32.to_bits()], &[l, c + ones as usize], (l, 1, 1))
 }
 
-fn split_heads(x: &Tensor, off: usize, c: usize, transposed: bool) -> Result<Tensor> {
+/// Columns [off, off + c) of x (L, W) as attention heads (1, heads, L, c / heads).
+fn split_heads(x: &Tensor, off: usize, c: usize) -> Result<Tensor> {
     let (l, w) = x.dims2()?;
     let d = c / HEADS;
-    let out = if transposed { [HEADS, d, l] } else { [HEADS, l, d] };
-    run("split_heads", x, &[], [l, w, off, HEADS, d, transposed as usize].map(|v| v as u32).to_vec(), &out, (d, l, HEADS))
+    run("split_heads", x, &[], [l, w, off, d].map(|v| v as u32).to_vec(), &[1, HEADS, l, d], (d, l, HEADS))
 }
 
 /// One transformer layer (self- or cross-attention) with its weights as transposed matrices
@@ -554,18 +529,20 @@ impl Layer {
     fn forward(&self, q: &Tensor, k: Option<&Tensor>, ones: bool) -> Result<Tensor> {
         let (l, c) = q.dims2()?;
         let nq = ln_rows(q, &self.norm1, true)?;
-        let (qh, kt, vh) = match (k, &self.norm_k, &self.in_kv) {
+        let (qh, kh, vh) = match (k, &self.norm_k, &self.in_kv) {
             (Some(k), Some(norm_k), Some(in_kv)) => {
                 let qp = mm(&nq, &self.in_q)?;
                 let kv = mm(&ln_rows(k, norm_k, true)?, in_kv)?;
-                (split_heads(&qp, 0, c, false)?, split_heads(&kv, 0, c, true)?, split_heads(&kv, c, c, false)?)
+                (split_heads(&qp, 0, c)?, split_heads(&kv, 0, c)?, split_heads(&kv, c, c)?)
             }
             _ => {
                 let p = mm(&nq, &self.in_q)?;
-                (split_heads(&p, 0, c, false)?, split_heads(&p, c, c, true)?, split_heads(&p, 2 * c, c, false)?)
+                (split_heads(&p, 0, c)?, split_heads(&p, c, c)?, split_heads(&p, 2 * c, c)?)
             }
         };
-        let attn = mm(&mm(&qh, &kt)?.apply_op1_no_bwd(&Softmax)?, &vh)?;
+        // Candle's fused attention kernel (scores, softmax and the weighted sum in one pass,
+        // without storing the L × S score matrix); the 1/sqrt(d) scale is already in `in_q`.
+        let attn = candle_nn::ops::sdpa(&qh, &kh, &vh, None, false, 1.0, 1.0)?;
         let d = c / HEADS;
         let merged = run("merge_heads", &attn, &[], [l, HEADS, d].map(|v| v as u32).to_vec(), &[l, c + 1], (c + 1, l, 1))?;
         let x = add(q, &mm(&merged, &self.out)?)?;

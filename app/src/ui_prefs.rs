@@ -15,7 +15,7 @@ use egui::{vec2, Context, RichText, Ui};
 /// Analysis reads `prefs.high_precision_grid`.
 const HIGH_PRECISION_WIRED: bool = false;
 /// The device writer deletes an imported history (reads `prefs.delete_history_after_import`).
-const HISTORY_DELETE_WIRED: bool = false;
+const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.
 const BG_COLOR_WRITTEN: bool = false;
 
@@ -798,6 +798,10 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         ui.indent("aa", |ui| {
             toggle(ui, &mut app.prefs.auto_analysis, "Enable");
         });
+    });
+    card(ui, "Key (Recordbox)", |ui| {
+        toggle(ui, &mut app.prefs.keep_tag_key, "Keep the key written in a file's tag (for example by Mixed In Key) instead of analysing it");
+        note(ui, "Track > Analyze Key always analyses and replaces the key.");
     });
     card(ui, "Auto Gain (Recordbox)", |ui| {
         ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));

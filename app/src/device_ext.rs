@@ -91,6 +91,8 @@ pub struct DeviceUi {
     pub pending_name: Option<(String, String)>,
     /// Background Color of each connected device (from its /.Recordbox/props.json).
     pub bg: HashMap<String, u8>,
+    /// Hot Cue Bank List window (export/hotcue_bank.rs).
+    pub banks: crate::export::hotcue_bank::BankUi,
 }
 
 /// Library playlists and folders ticked for a device, as the export tree: each ticked item
@@ -787,6 +789,7 @@ pub fn windows(app: &mut App, ctx: &Context) {
     property_window(app, ctx);
     sync_window(app, ctx);
     confirm_windows(app, ctx);
+    crate::export::hotcue_bank::windows(app, ctx);
 }
 
 fn import_progress(app: &mut App, ctx: &Context) {
@@ -1065,5 +1068,104 @@ mod tests {
         assert_eq!(sync_removals(&record, &keep, &lib), vec![6, 7]);
         // A recorded node that is no longer on the device (42) is ignored.
         assert!(!sync_removals(&record, &HashSet::new(), &lib).contains(&42));
+    }
+}
+
+/// Scripted states for checking the device windows with `--screenshot`
+/// (PREPDECK_SHOT_VIEW=devicelist|deviceprop|devicesync|devicereport|hotcuebank, the folder
+/// device at PREPDECK_SHOT_DEVICE, PREPDECK_SHOT_TAB for the Property tab). A device without a
+/// library gets a small one exported from the collection first.
+pub fn shot_setup(app: &mut App, what: &str) {
+    let root = PathBuf::from(std::env::var("PREPDECK_SHOT_DEVICE").unwrap_or_else(|_| std::env::temp_dir().join("recordbox_shot_devfeat").to_string_lossy().to_string()));
+    let _ = std::fs::create_dir_all(&root);
+    let r = root.to_string_lossy().to_string();
+    let mut report = None;
+    if !usb::pdb_path(&root).exists() || what == "devicereport" {
+        let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && usb::player_supported(&t.file_type)).take(6).map(|t| t.id).collect();
+        let mut tracks = HashMap::new();
+        for id in &ids {
+            if let Some(t) = app.track(*id).cloned() {
+                tracks.insert(*id, usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+            }
+        }
+        let half = ids.len() / 2;
+        let nodes = vec![ExportNode { id: 0, name: "Friday".into(), folder: true, children: vec![ExportNode { id: 0, name: "Warm Up".into(), folder: false, children: vec![], tracks: ids[..half].to_vec() }, ExportNode { id: 0, name: "Peak Time".into(), folder: false, children: vec![], tracks: ids[half..].to_vec() }], tracks: vec![] }];
+        let skipped = if what == "devicereport" { vec!["Example Track (file not found)".to_string()] } else { vec![] };
+        let req = usb::ExportRequest { root: root.clone(), nodes, tracks, skipped, analysis: app.analysis_settings(), fs: "folder".into(), ..Default::default() };
+        let got = std::sync::Mutex::new(None);
+        let res = usb::run_export(
+            req,
+            &|p| {
+                if let usb::Progress::Report(rep) = p {
+                    *got.lock().unwrap() = Some(rep);
+                }
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        if let Err(e) = res {
+            eprintln!("shot export failed: {e}");
+        }
+        report = got.into_inner().ok().flatten();
+    }
+    if !app.prefs.devices_extra.contains(&r) {
+        app.prefs.devices_extra.push(r.clone());
+    }
+    app.scan_devices();
+    app.side = SideMode::Devices;
+    app.view = View::Device { root: r.clone(), node: None };
+    match what {
+        "devicelist" => {
+            if let Some(lib) = app.devices.iter().find(|d| d.root == r).and_then(|d| d.lib.as_ref()) {
+                app.device_ui.sel = lib.tracks.keys().copied().take(2).collect();
+                app.device_ui.sel_root = r.clone();
+            }
+        }
+        "deviceprop" => {
+            app.open_device_property(&r);
+            if let Some(p) = app.device_ui.property.as_mut() {
+                p.tab = std::env::var("PREPDECK_SHOT_TAB").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                if p.name.is_empty() {
+                    p.name = "ADAM USB 1".into();
+                }
+            }
+        }
+        "devicesync" => {
+            if app.nodes.is_empty() {
+                let f = app.db.create_node(0, "Friday Set", NodeKind::Folder, None).unwrap_or(0);
+                let p = app.db.create_node(f, "Warm Up", NodeKind::Playlist, None).unwrap_or(0);
+                let ids: Vec<i64> = app.tracks.iter().take(5).map(|t| t.id).collect();
+                let _ = app.db.set_playlist_tracks(p, &ids);
+                let _ = app.db.create_node(0, "Closing", NodeKind::Playlist, None);
+                app.reload_playlists();
+            }
+            open_sync_manager(app, &r);
+            if let Some(s) = app.device_ui.sync.as_mut() {
+                if s.cfg.playlists.is_empty() {
+                    s.cfg.playlists = app.nodes.iter().filter(|n| n.kind != NodeKind::Folder).take(1).map(|n| n.id).collect();
+                }
+            }
+        }
+        "devicereport" => {
+            app.dialogs.export_open = true;
+            app.dialogs.export_root = Some(r.clone());
+            app.export_report = report;
+        }
+        "hotcuebank" => {
+            app.side = SideMode::Playlists;
+            let mut banks = crate::export::hotcue_bank::Banks::from_json(&app.db.setting("hot_cue_banks").unwrap_or_default());
+            if banks.0.is_empty() {
+                banks.create();
+            }
+            let id = banks.0[0].id;
+            let with_cues = app.tracks.iter().find(|t| app.db.cues(t.id).map(|c| c.iter().any(|c| c.kind == CueKind::Hot)).unwrap_or(false)).cloned();
+            if let Some(t) = with_cues {
+                let cues = app.db.cues(t.id).unwrap_or_default();
+                banks.fill_from_track(id, &t, &cues);
+                app.selected = [t.id].into();
+            }
+            app.db.set_setting("hot_cue_banks", &banks.to_json());
+            app.device_ui.banks.open = Some(id);
+        }
+        _ => {}
     }
 }

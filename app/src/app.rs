@@ -316,6 +316,9 @@ pub struct Prefs {
     pub show_phrase_bar: bool,
     /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
     pub analysis_mode: u8,
+    /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
+    /// track is first analysed; Analyze Key still replaces it.
+    pub keep_tag_key: bool,
 }
 
 /// Keyboard actions: (id, label, default shortcut in stored form or "" for none, category).
@@ -712,6 +715,7 @@ impl Default for Prefs {
             show_stems: true,
             show_phrase_bar: true,
             analysis_mode: 0,
+            keep_tag_key: true,
             delete_device_tracks: false,
             // rekordbox's standard: gain = -10 - integrated loudness.
             target_lufs: -10.0,
@@ -1226,6 +1230,8 @@ impl App {
                         app.view = View::Device { root: String::new(), node: None };
                     }
                     "history" => app.side = SideMode::History,
+                    // Device windows and lists (device_ext.rs).
+                    "devicelist" | "deviceprop" | "devicesync" | "devicereport" | "hotcuebank" => crate::device_ext::shot_setup(&mut app, v.as_str()),
                     "explorer" => {
                         app.side = SideMode::Explorer;
                         let d = dirs::audio_dir().unwrap_or_default().to_string_lossy().to_string();
@@ -2806,6 +2812,7 @@ impl App {
         let existing_grid = self.db.grid(id).filter(|g| !g.is_empty());
         // Earlier analysis means a stored waveform (a grid alone can come from an import).
         let had_analysis = self.db.wave(id).is_some();
+        let keep_tag_key = self.prefs.keep_tag_key;
         let key_requested = self.key_requested.remove(&id);
         let mut locked_peak: Option<f32> = None;
         let Some(t) = self.track_mut(id) else { return };
@@ -2833,7 +2840,7 @@ impl App {
                 let keep_grid = t.grid_locked || existing_grid.is_some();
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
-                if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid)))) {
+                if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid && !keep_tag_key)))) {
                     // Analyze Key asked for it explicitly: replaces even a chosen key.
                     t.set_key(res.key);
                     if key_requested {

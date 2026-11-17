@@ -39,7 +39,7 @@ pub fn assess() -> Hardware {
         (String::new(), mem / 1e6)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = metal_device().is_some();
+    let gpu = device().is_metal();
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
@@ -173,6 +173,7 @@ pub fn choose(_hw: &Hardware) -> &'static ModelSpec {
 }
 
 /// Whether this machine can run model `m` at all.
+#[allow(dead_code)]
 pub fn runs_on(m: &ModelSpec, hw: &Hardware) -> bool {
     hw.ram_gb >= m.min_ram_gb && (!m.needs_gpu || hw.gpu)
 }

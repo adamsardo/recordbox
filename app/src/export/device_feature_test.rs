@@ -118,7 +118,7 @@ fn b1_a_device_track_is_imported_with_cues_grid_tags_and_analysis() {
     // A track whose file is gone from the device is reported, not half-imported.
     let other_id = lib.tracks.keys().copied().find(|i| *i != dev_id).unwrap();
     std::fs::remove_file(root.join(lib.tracks[&other_id].file_path.trim_start_matches('/'))).unwrap();
-    assert!(import_track(&root, &lib, other_id, &music, &data, &artdir).unwrap_err().to_string().contains("not found on the device"));
+    assert!(import_track(&root, &lib, other_id, &music, &data, &artdir).err().unwrap().to_string().contains("not found on the device"));
 }
 
 #[test]

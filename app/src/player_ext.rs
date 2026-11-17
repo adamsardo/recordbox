@@ -678,7 +678,7 @@ mod tests {
 // ---------------------------------------------------------------------- screenshot checks
 
 /// The PREPDECK_SHOT_PLAYER switches (comma separated, with --screenshot), for looking at
-/// player states: `2p` 2 Players with a second track on deck B · `simple` Simple Player ·
+/// player states: `empty` an empty deck · `2p` 2 Players with a second track on deck B · `simple` Simple Player ·
 /// `ma` manual loop buttons · `loop` a 4-beat loop · `adjust` loop-out adjust · `count1` /
 /// `count2` Beat Count Display modes · `metro` metronome on at volume 3 · `bars` beat jump
 /// in bars · `clickmode` click-for-PLAY/CUE on · `menu` the waveform's right-click menu ·
@@ -736,6 +736,10 @@ impl App {
         if has("simple") {
             self.prefs.browser_only = false;
             self.prefs.player_layout = 2;
+        }
+        // `empty`: nothing on the deck (the state of reference 01).
+        if has("empty") {
+            self.unload_track();
         }
         if has("1p") {
             self.prefs.browser_only = false;

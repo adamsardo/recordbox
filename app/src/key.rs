@@ -1,7 +1,19 @@
-//! Key detection: tuning-corrected pitch-class profile (from spectral peaks) matched against
-//! major/minor key templates. Parameters were chosen by benchmarking against the original's
-//! own key results for 37 tracks (see MECHANICS.md).
+//! Key detection.
+//!
+//! The default detector (`key_rb.rs`, `key_rules.rs`, `key_judge.rs`) follows the reference
+//! application's analyser stage by stage; `checks/key-detector-trace.md` documents the trace
+//! and the measurements. The older template-matching detector is kept below as
+//! `legacy_detect_key`: it is the fallback for audio the traced detector cannot handle
+//! (shorter than about 3.5 s) and the comparison baseline in the benchmark.
 
+#[path = "key_judge.rs"]
+mod key_judge;
+#[path = "key_rb.rs"]
+pub mod key_rb;
+#[path = "key_rules.rs"]
+mod key_rules;
+
+use crate::model::BeatGrid;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 #[derive(Clone, Copy, Debug)]
@@ -265,82 +277,365 @@ pub fn key_from_features(f: &KeyFeatures, p: &KeyParams) -> i32 {
     crate::model::key_from_pitch(best.1 as i32, best.2)
 }
 
+/// Converts the traced detector's key (0..11 major on A, Bb, …; 12..23 the minors) to the
+/// Camelot-ordered index used everywhere else, or -1.
+fn from_traced(k: i32) -> i32 {
+    if (0..24).contains(&k) {
+        crate::model::key_from_pitch((k % 12 + 9) % 12, k >= 12)
+    } else {
+        -1
+    }
+}
+
+/// Brings left/right to 44.1 or 48 kHz, the two rates the analyser is defined for: integer
+/// multiples are averaged down, anything else is linearly interpolated to 44.1 kHz.
+fn to_base_rate(ch: Vec<f32>, sr: u32) -> (Vec<f32>, u32) {
+    if sr == 44100 || sr == 48000 || sr == 0 {
+        return (ch, sr);
+    }
+    for base in [44100u32, 48000] {
+        if sr % base == 0 {
+            let f = (sr / base) as usize;
+            let out = ch.chunks_exact(f).map(|c| c.iter().sum::<f32>() / f as f32).collect();
+            return (out, base);
+        }
+    }
+    let ratio = sr as f64 / 44100.0;
+    let n = (ch.len() as f64 / ratio) as usize;
+    let out = (0..n)
+        .map(|i| {
+            let p = i as f64 * ratio;
+            let j = p as usize;
+            let t = (p - j as f64) as f32;
+            let a = ch[j.min(ch.len() - 1)];
+            let b = ch[(j + 1).min(ch.len() - 1)];
+            a + (b - a) * t
+        })
+        .collect();
+    (out, 44100)
+}
+
+/// The traced analysis with its intermediate decisions. `left`/`right` at `sr` Hz; `bpm` and
+/// `grid` as analysed (no grid = one whole-track decision, without the vote over segments).
+pub fn trace_key(left: Vec<f32>, right: Option<Vec<f32>>, sr: u32, bpm: f64, grid: Option<&BeatGrid>) -> key_rb::Trace {
+    let frames = left.len();
+    let duration = if sr > 0 { frames as f64 / sr as f64 } else { 0.0 };
+    // Nothing audible (digital silence, or noise far below any music): no key.
+    let peak = left.iter().chain(right.iter().flatten()).fold(0f32, |m, v| m.max(v.abs()));
+    if frames == 0 || sr == 0 || !(peak > 1e-5) {
+        return key_rb::Trace { key: -1, ..Default::default() };
+    }
+    let beats: Vec<key_rb::GridBeat> = match grid {
+        Some(g) if !g.is_empty() => g
+            .beats(duration)
+            .iter()
+            .filter(|b| b.time >= 0.0)
+            .map(|b| key_rb::GridBeat { num: b.beat as u16, ms: (b.time * 1000.0).round() as u32 })
+            .collect(),
+        _ => vec![],
+    };
+    let bpm = if bpm > 0.0 { bpm } else { grid.map(|g| g.first_bpm()).unwrap_or(0.0) };
+    let (left, base) = to_base_rate(left, sr);
+    let right = right.map(|r| to_base_rate(r, sr).0);
+    key_rb::analyze(&left, right.as_deref(), base, bpm as f32, &beats)
+}
+
+/// Key of interleaved stereo audio with its analysed tempo and beat grid (estimated here when
+/// none is given)
+/// (Camelot-ordered index, see model::key_from_pitch, or -1).
+pub fn detect_key_stereo(samples: &[f32], sr: u32, bpm: f64, grid: Option<&BeatGrid>) -> i32 {
+    let left: Vec<f32> = samples.chunks_exact(2).map(|c| c[0]).collect();
+    let right: Vec<f32> = samples.chunks_exact(2).map(|c| c[1]).collect();
+    let mono = || -> Vec<f32> { samples.chunks_exact(2).map(|c| 0.5 * (c[0] + c[1])).collect() };
+    // Without a grid (grid analysis switched off) one is estimated just for the segment vote.
+    let estimated = match grid {
+        Some(g) if !g.is_empty() => None,
+        _ => Some(crate::analysis::tempo_and_grid(&mono(), sr as f64, 70.0, 180.0)),
+    };
+    let (bpm, grid) = match &estimated {
+        Some((b, g)) => (*b, g.as_ref()),
+        None => (bpm, grid),
+    };
+    let k = from_traced(trace_key(left, Some(right), sr, bpm, grid).key);
+    if k >= 0 {
+        return k;
+    }
+    legacy_detect_key(&mono(), sr as f64)
+}
+
+/// Key of mono audio; tempo and beat grid are estimated here for the vote over segments.
 pub fn detect_key(mono: &[f32], sr: f64) -> i32 {
+    let (bpm, grid) = crate::analysis::tempo_and_grid(mono, sr, 70.0, 180.0);
+    let k = from_traced(trace_key(mono.to_vec(), None, sr.round() as u32, bpm, grid.as_ref()).key);
+    if k >= 0 {
+        k
+    } else {
+        legacy_detect_key(mono, sr)
+    }
+}
+
+/// The earlier detector: pitch-class profile matched against key templates.
+pub fn legacy_detect_key(mono: &[f32], sr: f64) -> i32 {
     let f = features(mono, sr, &DEFAULT);
     key_from_features(&f, &DEFAULT)
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two bars of a chord progression per key, as plain harmonic tones with a click on every
+    /// beat, at 44.1 kHz.
+    fn progression(root_pc: i32, minor: bool, seconds: f64) -> Vec<f32> {
+        let sr = 44100.0;
+        let n = (seconds * sr) as usize;
+        let beat = 0.5; // 120 BPM
+        // i–iv–v–i (minor) or I–IV–V–I (major), one bar each.
+        let third = if minor { 3 } else { 4 };
+        let chords = [[0, third, 7], [5, 5 + third, 12], [7, 7 + third, 14], [0, third, 7]];
+        let mut out = vec![0f32; n];
+        for (i, o) in out.iter_mut().enumerate() {
+            let t = i as f64 / sr;
+            let bar = ((t / (4.0 * beat)) as usize) % 4;
+            let mut v = 0.0;
+            for (j, st) in chords[bar].iter().enumerate() {
+                for oct in [0, 12] {
+                    let midi = 48 + root_pc + st + oct;
+                    let f = 440.0 * 2f64.powf((midi as f64 - 69.0) / 12.0);
+                    for h in 1..=3 {
+                        v += (2.0 * std::f64::consts::PI * f * h as f64 * t).sin() / (h * h) as f64 * if j == 0 { 1.0 } else { 0.7 };
+                    }
+                }
+            }
+            let phase = (t / beat).fract() * beat;
+            let click = if phase < 0.01 { (1.0 - phase / 0.01) * (2.0 * std::f64::consts::PI * 60.0 * t).sin() } else { 0.0 };
+            *o = (0.08 * v + 0.5 * click) as f32;
+        }
+        out
+    }
+
+    #[test]
+    fn traced_detector_names_simple_progressions() {
+        for (pc, minor) in [(9, true), (0, false), (5, true), (7, false)] {
+            let mono = progression(pc, minor, 48.0);
+            let grid = BeatGrid::constant(0.0, 120.0, 1);
+            let tr = trace_key(mono.clone(), Some(mono), 44100, 120.0, Some(&grid));
+            assert_eq!(from_traced(tr.key), crate::model::key_from_pitch(pc, minor), "pc {pc} minor {minor}: {:?} {:?}", tr.whole, tr.key);
+        }
+    }
+
+    #[test]
+    fn traced_key_indices_map_to_camelot_order() {
+        // A minor = 8A (index 7), C major = 8B (index 19), F minor = 4A (index 3).
+        assert_eq!(from_traced(12), 7);
+        assert_eq!(from_traced(3), 19);
+        assert_eq!(from_traced(20), 3);
+        assert_eq!(from_traced(24), -1);
+        assert_eq!(from_traced(-1), -1);
+    }
+
+    #[test]
+    fn other_sample_rates_are_brought_to_a_base_rate() {
+        assert_eq!(to_base_rate(vec![0.0; 96000], 96000).1, 48000);
+        assert_eq!(to_base_rate(vec![0.0; 96000], 96000).0.len(), 48000);
+        assert_eq!(to_base_rate(vec![0.0; 88200], 88200).1, 44100);
+        let (v, sr) = to_base_rate(vec![1.0; 22050], 22050);
+        assert_eq!((v.len(), sr), (44100, 44100));
+        assert!(v.iter().all(|x| (*x - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn very_short_audio_falls_back_without_panicking() {
+        let mono = progression(9, true, 2.0);
+        let stereo: Vec<f32> = mono.iter().flat_map(|v| [*v, *v]).collect();
+        let _ = detect_key_stereo(&stereo, 44100, 0.0, None);
+        assert_eq!(detect_key_stereo(&vec![0.0; 2 * 441000], 44100, 0.0, None), -1, "silence has no key");
+        assert_eq!(detect_key(&vec![0.0; 441000], 44100.0), -1, "silence has no key");
+        assert_eq!(detect_key_stereo(&[], 44100, 0.0, None), legacy_detect_key(&[], 44100.0));
+    }
+}
+
+#[cfg(test)]
 mod bench {
     use super::*;
-    /// PREPDECK_KEYGT = tsv "path\tCamelot key" (reference keys from the original).
+
+    /// Relation of an estimated key to a reference key (both Camelot-ordered indices).
+    fn relation(reference: i32, got: i32) -> &'static str {
+        if reference < 0 || got < 0 {
+            return "none";
+        }
+        let (rn, rmaj) = (reference % 12, reference >= 12);
+        let (gn, gmaj) = (got % 12, got >= 12);
+        if reference == got {
+            "same"
+        } else if rmaj == gmaj && ((rn - gn).rem_euclid(12) == 1 || (gn - rn).rem_euclid(12) == 1) {
+            "fifth"
+        } else if rn == gn {
+            "relative"
+        } else if (!rmaj && gmaj && (gn - rn).rem_euclid(12) == 3) || (rmaj && !gmaj && (rn - gn).rem_euclid(12) == 3) {
+            "parallel"
+        } else {
+            "other"
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct Tally {
+        n: usize,
+        same: usize,
+        fifth: usize,
+        relative: usize,
+        parallel: usize,
+        other: usize,
+    }
+
+    impl Tally {
+        fn add(&mut self, reference: i32, got: i32) {
+            self.n += 1;
+            match relation(reference, got) {
+                "same" => self.same += 1,
+                "fifth" => self.fifth += 1,
+                "relative" => self.relative += 1,
+                "parallel" => self.parallel += 1,
+                _ => self.other += 1,
+            }
+        }
+        /// MIREX-style weighted score (fifth in either direction 0.5, relative 0.3, parallel 0.2).
+        fn line(&self) -> String {
+            let w = self.same as f64 + 0.5 * self.fifth as f64 + 0.3 * self.relative as f64 + 0.2 * self.parallel as f64;
+            format!(
+                "exact {}/{} ({:.1} %), weighted {:.1} %; fifth {} relative {} parallel {} other {}",
+                self.same,
+                self.n,
+                100.0 * self.same as f64 / self.n.max(1) as f64,
+                100.0 * w / self.n.max(1) as f64,
+                self.fifth,
+                self.relative,
+                self.parallel,
+                self.other
+            )
+        }
+    }
+
+    struct Row {
+        path: String,
+        key: i32,
+        conf: f64,
+        legacy: i32,
+        traced: i32,
+        /// The reference routine itself on the same samples and grid (PREPDECK_RBKEY), or -2.
+        oracle: i32,
+        secs: f64,
+    }
+
+    /// Runs the native research harness (directory in PREPDECK_RBKEY, see the trace notes) on
+    /// the same decoded audio and beat grid; returns the Camelot-ordered key or -2.
+    fn oracle_key(dir: &str, slice: &str, d: &crate::audio::Decoded, bpm: f64, grid: Option<&BeatGrid>, tag: usize) -> i32 {
+        let tmp = std::env::temp_dir().join(format!("prepdeck-keyoracle-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let pcm = tmp.join("pcm.f32");
+        let beats = tmp.join("beats.txt");
+        let bytes: Vec<u8> = d.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut text = format!("{}\n", bpm as f32);
+        if let Some(g) = grid {
+            for b in g.beats(d.duration()) {
+                if b.time >= 0.0 {
+                    text.push_str(&format!("{} {}\n", b.beat, (b.time * 1000.0).round() as u32));
+                }
+            }
+        }
+        let mut key = -2;
+        if std::fs::write(&pcm, bytes).is_ok() && std::fs::write(&beats, text).is_ok() {
+            let out = std::process::Command::new(format!("{dir}/rbkey"))
+                .current_dir(dir)
+                .args([slice, "fixups.txt", pcm.to_str().unwrap(), &d.sr.to_string(), beats.to_str().unwrap(), "2"])
+                .output();
+            if let Ok(o) = out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                if let Some(v) = s.lines().find_map(|l| l.strip_prefix("final ")).and_then(|v| v.trim().parse::<i32>().ok()) {
+                    key = from_traced(v);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        key
+    }
+
+    /// PREPDECK_KEYGT = tsv "path<TAB>key[<TAB>energy<TAB>confidence…]" (a header line is
+    /// skipped). Prints agreement of the traced and the legacy detector with those keys, using
+    /// this application's own decode, tempo and beat grid. PREPDECK_KEYOUT = tsv to write per
+    /// track results to. PREPDECK_RBKEY + PREPDECK_RBSLICE additionally run the reference
+    /// routine on identical input.
     #[test]
     #[ignore]
     fn key_benchmark() {
         let Ok(f) = std::env::var("PREPDECK_KEYGT") else { return };
-        let rows: Vec<(String, i32)> = std::fs::read_to_string(f)
+        let rows: Vec<(String, i32, f64)> = std::fs::read_to_string(f)
             .unwrap()
             .lines()
-            .filter_map(|l| l.split_once('\t').map(|(p, k)| (p.to_string(), crate::model::parse_key(k))))
+            .filter_map(|l| {
+                let mut p = l.split('\t');
+                let path = p.next()?.to_string();
+                let key = crate::model::parse_key(p.next()?);
+                let conf = p.nth(1).and_then(|c| c.trim().parse::<f64>().ok()).unwrap_or(1.0);
+                (key >= 0).then_some((path, key, conf))
+            })
             .collect();
-        let variants: Vec<KeyParams> = {
-            let mut v = vec![];
-            for tuning in [false, true] {
-                for peaks in [false, true] {
-                    for power in [0.5, 1.0] {
-                        v.push(KeyParams { tuning, peaks, power, bass_weight: 0.0, profile: 0, minor_bias: 0.0 });
-                    }
-                }
-            }
-            v
-        };
+        let oracle = std::env::var("PREPDECK_RBKEY").ok().zip(std::env::var("PREPDECK_RBSLICE").ok());
+        let next = std::sync::atomic::AtomicUsize::new(0);
         let results = std::sync::Mutex::new(vec![]);
         std::thread::scope(|s| {
-            for ch in rows.chunks((rows.len() / 8).max(1)) {
-                let results = &results;
-                let variants = &variants;
-                s.spawn(move || {
-                    for (p, k) in ch {
-                        let Ok(d) = crate::audio::decode_file(p) else { continue };
-                        let mono = d.mono();
-                        let feats: Vec<KeyFeatures> = variants.iter().map(|v| features(&mono, d.sr as f64, v)).collect();
-                        results.lock().unwrap().push((*k, feats, p.rsplit('/').next().unwrap().to_string()));
-                    }
+            for _ in 0..8 {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((path, key, conf)) = rows.get(i) else { break };
+                    let Ok(d) = crate::audio::decode_file(path) else { continue };
+                    let mono = d.mono();
+                    let (bpm, grid) = crate::analysis::tempo_and_grid(&mono, d.sr as f64, 70.0, 180.0);
+                    let t0 = std::time::Instant::now();
+                    let traced = detect_key_stereo(&d.samples, d.sr, bpm, grid.as_ref());
+                    let secs = t0.elapsed().as_secs_f64();
+                    let legacy = legacy_detect_key(&mono, d.sr as f64);
+                    let ok = match &oracle {
+                        Some((dir, slice)) => oracle_key(dir, slice, &d, bpm, grid.as_ref(), i),
+                        None => -2,
+                    };
+                    results.lock().unwrap().push(Row { path: path.clone(), key: *key, conf: *conf, legacy, traced, oracle: ok, secs });
                 });
             }
         });
         let res = results.into_inner().unwrap();
-        let n = res.len();
-        let mut table = vec![];
-        for (vi, v) in variants.iter().enumerate() {
-            for prof in 0..PROFILES.len() {
-                for (bw, mb) in [0.0, 0.3, 0.45, 0.6, 0.8, 1.0].iter().flat_map(|b| [0.0, 0.03, 0.06, 0.1, 0.15].map(|m| (*b, m))) {
-                    let pp = KeyParams { profile: prof, bass_weight: bw, minor_bias: mb, ..*v };
-                    let mut exact = 0;
-                    let mut close = 0;
-                    for (k, feats, _) in &res {
-                        let got = key_from_features(&feats[vi], &pp);
-                        if got == *k {
-                            exact += 1;
-                        } else if crate::app::compatible_key(*k, got) {
-                            close += 1;
-                        }
-                    }
-                    table.push((exact, close, format!("tuning {} peaks {} power {} profile {} bass {} minor {}", v.tuning, v.peaks, v.power, PROFILES[prof].0, bw, mb)));
+        let name = crate::model::key_alnum;
+        if let Ok(out) = std::env::var("PREPDECK_KEYOUT") {
+            let mut text = String::from("path\tlabel\tconfidence\tlegacy\ttraced\toracle\n");
+            for r in &res {
+                text.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", r.path, name(r.key), r.conf, name(r.legacy), name(r.traced), if r.oracle >= -1 { name(r.oracle) } else { "".into() }));
+            }
+            let _ = std::fs::write(out, text);
+        }
+        eprintln!("tracks {} (slowest key analysis {:.2} s, mean {:.2} s)", res.len(), res.iter().map(|r| r.secs).fold(0.0, f64::max), res.iter().map(|r| r.secs).sum::<f64>() / res.len().max(1) as f64);
+        for (label, min_conf) in [("all", 0.0), ("confidence >= 0.9", 0.9)] {
+            let (mut tl, mut tt, mut to, mut same) = (Tally::default(), Tally::default(), Tally::default(), 0usize);
+            let mut with_oracle = 0usize;
+            for r in res.iter().filter(|r| r.conf >= min_conf) {
+                tl.add(r.key, r.legacy);
+                tt.add(r.key, r.traced);
+                if r.oracle >= -1 {
+                    with_oracle += 1;
+                    to.add(r.key, r.oracle);
+                    same += (r.oracle == r.traced) as usize;
                 }
             }
+            eprintln!("[{label}] legacy : {}", tl.line());
+            eprintln!("[{label}] traced : {}", tt.line());
+            if with_oracle > 0 {
+                eprintln!("[{label}] reference routine on the same input: {}", to.line());
+                eprintln!("[{label}] traced == reference routine: {same}/{with_oracle}");
+            }
         }
-        table.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
-        eprintln!("tracks {n}");
-        for t in table.iter().take(15) {
-            eprintln!("exact {:2} related {:2} :: {}", t.0, t.1, t.2);
-        }
-        // detail for the current default
-        let vi = variants.iter().position(|v| v.tuning == DEFAULT.tuning && v.peaks == DEFAULT.peaks && v.power == DEFAULT.power).unwrap();
-        for (k, feats, name) in &res {
-            let got = key_from_features(&feats[vi], &DEFAULT);
-            if got != *k {
-                eprintln!("  ref {:>4} got {:>4} :: {}", crate::model::key_alnum(*k), crate::model::key_alnum(got), name);
+        for r in &res {
+            if r.traced != r.key {
+                eprintln!("  ref {:>4} traced {:>4} legacy {:>4} ({}) :: {}", name(r.key), name(r.traced), name(r.legacy), relation(r.key, r.traced), r.path.rsplit('/').next().unwrap());
             }
         }
     }

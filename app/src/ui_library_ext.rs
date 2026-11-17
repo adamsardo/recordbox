@@ -898,7 +898,7 @@ pub fn tree_search_field(app: &mut App, ui: &mut Ui) {
 pub fn tree_top_rows(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
     let n = app.ext.tag_list.len();
     if app.prefs.tree_item("Tag List") {
-    let r = tree_row(ui, 1, "Tag List", Some(n), app.view == View::TagList, TreeIcon::Note, 15.0);
+    let r = tree_row(ui, 0, "Tag List", Some(n), app.view == View::TagList, TreeIcon::Note, 15.0);
     {
         // The tag-list glyph over the note placeholder.
         let ir = Rect::from_min_size(pos2(r.rect.min.x + 4.0 + 15.0 - 1.0, r.rect.min.y), vec2(14.0, 15.0));
@@ -1034,7 +1034,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
         app.scan_devices();
     }
     ui.add_space(1.0);
-    let root = tree_row(ui, 0, "Histories", None, matches!(app.view, View::History(0)), TreeIcon::Open, 17.0);
+    let root = tree_row(ui, 0, "Histories", None, matches!(app.view, View::History(0)), TreeIcon::Open, 15.0);
     if root.clicked() {
         app.set_view(View::History(0));
     }
@@ -1058,7 +1058,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
             let yk = egui::Id::new(("hist_year", year.clone()));
             let ydef = newest.as_ref().map(|n| n.0 == year).unwrap_or(false);
             let yopen = ui.ctx().data(|d| d.get_temp::<bool>(yk)).unwrap_or(ydef);
-            if tree_row(ui, 1, &year, None, false, if yopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
+            if tree_row(ui, 1, &year, None, false, if yopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 15.0).clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(yk, !yopen));
             }
             if !yopen {
@@ -1068,7 +1068,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
                 let mk = egui::Id::new(("hist_month", year.clone(), month.clone()));
                 let mdef = newest.as_ref().map(|n| n.0 == year && n.1 == month).unwrap_or(false);
                 let mopen = ui.ctx().data(|d| d.get_temp::<bool>(mk)).unwrap_or(mdef);
-                if tree_row(ui, 2, month_name(&month), None, false, if mopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
+                if tree_row(ui, 2, month_name(&month), None, false, if mopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 15.0).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(mk, !mopen));
                 }
                 if !mopen {
@@ -1101,7 +1101,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
             if hist.is_empty() {
                 continue;
             }
-            let dr = tree_row(ui, 1, &name, None, false, TreeIcon::Device, 17.0);
+            let dr = tree_row(ui, 1, &name, None, false, TreeIcon::Device, 15.0);
             dr.context_menu(|ui| {
                 if ui.button("Import All Histories").clicked() {
                     app.import_device_histories();
@@ -1136,7 +1136,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
 /// Related Tracks tree pane: the saved lists, Matching, and the criteria of the selected list.
 pub fn related_panel(app: &mut App, ui: &mut Ui) {
     ui.add_space(1.0);
-    let head = tree_row(ui, 1, "Related Tracks", None, false, TreeIcon::Open, 17.0);
+    let head = tree_row(ui, 0, "Related Tracks", None, false, TreeIcon::Open, 15.0);
     head.context_menu(|ui| related_menu(app, ui, None));
     let lists: Vec<String> = app.prefs.related_lists.iter().map(|l| l.name.clone()).collect();
     for (i, name) in lists.iter().enumerate() {
@@ -1160,7 +1160,7 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
             }
         }
         let sel = app.view == View::Related && app.prefs.related_sel == i;
-        let r = tree_row(ui, 2, name, None, sel, TreeIcon::Playlist, 15.0);
+        let r = tree_row(ui, 1, name, None, sel, TreeIcon::Playlist, 15.0);
         if r.clicked() {
             app.related_select(i);
             app.set_view(View::Related);
@@ -1171,7 +1171,7 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
         r.context_menu(|ui| related_menu(app, ui, Some(i)));
     }
     if app.prefs.tree_item("Matching") {
-        let m = tree_row(ui, 2, "Matching", None, app.view == View::Matching, TreeIcon::None, 15.0);
+        let m = tree_row(ui, 1, "Matching", None, app.view == View::Matching, TreeIcon::Playlist, 15.0);
         let m = if app.prefs.tooltips { m.on_hover_text("Show tracks based on good match combinations.") } else { m };
         if m.clicked() {
             app.set_view(View::Matching);
@@ -1282,7 +1282,7 @@ fn source_name(kind: u8) -> &'static str {
 pub fn source_tree(app: &mut App, ui: &mut Ui, kind: u8) {
     let k = kind as usize % 2;
     ui.add_space(1.0);
-    let head = tree_row(ui, 1, source_name(kind), None, false, TreeIcon::Open, 17.0);
+    let head = tree_row(ui, 0, source_name(kind), None, false, TreeIcon::Open, 15.0);
     // Reload button at the right end of the heading.
     let rr = Rect::from_center_size(pos2(head.rect.max.x - 12.0, head.rect.center().y), vec2(16.0, 16.0));
     let rb = ui.interact(rr, ui.id().with(("src_reload", kind)), Sense::click());
@@ -1345,11 +1345,11 @@ pub fn source_tree(app: &mut App, ui: &mut Ui, kind: u8) {
     egui::ScrollArea::vertical().id_salt(("src_tree", kind)).auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let all = View::Source { kind, node: String::new() };
-        if tree_row(ui, 2, "All Tracks", Some(lib.tracks.len()), app.view == all, TreeIcon::Note, 15.0).clicked() {
+        if tree_row(ui, 0, "All Tracks", Some(lib.tracks.len()), app.view == all, TreeIcon::Note, 15.0).clicked() {
             app.ext.sources[k].sel.clear();
             app.set_view(all);
         }
-        tree_row(ui, 2, "Playlists", None, false, TreeIcon::Open, 15.0);
+        tree_row(ui, 0, "Playlists", None, false, TreeIcon::Open, 15.0);
         fn rows(app: &mut App, ui: &mut Ui, kind: u8, nodes: &[crate::itunes::SrcNode], prefix: &str, depth: usize) {
             let k = kind as usize % 2;
             for (i, n) in nodes.iter().enumerate() {

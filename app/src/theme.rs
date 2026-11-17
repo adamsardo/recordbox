@@ -20,6 +20,12 @@ pub const WHITE: Color32 = hex(0xFFFFFF);
 pub const BLUE: Color32 = hex(0x1473EB);
 pub const BEAT_BLUE: Color32 = hex(0x007DE1);
 pub const SELECT: Color32 = hex(0x294C6A);
+/// Selected row in rekordbox's browser (tree and track list), sampled from the references.
+pub const ROW_SEL: Color32 = hex(0x314B67);
+/// Lit source tile / "Tree View" button in the browser.
+pub const TILE_ON: Color32 = hex(0x3571E3);
+/// rekordbox's tree glyph grey (skins: rgb 160).
+pub const TREE_ICON: Color32 = hex(0xA0A0A0);
 pub const CUE_ORANGE: Color32 = hex(0xFFB937);
 pub const PLAY_GREEN: Color32 = hex(0x2DD728);
 pub const CUE_MARK: Color32 = hex(0xF8A030);
@@ -77,6 +83,14 @@ pub fn apply(ctx: &egui::Context) {
     } else {
         let fam = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
         fonts.families.insert(egui::FontFamily::Name("bold".into()), fam);
+    }
+    // Inter (SIL Open Font License, assets/fonts): the face of the Preferences window and the
+    // dialogs, as in the original. Families "inter" and "inter-bold" (see ui_kit.rs).
+    for (name, bytes) in [("inter", &include_bytes!("../assets/fonts/Inter-Regular.ttf")[..]), ("inter-bold", &include_bytes!("../assets/fonts/Inter-Bold.ttf")[..])] {
+        fonts.font_data.insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+        let mut fam = vec![name.to_owned()];
+        fam.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
+        fonts.families.insert(egui::FontFamily::Name(name.into()), fam);
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
