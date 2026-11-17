@@ -444,7 +444,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("recordbox", options, Box::new(move |cc| {
         let app = App::new(cc, screenshot);
         if bench_on() {
-            eprintln!("bench: App::new {:.0} ms ({:.0} ms since main)", 0.0, t0.elapsed().as_secs_f32() * 1000.0);
+            eprintln!("bench: ready to draw {:.0} ms after launch", t0.elapsed().as_secs_f32() * 1000.0);
         }
         Ok(Box::new(Gui { app }))
     }))
