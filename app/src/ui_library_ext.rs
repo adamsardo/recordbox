@@ -2,6 +2,7 @@
 //! Track Filter, the docked Information window, Missing File Manager, Histories, Tag List,
 //! Matching, Related Tracks lists, the Playlist Palette and the iTunes / rekordbox xml sources.
 
+use crate::ui_kit::{self as kit, btn};
 use crate::app::*;
 use crate::library_ext::*;
 use crate::model::*;
@@ -1844,24 +1845,22 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     if let Some((pl, ids)) = app.ext.dup_confirm.clone() {
         let name = app.node(pl).map(|n| n.name.clone()).unwrap_or_default();
         let mut answer: Option<Option<bool>> = None;
-        egui::Window::new("Add To Playlist").id(egui::Id::new("dup_confirm")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-            ui.label(RichText::new("There are duplicates being added to the playlist.").color(WHITE));
-            ui.label("Would you like to add the duplicates or skip them?");
+        kit::dialog(ctx, "Add To Playlist").id(egui::Id::new("dup_confirm")).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(400.0);
+            kit::message(ui, "There are duplicates being added to the playlist.\nWould you like to add the duplicates or skip them?");
             let cur: HashSet<i64> = app.db.playlist_tracks(pl).unwrap_or_default().into_iter().collect();
             let dups = ids.iter().filter(|i| cur.contains(i)).count();
-            ui.label(RichText::new(format!("\"{name}\": {dups} of {} track(s) are already in the playlist.", ids.len())).size(11.0).color(DIM2));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Add").clicked() {
-                    answer = Some(Some(true));
-                }
-                if ui.button("Skip").clicked() {
-                    answer = Some(Some(false));
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    answer = Some(None);
-                }
-            });
+            kit::message_note(ui, &format!("\"{name}\": {dups} of {} track(s) are already in the playlist.", ids.len()));
+            match kit::dialog_buttons(ui, &["Add", "Skip", "Cancel"]) {
+                Some(0) => answer = Some(Some(true)),
+                Some(1) => answer = Some(Some(false)),
+                Some(_) => answer = Some(None),
+                None => {}
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(None);
+            }
         });
         match answer {
             Some(Some(add)) => app.resolve_duplicates(add),
@@ -1872,18 +1871,20 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     // After a manual relocate: look for the others next to it?
     if let Some(dir) = app.ext.reloc_offer.clone() {
         let mut answer = None;
-        egui::Window::new("Relocate").id(egui::Id::new("reloc_offer")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-            ui.label("Would you like Recordbox to find other missing file using the location of this track ?");
-            ui.label(RichText::new(dir.to_string_lossy()).size(11.0).color(DIM2));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
-                    answer = Some(true);
-                }
-                if ui.button("No").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    answer = Some(false);
-                }
-            });
+        kit::dialog(ctx, "Relocate").id(egui::Id::new("reloc_offer")).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(420.0);
+            // The original's sentence, with this application's name.
+            kit::message(ui, "Would you like Recordbox to find other missing file using the location of this track ?");
+            kit::message_note(ui, &dir.to_string_lossy());
+            match kit::dialog_buttons(ui, &["Yes", "No"]) {
+                Some(0) => answer = Some(true),
+                Some(_) => answer = Some(false),
+                None => {}
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
         });
         if let Some(yes) = answer {
             app.ext.reloc_offer = None;
@@ -1895,26 +1896,25 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     // Delete History / Clear History.
     if let Some(which) = app.ext.history_confirm {
         let mut answer = None;
-        egui::Window::new(if which.is_some() { "Delete History" } else { "Clear History" }).id(egui::Id::new("history_confirm")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+        kit::dialog(ctx, if which.is_some() { "Delete History" } else { "Clear History" }).id(egui::Id::new("history_confirm")).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(360.0);
             match which {
                 Some(id) => {
                     let name = app.ext.histories.iter().find(|h| h.id == id).map(|h| h.name.clone()).unwrap_or_default();
-                    ui.label("Are you sure you want to delete this list?");
-                    ui.label(RichText::new(name).size(11.0).color(DIM2));
+                    kit::message(ui, "Are you sure you want to delete this list?");
+                    kit::message_note(ui, &name);
                 }
-                None => {
-                    ui.label("Are you sure you want to delete all the play histories?");
-                }
+                None => kit::message(ui, "Are you sure you want to delete all the play histories?"),
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    answer = Some(true);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    answer = Some(false);
-                }
-            });
+            match kit::dialog_buttons(ui, &["OK", "Cancel"]) {
+                Some(0) => answer = Some(true),
+                Some(_) => answer = Some(false),
+                None => {}
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
         });
         if let Some(yes) = answer {
             app.ext.history_confirm = None;
@@ -1939,7 +1939,8 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     let ids: HashSet<i64> = missing.iter().map(|t| t.id).collect();
     app.ext.missing_sel.retain(|t| ids.contains(t));
     let busy = app.ext.reloc_rx.is_some() || app.relocate_rx.is_some();
-    egui::Window::new("Missing File Manager").open(&mut open).collapsible(false).default_size([820.0, 430.0]).min_width(640.0).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+    kit::dialog(ctx, "Missing File Manager").open(&mut open).default_size([820.0, 430.0]).min_width(640.0).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+        kit::apply_style(ui);
         ui.horizontal(|ui| {
             ui.label(RichText::new(if missing.is_empty() { "All files exist.".to_string() } else { format!("{} missing file(s)", missing.len()) }).color(WHITE));
             if busy {
@@ -1968,7 +1969,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
                 let (rr, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
                 ui.painter().rect_filled(rr, 0.0, if i % 2 == 0 { BG1 } else { BG2 });
                 let mut on = app.ext.missing_sel.contains(&t.id);
-                if ui.put(Rect::from_min_size(pos2(rr.min.x + 3.0, rr.min.y + 1.0), vec2(18.0, 18.0)), egui::Checkbox::without_text(&mut on)).changed() {
+                if ui.put(Rect::from_min_size(pos2(rr.min.x + 3.0, rr.min.y + 1.0), vec2(18.0, 18.0)), kit::Check(&mut on)).changed() {
                     if on {
                         app.ext.missing_sel.insert(t.id);
                     } else {
@@ -1984,7 +1985,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
                 let mut bx = rr.max.x - btn_w + 4.0;
                 for (k, (label, bw)) in [("Relocate", 70.0), ("Auto Relocate", 98.0), ("Delete", 60.0)].into_iter().enumerate() {
                     let br = Rect::from_min_size(pos2(bx, rr.min.y + 1.5), vec2(bw, 17.0));
-                    if ui.put(br, egui::Button::new(RichText::new(label).size(10.5))).clicked() {
+                    if ui.put(br, btn(label).exact(br.size()).font_size(10.5)).clicked() {
                         match k {
                             0 => {
                                 if let Some(f) = rfd::FileDialog::new().set_title("Relocate").pick_file() {
@@ -2008,7 +2009,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
         }
         for (i, f) in folders.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.small_button("Remove").clicked() {
+                if ui.add(btn("Remove").small()).clicked() {
                     app.prefs.relocate_folders.remove(i);
                     app.save_prefs();
                 }
@@ -2016,7 +2017,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
             });
         }
         ui.horizontal(|ui| {
-            if ui.button(RichText::new("Add Folder…").size(11.5)).clicked() {
+            if ui.add(btn("Add Folder…")).clicked() {
                 if let Some(d) = rfd::FileDialog::new().set_title("Auto Relocate Search Folders").pick_folder() {
                     let s = d.to_string_lossy().to_string();
                     if !app.prefs.relocate_folders.contains(&s) {
@@ -2032,14 +2033,14 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
         let target: Vec<i64> = if some { picked } else { missing.iter().map(|t| t.id).collect() };
         ui.horizontal(|ui| {
             ui.label(RichText::new(if some { format!("{} selected:", target.len()) } else { "All:".to_string() }).size(11.5).color(DIM2));
-            if ui.add_enabled(!target.is_empty() && !busy, egui::Button::new("Auto Relocate")).clicked() {
+            if ui.add_enabled(!target.is_empty() && !busy, btn("Auto Relocate")).clicked() {
                 app.auto_relocate(Some(target.clone()));
             }
-            if ui.add_enabled(!target.is_empty(), egui::Button::new("Delete")).on_hover_text("Remove from Collection (the files are not deleted)").clicked() {
+            if ui.add_enabled(!target.is_empty(), btn("Delete")).on_hover_text("Remove from Collection (the files are not deleted)").clicked() {
                 app.dialogs.confirm_remove = Some(target.clone());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                if ui.add(btn("Close")).clicked() {
                     app.ext.missing_open = false;
                 }
             });

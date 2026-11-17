@@ -39,12 +39,13 @@ pub fn track_jump(p: &Painter, c: Pos2, k: f32, col: Color32, dir: f32) {
     p.rect_filled(Rect::from_two_pos(g(8.0, 3.5), g(9.0, 7.5)), 0.0, col);
 }
 
-/// Zoom In / Zoom Out: lens, handle and sign on a 12 × 12 grid, 1 unit strokes.
+/// Zoom In / Zoom Out: lens, handle and sign on a 12 × 12 grid, hairline strokes.
 pub fn zoom(p: &Painter, c: Pos2, k: f32, col: Color32, plus: bool) {
     let g = |x: f32, y: f32| c + vec2(x - 6.0, y - 6.0) * k;
-    let s = Stroke::new(k, col);
-    ring(p, g(5.5, 5.0), 4.5 * k, k, col);
-    p.line_segment([g(9.0, 8.5), g(11.5, 11.0)], s);
+    // The painter feathers strokes by half a pixel a side, so they are set a little under 1 unit.
+    let s = Stroke::new(k * 0.75, col);
+    ring(p, g(5.5, 5.0), 4.5 * k, k * 0.85, col);
+    p.line_segment([g(9.0, 8.5), g(11.5, 11.0)], Stroke::new(k * 0.9, col));
     p.line_segment([g(3.0, 5.0), g(8.0, 5.0)], s);
     if plus {
         p.line_segment([g(5.5, 2.5), g(5.5, 7.5)], s);

@@ -8,7 +8,7 @@ use eframe::egui;
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 /// The blue of selected rows, tabs, switches and radio buttons.
-pub const PBLUE: Color32 = hex(0x3571E3);
+pub const PBLUE: Color32 = hex(0x1473EB);
 /// Separator lines inside cards, scroll bar.
 pub const SEP: Color32 = hex(0x323232);
 /// Switch (off) and radio (off) grey, checkbox outline.
@@ -248,6 +248,8 @@ pub fn paint_text(ui: &Ui, pos: egui::Pos2, align: Align2, s: &str, font: FontId
 }
 
 fn label_galley(ui: &Ui, s: &str, size: f32, color: Color32, tracking: f32) -> std::sync::Arc<egui::Galley> {
+    // Labels in capitals ("BLUE", "CENTER", "OFF") are set wider in the original.
+    let tracking = if s.chars().any(|c| c.is_lowercase()) { tracking } else { 0.8 };
     let mut job = egui::text::LayoutJob::simple(s.to_string(), inter(size), color, f32::INFINITY);
     for sec in &mut job.sections {
         sec.format.line_height = Some((size * 16.0 / 14.0).round());
@@ -308,7 +310,7 @@ pub fn paint_radio(p: &egui::Painter, c: egui::Pos2, on: bool, enabled: bool) {
 /// 16 pt radio button with its label 21 pt from its left edge. True when clicked.
 pub fn radio_raw(ui: &mut Ui, on: bool, label: &str) -> Response {
     let en = ui.is_enabled();
-    let g = label_galley(ui, label, 14.0, if en { WHITE } else { OFF }, 0.6);
+    let g = label_galley(ui, label, 14.0, if en { WHITE } else { OFF }, -0.05);
     let (r, resp) = ui.allocate_exact_size(vec2(21.0 + g.size().x, g.size().y.max(16.0)), Sense::click());
     paint_radio(ui.painter(), pos2(r.min.x + 8.0, r.center().y), on, en);
     ui.painter().galley(pos2(r.min.x + 21.0, r.center().y - g.size().y / 2.0), g, WHITE);
@@ -367,7 +369,7 @@ pub fn help(ui: &mut Ui, space: f32, tip: &str) {
     help_in(ui, r.translate(vec2(0.0, 1.0)), tip);
 }
 
-fn chevron(ui: &Ui, rect: Rect, _v: &egui::style::WidgetVisuals, _open: bool, _ab: egui::AboveOrBelow) {
+pub fn chevron(ui: &Ui, rect: Rect, _v: &egui::style::WidgetVisuals, _open: bool, _ab: egui::AboveOrBelow) {
     // 15 x 6.5 pt arrow, its right end 2.5 pt from the field's right edge.
     let right = rect.max.x + ui.spacing().button_padding.x - 2.75;
     let y = rect.center().y + 0.75;
@@ -526,4 +528,30 @@ pub fn message(ui: &mut Ui, s: &str) {
 pub fn message_note(ui: &mut Ui, s: &str) {
     ui.add_space(4.0);
     ui.add(egui::Label::new(text(s, 11.0).color(DIM)).wrap());
+}
+
+/// A dialog window in the kit's look: bold 13 pt title, #1E1E1E panel, not collapsible.
+/// Call `apply_style(ui)` first thing inside it.
+pub fn dialog<'a>(ctx: &egui::Context, title: impl Into<String>) -> egui::Window<'a> {
+    egui::Window::new(RichText::new(title).font(inter_bold(13.0)).color(hex(0xB3B3B4))).collapsible(false).frame(dialog_frame(ctx))
+}
+
+/// A dropdown with the kit's arrow and the regular face for its value.
+pub fn combo_plain(id: impl std::hash::Hash) -> egui::ComboBox {
+    egui::ComboBox::from_id_salt(id).icon(chevron)
+}
+
+/// A checkbox without a label (list rows).
+pub struct Check<'a>(pub &'a mut bool);
+
+impl egui::Widget for Check<'_> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let (r, mut resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+        if resp.clicked() {
+            *self.0 = !*self.0;
+            resp.mark_changed();
+        }
+        paint_checkbox(ui.painter(), Rect::from_center_size(r.center(), vec2(14.0, 14.0)), *self.0, ui.is_enabled());
+        resp
+    }
 }

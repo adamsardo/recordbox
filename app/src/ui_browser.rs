@@ -57,7 +57,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     // Measured on rekordbox (28 pt header): EXPORT in 10.3 pt Arial Bold from x = 16.5 (caps
     // 9.5–17), pull-down chevrons (8 × 4, 1 pt) centred at 115.75 and 170.75, y 14.5.
     let ip = crate::icons_player::chevron_down;
-    p.text(pos2(r.min.x + 16.0, r.min.y + 13.0), Align2::LEFT_CENTER, "EXPORT", caps(10.3), WHITE);
+    p.text(pos2(r.min.x + 16.0, r.min.y + 14.0), Align2::LEFT_CENTER, "EXPORT", caps(10.3), WHITE);
     let mode_r = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y), pos2(r.min.x + 124.0, r.max.y));
     ip(&p, pos2(r.min.x + 115.75, r.min.y + 14.5), 1.0, WHITE);
     let _ = tipf(ui.interact(mode_r, ui.id().with("mode"), Sense::hover()), "This app covers EXPORT mode: library, preparation and USB export.");
@@ -1365,7 +1365,7 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
         ];
         for (dx, draw, on) in icons {
             let vr = Rect::from_center_size(pos2(bar.max.x - dx, bar.center().y), vec2(18.0, 18.0));
-            p.rect_stroke(vr, 1.5, Stroke::new(1.0, if on { hex(0x223758) } else { hex(0x2E2E2E) }), egui::StrokeKind::Inside);
+            p.rect_stroke(vr, 1.5, Stroke::new(1.0, if on { hex(0x1B385B) } else { hex(0x2E2E2E) }), egui::StrokeKind::Inside);
             draw(&p, vr, hex(0x616161));
         }
         let wide = p.with_clip_rect(ui.ctx().screen_rect());
@@ -1808,7 +1808,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                 let bg = if sel { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 };
                 ui.painter().rect_filled(rr, 0.0, bg);
                 if loaded && !sel {
-                    ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0, hex(0x335577)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0, hex(0x27567A)), egui::StrokeKind::Inside);
                 }
                 let mut x = rr.min.x;
                 for c in &all_cols {
@@ -2461,7 +2461,7 @@ fn mytag_panel(app: &mut App, ui: &mut Ui) {
                     let on = !sel.is_empty() && count == sel.len();
                     let partial = count > 0 && !on;
                     let filtering = app.filter_tags.contains(&tg.id);
-                    let fill = if filtering { hex(0x7A4E00) } else if on { BLUE } else if partial { hex(0x1F4170) } else { BTN };
+                    let fill = if filtering { hex(0x814B00) } else if on { BLUE } else if partial { hex(0x0F4274) } else { BTN };
                     let b = ui.add(egui::Button::new(RichText::new(&tg.name).size(11.0).color(WHITE)).fill(fill));
                     if b.clicked() {
                         if ui.input(|i| i.modifiers.alt) {

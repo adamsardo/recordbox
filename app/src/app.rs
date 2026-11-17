@@ -1391,6 +1391,11 @@ impl App {
                         }
                     }
                     "export" => app.dialogs.export_open = true,
+                    // Dialogs of ui_dialogs.rs.
+                    "property" => app.dialogs.info_track = app.tracks.first().cloned(),
+                    "confirmremove" => app.dialogs.confirm_remove = Some(app.tracks.iter().take(3).map(|t| t.id).collect()),
+                    "confirmdelete" => app.dialogs.confirm_delete_node = Some((0, "Warm Up".into(), false)),
+                    "about" => app.dialogs.about = true,
                     other => crate::library_ext::shot_view(&mut app, other),
                 }
             }

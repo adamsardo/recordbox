@@ -1440,7 +1440,8 @@ fn shortcuts_window(app: &mut App, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Keyboard Shortcuts").open(&mut open).default_size(vec2(520.0, 560.0)).collapsible(false).show(ctx, |ui| {
+    kit::dialog(ctx, "Keyboard Shortcuts").open(&mut open).default_size(vec2(520.0, 560.0)).show(ctx, |ui| {
+        kit::apply_style(ui);
         egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
             for cat in ACTION_CATEGORIES {
                 ui.add_space(4.0);
@@ -1470,7 +1471,7 @@ fn shortcuts_window(app: &mut App, ctx: &Context) {
             });
         });
         ui.separator();
-        if ui.button("Change shortcuts…").clicked() {
+        if ui.add(btn("Change shortcuts…")).clicked() {
             app.dialogs.prefs_open = true;
             app.dialogs.prefs_tab = 3;
         }
@@ -1482,23 +1483,19 @@ fn backup_windows(app: &mut App, ctx: &Context) {
     let center = egui::Align2::CENTER_CENTER;
     if app.dialogs.ext.backup_ask {
         let mut choice: Option<Option<bool>> = None;
-        egui::Window::new("Library Backup").collapsible(false).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
-            ui.label(RichText::new("Do you want to back up music files as well?").size(14.0).color(WHITE));
+        kit::dialog(ctx, "Library Backup").resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(400.0);
+            kit::message(ui, "Do you want to back up music files as well?");
             let n = app.tracks.len();
             let bytes: u64 = app.tracks.iter().filter(|t| !t.missing).map(|t| t.file_size as u64).sum();
-            note(ui, &format!("Database file, analysis and image files are always included. Music files: {n} track(s), about {:.1} GB.", bytes as f64 / 1e9));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
-                    choice = Some(Some(true));
-                }
-                if ui.button("No").clicked() {
-                    choice = Some(Some(false));
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(None);
-                }
-            });
+            kit::message_note(ui, &format!("Database file, analysis and image files are always included. Music files: {n} track(s), about {:.1} GB.", bytes as f64 / 1e9));
+            match kit::dialog_buttons(ui, &["Yes", "No", "Cancel"]) {
+                Some(0) => choice = Some(Some(true)),
+                Some(1) => choice = Some(Some(false)),
+                Some(_) => choice = Some(None),
+                None => {}
+            }
         });
         if let Some(c) = choice {
             app.dialogs.ext.backup_ask = false;
@@ -1514,22 +1511,20 @@ fn backup_windows(app: &mut App, ctx: &Context) {
     }
     if let Some(path) = app.dialogs.ext.restore_ask.clone() {
         let mut choice = None;
-        egui::Window::new("Library Restoration").collapsible(false).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
-            ui.label(RichText::new("Are you sure you want to overwrite the present library with a backup?").size(14.0).color(WHITE));
-            note(ui, &format!("Backup file: {}", path.display()));
+        kit::dialog(ctx, "Library Restoration").resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(440.0);
+            kit::message(ui, "Are you sure you want to overwrite the present library with a backup?");
+            kit::message_note(ui, &format!("Backup file: {}", path.display()));
             if let Ok(m) = crate::backup::read_manifest(&path) {
-                note(ui, &format!("Made {} · {} track(s) · {} artwork file(s) · {} music file(s)", m.created.get(..16).unwrap_or(&m.created).replace('T', " "), m.tracks, m.artwork_files, m.music.len()));
+                kit::message_note(ui, &format!("Made {} · {} track(s) · {} artwork file(s) · {} music file(s)", m.created.get(..16).unwrap_or(&m.created).replace('T', " "), m.tracks, m.artwork_files, m.music.len()));
             }
-            note(ui, "The present library is copied into the backups folder first. Music files are only put back where the file is missing.");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("No").clicked() {
-                    choice = Some(false);
-                }
-            });
+            kit::message_note(ui, "The present library is copied into the backups folder first. Music files are only put back where the file is missing.");
+            match kit::dialog_buttons(ui, &["Yes", "No"]) {
+                Some(0) => choice = Some(true),
+                Some(_) => choice = Some(false),
+                None => {}
+            }
         });
         if let Some(yes) = choice {
             app.dialogs.ext.restore_ask = None;
@@ -1543,14 +1538,15 @@ fn backup_windows(app: &mut App, ctx: &Context) {
         let (done, total, what) = job.progress.lock().clone();
         let restore = job.restore;
         let mut cancel = false;
-        egui::Window::new(if restore { "Library Restoration" } else { "Library Backup" }).collapsible(false).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+        kit::dialog(ctx, if restore { "Library Restoration" } else { "Library Backup" }).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
             ui.set_width(380.0);
             ui.label(RichText::new(if total == 0 { if restore { "Preparing restore..." } else { "Preparing backup..." } } else if restore { "Restore Collection" } else { "Back up Collection" }).size(14.0).color(WHITE));
             let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
             ui.add(egui::ProgressBar::new(frac).show_percentage());
             ui.label(RichText::new(what).size(11.0).color(DIM));
             let cancelling = job.cancel.load(std::sync::atomic::Ordering::Relaxed);
-            if ui.add_enabled(!cancelling, egui::Button::new(if cancelling { "Cancelling…" } else { "Cancel" })).clicked() {
+            if ui.add_enabled(!cancelling, btn(if cancelling { "Cancelling…" } else { "Cancel" })).clicked() {
                 cancel = true;
             }
         });
@@ -1561,13 +1557,13 @@ fn backup_windows(app: &mut App, ctx: &Context) {
     }
     if let Some((title, text)) = app.dialogs.ext.backup_done.clone() {
         let mut close = false;
-        egui::Window::new(title).collapsible(false).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+        kit::dialog(ctx, title).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
             ui.set_max_width(460.0);
             for (i, line) in text.lines().enumerate() {
                 ui.label(RichText::new(line).size(if i == 0 { 14.0 } else { 12.0 }).color(if i == 0 { WHITE } else { DIM2 }));
             }
-            ui.add_space(6.0);
-            if ui.button("OK").clicked() {
+            if kit::dialog_buttons(ui, &["OK"]).is_some() {
                 close = true;
             }
         });

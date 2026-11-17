@@ -6,6 +6,7 @@ use crate::app::*;
 use crate::model::*;
 use crate::smart::*;
 use crate::theme::*;
+use crate::ui_kit::{self as kit, btn};
 use egui::{vec2, Context, RichText, Ui};
 
 pub fn dialogs(app: &mut App, ctx: &Context) {
@@ -31,7 +32,8 @@ fn info_window(app: &mut App, ctx: &Context) {
     };
     let mut open = true;
     let mut save = false;
-    egui::Window::new("Property").open(&mut open).default_width(460.0).collapsible(false).show(ctx, |ui| {
+    kit::dialog(ctx, "Property").open(&mut open).default_width(460.0).show(ctx, |ui| {
+        kit::apply_style(ui);
         egui::Grid::new("prop").num_columns(2).spacing(vec2(10.0, 5.0)).show(ui, |ui| {
             let field = |ui: &mut Ui, label: &str, v: &mut String| {
                 ui.label(RichText::new(label).color(DIM2));
@@ -62,7 +64,7 @@ fn info_window(app: &mut App, ctx: &Context) {
             ui.end_row();
             ui.label(RichText::new("Key").color(DIM2));
             let alnum = app.prefs.key_alnum;
-            egui::ComboBox::from_id_salt("propkey").selected_text(if t.key < 0 { "—".to_string() } else { key_name(t.key, alnum) }).show_ui(ui, |ui| {
+            kit::combo_plain("propkey").selected_text(if t.key < 0 { "—".to_string() } else { key_name(t.key, alnum) }).show_ui(ui, |ui| {
                 ui.selectable_value(&mut t.key, -1, "—");
                 for k in 0..24 {
                     ui.selectable_value(&mut t.key, k, format!("{} ({})", key_name(k, alnum), key_name(k, !alnum)));
@@ -73,7 +75,7 @@ fn info_window(app: &mut App, ctx: &Context) {
             ui.add(egui::Slider::new(&mut t.rating, 0..=5));
             ui.end_row();
             ui.label(RichText::new("Color").color(DIM2));
-            egui::ComboBox::from_id_salt("propcolor").selected_text(app.prefs.color_name(t.color)).show_ui(ui, |ui| {
+            kit::combo_plain("propcolor").selected_text(app.prefs.color_name(t.color)).show_ui(ui, |ui| {
                 for i in 0..9u8 {
                     ui.selectable_value(&mut t.color, i, app.prefs.color_name(i));
                 }
@@ -88,14 +90,11 @@ fn info_window(app: &mut App, ctx: &Context) {
         });
         ui.add_space(6.0);
         ui.label(RichText::new("Changes are saved in your library only; the audio file is not modified.").size(10.5).color(DIM));
-        ui.horizontal(|ui| {
-            if ui.button("OK").clicked() {
-                save = true;
-            }
-            if ui.button("Cancel").clicked() {
-                app.dialogs.info_track = None;
-            }
-        });
+        match kit::dialog_buttons(ui, &["OK", "Cancel"]) {
+            Some(0) => save = true,
+            Some(_) => app.dialogs.info_track = None,
+            None => {}
+        }
     });
     if save {
         let id = t.id;
@@ -127,18 +126,19 @@ fn smart_window(app: &mut App, ctx: &Context) {
     let mut open = true;
     let mut done: Option<bool> = None;
     let title = if id.is_some() { "Edit the Intelligent Playlist" } else { "Create New Intelligent Playlist" };
-    egui::Window::new(title).open(&mut open).default_width(640.0).collapsible(false).show(ctx, |ui| {
+    kit::dialog(ctx, title).open(&mut open).default_width(640.0).show(ctx, |ui| {
+        kit::apply_style(ui);
         ui.horizontal(|ui| {
             ui.label("List Name");
             ui.add(egui::TextEdit::singleline(&mut name).desired_width(300.0));
         });
         ui.horizontal(|ui| {
-            ui.label("Match");
-            egui::ComboBox::from_id_salt("matchall").selected_text(if rule.match_all { "all of the" } else { "any of the" }).show_ui(ui, |ui| {
-                ui.selectable_value(&mut rule.match_all, true, "all of the");
-                ui.selectable_value(&mut rule.match_all, false, "any of the");
+            ui.label("Match the following condition:");
+            kit::combo_plain("matchall").selected_text(if rule.match_all { "Match all of the items" } else { "Match any of the items" }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut rule.match_all, true, "Match all of the items");
+                ui.selectable_value(&mut rule.match_all, false, "Match any of the items");
             });
-            ui.label("following conditions:");
+            ui.label("");
         });
         ui.separator();
         let mut remove = None;
@@ -146,7 +146,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
         let tags: Vec<MyTag> = app.mytags.clone();
         for (i, c) in rule.conditions.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt(("field", i)).width(130.0).selected_text(c.field.label()).show_ui(ui, |ui| {
+                kit::combo_plain(("field", i)).width(130.0).selected_text(c.field.label()).show_ui(ui, |ui| {
                     for f in FIELDS {
                         if ui.selectable_label(c.field == f, f.label()).clicked() {
                             c.field = f;
@@ -160,7 +160,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                     }
                 });
                 let ops = Op::for_type(c.field.ftype());
-                egui::ComboBox::from_id_salt(("op", i)).width(120.0).selected_text(c.op.label()).show_ui(ui, |ui| {
+                kit::combo_plain(("op", i)).width(120.0).selected_text(c.op.label()).show_ui(ui, |ui| {
                     for o in ops {
                         ui.selectable_value(&mut c.op, *o, o.label());
                     }
@@ -168,7 +168,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                 match c.field.ftype() {
                     FieldType::Key => {
                         let k = parse_key(&c.value);
-                        egui::ComboBox::from_id_salt(("kv", i)).selected_text(if k < 0 { "—".to_string() } else { key_name(k, alnum) }).show_ui(ui, |ui| {
+                        kit::combo_plain(("kv", i)).selected_text(if k < 0 { "—".to_string() } else { key_name(k, alnum) }).show_ui(ui, |ui| {
                             for k in 0..24 {
                                 if ui.selectable_label(false, key_name(k, alnum)).clicked() {
                                     c.value = key_name(k, false);
@@ -178,7 +178,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                     }
                     FieldType::Color => {
                         let v = c.value.parse::<usize>().unwrap_or(0).min(8);
-                        egui::ComboBox::from_id_salt(("cv", i)).selected_text(app.prefs.color_name(v as u8)).show_ui(ui, |ui| {
+                        kit::combo_plain(("cv", i)).selected_text(app.prefs.color_name(v as u8)).show_ui(ui, |ui| {
                             for k in 0..9 {
                                 if ui.selectable_label(v == k, app.prefs.color_name(k as u8)).clicked() {
                                     c.value = k.to_string();
@@ -189,7 +189,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                     FieldType::Tag => {
                         let cur = c.value.parse::<i64>().unwrap_or(-1);
                         let label = tags.iter().find(|t| t.id == cur).map(|t| t.name.clone()).unwrap_or("—".into());
-                        egui::ComboBox::from_id_salt(("tv", i)).selected_text(label).show_ui(ui, |ui| {
+                        kit::combo_plain(("tv", i)).selected_text(label).show_ui(ui, |ui| {
                             for t in tags.iter().filter(|t| t.parent != 0) {
                                 if ui.selectable_label(cur == t.id, &t.name).clicked() {
                                     c.value = t.id.to_string();
@@ -218,7 +218,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                         };
                         if matches!(c.op, Op::InLast | Op::NotInLast) {
                             ui.add(egui::TextEdit::singleline(&mut c.value).desired_width(50.0));
-                            egui::ComboBox::from_id_salt(("unit", i)).width(80.0).selected_text(if c.months { "month(s)" } else { "day(s)" }).show_ui(ui, |ui| {
+                            kit::combo_plain(("unit", i)).width(80.0).selected_text(if c.months { "month(s)" } else { "day(s)" }).show_ui(ui, |ui| {
                                 ui.selectable_value(&mut c.months, false, "day(s)");
                                 ui.selectable_value(&mut c.months, true, "month(s)");
                             });
@@ -231,7 +231,7 @@ fn smart_window(app: &mut App, ctx: &Context) {
                         }
                     }
                 }
-                if ui.small_button("−").clicked() {
+                if ui.add(btn("−").small()).clicked() {
                     remove = Some(i);
                 }
             });
@@ -239,21 +239,18 @@ fn smart_window(app: &mut App, ctx: &Context) {
         if let Some(i) = remove {
             rule.conditions.remove(i);
         }
-        if ui.small_button("+ Add condition").clicked() {
+        if ui.add(btn("+ Add condition").small()).clicked() {
             rule.conditions.push(Condition::default());
         }
         ui.separator();
-        ui.checkbox(&mut rule.auto_update, "Update automatically");
+        kit::checkbox_raw(ui, &mut rule.auto_update, "Update automatically");
         let n = app.smart_tracks(&rule).len();
         ui.label(RichText::new(format!("{n} track(s) match now")).color(DIM));
-        ui.horizontal(|ui| {
-            if ui.button("OK").clicked() {
-                done = Some(true);
-            }
-            if ui.button("Cancel").clicked() {
-                done = Some(false);
-            }
-        });
+        match kit::dialog_buttons(ui, &["OK", "Cancel"]) {
+            Some(0) => done = Some(true),
+            Some(_) => done = Some(false),
+            None => {}
+        }
     });
     match done {
         Some(true) => {
@@ -288,13 +285,15 @@ fn export_window(app: &mut App, ctx: &Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Export to device").open(&mut open).default_width(560.0).collapsible(false).show(ctx, |ui| {
+    kit::dialog(ctx, "Export to device").open(&mut open).default_width(560.0).show(ctx, |ui| {
+        kit::apply_style(ui);
         if let Some(job) = &app.export_job {
             let (d, t, txt) = job.last.clone();
-            ui.label(RichText::new("Write to the device").strong());
+            ui.label(RichText::new("Write to the device").font(kit::inter_bold(14.0)).color(WHITE));
+            ui.label(kit::text("Exporting", 12.0).color(DIM2));
             ui.add(egui::ProgressBar::new(if t > 0 { d as f32 / t as f32 } else { 0.0 }).text(format!("{d} / {t}  ({} remaining)", t.saturating_sub(d))));
             ui.label(RichText::new(txt).size(11.0).color(DIM));
-            if ui.button("Stop").clicked() {
+            if ui.add(btn("Stop")).clicked() {
                 job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             ui.ctx().request_repaint();
@@ -302,7 +301,7 @@ fn export_window(app: &mut App, ctx: &Context) {
         }
         // What the last export did, until it is dismissed.
         if let Some(rep) = app.export_report.clone() {
-            ui.label(RichText::new("Export completed").strong());
+            ui.label(RichText::new("Playlist export complete").font(kit::inter_bold(14.0)).color(WHITE));
             ui.label(format!("{} track(s) copied to the device, {} already there updated. The device now has {} tracks and {} playlists.", rep.copied, rep.updated, rep.tracks_on_device, rep.playlists_on_device));
             if rep.removed_lists > 0 || rep.removed_tracks > 0 {
                 ui.label(format!("Removed from the device: {} list(s), {} track(s).", rep.removed_lists, rep.removed_tracks));
@@ -315,7 +314,7 @@ fn export_window(app: &mut App, ctx: &Context) {
                     }
                 });
             }
-            if ui.button("OK").clicked() {
+            if ui.add(btn("OK")).clicked() {
                 app.export_report = None;
             }
             ui.separator();
@@ -324,14 +323,14 @@ fn export_window(app: &mut App, ctx: &Context) {
             ui.label("Device");
             let cur = app.dialogs.export_root.clone().unwrap_or_default();
             let label = app.devices.iter().find(|d| d.root == cur).map(|d| format!("{} ({})", d.name, App::fs_label(&d.fs))).unwrap_or("Select a device".into());
-            egui::ComboBox::from_id_salt("exdev").width(300.0).selected_text(label).show_ui(ui, |ui| {
+            kit::combo_plain("exdev").width(300.0).selected_text(label).show_ui(ui, |ui| {
                 for d in &app.devices {
                     if ui.selectable_label(cur == d.root, format!("{} ({})", d.name, App::fs_label(&d.fs))).clicked() {
                         app.dialogs.export_root = Some(d.root.clone());
                     }
                 }
             });
-            if ui.button("Refresh").clicked() {
+            if ui.add(btn("Refresh")).clicked() {
                 app.scan_devices();
             }
         });
@@ -357,15 +356,15 @@ fn export_window(app: &mut App, ctx: &Context) {
         }
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Export").strong());
-            if ui.radio(!app.device_ui.export_tracks_only, "Selected playlists with their folders").on_hover_text("The ticked playlists and folders are created on the device, with their tracks.").clicked() {
+            ui.label(RichText::new("Export").font(kit::inter_bold(13.0)).color(WHITE));
+            if kit::radio_raw(ui, !app.device_ui.export_tracks_only, "Selected playlists with their folders").on_hover_text("The ticked playlists and folders are created on the device, with their tracks.").clicked() {
                 app.device_ui.export_tracks_only = false;
             }
-            if ui.radio(app.device_ui.export_tracks_only, "Tracks only").on_hover_text("Only the tracks of the ticked playlists go to the device (its track list); no playlists are created or changed.").clicked() {
+            if kit::radio_raw(ui, app.device_ui.export_tracks_only, "Tracks only").on_hover_text("Only the tracks of the ticked playlists go to the device (its track list); no playlists are created or changed.").clicked() {
                 app.device_ui.export_tracks_only = true;
             }
         });
-        ui.label(RichText::new("Playlists to export").strong());
+        ui.label(RichText::new("Playlists to export").font(kit::inter_bold(13.0)).color(WHITE));
         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
             fn rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize) {
                 let kids: Vec<PlaylistNode> = app.nodes.iter().filter(|n| n.parent == parent).cloned().collect();
@@ -383,7 +382,7 @@ fn export_window(app: &mut App, ctx: &Context) {
                             NodeKind::Smart => "⚙",
                             NodeKind::Playlist => "☰",
                         };
-                        if ui.checkbox(&mut on, format!("{icon} {}{count}", n.name)).changed() {
+                        if kit::checkbox_raw(ui, &mut on, &format!("{icon} {}{count}", n.name)).changed() {
                             if on {
                                 app.dialogs.export_sel.insert(n.id);
                             } else {
@@ -408,14 +407,14 @@ fn export_window(app: &mut App, ctx: &Context) {
         ui.label(RichText::new("Music files are copied to the device; your originals are only read. Tracks that are not analysed yet are analysed first.").size(10.5).color(DIM));
         ui.horizontal(|ui| {
             let can = app.dialogs.export_root.is_some() && (!app.dialogs.export_sel.is_empty() || !app.dialogs.export_tracks.is_empty());
-            if ui.add_enabled(can, egui::Button::new(RichText::new("Export").strong()).fill(BLUE)).on_disabled_hover_text("Choose a device and at least one playlist or track to export.").clicked() {
+            if ui.add_enabled(can, btn("Export").min_size(vec2(96.0, 24.0))).on_disabled_hover_text("Choose a device and at least one playlist or track to export.").clicked() {
                 let root = app.dialogs.export_root.clone().unwrap();
                 let sel: Vec<i64> = app.dialogs.export_sel.iter().copied().collect();
                 let tracks = app.dialogs.export_tracks.clone();
                 // Free space is checked first; the reason is shown when there is not enough.
                 app.export_from_dialog(&root, &sel, &tracks);
             }
-            if ui.button("Close").clicked() {
+            if ui.add(btn("Close").min_size(vec2(96.0, 24.0))).clicked() {
                 app.dialogs.export_open = false;
             }
         });
@@ -426,69 +425,74 @@ fn export_window(app: &mut App, ctx: &Context) {
 }
 
 fn confirm_windows(app: &mut App, ctx: &Context) {
+    let center = egui::Align2::CENTER_CENTER;
     if let Some((id, name, folder)) = app.dialogs.confirm_delete_node.clone() {
-        egui::Window::new(if folder { "Delete Folder" } else { "Delete Playlist" }).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!("Delete \"{name}\"?"));
-            ui.label(RichText::new(if folder { "The folder and every playlist inside it are deleted. The tracks stay in the collection." } else { "The tracks stay in the collection." }).size(11.0).color(DIM));
-            ui.horizontal(|ui| {
-                if ui.button("Delete").clicked() {
-                    let _ = app.db.delete_node(id);
-                    if app.view == View::Playlist(id) {
-                        app.set_view(View::Collection);
-                    }
-                    app.reload_playlists();
-                    app.dialogs.confirm_delete_node = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    app.dialogs.confirm_delete_node = None;
-                }
-            });
+        let mut answer = None;
+        kit::dialog(ctx, if folder { "Delete Folder" } else { "Delete Playlist" }).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(360.0);
+            kit::message(ui, if folder { "Are you sure you want to delete this folder?" } else { "Are you sure you want to delete this playlist?" });
+            kit::message_note(ui, &format!("\"{name}\". {}", if folder { "The folder and every playlist inside it are deleted. The tracks stay in the collection." } else { "The tracks stay in the collection." }));
+            answer = kit::dialog_buttons(ui, &["OK", "Cancel"]);
         });
+        if answer == Some(0) {
+            let _ = app.db.delete_node(id);
+            if app.view == View::Playlist(id) {
+                app.set_view(View::Collection);
+            }
+            app.reload_playlists();
+        }
+        if answer.is_some() {
+            app.dialogs.confirm_delete_node = None;
+        }
     }
     if let Some(ids) = app.dialogs.confirm_remove.clone() {
-        egui::Window::new("Remove from Collection").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!("Remove {} track(s) from the collection?", ids.len()));
-            ui.label(RichText::new("The music files are not deleted. For 30 days the tracks, with their cues, grids, tags and playlist positions, can be brought back with Track > Restore Removed Tracks.").size(11.0).color(DIM));
-            ui.horizontal(|ui| {
-                if ui.button("Remove").clicked() {
-                    app.remove_from_collection(&ids);
-                    app.dialogs.confirm_remove = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    app.dialogs.confirm_remove = None;
-                }
-            });
+        let mut answer = None;
+        kit::dialog(ctx, "Remove from Collection").resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(400.0);
+            kit::message(ui, if ids.len() == 1 { "Are you sure you want to remove the selected track(s) from your Collection?" } else { "Are you sure you want to remove the selected tracks?" });
+            kit::message_note(ui, &format!("{} track(s). The music files are not deleted. For 30 days the tracks, with their cues, grids, tags and playlist positions, can be brought back with Track > Restore Removed Tracks.", ids.len()));
+            answer = kit::dialog_buttons(ui, &["OK", "Cancel"]);
         });
+        if answer == Some(0) {
+            app.remove_from_collection(&ids);
+        }
+        if answer.is_some() {
+            app.dialogs.confirm_remove = None;
+        }
     }
     if let Some((root, id, name)) = app.dialogs.device_remove.clone() {
-        egui::Window::new("Delete from device").collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!("Delete \"{name}\" from the device?"));
-            let del = app.prefs.delete_device_tracks;
-            ui.label(RichText::new(if del { "Its tracks that are in no other playlist are also deleted from the device." } else { "Tracks stay on the device (change this in Preferences > DJ System)." }).size(11.0).color(DIM));
-            ui.horizontal(|ui| {
-                if ui.button("Delete").clicked() {
-                    if app.export_job.is_some() {
-                        app.toast_err("Wait for the export to finish before changing the device.");
-                    } else {
-                        match crate::export::usb::remove_node(std::path::Path::new(&root), id, del) {
-                            Ok(_) => app.toast(format!("Deleted \"{name}\" from the device")),
-                            Err(e) => app.toast_err(format!("Could not change the device: {e}")),
-                        }
-                    }
-                    app.dialogs.device_remove = None;
-                    app.scan_devices();
-                    app.set_view(View::Device { root: root.clone(), node: None });
-                }
-                if ui.button("Cancel").clicked() {
-                    app.dialogs.device_remove = None;
-                }
-            });
+        let mut answer = None;
+        let del = app.prefs.delete_device_tracks;
+        kit::dialog(ctx, "Delete Playlist").id(egui::Id::new("Delete from device")).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(400.0);
+            kit::message(ui, "Are you sure you want to delete this playlist?");
+            kit::message_note(ui, &format!("\"{name}\" on the device. {}", if del { "Its tracks that are in no other playlist are also deleted from the device." } else { "Tracks stay on the device (change this in Preferences > DJ System > Device)." }));
+            answer = kit::dialog_buttons(ui, &["OK", "Cancel"]);
         });
+        if answer == Some(0) {
+            if app.export_job.is_some() {
+                app.toast_err("Wait for the export to finish before changing the device.");
+            } else {
+                match crate::export::usb::remove_node(std::path::Path::new(&root), id, del) {
+                    Ok(_) => app.toast(format!("Deleted \"{name}\" from the device")),
+                    Err(e) => app.toast_err(format!("Could not change the device: {e}")),
+                }
+            }
+            app.scan_devices();
+            app.set_view(View::Device { root: root.clone(), node: None });
+        }
+        if answer.is_some() {
+            app.dialogs.device_remove = None;
+        }
     }
     if let Some((root, name, files)) = app.dialogs.device_cleanup.clone() {
         let mut close = false;
         let total: u64 = files.iter().map(|f| f.1).sum();
-        egui::Window::new("Clean Up Unused Files").collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
+        kit::dialog(ctx, "Clean Up Unused Files").resizable(true).default_width(560.0).show(ctx, |ui| {
+            kit::apply_style(ui);
             ui.label(format!("{} file(s) on {name} ({:.1} MB) are not used by any track in its library.", files.len(), total as f64 / 1e6));
             ui.label(RichText::new("They were left by deleted playlists, other programs or copies made by hand. Deleting them cannot be undone.").size(11.0).color(DIM));
             egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
@@ -504,7 +508,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 let confirm_id = egui::Id::new("cleanup_confirm");
                 let armed: bool = ui.ctx().data(|d| d.get_temp(confirm_id)).unwrap_or(false);
                 let label = if armed { format!("Click again to delete {} file(s)", files.len()) } else { format!("Delete {} File(s)", files.len()) };
-                if ui.button(label).clicked() {
+                if ui.add(btn(label)).clicked() {
                     if armed && app.export_job.is_some() {
                         app.toast_err("Wait for the export to finish before changing the device.");
                     } else if armed {
@@ -517,7 +521,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                     }
                     ui.ctx().data_mut(|d| d.insert_temp(confirm_id, !armed));
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.add(btn("Cancel")).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("cleanup_confirm"), false));
                     close = true;
                 }
@@ -533,17 +537,18 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
         let mut act: Option<bool> = None;
         let list = app.db.trash_list().unwrap_or_default();
         let picked = app.dialogs.trash.as_mut().unwrap();
-        egui::Window::new("Restore Removed Tracks").open(&mut open).collapsible(false).resizable(true).default_width(520.0).show(ctx, |ui| {
+        kit::dialog(ctx, "Restore Removed Tracks").open(&mut open).resizable(true).default_width(520.0).show(ctx, |ui| {
+            kit::apply_style(ui);
             if list.is_empty() {
                 ui.label("No removed tracks. Tracks removed from the collection stay here for 30 days.");
                 return;
             }
             ui.label(RichText::new("Tracks removed from the collection in the last 30 days. Restoring brings back their cues, grids, tags and playlist positions.").size(11.0).color(DIM));
             ui.horizontal(|ui| {
-                if ui.small_button("Select All").clicked() {
+                if ui.add(btn("Select All").small()).clicked() {
                     picked.extend(list.iter().map(|e| e.0));
                 }
-                if ui.small_button("Select None").clicked() {
+                if ui.add(btn("Select None").small()).clicked() {
                     picked.clear();
                 }
             });
@@ -552,7 +557,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 for (id, title, artist, path, at) in &list {
                     ui.horizontal(|ui| {
                         let mut on = picked.contains(id);
-                        if ui.checkbox(&mut on, "").changed() {
+                        if ui.add(kit::Check(&mut on)).changed() {
                             if on {
                                 picked.insert(*id);
                             } else {
@@ -567,14 +572,14 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!picked.is_empty(), egui::Button::new(format!("Restore {}", picked.len()))).on_disabled_hover_text("Tick the tracks to restore.").clicked() {
+                if ui.add_enabled(!picked.is_empty(), btn(format!("Restore {}", picked.len()))).on_disabled_hover_text("Tick the tracks to restore.").clicked() {
                     act = Some(true);
                 }
                 // Two clicks: the entries cannot be restored afterwards.
                 let confirm_id = egui::Id::new("trash_confirm");
                 let armed: bool = ui.ctx().data(|d| d.get_temp(confirm_id)).unwrap_or(false);
                 let label = if armed { format!("Click again to forget {} permanently", picked.len()) } else { "Delete Permanently".to_string() };
-                if ui.add_enabled(!picked.is_empty(), egui::Button::new(label)).on_hover_text("Forget these entries now; they can't be restored afterwards. The music files are not affected.").clicked() {
+                if ui.add_enabled(!picked.is_empty(), btn(label)).on_hover_text("Forget these entries now; they can't be restored afterwards. The music files are not affected.").clicked() {
                     if armed {
                         act = Some(false);
                     }
@@ -603,14 +608,15 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     if app.dialogs.player_edits.is_some() {
         let mut close = None;
         let pe = app.dialogs.player_edits.as_mut().unwrap();
-        egui::Window::new("Cue changes made on players").collapsible(false).resizable(false).show(ctx, |ui| {
+        kit::dialog(ctx, "Cue changes made on players").resizable(false).show(ctx, |ui| {
+            kit::apply_style(ui);
             ui.label(format!("{} track(s) on {} have cues that were changed after the last export from Recordbox.", pe.items.len(), pe.device));
             ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in Recordbox with the ones on the device. The device is not changed.").size(11.0).color(DIM));
             ui.add_space(4.0);
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 for it in pe.items.iter_mut() {
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut it.pick, "");
+                        ui.add(kit::Check(&mut it.pick));
                         let hot = it.edit.cues.iter().filter(|c| c.kind == CueKind::Hot).count();
                         let mem = it.edit.cues.len() - hot;
                         ui.label(format!("{} – {}", it.edit.title, it.edit.artist));
@@ -624,10 +630,10 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let n = pe.items.iter().filter(|i| i.pick).count();
-                if ui.add_enabled(n > 0, egui::Button::new(format!("Import {n}"))).on_disabled_hover_text("Tick the tracks whose cues to import.").clicked() {
+                if ui.add_enabled(n > 0, btn(format!("Import {n}"))).on_disabled_hover_text("Tick the tracks whose cues to import.").clicked() {
                     close = Some(true);
                 }
-                if ui.button("Not now").on_hover_text("These changes are not offered again unless they change on the device.").clicked() {
+                if ui.add(btn("Not now")).on_hover_text("These changes are not offered again unless they change on the device.").clicked() {
                     close = Some(false);
                 }
             });
@@ -643,10 +649,13 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     }
     if app.dialogs.about {
         let mut open = true;
-        egui::Window::new("About Recordbox").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(RichText::new("Recordbox").size(18.0).strong());
-            ui.label("Library management, track analysis, set preparation and USB export for CDJ/XDJ players.");
-            ui.label(RichText::new("Everything stays on this Mac. Your music files and any existing rekordbox library are never modified.").size(11.0).color(DIM));
+        kit::dialog(ctx, "About Recordbox").open(&mut open).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.set_width(380.0);
+            ui.label(RichText::new("Recordbox").font(kit::inter_bold(17.0)).color(WHITE));
+            ui.add_space(6.0);
+            kit::message(ui, "Library management, track analysis, set preparation and USB export for CDJ/XDJ players.");
+            kit::message_note(ui, "Everything stays on this Mac. Your music files and any existing rekordbox library are never modified.");
         });
         app.dialogs.about = open;
     }

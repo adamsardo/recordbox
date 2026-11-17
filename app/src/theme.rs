@@ -21,9 +21,9 @@ pub const BLUE: Color32 = hex(0x1473EB);
 pub const BEAT_BLUE: Color32 = hex(0x007DE1);
 pub const SELECT: Color32 = hex(0x294C6A);
 /// Selected row in rekordbox's browser (tree and track list), sampled from the references.
-pub const ROW_SEL: Color32 = hex(0x314B67);
+pub const ROW_SEL: Color32 = hex(0x294C6A);
 /// Lit source tile / "Tree View" button in the browser.
-pub const TILE_ON: Color32 = hex(0x3571E3);
+pub const TILE_ON: Color32 = hex(0x1473EB);
 /// rekordbox's tree glyph grey (skins: rgb 160).
 pub const TREE_ICON: Color32 = hex(0xA0A0A0);
 pub const CUE_ORANGE: Color32 = hex(0xFFB937);
