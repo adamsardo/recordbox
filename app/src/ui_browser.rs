@@ -1448,7 +1448,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     // Reference 01: the column menu sits in the icon strip's column, 12.75 pt from the window edge.
     let clip = ui.clip_rect();
     ui.set_clip_rect(ui.ctx().screen_rect());
-    let cm = icon_button_ui(ui, Rect::from_center_size(pos2(rx + 14.25, bar.center().y + 1.0), vec2(14.0, 18.0)), "colmenu", crate::icons::hamburger);
+    let cm = icon_button_ui(ui, Rect::from_center_size(pos2(rx + 14.25, bar.center().y + 1.0), vec2(18.0, 18.0)), "colmenu", crate::icons::view_art_list);
     ui.set_clip_rect(clip);
     dropdown(ui, &cm, "cols", |ui| {
         ui.label(RichText::new("Columns").strong());
