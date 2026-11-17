@@ -289,6 +289,9 @@ pub struct LibExt {
     /// A click on an already-selected row's cell, waiting to see it is not a double-click:
     /// (track, column, time of the click).
     pub edit_pending: Option<(i64, Col, f64)>,
+    /// The tree (or source strip) was clicked last, not the track list: the lit source tile is
+    /// bright then and muted otherwise, as in rekordbox.
+    pub tree_focus: bool,
     /// Colour chooser open for a track at a screen position.
     pub color_pick: Option<(i64, eframe::egui::Pos2, f64)>,
     pub preview: crate::preview::Preview,
@@ -328,6 +331,7 @@ impl Default for LibExt {
             edit: None,
             edit_drawn: false,
             edit_pending: None,
+            tree_focus: false,
             color_pick: None,
             preview: Default::default(),
             filter: Default::default(),

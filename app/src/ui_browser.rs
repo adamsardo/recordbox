@@ -343,6 +343,14 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
     let strip = Rect::from_min_size(full.min, vec2(37.0, full.height()));
     let tree = Rect::from_min_max(pos2(strip.max.x, full.min.y), pos2(full.min.x + 248.0, full.max.y));
     let right_strip = Rect::from_min_max(pos2(full.max.x - 25.0, full.min.y), full.max);
+    // Which side was clicked last decides how bright the lit source tile is.
+    if let Some(pp) = ui.input(|i| if i.pointer.primary_pressed() { i.pointer.interact_pos() } else { None }) {
+        if strip.contains(pp) || tree.contains(pp) {
+            app.ext.tree_focus = true;
+        } else if full.contains(pp) && !right_strip.contains(pp) {
+            app.ext.tree_focus = false;
+        }
+    }
     // Information window (268 pt) at the far right, My Tag (230 pt) to its left.
     let info_w = if app.prefs.info_panel { 268.0 } else { 0.0 };
     let info = Rect::from_min_max(pos2(right_strip.min.x - info_w - 2.5, full.min.y), pos2(right_strip.min.x - 2.5, full.max.y));
@@ -497,8 +505,9 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
         (src::history, Tile::Side(SideMode::History), "Histories"),
         (src::recording, Tile::Off, "Recordings (not available in this app)"),
     ];
-    // The highlight is bright while a track row holds the selection, muted otherwise (01 / 04).
-    let hi = if app.selected.is_empty() { ROW_SEL } else { TILE_ON };
+    // The highlight is bright while the tree side was clicked last (reference 04) and muted
+    // while the track list was, or nothing yet (references 01 and 02).
+    let hi = if app.ext.tree_focus { TILE_ON } else { ROW_SEL };
     for (i, (draw, tile, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2)).collect::<Vec<_>>().into_iter().enumerate() {
         let c = pos2(r.min.x + 16.0, r.min.y + 34.0 + i as f32 * 20.0);
         let rr = Rect::from_center_size(c, vec2(18.0, 18.0));
@@ -2284,11 +2293,15 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
                     .map(|i| {
                         let a = i * len / n;
                         let b = ((i + 1) * len / n).max(a + 1).min(len);
+                        // Mostly the mean of the columns under each pixel, which keeps the
+                        // track's shape (the maximum alone flattens loud music into a solid
+                        // block), with some of the maximum so single hits still stand out.
+                        let part = src.get(a..b).unwrap_or(&[]);
                         let mut m = [0u8; 4];
-                        for f in src.get(a..b).unwrap_or(&[]) {
-                            for k in 0..4 {
-                                m[k] = m[k].max(f[k]);
-                            }
+                        for k in 0..4 {
+                            let mean = part.iter().map(|f| f[k] as f32).sum::<f32>() / part.len().max(1) as f32;
+                            let peak = part.iter().map(|f| f[k]).max().unwrap_or(0) as f32;
+                            m[k] = (0.6 * mean + 0.4 * peak) as u8;
                         }
                         m
                     })
@@ -2297,8 +2310,24 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
                 let hh = (r.height() - 6.0).max(4.0);
                 for (k, v) in cols.iter().enumerate() {
                     let x = x0 + k as f32 + 0.5;
-                    for (h, cc) in crate::ui_player::wave_bars(app.prefs.wave_color, *v) {
-                        p.line_segment([pos2(x, base), pos2(x, base - h * hh)], Stroke::new(1.0, cc));
+                    if app.prefs.wave_color == 2 {
+                        // 3Band, as rekordbox's preview stacks it (reference 02): the low band
+                        // stands on the base in blue, the mid band sits on top of it in orange
+                        // and the highs on top of that in white. Display levels carry the
+                        // gains 1 / 1.5 / 2.6, taken out again here.
+                        let f = |b: u8, g: f32| b as f32 / 255.0 / g;
+                        let mut y = base;
+                        for (h, cc) in [(f(v[1], 1.0) * 0.46, WAVE_LOW), (f(v[2], 1.5) * 0.40, WAVE_MID), (f(v[3], 2.6) * 0.75, WAVE_HIGH)] {
+                            let top = y - h * hh;
+                            if h > 0.0 {
+                                p.rect_filled(Rect::from_min_max(pos2(x - 0.5, top), pos2(x + 0.5, y)), 0.0, cc);
+                            }
+                            y = top;
+                        }
+                    } else {
+                        for (h, cc) in crate::ui_player::wave_bars(app.prefs.wave_color, *v) {
+                            p.line_segment([pos2(x, base), pos2(x, base - h * hh)], Stroke::new(1.0, cc));
+                        }
                     }
                 }
                 // Hot cue letters at their positions (as the original's preview shows them).

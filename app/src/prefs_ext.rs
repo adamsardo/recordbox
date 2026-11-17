@@ -34,7 +34,9 @@ pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekor
 impl Prefs {
     /// Whether a Tree View source is shown. Collection always is.
     pub fn tree_item(&self, name: &str) -> bool {
-        name == "Collection" || self.tree_items.get(name).copied().unwrap_or(true)
+        // As in rekordbox, Tag List, Hot Cue Bank List and rekordbox xml are off until ticked in
+        // Preferences > View > Layout.
+        name == "Collection" || self.tree_items.get(name).copied().unwrap_or(!matches!(name, "Tag List" | "Hot Cue Bank List" | "rekordbox xml"))
     }
     /// The name of track colour `i` (0 = "No Color", 1..=8 the user's Color comments).
     pub fn color_name(&self, i: u8) -> String {

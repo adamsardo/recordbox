@@ -15,17 +15,17 @@ fn poly(p: &Painter, pts: &[Pos2], c: Color32, w: f32) {
 pub fn chevron_left(p: &Painter, r: Rect, c: Color32) {
     let m = r.center();
     let h = r.height().min(r.width()) * 0.32;
-    poly(p, &[m + vec2(h * 0.5, -h), m + vec2(-h * 0.5, 0.0), m + vec2(h * 0.5, h)], c, 1.6);
+    poly(p, &[m + vec2(h * 0.5, -h), m + vec2(-h * 0.5, 0.0), m + vec2(h * 0.5, h)], c, 1.0);
 }
 pub fn chevron_right(p: &Painter, r: Rect, c: Color32) {
     let m = r.center();
     let h = r.height().min(r.width()) * 0.32;
-    poly(p, &[m + vec2(-h * 0.5, -h), m + vec2(h * 0.5, 0.0), m + vec2(-h * 0.5, h)], c, 1.6);
+    poly(p, &[m + vec2(-h * 0.5, -h), m + vec2(h * 0.5, 0.0), m + vec2(-h * 0.5, h)], c, 1.0);
 }
 pub fn chevron_down(p: &Painter, r: Rect, c: Color32) {
     let m = r.center();
     let h = r.height().min(r.width()) * 0.3;
-    poly(p, &[m + vec2(-h, -h * 0.45), m + vec2(0.0, h * 0.45), m + vec2(h, -h * 0.45)], c, 1.4);
+    poly(p, &[m + vec2(-h, -h * 0.45), m + vec2(0.0, h * 0.45), m + vec2(h, -h * 0.45)], c, 1.0);
 }
 
 /// "↤": arrow pointing left with a stop bar at its tail.
