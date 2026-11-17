@@ -53,9 +53,10 @@ pub enum Col {
     Lyricist,
     Message,
     HotCue,
+    DateCreated,
 }
 
-pub const ALL_COLS: [Col; 38] = [
+pub const ALL_COLS: [Col; 39] = [
     Col::Num,
     Col::Status,
     Col::Preview,
@@ -94,6 +95,7 @@ pub const ALL_COLS: [Col; 38] = [
     Col::Lyricist,
     Col::Message,
     Col::HotCue,
+    Col::DateCreated,
 ];
 
 impl Col {
@@ -137,6 +139,7 @@ impl Col {
             Col::Lyricist => "Lyricist",
             Col::Message => "Message",
             Col::HotCue => "Hot Cue",
+            Col::DateCreated => "Date Created",
         }
     }
     pub fn key(self) -> String {
@@ -154,7 +157,7 @@ impl Col {
             Col::Rating => 87.0,
             Col::Time => 83.0,
             Col::Key => 128.5,
-            Col::DateAdded | Col::ReleaseDate => 82.0,
+            Col::DateAdded | Col::ReleaseDate | Col::DateCreated => 82.0,
             Col::Color => 46.0,
             Col::Location => 260.0,
             Col::Comments | Col::MyTag => 160.0,
@@ -244,30 +247,84 @@ pub struct Prefs {
     pub columns_other: Vec<Col>,
     pub sort_other: (Col, bool),
     pub columns_for_playlist: bool,
+    // ---- Preferences window (prefs_ext.rs documents each and who reads it) ----
+    /// View > Layout > Tree View: source name -> shown (a missing name is shown).
+    pub tree_items: std::collections::BTreeMap<String, bool>,
+    /// View > Layout: "Display the playlist palette".
+    pub show_palette: bool,
+    /// View > Layout: Add "My Tag" to the "Comments".
+    pub mytag_to_comments: bool,
+    /// View > Layout: "Display Cue Markers on Preview".
+    pub cue_markers_on_preview: bool,
+    /// View > Color: Half Waveform (upper half only) instead of Full Waveform (mirrored).
+    pub wave_half: bool,
+    /// View > Color > Customize Color Comments: names of the 8 track colours (Pink..Purple).
+    pub color_names: [String; 8],
+    /// Analysis: "Use high precision BeatGrid analysis".
+    pub high_precision_grid: bool,
+    /// CUE Analysis: "Set Memory Cue at the first beat of track when analyzing".
+    pub memory_cue_first_beat: bool,
+    /// Audio: buffer size in frames (0 = the device's default), sample rate (0 = the
+    /// device's default) and the first channel of the output pair (0 = channels 1/2).
+    pub audio_buffer: u32,
+    pub audio_rate: u32,
+    pub audio_channel: u16,
+    /// DJ System > General: Background Color (0 Default Color, 1..8 Pink..Purple).
+    pub device_bg_color: u8,
+    /// DJ System > Device: "Delete from the device after importing the play history".
+    pub delete_history_after_import: bool,
+    /// DJ System > Others: Hot Cue Auto Load switched on for tracks as they are imported.
+    pub hot_cue_auto_load_on_import: bool,
+    /// Advanced > Browse: iTunes library file, rekordbox xml ("Imported Library"), and
+    /// the folders Auto Relocate searches.
+    pub itunes_xml: Option<String>,
+    pub rekordbox_xml_path: Option<String>,
+    pub relocate_folders: Vec<String>,
     /// Phrase analysis: shown in the player and written to USB exports.
     pub phrase_analysis: bool,
+    /// Library (see library_ext.rs). Auto Relocate Search Folders: missing files are looked
+    /// for under these.
+    pub relocate_folders: Vec<String>,
+    /// iTunes Library File chosen by the user (None: the usual places, else the Music app).
+    pub itunes_xml: Option<String>,
+    /// The rekordbox xml file browsed under "rekordbox xml" in the tree.
+    pub rekordbox_xml_path: Option<String>,
+    /// Track list artwork: false shows the upper part in normal rows, true the entire artwork
+    /// in taller rows.
+    pub artwork_full: bool,
+    /// Playlist Palette: up to four playlists (0 = not assigned) and whether it is shown.
+    pub palette: Vec<i64>,
+    pub palette_open: bool,
+    /// Tree shortcuts to playlists and folders.
+    pub shortcuts: Vec<i64>,
+    pub shortcuts_open: bool,
+    /// Information window docked at the right of the browser.
+    pub info_panel: bool,
+    /// Saved "Related Tracks" lists; `related` holds the criteria of the selected one.
+    pub related_lists: Vec<crate::library_ext::RelatedList>,
+    pub related_sel: usize,
+    /// Player (see player_ext.rs). Beat Count Display above the enlarged waveform: 0 Current
+    /// Position (Bars), 1 Count to the next MEMORY CUE (Bars), 2 the same in Beats.
+    pub beat_count_mode: u8,
+    /// "Click on the waveform for PLAY and CUE".
+    pub wave_click_play_cue: bool,
+    /// Player layout: 0 = 1 Player, 1 = 2 Players, 2 = Simple Player (`browser_only` hides it).
+    pub player_layout: u8,
+    /// Metronome volume step 1–3.
+    pub metronome_vol: u8,
+    /// Beat jump length shown and chosen in bars (`beat_jump` stays in beats).
+    pub beat_jump_bars: bool,
+    /// Recordbox extras in the player: the STEMS button and the phrase bar (the vocal layer
+    /// is `show_vocal`).
+    pub show_stems: bool,
+    pub show_phrase_bar: bool,
+    /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
+    pub analysis_mode: u8,
 }
 
-/// Keyboard actions: (id, label, default key name as egui names it).
-pub const ACTIONS: [(&str, &str, &str); 17] = [
-    ("play", "Play / Pause", "Space"),
-    ("cue", "Cue", "C"),
-    ("memory", "Set Memory Cue", "M"),
-    ("hot1", "Hot Cue A", "1"),
-    ("hot2", "Hot Cue B", "2"),
-    ("hot3", "Hot Cue C", "3"),
-    ("hot4", "Hot Cue D", "4"),
-    ("hot5", "Hot Cue E", "5"),
-    ("hot6", "Hot Cue F", "6"),
-    ("hot7", "Hot Cue G", "7"),
-    ("hot8", "Hot Cue H", "8"),
-    ("jump_back", "Beat Jump back", "ArrowLeft"),
-    ("jump_fwd", "Beat Jump forward", "ArrowRight"),
-    ("list_up", "Select previous track", "ArrowUp"),
-    ("list_down", "Select next track", "ArrowDown"),
-    ("load", "Load selected track", "Enter"),
-    ("remove", "Remove from playlist", "Delete"),
-];
+/// Keyboard actions: (id, label, default shortcut in stored form or "" for none, category).
+/// The table lives in prefs_ext.rs.
+pub use crate::prefs_ext::ACTIONS;
 
 /// A key with modifiers, stored as "Ctrl+Alt+Shift+Cmd+Key" (any subset, in that order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,11 +413,13 @@ pub struct RelatedRules {
     pub label: bool,
     pub color: bool,
     pub rating: bool,
+    /// Only tracks registered as a good match of the source track ("Matching").
+    pub matching: bool,
 }
 
 impl Default for RelatedRules {
     fn default() -> Self {
-        RelatedRules { key: 2, bpm: true, bpm_pct: 6.0, genre: false, artist: false, label: false, color: false, rating: false }
+        RelatedRules { key: 2, bpm: true, bpm_pct: 6.0, genre: false, artist: false, label: false, color: false, rating: false, matching: false }
     }
 }
 
@@ -522,8 +581,8 @@ mod keymap_tests {
     #[test]
     fn default_and_custom_keys() {
         let mut p = super::Prefs::default();
-        for (id, _, _) in super::ACTIONS {
-            assert!(p.key_for(id).is_some(), "{id} has no default key");
+        for (id, _, def, _) in super::ACTIONS {
+            assert!(def.is_empty() || p.key_for(id).is_some(), "{id}: default key {def} is not a key name");
         }
         assert_eq!(p.key_for("play"), Some(eframe::egui::Key::Space));
         p.keymap.insert("play".into(), "P".into());
@@ -623,7 +682,43 @@ impl Default for Prefs {
             columns_other: vec![Col::Num, Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Genre, Col::Bpm, Col::Time, Col::Key, Col::DateAdded],
             sort_other: (Col::Num, true),
             columns_for_playlist: false,
+            tree_items: Default::default(),
+            show_palette: false,
+            mytag_to_comments: false,
+            cue_markers_on_preview: true,
+            wave_half: false,
+            color_names: crate::prefs_ext::default_color_names(),
+            high_precision_grid: true,
+            memory_cue_first_beat: false,
+            audio_buffer: 0,
+            audio_rate: 0,
+            audio_channel: 0,
+            device_bg_color: 0,
+            delete_history_after_import: false,
+            hot_cue_auto_load_on_import: true,
+            itunes_xml: None,
+            rekordbox_xml_path: None,
+            relocate_folders: vec![],
             phrase_analysis: true,
+            relocate_folders: vec![],
+            itunes_xml: None,
+            rekordbox_xml_path: None,
+            artwork_full: false,
+            palette: vec![0; 4],
+            palette_open: false,
+            shortcuts: vec![],
+            shortcuts_open: true,
+            info_panel: false,
+            related_lists: vec![],
+            related_sel: 0,
+            beat_count_mode: 0,
+            wave_click_play_cue: false,
+            player_layout: 0,
+            metronome_vol: 2,
+            beat_jump_bars: false,
+            show_stems: true,
+            show_phrase_bar: true,
+            analysis_mode: 0,
             delete_device_tracks: false,
             // rekordbox's standard: gain = -10 - integrated loudness.
             target_lufs: -10.0,
@@ -694,6 +789,15 @@ pub enum View {
     /// A folder on disk (Explorer); its audio files are listed whether or not they are in the
     /// collection.
     Explorer(String),
+    /// A day's play history kept by Recordbox (0: the Histories item itself, an empty list).
+    History(i64),
+    /// The Tag List (temporary pick list).
+    TagList,
+    /// Good matches registered for the loaded (or selected) track.
+    Matching,
+    /// An outside library (kind 0 iTunes, 1 rekordbox xml): node "" is All Tracks, else the
+    /// playlist's key (see `SourceLib::node`). Its tracks are not collection tracks.
+    Source { kind: u8, node: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -704,6 +808,8 @@ pub enum SideMode {
     History,
     Related,
     Explorer,
+    Itunes,
+    RekordboxXml,
 }
 
 pub struct Deck {
@@ -745,6 +851,8 @@ pub struct Deck {
     pub editing_comment: Option<i64>,
     pub metronome: bool,
     pub bpm_text: String,
+    /// Loop adjust, waveform menu and other state added in player_ext.rs.
+    pub x: crate::player_ext::DeckExt,
 }
 
 impl Default for Deck {
@@ -779,6 +887,7 @@ impl Default for Deck {
             editing_comment: None,
             metronome: false,
             bpm_text: String::new(),
+            x: Default::default(),
         }
     }
 }
@@ -793,6 +902,8 @@ pub struct Toast {
 pub struct Dialogs {
     pub prefs_open: bool,
     pub prefs_tab: u8,
+    /// Shortcuts window, backup/restore, reset confirmations (prefs_ext.rs).
+    pub ext: crate::prefs_ext::DialogsExt,
     pub info_track: Option<Track>,
     pub smart_edit: Option<(Option<i64>, i64, String, SmartRule)>,
     pub rename: Option<(i64, String)>,
@@ -879,7 +990,14 @@ pub struct App {
     pub filter_tags: HashSet<i64>,
     pub filter_tags_all: bool,
     pub player: Player,
+    /// The active deck (deck A, or in the 2 Players layout the one last operated). The other
+    /// deck is kept in `px` and the two are swapped when the active deck changes.
     pub deck: Deck,
+    /// Second deck, active deck number and other player state (player_ext.rs).
+    pub px: crate::player_ext::PlayerExt,
+    /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
+    /// (B only in the 2 Players layout).
+    pub load_target: u8,
     /// The deck as it was before the load in progress, with its playback position and gain;
     /// put back if the new file can't be decoded, so a failed load never empties the player.
     pub deck_backup: Option<(Deck, f64, f32)>,
@@ -928,6 +1046,8 @@ pub struct App {
     pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
+    /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
+    pub ext: crate::library_ext::LibExt,
 }
 
 impl App {
@@ -1002,6 +1122,8 @@ impl App {
             filter_tags: HashSet::new(),
             filter_tags_all: false,
             player: Player::with_device(audio_device.as_deref()),
+            px: Default::default(),
+            load_target: 0,
             deck: Deck::default(),
             pool,
             analysis_total: 0,
@@ -1028,9 +1150,11 @@ impl App {
             scroll_to_selected: false,
             list_scroll_to: None,
             menu: None,
+            ext: Default::default(),
         };
         app.menu = crate::menus::build();
         app.reload_all();
+        app.reload_library_ext();
         if let Some(e) = app.player.error.clone() {
             app.toast_err(format!("Audio output unavailable: {e}"));
         }
@@ -1237,7 +1361,7 @@ impl App {
                         }
                     }
                     "export" => app.dialogs.export_open = true,
-                    _ => {}
+                    other => crate::library_ext::shot_view(&mut app, other),
                 }
             }
             // PREPDECK_SHOT_TRACK=<part of a title>: load that track (analysed first if needed).
@@ -1321,9 +1445,13 @@ impl App {
         self.toasts.push(Toast { text: s.into(), until: Instant::now() + std::time::Duration::from_secs(8), error: true });
     }
 
+    /// Tracks queued with "Analyze Track (Normal)" / "(Dynamic)" override the preference once.
+    pub fn analysis_dynamic(&self) -> bool {
+        self.prefs.analysis_mode == 1
+    }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs }
+        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
     }
 
     // ------------------------------------------------------------------ loading
@@ -1483,7 +1611,10 @@ impl App {
                 Some(_) => self.db.playlist_tracks(*id).unwrap_or_default().into_iter().filter(|t| self.index.contains_key(t)).collect(),
                 None => vec![],
             },
-            View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) => vec![],
+            View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. } => vec![],
+            View::History(id) => self.db.history_tracks(*id).unwrap_or_default().into_iter().filter(|t| self.index.contains_key(t)).collect(),
+            View::TagList => self.ext.tag_list.iter().copied().filter(|t| self.index.contains_key(t)).collect(),
+            View::Matching => self.related_source().map(|s| self.matching_of(s)).unwrap_or_default(),
             View::Related => self.related_tracks(),
             View::Category { field, value } => self
                 .tracks
@@ -1519,6 +1650,9 @@ impl App {
             .filter(|t| t.id != src.id && !t.missing)
             .filter_map(|t| {
                 let mut score = 0i64;
+                if r.matching && !self.is_match(src.id, t.id) {
+                    return None;
+                }
                 if r.key > 0 {
                     let d = key_distance(src.key, t.key)?;
                     if d > r.key as i32 - 1 {
@@ -1634,23 +1768,10 @@ impl App {
                     }
                 }
                 if self.filter_open {
-                    let (lo, hi) = self.filter_bpm;
-                    if lo > 0.0 && t.bpm < lo {
+                    if !crate::library_ext::filter_pass(&self.ext.filter, t) {
                         return false;
                     }
-                    if hi > 0.0 && t.bpm > hi {
-                        return false;
-                    }
-                    if self.filter_key >= 0 && !compatible_key(self.filter_key, t.key) {
-                        return false;
-                    }
-                    if self.filter_rating > 0 && t.rating < self.filter_rating {
-                        return false;
-                    }
-                    if self.filter_color > 0 && t.color != self.filter_color {
-                        return false;
-                    }
-                    if !self.filter_tags.is_empty() {
+                    if self.ext.filter.tags_on && !self.filter_tags.is_empty() {
                         let empty = HashSet::new();
                         let tt = self.track_tags.get(&t.id).unwrap_or(&empty);
                         let ok = if self.filter_tags_all { self.filter_tags.iter().all(|x| tt.contains(x)) } else { self.filter_tags.iter().any(|x| tt.contains(x)) };
@@ -1746,10 +1867,12 @@ impl App {
                 Col::Lyricist => tc(&ta.lyricist, &tb.lyricist),
                 Col::Message => tc(&ta.message, &tb.message),
                 Col::HotCue => self.cue_counts.get(a).map(|c| c.0).cmp(&self.cue_counts.get(b).map(|c| c.0)),
+                Col::DateCreated => ta.date_created.cmp(&tb.date_created),
             };
             let o = if asc { o } else { o.reverse() };
             o.then(order[a].cmp(&order[b]))
         });
+        self.ext.list_num = v.iter().map(|id| order[id] + 1).collect();
         self.list = v;
         let idx = &self.index;
         self.selected.retain(|id| idx.contains_key(id));
@@ -1968,7 +2091,7 @@ impl App {
         if self.view != v {
             self.view = v;
             self.colbrowse = Default::default();
-            let manual = matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
+            let manual = matches!(self.view, View::History(_) | View::TagList) || matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
             // Switch to the other column set and sort when moving between playlists and the
             // rest; each keeps the user's own choices.
             if manual != self.prefs.columns_for_playlist {
@@ -2011,11 +2134,13 @@ impl App {
         let mut finished = false;
         while let Ok(m) = rx.try_recv() {
             match m {
-                Some(t) => {
+                Some(mut t) => {
                     if let Some(id) = self.db.track_by_path(&t.path) {
                         added.push(id);
                         continue;
                     }
+                    // Preferences > DJ System > Others: Hot Cue Auto Load for imported tracks.
+                    t.autoload_hotcue = self.prefs.hot_cue_auto_load_on_import;
                     if let Ok(id) = self.db.insert_track(&t) {
                         added.push(id);
                         self.import_count += 1;
@@ -2754,6 +2879,12 @@ impl App {
                         }
                     }
                 }
+                // Preferences > Analysis > CUE Analysis: memory cue at the first beat.
+                if self.prefs.memory_cue_first_beat && first_analysis {
+                    if let Some(g) = &new_grid {
+                        crate::prefs_ext::memory_cue_at_first_beat(self, id, g);
+                    }
+                }
                 if self.deck.track == Some(id) {
                     self.deck.wave = Some(res.wave);
                     if self.deck.audio.is_none() {
@@ -2805,7 +2936,13 @@ impl App {
         self.player.state.lock().playing = p && self.deck.audio.is_some();
     }
 
+    /// Load a track into the load-target deck (`load_target`; deck A outside 2 Players).
     pub fn load_track(&mut self, id: i64) {
+        self.load_track_to(self.load_target, id);
+    }
+
+    /// Load a track into the active deck.
+    pub fn load_track_here(&mut self, id: i64) {
         let Some(t) = self.track(id).cloned() else { return };
         if t.missing {
             self.toast_err(format!("The file for \"{}\" cannot be found.", t.display_title()));
@@ -2819,6 +2956,7 @@ impl App {
             s.pos = 0.0;
             s.loop_range = None;
             s.metronome = None;
+            s.search = 0.0;
             let mut g = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
             // rekordbox's optional peak cap (traced): when gain × peak reaches 1, the gain becomes
             // 0.9999998807907104 / peak.
@@ -2834,7 +2972,8 @@ impl App {
         };
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
-        let old = std::mem::replace(&mut self.deck, Deck { ctrl_tab: ctrl, panel_tab: panel, ..Deck::default() });
+        let metronome = self.deck.metronome;
+        let old = std::mem::replace(&mut self.deck, Deck { ctrl_tab: ctrl, panel_tab: panel, metronome, ..Deck::default() });
         // Keep the last successfully loaded deck (not a deck that is itself still loading).
         if old.audio.is_some() {
             self.deck_backup = Some((old, old_pos, old_gain));
@@ -2925,7 +3064,9 @@ impl App {
 
     pub fn update_metronome(&mut self) {
         let beats = if self.deck.metronome { Some(Arc::new(self.deck.beats.iter().map(|b| b.time).collect::<Vec<f64>>())) } else { None };
-        self.player.state.lock().metronome = beats;
+        let mut s = self.player.state.lock();
+        s.metronome = beats;
+        s.metronome_vol = crate::audio::metronome_level(self.prefs.metronome_vol);
     }
 
     pub fn quantized(&self, t: f64) -> f64 {
@@ -3064,6 +3205,9 @@ impl App {
                 if self.deck.track == Some(track) {
                     self.deck.cues = self.db.cues(track).unwrap_or_default();
                 }
+                if self.px.other.track == Some(track) {
+                    self.px.other.cues = self.db.cues(track).unwrap_or_default();
+                }
                 let cues = self.db.cues(track).unwrap_or_default();
                 let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
                 if hp.is_empty() {
@@ -3092,6 +3236,10 @@ impl App {
                     return;
                 }
                 let _ = self.db.save_grid(track, &before);
+                if self.px.other.track == Some(track) {
+                    let g = before.clone();
+                    self.with_deck(1 - self.px.active, |a| a.set_deck_grid(g, false));
+                }
                 if self.deck.track == Some(track) {
                     self.set_deck_grid(before, false);
                 }
@@ -3440,6 +3588,15 @@ impl App {
             self.toast_err("Up to 10000 tracks can be added in one playlist");
             return;
         }
+        // "There are duplicates being added to the playlist.": asked first.
+        if self.dup_pending(pl, ids) {
+            return;
+        }
+        self.add_to_playlist_force(pl, ids);
+    }
+    /// Add tracks to a playlist without asking about duplicates.
+    pub fn add_to_playlist_force(&mut self, pl: i64, ids: &[i64]) {
+        let mut cur = self.db.playlist_tracks(pl).unwrap_or_default();
         cur.extend_from_slice(ids);
         let _ = self.db.set_playlist_tracks(pl, &cur);
         self.reload_playlists();
@@ -3565,6 +3722,10 @@ impl App {
             } else {
                 e.remove(&tag);
             }
+        }
+        // Preferences > View > Layout: Add "My Tag" to the "Comments".
+        if self.prefs.mytag_to_comments {
+            crate::prefs_ext::sync_mytag_comments(self, ids);
         }
         self.list_dirty = true;
     }

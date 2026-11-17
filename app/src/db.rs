@@ -95,7 +95,14 @@ impl Db {
             CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS xml_extra(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, track_id INTEGER NOT NULL, path TEXT NOT NULL,
-                title TEXT NOT NULL, artist TEXT NOT NULL, removed_at INTEGER NOT NULL, json TEXT NOT NULL, wave BLOB, preview BLOB);",
+                title TEXT NOT NULL, artist TEXT NOT NULL, removed_at INTEGER NOT NULL, json TEXT NOT NULL, wave BLOB, preview BLOB);
+            CREATE TABLE IF NOT EXISTS histories(id INTEGER PRIMARY KEY, name TEXT NOT NULL, date TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS history_entries(id INTEGER PRIMARY KEY, history_id INTEGER NOT NULL REFERENCES histories(id) ON DELETE CASCADE,
+                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, played_at INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS he_hist ON history_entries(history_id, id);
+            CREATE TABLE IF NOT EXISTS tag_list(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS track_matches(a INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                b INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, PRIMARY KEY(a, b));",
         )?;
         // Columns added after the first release, and the version stamp, in one transaction:
         // an interrupted upgrade leaves the library as it was (a backup was taken above).

@@ -234,8 +234,15 @@ pub struct PlayState {
     /// drums, bass, other, vocals. With all on (or no stems) the original mix plays.
     pub stems: Option<Arc<crate::stems::Stems>>,
     pub stem_on: [bool; 4],
+    /// Search (scan): 0 = off; otherwise the speed and direction (e.g. 8.0 forward, -8.0
+    /// backward). Short grains are played at normal pitch and the position skips between
+    /// them, as a CDJ's SEARCH buttons do; it sounds whether or not the deck is playing.
+    pub search: f64,
+    /// Master mute (the level is kept).
+    pub muted: bool,
     click_phase: usize,
     next_click: usize,
+    search_count: usize,
 }
 
 impl Default for PlayState {
@@ -251,14 +258,21 @@ impl Default for PlayState {
             metronome_vol: 0.5,
             stems: None,
             stem_on: [true; 4],
+            search: 0.0,
+            muted: false,
             click_phase: usize::MAX,
             next_click: 0,
+            search_count: 0,
         }
     }
 }
 
 pub struct Player {
+    /// The active deck's playback state.
     pub state: Arc<Mutex<PlayState>>,
+    /// The other deck's (2 Players layout); both are mixed to the output. The two are swapped
+    /// when the active deck changes, so `state` always belongs to the deck being operated.
+    pub other: Arc<Mutex<PlayState>>,
     /// Set by the stream when its device stops working (unplugged, switched off).
     pub lost: Arc<std::sync::atomic::AtomicBool>,
     _stream: Option<cpal::Stream>,
@@ -274,10 +288,11 @@ impl Player {
     /// Open the named output device (None: the system's default output).
     pub fn with_device(device: Option<&str>) -> Player {
         let state = Arc::new(Mutex::new(PlayState::default()));
+        let other = Arc::new(Mutex::new(PlayState::default()));
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match Self::open_stream(state.clone(), device, lost.clone()) {
-            Ok((s, rate)) => Player { state, lost, _stream: Some(s), device_rate: rate, error: None },
-            Err(e) => Player { state, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
+        match Self::open_stream([state.clone(), other.clone()], device, lost.clone()) {
+            Ok((s, rate)) => Player { state, other, lost, _stream: Some(s), device_rate: rate, error: None },
+            Err(e) => Player { state, other, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
         }
     }
 
@@ -308,7 +323,7 @@ impl Player {
 
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
-        let (s, rate) = Self::open_stream(self.state.clone(), device, self.lost.clone())?;
+        let (s, rate) = Self::open_stream([self.state.clone(), self.other.clone()], device, self.lost.clone())?;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
         self._stream = Some(s);
         self.device_rate = rate;
@@ -316,7 +331,7 @@ impl Player {
         Ok(())
     }
 
-    fn open_stream(state: Arc<Mutex<PlayState>>, device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
+    fn open_stream(state: [Arc<Mutex<PlayState>>; 2], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
@@ -383,25 +398,50 @@ fn cubic(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     ((a * t + b) * t + c) * t + y1
 }
 
-fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate: u32) {
+/// The audio callback: both decks mixed into `out`.
+fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize, rate: u32) {
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    let Some(mut s) = state.try_lock() else { return };
-    if !s.playing {
+    for st in states {
+        if let Some(mut s) = st.try_lock() {
+            render_deck(&mut s, out, channels, rate);
+        }
+    }
+}
+
+/// Frames per search grain at the device rate (60 ms).
+fn search_grain(rate: u32) -> usize {
+    (rate as usize * 60 / 1000).max(1)
+}
+
+/// Add one deck's audio to `out` (which the caller has cleared) and advance its position.
+pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u32) {
+    let searching = s.search != 0.0;
+    if !s.playing && !searching {
+        s.search_count = 0;
         return;
     }
     let Some(audio) = s.audio.clone() else { return };
     let step = audio.sr as f64 / rate as f64;
     let frames = audio.frames();
-    let vol = s.volume * s.gain;
+    let vol = if s.muted { 0.0 } else { s.volume * s.gain * if searching { 0.7 } else { 1.0 } };
     let click_len = (rate as f64 * 0.03) as usize;
     let stems = if s.stem_on.iter().all(|x| *x) { None } else { s.stems.clone() };
     let stem_on = s.stem_on;
     let stem_ratio = crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64;
-    let metro = s.metronome.clone();
+    let metro = if searching { None } else { s.metronome.clone() };
+    let grain = search_grain(rate);
     for f in out.chunks_mut(channels) {
-        if let Some((a, b)) = s.loop_range {
+        if searching {
+            // After each grain the position skips so that, overall, it moves at `search`
+            // times normal speed (backward for negative values).
+            s.search_count += 1;
+            if s.search_count >= grain {
+                s.search_count = 0;
+                s.pos = (s.pos + (s.search - 1.0) * grain as f64 * step).clamp(0.0, frames.saturating_sub(2) as f64);
+            }
+        } else if let Some((a, b)) = s.loop_range {
             let bf = b * audio.sr as f64;
             if s.pos >= bf {
                 s.pos = a * audio.sr as f64 + (s.pos - bf);
@@ -463,17 +503,26 @@ fn render(state: &Arc<Mutex<PlayState>>, out: &mut [f32], channels: usize, rate:
             }
             if s.click_phase < click_len {
                 let env = 1.0 - s.click_phase as f32 / click_len as f32;
-                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * 1500.0 / rate as f32).sin() * env * s.metronome_vol;
+                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * 1500.0 / rate as f32).sin() * env * s.metronome_vol * if s.muted { 0.0 } else { 1.0 };
                 s.click_phase += 1;
             }
         }
         if channels >= 2 {
-            f[0] = l * vol + click;
-            f[1] = r * vol + click;
+            f[0] += l * vol + click;
+            f[1] += r * vol + click;
         } else {
-            f[0] = 0.5 * (l + r) * vol + click;
+            f[0] += 0.5 * (l + r) * vol + click;
         }
         s.pos += step;
+    }
+}
+
+/// Metronome click level for the three volume steps of the GRID panel (1 = quiet … 3 = loud).
+pub fn metronome_level(step: u8) -> f32 {
+    match step {
+        0 | 1 => 0.2,
+        2 => 0.45,
+        _ => 0.9,
     }
 }
 
@@ -552,5 +601,85 @@ mod interp_tests {
             e_cub += (super::cubic(f(n - 1.0), f(n), f(n + 1.0), f(n + 2.0), 0.5) - truth).abs();
         }
         assert!(e_cub < e_lin * 0.6, "cubic {e_cub} vs linear {e_lin}");
+    }
+}
+
+#[cfg(test)]
+mod deck_mix_tests {
+    use super::*;
+
+    fn dc(level: f32, frames: usize) -> Arc<Decoded> {
+        Arc::new(Decoded { sr: 44100, samples: vec![level; frames * 2], raw_frames: frames, damaged: 0, truncated: false })
+    }
+    fn playing(level: f32) -> PlayState {
+        PlayState { audio: Some(dc(level, 44100)), playing: true, volume: 1.0, gain: 1.0, ..Default::default() }
+    }
+
+    #[test]
+    fn two_decks_are_summed_and_a_paused_deck_is_silent() {
+        let (mut a, mut b) = (playing(0.25), playing(0.5));
+        let mut out = vec![0.0f32; 512];
+        render_deck(&mut a, &mut out, 2, 44100);
+        render_deck(&mut b, &mut out, 2, 44100);
+        assert!(out.iter().all(|v| (*v - 0.75).abs() < 1e-5), "{:?}", &out[..4]);
+        assert_eq!(a.pos, 256.0);
+        assert_eq!(b.pos, 256.0);
+        // Deck B paused: only deck A sounds, and B's position stays.
+        b.playing = false;
+        let mut out = vec![0.0f32; 512];
+        render_deck(&mut a, &mut out, 2, 44100);
+        render_deck(&mut b, &mut out, 2, 44100);
+        assert!(out.iter().all(|v| (*v - 0.25).abs() < 1e-5));
+        assert_eq!(b.pos, 256.0);
+        // Mute silences a deck but it keeps moving.
+        a.muted = true;
+        let mut out = vec![0.0f32; 512];
+        render_deck(&mut a, &mut out, 2, 44100);
+        assert!(out.iter().all(|v| *v == 0.0));
+        assert_eq!(a.pos, 768.0);
+    }
+
+    #[test]
+    fn search_moves_at_its_speed_in_both_directions_even_when_paused() {
+        let mut s = PlayState { audio: Some(dc(0.5, 44100 * 60)), volume: 1.0, ..Default::default() };
+        s.pos = 44100.0 * 30.0;
+        s.search = 8.0;
+        let mut out = vec![0.0f32; 44100 * 2];
+        render_deck(&mut s, &mut out, 2, 44100);
+        // One second of output: about eight seconds of track, and it is audible.
+        let moved = (s.pos - 44100.0 * 30.0) / 44100.0;
+        assert!((moved - 8.0).abs() < 0.5, "{moved}");
+        assert!(out.iter().any(|v| *v > 0.1));
+        s.search = -8.0;
+        let from = s.pos;
+        let mut out = vec![0.0f32; 44100 * 2];
+        render_deck(&mut s, &mut out, 2, 44100);
+        let moved = (s.pos - from) / 44100.0;
+        assert!((moved + 8.0).abs() < 0.5, "{moved}");
+        // Search off and not playing: silent, position kept.
+        s.search = 0.0;
+        let from = s.pos;
+        let mut out = vec![0.0f32; 512];
+        render_deck(&mut s, &mut out, 2, 44100);
+        assert!(out.iter().all(|v| *v == 0.0));
+        assert_eq!(s.pos, from);
+    }
+
+    #[test]
+    fn metronome_has_three_rising_levels() {
+        assert!(metronome_level(1) < metronome_level(2) && metronome_level(2) < metronome_level(3));
+        let mut s = playing(0.0);
+        s.metronome = Some(Arc::new(vec![0.0]));
+        let peak = |s: &mut PlayState, step: u8| {
+            s.pos = 0.0;
+            s.next_click = 0;
+            s.click_phase = usize::MAX;
+            s.metronome_vol = metronome_level(step);
+            let mut out = vec![0.0f32; 2048];
+            render_deck(s, &mut out, 2, 44100);
+            out.iter().fold(0f32, |m, v| m.max(v.abs()))
+        };
+        let (p1, p2, p3) = (peak(&mut s, 1), peak(&mut s, 2), peak(&mut s, 3));
+        assert!(p1 > 0.05 && p2 > p1 * 1.5 && p3 > p2 * 1.5, "{p1} {p2} {p3}");
     }
 }

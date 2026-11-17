@@ -4,23 +4,34 @@ use eframe::egui;
 mod analysis;
 mod app;
 mod audio;
+mod backup;
 mod db;
 mod demo;
 mod export;
 mod icons;
 mod importer;
+mod itunes;
 mod jobs;
 mod key;
+mod library_ext;
 mod menus;
 mod model;
+mod manual;
 mod phrase;
+mod playlist_files;
+mod preview;
+mod player_ext;
+mod prefs_ext;
 mod rbimport;
 mod stems;
 mod smart;
 mod theme;
 mod ui_browser;
 mod ui_dialogs;
+mod ui_library_ext;
 mod ui_player;
+mod ui_prefs;
+mod ui_player2;
 mod xmlexport;
 
 use app::App;
@@ -86,6 +97,7 @@ impl eframe::App for Gui {
         app.poll_import();
         app.poll_analysis();
         app.poll_load();
+        app.poll_decks();
         app.poll_export();
         app.poll_rekordbox_sync();
         app.poll_stems();
@@ -94,8 +106,16 @@ impl eframe::App for Gui {
         app.poll_key_job();
         app.poll_audio_device();
         app.poll_relocate();
+        backup::poll(app);
         menus::poll(app);
+        menus::sync(app);
         shortcuts(app, ctx);
+        // Full screen (View menu, keyboard): the window follows; the menu tick follows the window.
+        let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if std::mem::take(&mut app.dialogs.ext.toggle_fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+        app.dialogs.ext.fullscreen = fs;
 
         egui::TopBottomPanel::top("header").exact_height(29.0).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
             ui_browser::header_bar(app, ui);
@@ -104,8 +124,12 @@ impl eframe::App for Gui {
             ui_browser::footer(app, ui);
         });
         if !app.prefs.browser_only {
-            egui::TopBottomPanel::top("player").exact_height(255.0).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
-                ui_player::player_panel(app, ui);
+            // 1 Player and 2 Players are 255 pt tall; the Simple Player is one 58 pt row.
+            let h = if app.prefs.player_layout == 2 { ui_player2::SIMPLE_HEIGHT } else { 255.0 };
+            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(2)))).exact_height(h).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+                1 => ui_player2::two_players(app, ui),
+                2 => ui_player2::simple_player(app, ui),
+                _ => ui_player::player_panel(app, ui),
             });
         }
         egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
@@ -240,10 +264,45 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
             app.hot_cue_up();
         }
     }
-    if left {
-        app.beat_jump(-if shift { 1.0 } else { app.prefs.beat_jump });
+    // One-shot actions (prefs_ext.rs). A shortcut the menu bar holds as an accelerator is
+    // the menu's to answer.
+    let mut acts = vec![];
+    for (id, _, _, _) in app::ACTIONS {
+        if prefs_ext::HELD_ACTIONS.contains(&id) || menus::owns_shortcut(app, id) {
+            continue;
+        }
+        if let Some(act) = prefs_ext::Act::parse(id) {
+            if hit(id, act.repeats()) {
+                acts.push(act);
+            }
+        }
     }
-    if right {
+    for act in acts {
+        prefs_ext::run_action(app, act);
+    }
+    // Search Backward / Forward run while their key is held.
+    for (id, dir) in [("search_back", -1), ("search_fwd", 1)] {
+        if first(id) {
+            app.search(dir);
+        } else if released(id) && app.searching() == dir {
+            app.search(0);
+        }
+    }
+    // Change Focus: with the keyboard focus on the Tree View the arrows move there.
+    let tree = app.dialogs.ext.focus_tree;
+    if tree && (left || right) {
+        prefs_ext::tree_expand(app, right);
+    }
+    if tree && (up || down) {
+        prefs_ext::tree_step(app, if up { -1 } else { 1 });
+    }
+    let (left, right, up, down) = (left && !tree, right && !tree, up && !tree, down && !tree);
+    // In loop adjust the arrows move the loop edge (Shift: 1 ms) instead of jumping.
+    if (left || right) && app.deck.x.loop_adjust != 0 && app.loop_active().is_some() {
+        app.loop_adjust_step(if left { -1 } else { 1 }, shift);
+    } else if left {
+        app.beat_jump(-if shift { 1.0 } else { app.prefs.beat_jump });
+    } else if right {
         app.beat_jump(if shift { 1.0 } else { app.prefs.beat_jump });
     }
     if up || down {

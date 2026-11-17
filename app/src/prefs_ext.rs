@@ -1,0 +1,672 @@
+//! Preferences that came with the rekordbox-style Preferences window, the keyboard action
+//! table and its dispatcher, and small helpers the menus share.
+//!
+//! Who reads which preference (all are fields of `Prefs` in app.rs):
+//! - `tree_items`: the icon strip in ui_browser.rs (`Prefs::tree_item(name)`).
+//! - `show_palette`: the playlist palette (library code).
+//! - `mytag_to_comments`: `App::set_tag` calls `sync_mytag_comments`.
+//! - `cue_markers_on_preview`: the Preview column in ui_browser.rs.
+//! - `wave_half`: the enlarged and overview waveforms in ui_player.rs.
+//! - `color_names`: every colour menu, through `Prefs::color_name`; the device colour table.
+//! - `high_precision_grid`, `analysis_mode`: the analysis code.
+//! - `memory_cue_first_beat`: `App::apply_analysis` calls `memory_cue_at_first_beat`.
+//! - `audio_buffer`, `audio_rate`, `audio_channel`: the output stream (audio.rs).
+//! - `device_bg_color`, `delete_history_after_import`: the USB code.
+//! - `hot_cue_auto_load_on_import`: `App::poll_import`.
+
+use crate::app::*;
+use crate::model::*;
+use eframe::egui;
+
+pub fn default_color_names() -> [String; 8] {
+    std::array::from_fn(|i| COLOR_NAMES[i + 1].to_string())
+}
+
+/// Tree View items of Preferences > View > Layout, in rekordbox's order.
+pub const TREE_ITEMS: [&str; 11] = ["Collection", "Playlists", "Related Tracks", "Matching", "Tag List", "Hot Cue Bank List", "iTunes", "rekordbox xml", "Explorer", "Devices", "Histories"];
+
+/// Tree View items Recordbox has a source for. The others are shown disabled in Preferences
+/// until their source exists (add the name here when it does).
+pub fn tree_item_available(name: &str) -> bool {
+    matches!(name, "Collection" | "Playlists" | "Related Tracks" | "Explorer" | "Devices" | "Histories") || TREE_ITEMS_EXTRA.contains(&name)
+}
+/// Sources added by the library code since (kept apart so adding one is a one-word edit).
+pub const TREE_ITEMS_EXTRA: &[&str] = &[];
+
+impl Prefs {
+    /// Whether a Tree View source is shown. Collection always is.
+    pub fn tree_item(&self, name: &str) -> bool {
+        name == "Collection" || self.tree_items.get(name).copied().unwrap_or(true)
+    }
+    /// The name of track colour `i` (0 = "No Color", 1..=8 the user's Color comments).
+    pub fn color_name(&self, i: u8) -> String {
+        match i {
+            1..=8 => {
+                let n = self.color_names[i as usize - 1].trim();
+                if n.is_empty() { COLOR_NAMES[i as usize].to_string() } else { n.to_string() }
+            }
+            _ => COLOR_NAMES[0].to_string(),
+        }
+    }
+}
+
+// ------------------------------------------------------------------ keyboard actions
+
+/// (id, label, default shortcut in stored form or "" for none, category).
+pub const ACTIONS: [(&str, &str, &str, &str); 79] = [
+    ("play", "Play/Pause", "Space", "Player"),
+    ("cue", "Cue", "C", "Player"),
+    ("jump_back", "Jump Reverse", "ArrowLeft", "Player"),
+    ("jump_fwd", "Jump Forward", "ArrowRight", "Player"),
+    ("search_back", "Search Backward", "Comma", "Player"),
+    ("search_fwd", "Search Forward", "Period", "Player"),
+    ("prev_track", "Previous Track", "Alt+ArrowUp", "Player"),
+    ("next_track", "Next Track", "Alt+ArrowDown", "Player"),
+    ("vol_up", "Volume Up", "Equals", "Player"),
+    ("vol_down", "Volume Down", "Minus", "Player"),
+    ("zoom_in", "Zoom In", "Shift+ArrowUp", "Player"),
+    ("zoom_out", "Zoom Out", "Shift+ArrowDown", "Player"),
+    ("zoom_reset", "Reset Zoom", "Shift+0", "Player"),
+    ("time_mode", "Switch Time/Remain", "T", "Player"),
+    ("quantize", "Quantize ON/OFF", "Q", "Player"),
+    ("hot1", "Set/Play Hot Cue A", "1", "Hot Cue"),
+    ("hot2", "Set/Play Hot Cue B", "2", "Hot Cue"),
+    ("hot3", "Set/Play Hot Cue C", "3", "Hot Cue"),
+    ("hot4", "Set/Play Hot Cue D", "4", "Hot Cue"),
+    ("hot5", "Set/Play Hot Cue E", "5", "Hot Cue"),
+    ("hot6", "Set/Play Hot Cue F", "6", "Hot Cue"),
+    ("hot7", "Set/Play Hot Cue G", "7", "Hot Cue"),
+    ("hot8", "Set/Play Hot Cue H", "8", "Hot Cue"),
+    ("clear_hot1", "Clear Hot Cue A", "Shift+1", "Hot Cue"),
+    ("clear_hot2", "Clear Hot Cue B", "Shift+2", "Hot Cue"),
+    ("clear_hot3", "Clear Hot Cue C", "Shift+3", "Hot Cue"),
+    ("clear_hot4", "Clear Hot Cue D", "Shift+4", "Hot Cue"),
+    ("clear_hot5", "Clear Hot Cue E", "Shift+5", "Hot Cue"),
+    ("clear_hot6", "Clear Hot Cue F", "Shift+6", "Hot Cue"),
+    ("clear_hot7", "Clear Hot Cue G", "Shift+7", "Hot Cue"),
+    ("clear_hot8", "Clear Hot Cue H", "Shift+8", "Hot Cue"),
+    ("memory", "Memory Cue", "M", "Memory Cue"),
+    ("mem_next", "Call Next Memory Cue", "Alt+ArrowRight", "Memory Cue"),
+    ("mem_prev", "Call Previous Memory Cue", "Alt+ArrowLeft", "Memory Cue"),
+    ("mem_call1", "Memory Cue 1", "Alt+1", "Memory Cue"),
+    ("mem_call2", "Memory Cue 2", "Alt+2", "Memory Cue"),
+    ("mem_call3", "Memory Cue 3", "Alt+3", "Memory Cue"),
+    ("mem_call4", "Memory Cue 4", "Alt+4", "Memory Cue"),
+    ("mem_call5", "Memory Cue 5", "Alt+5", "Memory Cue"),
+    ("mem_call6", "Memory Cue 6", "Alt+6", "Memory Cue"),
+    ("mem_call7", "Memory Cue 7", "Alt+7", "Memory Cue"),
+    ("mem_call8", "Memory Cue 8", "Alt+8", "Memory Cue"),
+    ("mem_call9", "Memory Cue 9", "Alt+9", "Memory Cue"),
+    ("mem_call10", "Memory Cue 10", "Alt+0", "Memory Cue"),
+    ("mem_delete", "Delete Memory Cue", "Alt+M", "Memory Cue"),
+    ("mem_delete1", "Delete Memory Cue 1", "", "Memory Cue"),
+    ("mem_delete2", "Delete Memory Cue 2", "", "Memory Cue"),
+    ("mem_delete3", "Delete Memory Cue 3", "", "Memory Cue"),
+    ("mem_delete4", "Delete Memory Cue 4", "", "Memory Cue"),
+    ("mem_delete5", "Delete Memory Cue 5", "", "Memory Cue"),
+    ("mem_delete6", "Delete Memory Cue 6", "", "Memory Cue"),
+    ("mem_delete7", "Delete Memory Cue 7", "", "Memory Cue"),
+    ("mem_delete8", "Delete Memory Cue 8", "", "Memory Cue"),
+    ("mem_delete9", "Delete Memory Cue 9", "", "Memory Cue"),
+    ("mem_delete10", "Delete Memory Cue 10", "", "Memory Cue"),
+    ("loop_in", "Loop In", "I", "Loop"),
+    ("loop_out", "Loop Out", "O", "Loop"),
+    ("reloop", "Exit/Reloop", "P", "Loop"),
+    ("auto_loop", "4 Beat Loop", "L", "Loop"),
+    ("loop_halve", "Halve the loop", "OpenBracket", "Loop"),
+    ("loop_double", "Double the loop", "CloseBracket", "Loop"),
+    ("grid_left", "Move the beat grid to the left", "Alt+Comma", "Grid"),
+    ("grid_right", "Move the beat grid to the right", "Alt+Period", "Grid"),
+    ("grid_downbeat", "Set the first beat of a bar to the current position.", "Alt+B", "Grid"),
+    ("grid_tap", "Set BPM with the tapping interval", "Alt+T", "Grid"),
+    ("list_up", "Up", "ArrowUp", "Browse"),
+    ("list_down", "Down", "ArrowDown", "Browse"),
+    ("load", "Load track to player 1", "Enter", "Browse"),
+    ("remove", "Remove from Playlist", "Delete", "Browse"),
+    ("focus", "Change Focus", "Tab", "Browse"),
+    ("filter", "Display/Hide Track Filter", "Alt+F", "Browse"),
+    ("import_file", "Import file", "Cmd+O", "Others"),
+    ("import_dir", "Import directory", "Shift+Cmd+O", "Others"),
+    ("fullscreen", "Fullscreen mode", "Ctrl+Cmd+F", "Others"),
+    ("backup", "Backup Library", "", "Others"),
+    ("restore", "Restore Library", "", "Others"),
+    ("export_playlists_info", "Export Playlists information", "", "Others"),
+    ("prefs", "Preferences", "Cmd+Comma", "Others"),
+    ("about", "About...", "", "Others"),
+];
+
+/// Categories in the order the Keyboard page shows them.
+pub const ACTION_CATEGORIES: [&str; 7] = ["Player", "Hot Cue", "Memory Cue", "Loop", "Grid", "Browse", "Others"];
+
+/// Actions the key loop in main.rs handles itself, because they react to key releases,
+/// key repeats or held modifiers.
+pub const HELD_ACTIONS: [&str; 19] = ["search_back", "search_fwd", "play", "cue", "memory", "hot1", "hot2", "hot3", "hot4", "hot5", "hot6", "hot7", "hot8", "jump_back", "jump_fwd", "list_up", "list_down", "load", "remove"];
+
+/// Actions that also have a menu item: with a ⌘ or ⌃ shortcut the menu bar receives the keys
+/// (as its accelerator); otherwise the key loop does.
+pub const MENU_ACTIONS: [(&str, &str); 4] = [("import_file", "import_track"), ("import_dir", "import_folder"), ("fullscreen", "fullscreen"), ("prefs", "prefs")];
+
+/// What a one-shot keyboard action does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Act {
+    Track(i32),
+    Volume(f32),
+    Zoom(i32),
+    TimeMode,
+    Quantize,
+    ClearHot(i32),
+    MemJump(i32),
+    MemCall(usize),
+    MemDeleteCurrent,
+    MemDelete(usize),
+    LoopIn,
+    LoopOut,
+    Reloop,
+    AutoLoop,
+    LoopResize(f64),
+    GridShift(f64),
+    GridDownbeat,
+    GridTap,
+    Focus,
+    Filter,
+    Menu(&'static str),
+}
+
+impl Act {
+    pub fn parse(id: &str) -> Option<Act> {
+        let num = |p: &str| id.strip_prefix(p).and_then(|n| n.parse::<usize>().ok());
+        Some(match id {
+            "prev_track" => Act::Track(-1),
+            "next_track" => Act::Track(1),
+            "vol_up" => Act::Volume(0.05),
+            "vol_down" => Act::Volume(-0.05),
+            "zoom_in" => Act::Zoom(-1),
+            "zoom_out" => Act::Zoom(1),
+            "zoom_reset" => Act::Zoom(0),
+            "time_mode" => Act::TimeMode,
+            "quantize" => Act::Quantize,
+            "mem_next" => Act::MemJump(1),
+            "mem_prev" => Act::MemJump(-1),
+            "mem_delete" => Act::MemDeleteCurrent,
+            "loop_in" => Act::LoopIn,
+            "loop_out" => Act::LoopOut,
+            "reloop" => Act::Reloop,
+            "auto_loop" => Act::AutoLoop,
+            "loop_halve" => Act::LoopResize(0.5),
+            "loop_double" => Act::LoopResize(2.0),
+            "grid_left" => Act::GridShift(-0.001),
+            "grid_right" => Act::GridShift(0.001),
+            "grid_downbeat" => Act::GridDownbeat,
+            "grid_tap" => Act::GridTap,
+            "focus" => Act::Focus,
+            "filter" => Act::Filter,
+            "import_file" => Act::Menu("import_track"),
+            "import_dir" => Act::Menu("import_folder"),
+            "fullscreen" => Act::Menu("fullscreen"),
+            "backup" => Act::Menu("backup"),
+            "restore" => Act::Menu("restore"),
+            "export_playlists_info" => Act::Menu("export_playlists_info"),
+            "prefs" => Act::Menu("prefs"),
+            "about" => Act::Menu("about"),
+            _ => {
+                if let Some(n) = num("clear_hot").filter(|n| (1..=8).contains(n)) {
+                    Act::ClearHot(n as i32 - 1)
+                } else if let Some(n) = num("mem_call").filter(|n| (1..=10).contains(n)) {
+                    Act::MemCall(n - 1)
+                } else if let Some(n) = num("mem_delete").filter(|n| (1..=10).contains(n)) {
+                    Act::MemDelete(n - 1)
+                } else {
+                    return None;
+                }
+            }
+        })
+    }
+    /// Held keys repeat the action (searching, volume, grid nudges).
+    pub fn repeats(&self) -> bool {
+        matches!(self, Act::Volume(_) | Act::GridShift(_))
+    }
+}
+
+/// Carry out a one-shot keyboard action.
+pub fn run_action(app: &mut App, act: Act) {
+    match act {
+        Act::Track(dir) => app.load_adjacent(dir),
+        Act::Volume(d) => {
+            let mut s = app.player.state.lock();
+            s.volume = (s.volume + d).clamp(0.0, 1.0);
+        }
+        Act::Zoom(d) => {
+            app.prefs.zoom = match d {
+                0 => 2,
+                d if d < 0 => app.prefs.zoom.saturating_sub(1),
+                _ => (app.prefs.zoom + 1).min(ZOOMS.len() - 1),
+            };
+            app.save_prefs();
+        }
+        Act::TimeMode => {
+            app.prefs.time_remain = !app.prefs.time_remain;
+            app.save_prefs();
+        }
+        Act::Quantize => {
+            app.prefs.quantize = !app.prefs.quantize;
+            app.save_prefs();
+            app.toast(if app.prefs.quantize { "Quantize ON" } else { "Quantize OFF" });
+        }
+        Act::ClearHot(slot) => {
+            if let Some(id) = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| c.id) {
+                app.delete_cue(id);
+            }
+        }
+        Act::MemJump(d) => app.memory_jump(d),
+        Act::MemCall(n) => {
+            if let Some(c) = app.memory_cues().get(n).cloned() {
+                app.call_memory(&c);
+            }
+        }
+        Act::MemDeleteCurrent => app.memory_delete_current(),
+        Act::MemDelete(n) => {
+            if let Some(id) = app.memory_cues().get(n).map(|c| c.id) {
+                app.delete_cue(id);
+            }
+        }
+        Act::LoopIn => app.loop_in_pressed(),
+        Act::LoopOut => app.loop_out_pressed(),
+        Act::Reloop => app.exit_reloop(),
+        Act::AutoLoop => {
+            if app.loop_active().is_some() {
+                app.loop_exit();
+            } else {
+                app.auto_loop(4.0);
+            }
+        }
+        Act::LoopResize(f) => app.resize_loop(f),
+        Act::GridShift(s) => app.grid_shift(s),
+        Act::GridDownbeat => app.grid_set_downbeat(),
+        Act::GridTap => app.grid_tap(),
+        Act::Focus => {
+            app.dialogs.ext.focus_tree = !app.dialogs.ext.focus_tree;
+            app.toast(if app.dialogs.ext.focus_tree { "Keyboard focus: Tree View" } else { "Keyboard focus: track list" });
+        }
+        Act::Filter => crate::menus::handle(app, "filter"),
+        Act::Menu(id) => crate::menus::handle(app, id),
+    }
+}
+
+/// Playlists and folders as the tree shows them (folders that are open show their children).
+pub fn visible_nodes(nodes: &[PlaylistNode], expanded: &std::collections::HashSet<i64>) -> Vec<i64> {
+    fn walk(nodes: &[PlaylistNode], expanded: &std::collections::HashSet<i64>, parent: i64, out: &mut Vec<i64>, depth: u8) {
+        if depth > 32 {
+            return;
+        }
+        let mut kids: Vec<&PlaylistNode> = nodes.iter().filter(|n| n.parent == parent).collect();
+        kids.sort_by_key(|n| n.seq);
+        for k in kids {
+            out.push(k.id);
+            if k.kind == NodeKind::Folder && expanded.contains(&k.id) {
+                walk(nodes, expanded, k.id, out, depth + 1);
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(nodes, expanded, 0, &mut out, 0);
+    out
+}
+
+/// Up/Down while the keyboard focus is on the Tree View: the previous/next playlist or
+/// folder (Collection sits above the first one).
+pub fn tree_step(app: &mut App, dir: i32) {
+    let vis = visible_nodes(&app.nodes, &app.expanded);
+    let cur = match &app.view {
+        View::Playlist(id) => vis.iter().position(|x| x == id).map(|i| i as i64),
+        _ => None,
+    };
+    let next = cur.unwrap_or(-1) + dir as i64;
+    if next < 0 {
+        app.side = SideMode::Collection;
+        app.set_view(View::Collection);
+    } else if let Some(id) = vis.get(next as usize) {
+        app.side = SideMode::Playlists;
+        app.set_view(View::Playlist(*id));
+    }
+}
+
+/// Left/Right while the keyboard focus is on the Tree View: close/open the selected folder.
+pub fn tree_expand(app: &mut App, open: bool) {
+    if let View::Playlist(id) = app.view {
+        if app.node(id).map(|n| n.kind == NodeKind::Folder).unwrap_or(false) {
+            if open {
+                app.expanded.insert(id);
+            } else {
+                app.expanded.remove(&id);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ My Tag in Comments
+
+/// rekordbox's form: the tag names in a `/* A / B */` block at the end of the comment.
+pub fn comment_with_tags(comment: &str, tags: &[String]) -> String {
+    let base = match (comment.rfind("/*"), comment.trim_end().ends_with("*/")) {
+        (Some(i), true) => comment[..i].trim_end(),
+        _ => comment.trim_end(),
+    };
+    if tags.is_empty() {
+        return base.to_string();
+    }
+    let block = format!("/* {} */", tags.join(" / "));
+    if base.is_empty() { block } else { format!("{base} {block}") }
+}
+
+pub fn sync_mytag_comments(app: &mut App, ids: &[i64]) {
+    for id in ids {
+        let set = app.track_tags.get(id).cloned().unwrap_or_default();
+        let names: Vec<String> = app.mytags.iter().filter(|t| t.parent != 0 && set.contains(&t.id)).map(|t| t.name.clone()).collect();
+        let Some(cur) = app.track(*id).map(|t| t.comment.clone()) else { continue };
+        let next = comment_with_tags(&cur, &names);
+        if next != cur {
+            if let Some(t) = app.track_mut(*id) {
+                t.comment = next;
+            }
+            app.save_track_quiet(*id);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ CUE Analysis
+
+/// "Set Memory Cue at the first beat of track when analyzing": for a track that has no
+/// memory cue yet.
+pub fn memory_cue_at_first_beat(app: &mut App, id: i64, grid: &BeatGrid) {
+    let dur = app.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
+    let Some(first) = grid.beats(dur).first().map(|b| b.time) else { return };
+    let cues = app.db.cues(id).unwrap_or_default();
+    if cues.iter().any(|c| c.kind == CueKind::Memory) {
+        return;
+    }
+    let c = Cue { id: 0, track_id: id, kind: CueKind::Memory, slot: -1, start: first.max(0.0), end: None, color: 0, comment: String::new(), active_loop: false };
+    if app.db.save_cue(&c).is_ok() {
+        app.cue_counts.entry(id).or_insert((0, 0)).1 += 1;
+        if app.deck.track == Some(id) {
+            app.deck.cues = app.db.cues(id).unwrap_or_default();
+        }
+    }
+}
+
+// ------------------------------------------------------------------ menu helpers
+
+/// The menu-bar accelerator for a shortcut (None: the key loop handles it).
+pub fn accelerator(sc: &Shortcut) -> Option<muda::accelerator::Accelerator> {
+    use muda::accelerator::{Accelerator, Code, Modifiers};
+    if !(sc.cmd || sc.ctrl) {
+        return None;
+    }
+    let name = sc.key.name();
+    let code_name = match name {
+        n if n.len() == 1 && n.as_bytes()[0].is_ascii_alphabetic() => format!("Key{}", n.to_ascii_uppercase()),
+        n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => format!("Digit{n}"),
+        "Equals" => "Equal".into(),
+        "OpenBracket" => "BracketLeft".into(),
+        "CloseBracket" => "BracketRight".into(),
+        "Backtick" => "Backquote".into(),
+        n => n.to_string(),
+    };
+    let code: Code = code_name.parse().ok()?;
+    let mut m = Modifiers::empty();
+    if sc.cmd {
+        m |= Modifiers::META;
+    }
+    if sc.ctrl {
+        m |= Modifiers::CONTROL;
+    }
+    if sc.alt {
+        m |= Modifiers::ALT;
+    }
+    if sc.shift {
+        m |= Modifiers::SHIFT;
+    }
+    Some(Accelerator::new(Some(m), code))
+}
+
+/// Window state added with the menu and Preferences work (a field of `Dialogs`).
+#[derive(Default)]
+pub struct DialogsExt {
+    /// Help > Keyboard Shortcuts window.
+    pub shortcuts_open: bool,
+    /// Up/Down move in the Tree View instead of the track list (Change Focus).
+    pub focus_tree: bool,
+    /// Preferences sidebar search text.
+    pub prefs_search: String,
+    /// Backup Library: waiting for the answer to "Do you want to back up music files as well?".
+    pub backup_ask: bool,
+    /// Restore Library: the chosen archive, waiting for confirmation.
+    pub restore_ask: Option<std::path::PathBuf>,
+    /// Backup or restore running in the background.
+    pub backup_job: Option<crate::backup::Job>,
+    /// Result text of the last backup/restore, shown until dismissed: (title, text).
+    pub backup_done: Option<(String, String)>,
+    /// "Reset to defaults" waiting for confirmation: Some(page) for one page, Some(None) all.
+    pub reset_ask: Option<Option<u8>>,
+    /// Customize Color Comments window.
+    pub color_comments: bool,
+    /// Full screen asked for from the menu or keyboard (applied by the main loop).
+    pub toggle_fullscreen: bool,
+    pub fullscreen: bool,
+}
+
+// ------------------------------------------------------------------ library functions
+// The library code is to provide App::import_playlist_file, export_playlist_file,
+// export_all_playlists_info, open_missing_file_manager and analyze_missing. Until it does,
+// the menus call these stand-ins (swap the bodies for the App methods when they exist).
+
+pub fn import_playlist_file(app: &mut App, path: &std::path::Path, _parent: i64) {
+    crate::ui_browser::import_m3u(app, path);
+}
+
+fn m3u8(app: &App, tracks: &[i64]) -> String {
+    let mut s = String::from("#EXTM3U\n");
+    for id in tracks {
+        if let Some(t) = app.track(*id) {
+            s.push_str(&format!("#EXTINF:{},{} - {}\n{}\n", t.duration.round() as i64, t.artist, t.title, t.path));
+        }
+    }
+    s
+}
+
+fn file_safe(name: &str) -> String {
+    let s: String = name.chars().map(|c| if matches!(c, '/' | ':' | '\\' | '\0') { '_' } else { c }).collect();
+    if s.trim().is_empty() { "Untitled Playlist".into() } else { s }
+}
+
+pub fn export_playlist_file(app: &mut App, node: i64, path: &std::path::Path) -> anyhow::Result<usize> {
+    let tracks = app.view_tracks_of(&View::Playlist(node));
+    std::fs::write(path, m3u8(app, &tracks))?;
+    Ok(tracks.len())
+}
+
+/// One .m3u8 per playlist, in folders that mirror the playlist tree. Returns the number of
+/// playlists written.
+pub fn export_all_playlists_info(app: &mut App, dir: &std::path::Path) -> anyhow::Result<usize> {
+    fn walk(app: &App, parent: i64, dir: &std::path::Path, n: &mut usize, depth: u8) -> anyhow::Result<()> {
+        if depth > 32 {
+            return Ok(());
+        }
+        let mut kids: Vec<PlaylistNode> = app.nodes.iter().filter(|x| x.parent == parent).cloned().collect();
+        kids.sort_by_key(|x| x.seq);
+        for k in kids {
+            if k.kind == NodeKind::Folder {
+                let d = dir.join(file_safe(&k.name));
+                std::fs::create_dir_all(&d)?;
+                walk(app, k.id, &d, n, depth + 1)?;
+            } else {
+                let tracks = app.view_tracks_of(&View::Playlist(k.id));
+                std::fs::write(dir.join(format!("{}.m3u8", file_safe(&k.name))), m3u8(app, &tracks))?;
+                *n += 1;
+            }
+        }
+        Ok(())
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut n = 0;
+    walk(app, 0, dir, &mut n, 0)?;
+    Ok(n)
+}
+
+pub fn open_missing_file_manager(app: &mut App) {
+    app.side = SideMode::Collection;
+    app.set_view(View::Collection);
+    let missing: Vec<i64> = app.tracks.iter().filter(|t| t.missing).map(|t| t.id).collect();
+    app.toast(format!("{} missing file(s) in the collection", missing.len()));
+    app.selected = missing.into_iter().collect();
+}
+
+pub fn analyze_missing(app: &mut App, ids: &[i64]) {
+    app.analyze(ids, false);
+}
+
+/// Relocate > Auto Relocate: search the folders of Preferences > Advanced > Browse.
+pub fn auto_relocate(app: &mut App) {
+    let folders: Vec<String> = app.prefs.relocate_folders.iter().filter(|f| std::path::Path::new(f).is_dir()).cloned().collect();
+    match folders.first() {
+        Some(f) => {
+            if folders.len() > 1 {
+                app.toast(format!("Searching {f} first; run Auto Relocate again for the other folders."));
+            }
+            app.relocate_missing(std::path::Path::new(f));
+        }
+        None => app.toast_err("No folder to search. Add folders in Preferences > Advanced > Browse > Auto Relocate Search Folders."),
+    }
+}
+
+/// Playlist > Sort Items: the children of a folder (0 = the top level) by name.
+pub fn sort_items(app: &mut App, parent: i64) {
+    let mut kids: Vec<PlaylistNode> = app.nodes.iter().filter(|n| n.parent == parent).cloned().collect();
+    kids.sort_by_key(|n| n.name.to_lowercase());
+    for (i, k) in kids.iter().enumerate() {
+        let _ = app.db.move_node(k.id, parent, i as i64);
+    }
+    app.reload_playlists();
+}
+
+/// The folder Sort Items and the Create commands act in: the selected folder, else the
+/// folder of the selected playlist, else the top level.
+pub fn current_parent(app: &App) -> i64 {
+    match &app.view {
+        View::Playlist(id) => match app.node(*id) {
+            Some(n) if n.kind == NodeKind::Folder => n.id,
+            Some(n) => n.parent,
+            None => 0,
+        },
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_action_is_dispatched_and_defaults_are_keys() {
+        let mut ids = std::collections::HashSet::new();
+        let mut keys = std::collections::HashMap::new();
+        for (id, label, def, cat) in ACTIONS {
+            assert!(ids.insert(id), "duplicate action {id}");
+            assert!(!label.is_empty());
+            assert!(ACTION_CATEGORIES.contains(&cat), "{id}: unknown category {cat}");
+            assert!(HELD_ACTIONS.contains(&id) || Act::parse(id).is_some(), "{id} has no handler");
+            if !def.is_empty() {
+                let sc = Shortcut::parse(def).unwrap_or_else(|| panic!("{id}: {def} is not a shortcut"));
+                assert_eq!(sc.name(), def, "{id}: stored form");
+                if let Some(other) = keys.insert(def, id) {
+                    panic!("{id} and {other} share {def}");
+                }
+            }
+        }
+        for h in HELD_ACTIONS {
+            assert!(ids.contains(h), "{h} is not an action");
+        }
+        for (a, _) in MENU_ACTIONS {
+            assert!(matches!(Act::parse(a), Some(Act::Menu(_))), "{a}");
+        }
+        // Shift+arrow left/right stay free: beat jumps use Shift for a one-beat jump.
+        assert!(!keys.contains_key("Shift+ArrowLeft") && !keys.contains_key("Shift+ArrowRight"));
+        assert_eq!(Act::parse("clear_hot8"), Some(Act::ClearHot(7)));
+        assert_eq!(Act::parse("mem_call10"), Some(Act::MemCall(9)));
+        assert_eq!(Act::parse("mem_delete3"), Some(Act::MemDelete(2)));
+        assert_eq!(Act::parse("mem_delete"), Some(Act::MemDeleteCurrent));
+        assert_eq!(Act::parse("clear_hot9"), None);
+        assert_eq!(Act::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn menu_accelerators() {
+        for (a, _) in MENU_ACTIONS {
+            let def = ACTIONS.iter().find(|x| x.0 == a).unwrap().2;
+            assert!(accelerator(&Shortcut::parse(def).unwrap()).is_some(), "{a}: {def}");
+        }
+        // Plain keys never become menu accelerators (they would take typing away from text fields).
+        assert!(accelerator(&Shortcut::parse("F").unwrap()).is_none());
+        assert!(accelerator(&Shortcut::parse("Shift+Cmd+O").unwrap()).is_some());
+        assert!(accelerator(&Shortcut::parse("Cmd+1").unwrap()).is_some());
+        assert!(accelerator(&Shortcut::parse("Cmd+ArrowUp").unwrap()).is_some());
+    }
+
+    #[test]
+    fn new_prefs_round_trip() {
+        let mut p = Prefs::default();
+        assert!(p.tree_item("Devices") && p.cue_markers_on_preview && p.high_precision_grid && !p.wave_half);
+        p.tree_items.insert("Devices".into(), false);
+        p.tree_items.insert("Collection".into(), false);
+        p.show_palette = true;
+        p.mytag_to_comments = true;
+        p.cue_markers_on_preview = false;
+        p.wave_half = true;
+        p.color_names[2] = "Peak time".into();
+        p.color_names[3] = "  ".into();
+        p.high_precision_grid = false;
+        p.memory_cue_first_beat = true;
+        p.audio_buffer = 256;
+        p.audio_rate = 48000;
+        p.audio_channel = 2;
+        p.device_bg_color = 5;
+        p.delete_history_after_import = true;
+        p.hot_cue_auto_load_on_import = false;
+        p.itunes_xml = Some("/tmp/iTunes Library.xml".into());
+        p.rekordbox_xml_path = Some("/tmp/rekordbox.xml".into());
+        p.relocate_folders = vec!["/Volumes/Music".into()];
+        let s = serde_json::to_string(&p).unwrap();
+        let q: Prefs = serde_json::from_str(&s).unwrap();
+        assert_eq!(format!("{p:?}"), format!("{q:?}"));
+        assert!(!q.tree_item("Devices"));
+        assert!(q.tree_item("Collection"), "Collection cannot be hidden");
+        assert_eq!(q.color_name(3), "Peak time");
+        assert_eq!(q.color_name(4), "Yellow", "a blank name falls back to the colour");
+        assert_eq!(q.color_name(0), "No Color");
+        // Preferences saved before these settings existed load with the defaults.
+        let old: Prefs = serde_json::from_str(r#"{"key_alnum":true}"#).unwrap();
+        assert!(old.key_alnum && old.cue_markers_on_preview && old.hot_cue_auto_load_on_import);
+        assert_eq!(old.color_names, default_color_names());
+        assert_eq!(old.audio_buffer, 0);
+    }
+
+    #[test]
+    fn tags_in_comments() {
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(comment_with_tags("", &tags(&["House", "Peak"])), "/* House / Peak */");
+        assert_eq!(comment_with_tags("great intro", &tags(&["House"])), "great intro /* House */");
+        assert_eq!(comment_with_tags("great intro /* House */", &tags(&["House", "Vocal"])), "great intro /* House / Vocal */");
+        assert_eq!(comment_with_tags("great intro /* House */", &[]), "great intro");
+        assert_eq!(comment_with_tags("/* House */", &[]), "");
+        assert_eq!(comment_with_tags("a /* b */ c", &tags(&["X"])), "a /* b */ c /* X */");
+    }
+
+    #[test]
+    fn tree_order() {
+        let n = |id, parent, seq, kind| PlaylistNode { id, parent, name: format!("n{id}"), kind, seq, smart: None };
+        let nodes = vec![n(1, 0, 1, NodeKind::Folder), n(2, 1, 0, NodeKind::Playlist), n(3, 0, 0, NodeKind::Playlist), n(4, 1, 1, NodeKind::Playlist)];
+        let mut open = std::collections::HashSet::new();
+        assert_eq!(visible_nodes(&nodes, &open), vec![3, 1]);
+        open.insert(1);
+        assert_eq!(visible_nodes(&nodes, &open), vec![3, 1, 2, 4]);
+    }
+}
