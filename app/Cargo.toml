@@ -35,6 +35,8 @@ candle-core = "0.9"
 candle-nn = "0.9"
 sha2 = "0.10"
 ureq = "2"
+# Clipboard text for Edit > Paste (already in the tree through egui).
+arboard = { version = "3", default-features = false }
 # Library backup archives (stored entries only: the database is small and audio/artwork
 # are compressed already).
 zip = { version = "7", default-features = false }

@@ -286,6 +286,7 @@ pub fn inline_editor(app: &mut App, ui: &mut Ui, r: Rect) {
     if !ed.focused {
         te.request_focus();
         ed.focused = true;
+        ui.ctx().request_repaint();
         app.ext.edit = Some(ed);
         return;
     }
@@ -1155,9 +1156,13 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
                     ui.add_space(36.0);
                     ui.add(egui::TextEdit::singleline(&mut s).desired_width(150.0))
                 }).inner;
-                resp.request_focus();
+                // Whether the field just gave up focus must be read before focus is asked for again.
+                let gave_up = resp.lost_focus();
+                if !gave_up {
+                    resp.request_focus();
+                }
                 app.ext.related_rename = Some((ri, s.clone()));
-                if resp.lost_focus() {
+                if gave_up {
                     if !s.trim().is_empty() {
                         app.prefs.related_lists[i].name = s.trim().to_string();
                         app.save_prefs();

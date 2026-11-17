@@ -540,7 +540,7 @@ fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, key
     // The same button faces as the 1 Player layout, scaled to this layout's size.
     let dia = rad * 2.0 + 3.0;
     crate::ui_player::cue_button_face(&p, cue_c, dia, cue_lit, loaded, cr.hovered());
-    if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
+    if crate::ui_player::press_fired(ui, &cr) && !app.deck.cue_preview {
         app.cue_down();
     }
     let cue_key_held = keys && app.prefs.key_for("cue").map(|k| ui.input(|i| i.key_down(k))).unwrap_or(false);
@@ -808,7 +808,7 @@ fn hot_pad(app: &mut App, ui: &mut Ui, r: Rect, slot: i32) {
     };
     let letter = (b'A' + slot as u8) as char;
     p.text(r.center() + vec2(-0.3, -1.1), Align2::CENTER_CENTER, letter.to_string(), FontId::proportional(13.0), tc);
-    if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+    if crate::ui_player::press_fired(ui, &resp) {
         if ui.input(|i| i.modifiers.shift) {
             if let Some(c) = &cue {
                 app.delete_cue(c.id);

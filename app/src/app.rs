@@ -1047,6 +1047,9 @@ pub struct App {
     pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
+    /// Edit menu commands waiting to be handed to egui as input events on the next frame:
+    /// 0 cut, 1 copy, 2 paste, 3 select all.
+    pub edit_cmds: Vec<u8>,
     /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
     pub ext: crate::library_ext::LibExt,
 }
@@ -1154,9 +1157,11 @@ impl App {
             scroll_to_selected: false,
             list_scroll_to: None,
             menu: None,
+            edit_cmds: vec![],
             ext: Default::default(),
         };
         app.menu = crate::menus::build();
+        crate::menus::wake_on_menu(&app.ctx);
         app.reload_all();
         app.reload_library_ext();
         if let Some(e) = app.player.error.clone() {

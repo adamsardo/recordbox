@@ -876,9 +876,13 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
                     ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0))
                 });
                 let resp = resp.inner;
-                resp.request_focus();
+                // Whether the field just gave up focus must be read before focus is asked for again.
+                let gave_up = resp.lost_focus();
+                if !gave_up {
+                    resp.request_focus();
+                }
                 app.dialogs.rename.as_mut().unwrap().1 = name.clone();
-                if resp.lost_focus() {
+                if gave_up {
                     if !name.trim().is_empty() {
                         let _ = app.db.rename_node(n.id, name.trim());
                     }
@@ -1986,6 +1990,8 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                 if let Some(t) = app.track(id) {
                     let text = crate::library_ext::edit_text(t, c, app.prefs.key_alnum);
                     app.ext.edit = Some(crate::library_ext::CellEdit { track: id, col: c, text, focused: false });
+                    // The editor is drawn by the row on the next frame: ask for that frame now.
+                    ui.ctx().request_repaint();
                 }
             }
         } else {
@@ -1996,6 +2002,10 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     // removes from the Tag List or history shown, and Cut / Copy / Paste move tracks between
     // playlists.
     if !ui.ctx().wants_keyboard_input() {
+        // Select All (Edit menu / Cmd+A) selects every track of the list shown.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            app.select_all();
+        }
         let (esc, del, copy, cut, paste) = ui.input(|i| {
             let ev = |f: &dyn Fn(&egui::Event) -> bool| i.events.iter().any(|e| f(e));
             (i.key_pressed(egui::Key::Escape), (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) && i.modifiers.is_none(), ev(&|e| matches!(e, egui::Event::Copy)), ev(&|e| matches!(e, egui::Event::Cut)), ev(&|e| matches!(e, egui::Event::Paste(_))))
@@ -2412,9 +2422,13 @@ fn mytag_panel(app: &mut App, ui: &mut Ui) {
                 if rid == c.id {
                     let mut n = name;
                     let r = ui.text_edit_singleline(&mut n);
-                    r.request_focus();
+                    // Whether the field just gave up focus must be read before focus is asked for again.
+                    let gave_up = r.lost_focus();
+                    if !gave_up {
+                        r.request_focus();
+                    }
                     app.dialogs.rename_tag = Some((rid, n.clone()));
-                    if r.lost_focus() {
+                    if gave_up {
                         let _ = app.db.rename_mytag(rid, n.trim());
                         app.dialogs.rename_tag = None;
                         app.reload_tags();
@@ -2447,9 +2461,13 @@ fn mytag_panel(app: &mut App, ui: &mut Ui) {
                         if rid == tg.id {
                             let mut n = name;
                             let r = ui.add(egui::TextEdit::singleline(&mut n).desired_width(90.0));
-                            r.request_focus();
+                            // Whether the field just gave up focus must be read before focus is asked for again.
+                            let gave_up = r.lost_focus();
+                            if !gave_up {
+                                r.request_focus();
+                            }
                             app.dialogs.rename_tag = Some((rid, n.clone()));
-                            if r.lost_focus() {
+                            if gave_up {
                                 let _ = app.db.rename_mytag(rid, n.trim());
                                 app.dialogs.rename_tag = None;
                                 app.reload_tags();
@@ -2497,9 +2515,13 @@ fn mytag_panel(app: &mut App, ui: &mut Ui) {
                     if cid == c.id {
                         let mut n = name;
                         let r = ui.add(egui::TextEdit::singleline(&mut n).desired_width(90.0).hint_text("New tag"));
-                        r.request_focus();
+                        // Whether the field just gave up focus must be read before focus is asked for again.
+                        let gave_up = r.lost_focus();
+                        if !gave_up {
+                            r.request_focus();
+                        }
                         app.dialogs.new_tag = Some((cid, n.clone()));
-                        if r.lost_focus() {
+                        if gave_up {
                             if !n.trim().is_empty() {
                                 let _ = app.db.add_mytag(cid, n.trim());
                                 app.reload_tags();

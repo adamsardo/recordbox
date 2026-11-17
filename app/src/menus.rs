@@ -28,7 +28,11 @@ thread_local! {
 }
 
 /// Every menu command: (id, label, ticked item). The order here is not the menu order.
-pub const COMMANDS: [(&str, &str, bool); 60] = [
+pub const COMMANDS: [(&str, &str, bool); 64] = [
+    ("edit_cut", "Cut", false),
+    ("edit_copy", "Copy", false),
+    ("edit_paste", "Paste", false),
+    ("edit_select_all", "Select All", false),
     ("about", "About Recordbox", false),
     ("prefs", "Preferences…", false),
     ("import_track", "Import Track", false),
@@ -105,9 +109,31 @@ fn fixed_accelerator(id: &str) -> Option<Accelerator> {
         "new_playlist" => (cmd, Code::KeyN),
         "export_device" => (cmd, Code::KeyE),
         "property" => (cmd, Code::KeyI),
+        // Edit commands carry their own shortcuts and are passed on to the focused text field
+        // or the track list (the system's predefined items never reach the egui view).
+        "edit_cut" => (cmd, Code::KeyX),
+        "edit_copy" => (cmd, Code::KeyC),
+        "edit_paste" => (cmd, Code::KeyV),
+        "edit_select_all" => (cmd, Code::KeyA),
         _ => return None,
     };
     Some(Accelerator::new(m, c))
+}
+
+/// Menu choices travel through this channel; see `wake_on_menu`.
+fn menu_channel() -> &'static (crossbeam_channel::Sender<MenuEvent>, crossbeam_channel::Receiver<MenuEvent>) {
+    static CH: std::sync::OnceLock<(crossbeam_channel::Sender<MenuEvent>, crossbeam_channel::Receiver<MenuEvent>)> = std::sync::OnceLock::new();
+    CH.get_or_init(crossbeam_channel::unbounded)
+}
+
+/// A menu choice must be acted on at once: the window only redraws on input, so without a
+/// wake-up a command chosen from the menu bar would wait for the next mouse move.
+pub fn wake_on_menu(ctx: &eframe::egui::Context) {
+    let ctx = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+        let _ = menu_channel().0.send(ev);
+        ctx.request_repaint();
+    }));
 }
 
 pub fn build() -> Option<Menu> {
@@ -130,7 +156,7 @@ pub fn build() -> Option<Menu> {
         let file = Submenu::new("File", true);
         file.append_items(&[&import, &library, &sep(), it(&h, "missing"), &sep(), it(&h, "export_xml"), it(&h, "export_playlists_info"), &sep(), it(&h, "sync_rekordbox"), it(&h, "import_xml"), it(&h, "relocate_missing"), it(&h, "library_folder")]).ok()?;
         let edit = Submenu::new("Edit", true);
-        edit.append_items(&[it(&h, "undo"), it(&h, "redo"), &sep(), &PredefinedMenuItem::cut(None), &PredefinedMenuItem::copy(None), &PredefinedMenuItem::paste(None), &PredefinedMenuItem::select_all(None)]).ok()?;
+        edit.append_items(&[it(&h, "undo"), it(&h, "redo"), &sep(), it(&h, "edit_cut"), it(&h, "edit_copy"), it(&h, "edit_paste"), it(&h, "edit_select_all")]).ok()?;
         let view = Submenu::new("View", true);
         view.append_items(&[
             it(&h, "fullscreen"),
@@ -209,7 +235,7 @@ pub fn build() -> Option<Menu> {
 }
 
 pub fn poll(app: &mut App) {
-    while let Ok(ev) = MenuEvent::receiver().try_recv() {
+    while let Ok(ev) = menu_channel().1.try_recv() {
         let id: &str = ev.id().as_ref();
         handle(app, id);
     }
@@ -341,6 +367,15 @@ pub fn handle(app: &mut App, id: &str) {
     let sel = selected(app);
     match id {
         "about" | "h_about" => app.dialogs.about = true,
+        "edit_cut" | "edit_copy" | "edit_paste" | "edit_select_all" => {
+            app.edit_cmds.push(match id {
+                "edit_cut" => 0,
+                "edit_copy" => 1,
+                "edit_paste" => 2,
+                _ => 3,
+            });
+            app.ctx.request_repaint();
+        }
         "undo" => app.undo_edit(),
         "redo" => app.redo_edit(),
         "trash" => app.dialogs.trash = Some(Default::default()),

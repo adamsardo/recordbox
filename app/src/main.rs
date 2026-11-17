@@ -48,6 +48,24 @@ impl eframe::App for Gui {
     /// PREPDECK_SHOT_DRAG (with --screenshot): drag hot cue A 100 px to the right with real
     /// pointer events, to check marker dragging end to end; the result goes to stderr.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Edit menu commands (and their shortcuts, which the menu bar takes before the view sees
+        // the keys) become the input events egui's text fields and the track list act on.
+        for c in std::mem::take(&mut self.app.edit_cmds) {
+            match c {
+                0 => raw.events.push(egui::Event::Cut),
+                1 => raw.events.push(egui::Event::Copy),
+                2 => {
+                    if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok()) {
+                        raw.events.push(egui::Event::Paste(t));
+                    }
+                }
+                _ => {
+                    let m = egui::Modifiers { command: true, mac_cmd: true, ..Default::default() };
+                    raw.events.push(egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: m });
+                    raw.events.push(egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: false, repeat: false, modifiers: m });
+                }
+            }
+        }
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {

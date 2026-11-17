@@ -41,6 +41,25 @@ pub fn icon_button(ui: &mut Ui, rect: Rect, id: &str, fill: Option<Color32>, dra
     r
 }
 
+/// True once per press of a pad-like control: on the frame the button goes down on it, or,
+/// when press and release arrive within one frame (a quick tap), on the click itself.
+pub fn press_fired(ui: &Ui, resp: &Response) -> bool {
+    let key = resp.id.with("press_fired");
+    let down_now = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+    if down_now {
+        ui.ctx().data_mut(|d| d.insert_temp(key, true));
+        return true;
+    }
+    if resp.clicked() {
+        let was = ui.ctx().data_mut(|d| d.remove_temp::<bool>(key)).unwrap_or(false);
+        return !was;
+    }
+    if !ui.input(|i| i.pointer.any_down()) {
+        ui.ctx().data_mut(|d| d.remove::<bool>(key));
+    }
+    false
+}
+
 /// Horizontal positions in the player are measured on a 1512 pt wide window, where the
 /// waveform area spans x = 80..1300. `sx` maps such an x to the current width.
 pub(crate) fn sx(main: Rect, x: f32) -> f32 {
@@ -123,7 +142,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let cr = ui.interact(cue_rect, ui.id().with("cuebtn"), Sense::click_and_drag());
     let cue_lit = loaded && (!playing || app.deck.cue_preview);
     cue_button_face(&p, cue_c, 40.0, cue_lit, loaded, cr.hovered());
-    if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
+    if press_fired(ui, &cr) && !app.deck.cue_preview {
         app.cue_down();
     }
     let cue_key_held = app.prefs.key_for("cue").map(|k| ui.input(|i| i.key_down(k))).unwrap_or(false);
@@ -746,7 +765,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                 None => OFF,
             };
             p.text(r.center() + vec2(-0.3, -1.1), Align2::CENTER_CENTER, ((b'A' + slot as u8) as char).to_string(), FontId::proportional(13.0), tc);
-            if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+            if crate::ui_player::press_fired(ui, &resp) {
                 if ui.input(|i| i.modifiers.shift) {
                     if let Some(c) = &cue {
                         app.delete_cue(c.id);
@@ -1040,13 +1059,17 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     let mut txt = c.comment.clone();
                     let er = Rect::from_min_max(pos2(rr.min.x + 96.0, rr.min.y + 1.0), pos2(rr.max.x - 20.0, rr.max.y - 1.0));
                     let resp = child.put(er, egui::TextEdit::singleline(&mut txt).font(FontId::proportional(10.5)));
-                    resp.request_focus();
+                    // Whether the field just gave up focus must be read before focus is asked for again.
+                    let gave_up = resp.lost_focus();
+                    if !gave_up {
+                        resp.request_focus();
+                    }
                     if txt != c.comment {
                         let mut n = c.clone();
                         n.comment = txt;
                         app.update_cue(n);
                     }
-                    if resp.lost_focus() {
+                    if gave_up {
                         app.deck.editing_comment = None;
                     }
                 } else {
@@ -1125,13 +1148,17 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                             let mut txt = c.comment.clone();
                             let er = Rect::from_min_max(pos2(rr.min.x + 66.5, rr.min.y + 3.0), pos2(rr.max.x - 26.0, rr.max.y - 3.0));
                             let resp = child.put(er, egui::TextEdit::singleline(&mut txt).font(FontId::proportional(10.5)));
-                            resp.request_focus();
+                            // Whether the field just gave up focus must be read before focus is asked for again.
+                            let gave_up = resp.lost_focus();
+                            if !gave_up {
+                                resp.request_focus();
+                            }
                             if txt != c.comment {
                                 let mut n = c.clone();
                                 n.comment = txt;
                                 app.update_cue(n);
                             }
-                            if resp.lost_focus() {
+                            if gave_up {
                                 app.deck.editing_comment = None;
                             }
                         } else {
