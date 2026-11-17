@@ -488,6 +488,11 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                     };
                     for (h, col) in bars {
                         let hh = h * half;
+                        // Preferences > View > Color: Half Waveform draws the upper half only.
+                        if app.prefs.wave_half {
+                            p.line_segment([pos2(x + 0.5, mid + half - 2.0 * hh), pos2(x + 0.5, mid + half)], Stroke::new(1.0, col));
+                            continue;
+                        }
                         p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0, col));
                     }
                 }
@@ -1061,7 +1066,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     }
                     ui.menu_button("Color", |ui| {
                         for i in 0..9u8 {
-                            if ui.selectable_label(c.color == i, egui::RichText::new(format!("■ {}", COLOR_NAMES[i as usize])).color(if i == 0 { DIM } else { label_color(i) })).clicked() {
+                            if ui.selectable_label(c.color == i, egui::RichText::new(format!("■ {}", app.prefs.color_name(i))).color(if i == 0 { DIM } else { label_color(i) })).clicked() {
                                 let mut n = c.clone();
                                 n.color = i;
                                 app.update_cue(n);
@@ -1177,7 +1182,7 @@ fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
             if t.color == i {
                 ui.painter().rect_stroke(rr, 2.0, Stroke::new(1.5, WHITE), egui::StrokeKind::Inside);
             }
-            if resp.on_hover_text(COLOR_NAMES[i as usize]).clicked() {
+            if resp.on_hover_text(app.prefs.color_name(i)).clicked() {
                 if let Some(tm) = app.track_mut(id) {
                     tm.color = i;
                 }

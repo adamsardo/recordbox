@@ -68,13 +68,12 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     crate::icons::layout_icon(&p, Rect::from_center_size(pos2(r.min.x + 145.0, cy), vec2(18.0, 14.0)), WHITE);
     crate::icons::chevron_down(&p, Rect::from_center_size(pos2(r.min.x + 171.0, cy), vec2(14.0, 12.0)), WHITE);
     dropdown(ui, &lay, "layout", |ui| {
-        if ui.selectable_label(!app.prefs.browser_only, "1 Player").clicked() {
-            app.prefs.browser_only = false;
-            app.save_prefs();
-        }
-        if ui.selectable_label(app.prefs.browser_only, "Full Browser").clicked() {
-            app.prefs.browser_only = true;
-            app.save_prefs();
+        // Layouts of the player (App::set_player_layout: 0–2 player layouts, 3 = browser only).
+        let cur = app.player_layout();
+        for (i, name) in ["1 Player", "2 Players", "Simple Player", "Full Browser"].iter().enumerate() {
+            if ui.selectable_label(cur == i as u8, *name).clicked() {
+                app.set_player_layout(i as u8);
+            }
         }
     });
     // Auto-analysis switch in the place of the original's circle icon (320 pt).
@@ -272,26 +271,7 @@ fn menus(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn import_m3u(app: &mut App, f: &std::path::Path) {
-    let Ok(text) = std::fs::read_to_string(f) else { return };
-    let base = f.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let paths: Vec<std::path::PathBuf> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let p = std::path::PathBuf::from(l);
-            if p.is_absolute() {
-                p
-            } else {
-                base.join(p)
-            }
-        })
-        .filter(|p| p.exists())
-        .collect();
-    let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Imported".into());
-    let id = app.db.create_node(0, &name, NodeKind::Playlist, None).unwrap_or(0);
-    app.reload_playlists();
-    app.import_paths(paths, Some(id));
+    app.import_playlist_file(f, 0);
 }
 
 pub fn open_export(app: &mut App, playlists: Vec<i64>, tracks: Vec<i64>) {
@@ -355,12 +335,17 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
 /// Browser geometry measured in the original (pt): icon strip 0..26.5, tree pane 26.5..247,
 /// track list 253..1485.5, right icon strip 1488..1512; top row of the tree area 20 pt high.
 pub fn browser(app: &mut App, ui: &mut Ui) {
+    app.poll_library_ext();
     let full = ui.max_rect();
     let strip = Rect::from_min_size(full.min, vec2(26.5, full.height()));
     let tree = Rect::from_min_max(pos2(strip.max.x, full.min.y), pos2(full.min.x + 247.0, full.max.y));
     let right_strip = Rect::from_min_max(pos2(full.max.x - 24.0, full.min.y), full.max);
+    // Information window (268 pt) at the far right, My Tag (230 pt) to its left.
+    let info_w = if app.prefs.info_panel { 268.0 } else { 0.0 };
+    let info = Rect::from_min_max(pos2(right_strip.min.x - info_w - 2.5, full.min.y), pos2(right_strip.min.x - 2.5, full.max.y));
     let mytag_w = if app.prefs.show_mytag { 230.0 } else { 0.0 };
-    let mytag = Rect::from_min_max(pos2(right_strip.min.x - mytag_w - 2.5, full.min.y), pos2(right_strip.min.x - 2.5, full.max.y));
+    let mytag_right = if app.prefs.info_panel { info.min.x - 2.5 } else { right_strip.min.x - 2.5 };
+    let mytag = Rect::from_min_max(pos2(mytag_right - mytag_w, full.min.y), pos2(mytag_right, full.max.y));
     let list = Rect::from_min_max(pos2(full.min.x + 253.0, full.min.y), pos2(mytag.min.x, full.max.y));
     let p = ui.painter().clone();
     p.rect_filled(full, 0.0, BG);
@@ -386,7 +371,15 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
             ui.painter().text(pp + vec2(12.0, 4.0), Align2::LEFT_CENTER, &n.name, FontId::proportional(11.5), WHITE);
         }
     }
-    let track_view = !matches!(app.view, View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_));
+    let track_view = !matches!(app.view, View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. });
+    // Playlist Palette: a 26 pt strip of four slots under the track list.
+    let list = if app.prefs.palette_open && track_view {
+        let pr = Rect::from_min_max(pos2(list.min.x, list.max.y - 26.0), list.max);
+        crate::ui_library_ext::palette_bar(app, ui, pr, &mut drop_targets);
+        Rect::from_min_max(list.min, pos2(list.max.x, pr.min.y - 2.0))
+    } else {
+        list
+    };
     let list = if app.prefs.sub_browser && track_view {
         let split = list.min.y + (list.height() * 0.58).round();
         let sub = Rect::from_min_max(pos2(list.min.x, split + 4.0), list.max);
@@ -407,6 +400,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
         View::Device { root, node } => device_list(app, &mut lui, &root, node, None),
         View::DeviceHistory { root, id } => device_list(app, &mut lui, &root, None, Some(id)),
         View::Explorer(dir) => explorer_list(app, &mut lui, &dir),
+        View::Source { kind, node } => crate::ui_library_ext::source_list(app, &mut lui, kind, &node),
         _ => track_list(app, &mut lui),
     }
     if app.prefs.show_mytag {
@@ -414,7 +408,14 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
         let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(mytag.shrink(6.0)));
         mytag_panel(app, &mut mui);
     }
+    if app.prefs.info_panel {
+        p.rect_filled(info, 0.0, BG2);
+        let mut iui = ui.new_child(egui::UiBuilder::new().max_rect(info.shrink(6.0)));
+        crate::ui_library_ext::info_panel(app, &mut iui);
+    }
     right_icons(app, ui, right_strip);
+    let ctx = ui.ctx().clone();
+    crate::ui_library_ext::windows(app, &ctx);
 
     // drag & drop of tracks onto playlists
     if let Some(ids) = app.drag.clone() {
@@ -434,7 +435,18 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
         if ui.input(|i| i.pointer.any_released()) {
             if let Some(pp) = ptr {
                 if let Some((_, id)) = drop_targets.iter().find(|(r, _)| r.contains(pp)) {
-                    app.add_to_playlist(*id, &ids);
+                    match *id {
+                        // The Tag List row, and the Matching panel (link with its source track).
+                        -1 => app.tag_list_add(&ids),
+                        -2 => {
+                            if let Some(src) = app.related_source() {
+                                for t in &ids {
+                                    app.matching_set(src, *t, true);
+                                }
+                            }
+                        }
+                        pl => app.add_to_playlist(pl, &ids),
+                    }
                 }
             }
             app.drag = None;
@@ -449,16 +461,18 @@ type IconFn = fn(&egui::Painter, Rect, Color32);
 /// x = 16 pt, each in a thin outlined square; the selected one filled blue.
 fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
     let bm: IconFn = |p, r, c| crate::icons::bookmark(p, r, c, true);
-    let items: [(IconFn, Option<SideMode>, &str); 7] = [
+    let items: [(IconFn, Option<SideMode>, &str); 9] = [
         (bm, Some(SideMode::Collection), "Collection"),
         (crate::icons::list, Some(SideMode::Playlists), "Playlists"),
         (crate::icons::link, Some(SideMode::Related), "Related Tracks"),
+        (crate::ui_library_ext::icon_itunes, Some(SideMode::Itunes), "iTunes"),
+        (crate::ui_library_ext::icon_xml, Some(SideMode::RekordboxXml), "rekordbox xml"),
         (crate::icons::monitor, Some(SideMode::Explorer), "Explorer"),
         (crate::icons::usb, Some(SideMode::Devices), "Devices"),
         (crate::icons::history, Some(SideMode::History), "Histories"),
         (crate::icons::record, None, "Recordings (not available in this app)"),
     ];
-    for (i, (draw, mode, name)) in items.iter().enumerate() {
+    for (i, (draw, mode, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2)).collect::<Vec<_>>().into_iter().enumerate() {
         // Reference 04: 18 pt tiles on a 20 pt pitch, centred at x 15.75 pt; a 1 pt #646464
         // rounded border and a white glyph; the selected one blue with a white inner border.
         let c = pos2(r.min.x + 15.75, r.min.y + 36.85 + i as f32 * 20.0);
@@ -488,8 +502,10 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
                 SideMode::Explorer => {}
                 SideMode::History => {
                     app.scan_devices();
-                    app.set_view(View::DeviceHistory { root: String::new(), id: 0 });
+                    app.set_view(View::History(0));
                 }
+                SideMode::Itunes => app.set_view(View::Source { kind: crate::library_ext::SRC_ITUNES, node: String::new() }),
+                SideMode::RekordboxXml => app.set_view(View::Source { kind: crate::library_ext::SRC_RBXML, node: String::new() }),
                 SideMode::Playlists => {}
             }
         }
@@ -499,12 +515,12 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
     crate::icons::sync(ui.painter(), sr, DIM2);
 }
 
-/// Right icon strip: My Tag, Related, Filter, Information, Sub-browser at 193/227/261/294/328 pt.
+/// Right icon strip: My Tag, Related, Matching, Information, Sub-browser at 193/227/261/294/328 pt.
 fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
     let items: [(IconFn, &str); 5] = [
         (crate::icons::tag, "Display My Tag configuration window."),
-        (crate::icons::link, "Related Tracks"),
-        (crate::icons::funnel, "Filter"),
+        (crate::icons::link, "Display related track list window."),
+        (crate::ui_library_ext::icon_matching, "Set a good match combination of tracks.\nSee also Related Track List window.(Matching)"),
         (crate::icons::info, "Display information window."),
         (crate::icons::split_panes, "Sub-browser"),
     ];
@@ -515,7 +531,8 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
         let on = match i {
             0 => app.prefs.show_mytag,
             1 => app.view == View::Related,
-            2 => app.filter_open,
+            2 => app.view == View::Matching,
+            3 => app.prefs.info_panel,
             4 => app.prefs.sub_browser,
             _ => false,
         };
@@ -546,13 +563,17 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
                     }
                 }
                 2 => {
-                    app.filter_open = !app.filter_open;
-                    app.list_dirty = true;
+                    if app.view == View::Matching {
+                        app.side = SideMode::Collection;
+                        app.set_view(View::Collection);
+                    } else {
+                        app.side = SideMode::Related;
+                        app.set_view(View::Matching);
+                    }
                 }
                 3 => {
-                    if let Some(id) = app.list.iter().find(|t| app.selected.contains(t)).copied() {
-                        app.dialogs.info_track = app.track(id).cloned();
-                    }
+                    app.prefs.info_panel = !app.prefs.info_panel;
+                    app.save_prefs();
                 }
                 4 => {
                     app.prefs.sub_browser = !app.prefs.sub_browser;
@@ -581,7 +602,7 @@ pub enum TreeIcon {
 
 /// One tree row: 15 pt high (rows sit on an 18 pt pitch in the Collection list, 15 pt in the
 /// playlist tree), 15 pt indentation per level, selection #294C6A.
-fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usize>, selected: bool, icon: TreeIcon, pitch: f32) -> egui::Response {
+pub(crate) fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usize>, selected: bool, icon: TreeIcon, pitch: f32) -> egui::Response {
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click_and_drag());
     let p = ui.painter();
     let bar = Rect::from_center_size(rr.center(), vec2(rr.width(), 15.0));
@@ -634,9 +655,11 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
             ui.painter().text(pos2(hr.min.x + 4.0, hr.center().y), Align2::LEFT_CENTER, "Collection", FontId::proportional(12.0), WHITE);
             let sel = app.view == View::Collection;
-            if tree_row(ui, 0, "All", None, sel, TreeIcon::None, 17.0).clicked() {
+            let all = tree_row(ui, 0, "All", None, sel, TreeIcon::None, 17.0);
+            if all.clicked() {
                 app.set_view(View::Collection);
             }
+            all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
             for (fi, f) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
                 let key = egui::Id::new(("cat_open", fi));
                 let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
@@ -669,8 +692,23 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             // starts 24 pt below the top.
             let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
             let st = Rect::from_center_size(pos2(row.min.x + 11.0, row.min.y + 12.5), vec2(18.0, 18.0));
-            ui.painter().rect_stroke(st, 3.0, Stroke::new(1.0, hex(0x646464)), egui::StrokeKind::Inside);
-            crate::icons::magnifier(ui.painter(), st.shrink(2.0), DIM2, 0);
+            // The search tile opens a field that narrows the tree to matching names.
+            let sresp = ui.interact(st, ui.id().with("tree_search_tile"), Sense::click());
+            if app.ext.tree_search_open {
+                ui.painter().rect_filled(st, 3.0, BLUE);
+                ui.painter().rect_stroke(st.shrink(1.0), 2.0, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
+            } else {
+                ui.painter().rect_stroke(st, 3.0, Stroke::new(1.0, if sresp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) }), egui::StrokeKind::Inside);
+            }
+            crate::icons::magnifier(ui.painter(), st.shrink(2.0), if app.ext.tree_search_open { WHITE } else { DIM2 }, 0);
+            if sresp.clicked() {
+                app.ext.tree_search_open = !app.ext.tree_search_open;
+                if app.ext.tree_search_open {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("tree_search_focus"), true));
+                } else {
+                    app.ext.tree_search.clear();
+                }
+            }
             let tv = Rect::from_min_max(pos2(row.min.x + 26.0, row.min.y + 2.0), pos2(row.min.x + 124.0, row.min.y + 23.0));
             ui.painter().rect_filled(tv, 0.0, BLUE);
             ui.painter().text(tv.center(), Align2::CENTER_CENTER, "Tree View", FontId::proportional(12.5), WHITE);
@@ -678,12 +716,18 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             ui.painter().rect_filled(cv, 0.0, hex(0x323232));
             crate::icons::lock(ui.painter(), Rect::from_center_size(pos2(cv.min.x + 9.0, cv.center().y), vec2(10.0, 10.0)), DIM);
             ui.painter().with_clip_rect(cv).text(pos2(cv.min.x + 18.0, cv.center().y), Align2::LEFT_CENTER, "Column View", FontId::proportional(12.0), DIM);
+            if app.ext.tree_search_open {
+                crate::ui_library_ext::tree_search_field(app, ui);
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let all_sel = app.view == View::Collection;
-                if tree_row(ui, 1, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0).clicked() {
+                let all = tree_row(ui, 1, "All Tracks", Some(app.tracks.len()), all_sel, TreeIcon::Note, 15.0);
+                if all.clicked() {
                     app.set_view(View::Collection);
                 }
+                all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
+                crate::ui_library_ext::tree_top_rows(app, ui, drop);
                 let root = tree_row(ui, 0, "Playlists", None, false, TreeIcon::Open, 15.0);
                 root.context_menu(|ui| {
                     if ui.button("Create New Playlist").clicked() {
@@ -698,13 +742,22 @@ fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
                         app.create_node(0, NodeKind::Folder);
                         ui.close_menu();
                     }
+                    crate::ui_library_ext::root_menu_extra(app, ui);
                 });
                 node_rows(app, ui, 0, 1, drop);
             });
         }
         SideMode::Devices => devices_tree(app, ui),
-        SideMode::History => history_tree(app, ui),
-        SideMode::Related => related_rules(app, ui),
+        SideMode::History => crate::ui_library_ext::history_tree(app, ui),
+        SideMode::Related => {
+            // Tracks dropped on the Matching panel are linked with its source track.
+            if app.view == View::Matching {
+                drop.push((ui.max_rect(), -2));
+            }
+            crate::ui_library_ext::related_panel(app, ui)
+        }
+        SideMode::Itunes => crate::ui_library_ext::source_tree(app, ui, crate::library_ext::SRC_ITUNES),
+        SideMode::RekordboxXml => crate::ui_library_ext::source_tree(app, ui, crate::library_ext::SRC_RBXML),
         SideMode::Explorer => explorer_tree(app, ui),
     }
 }
@@ -714,9 +767,14 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
         app.node_drag = None;
     }
     let kids: Vec<PlaylistNode> = app.nodes.iter().filter(|n| n.parent == parent).cloned().collect();
+    // Tree search: only names that match (and the folders leading to them) are listed.
+    let query = if app.ext.tree_search_open { crate::smart::fold(app.ext.tree_search.trim()) } else { String::new() };
     for n in kids {
+        if !query.is_empty() && !crate::ui_library_ext::node_matches(app, n.id, &query, 0) {
+            continue;
+        }
         let sel = app.view == View::Playlist(n.id);
-        let open = app.expanded.contains(&n.id);
+        let open = app.expanded.contains(&n.id) || !query.is_empty();
         let (icon, count) = match n.kind {
             NodeKind::Folder => (if open { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, None),
             NodeKind::Smart => (TreeIcon::Smart, n.smart.as_ref().map(|r| app.smart_tracks(r).len())),
@@ -831,10 +889,11 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
                 app.reload_playlists();
                 ui.close_menu();
             }
-            if ui.button(format!("Export {what}…")).clicked() {
+            if ui.button(format!("Export {what}")).clicked() {
                 open_export(app, vec![nn.id], vec![]);
                 ui.close_menu();
             }
+            crate::ui_library_ext::node_menu_extra(app, ui, &nn);
             if ui.button("Move to top level").clicked() {
                 let _ = app.db.move_node(nn.id, 0, 0);
                 app.reload_playlists();
@@ -1186,71 +1245,6 @@ fn explorer_list(app: &mut App, ui: &mut Ui, dir: &str) {
     body.ctx().data_mut(|d| d.insert_temp(sel_key, sel));
 }
 
-/// Related Tracks: the rules, edited in the tree pane; the list shows matching tracks.
-fn related_rules(app: &mut App, ui: &mut Ui) {
-    ui.add_space(1.0);
-    if tree_row(ui, 1, "Related Tracks", None, app.view == View::Related, TreeIcon::Open, 17.0).clicked() {
-        app.set_view(View::Related);
-    }
-    ui.add_space(4.0);
-    let before = app.prefs.related.clone();
-    let r = &mut app.prefs.related;
-    ui.label(RichText::new("Key").size(12.0).color(WHITE));
-    egui::ComboBox::from_id_salt("rel_key").width(180.0).selected_text(["Off", "Same Key", "Related Key 1", "Related Key 2", "Related Key 3"][r.key as usize % 5]).show_ui(ui, |ui| {
-        for (i, n) in ["Off", "Same Key", "Related Key 1", "Related Key 2", "Related Key 3"].iter().enumerate() {
-            ui.selectable_value(&mut r.key, i as u8, *n);
-        }
-    });
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut r.bpm, RichText::new("BPM within ±").size(12.0));
-        ui.add(egui::DragValue::new(&mut r.bpm_pct).range(1.0..=50.0).speed(0.5).suffix("%"));
-    });
-    ui.checkbox(&mut r.genre, RichText::new("Same Genre").size(12.0));
-    ui.checkbox(&mut r.artist, RichText::new("Same Artist").size(12.0));
-    ui.checkbox(&mut r.label, RichText::new("Same Label").size(12.0));
-    ui.checkbox(&mut r.color, RichText::new("Same Colour").size(12.0));
-    ui.checkbox(&mut r.rating, RichText::new("Rating at least as high").size(12.0));
-    ui.add_space(6.0);
-    ui.label(RichText::new("Matches the loaded track (or the selected one when nothing is loaded). Half and double tempo count for BPM.").size(10.5).color(DIM));
-    if app.prefs.related != before {
-        app.list_dirty = true;
-        app.save_prefs();
-    }
-}
-
-/// Histories: the play histories each device's players saved on it.
-fn history_tree(app: &mut App, ui: &mut Ui) {
-    if app.devices_scanned.map(|t| t.elapsed().as_secs() > 4).unwrap_or(true) && app.export_job.is_none() {
-        app.scan_devices();
-    }
-    ui.add_space(1.0);
-    tree_row(ui, 1, "Histories", None, false, TreeIcon::Open, 17.0);
-    let devs: Vec<(String, String, Vec<(u32, String, usize)>)> = app
-        .devices
-        .iter()
-        .filter_map(|d| d.lib.as_ref().map(|l| (d.root.clone(), d.name.clone(), l.histories.iter().map(|h| (h.id, h.name.clone(), h.entries.len())).collect())))
-        .collect();
-    let mut any = false;
-    for (root, name, hist) in devs {
-        if hist.is_empty() {
-            continue;
-        }
-        any = true;
-        tree_row(ui, 2, &name, None, false, TreeIcon::Device, 17.0);
-        for (id, hname, n) in hist {
-            let sel = app.view == View::DeviceHistory { root: root.clone(), id };
-            if tree_row(ui, 3, &hname, Some(n), sel, TreeIcon::Playlist, 15.0).clicked() {
-                app.set_view(View::DeviceHistory { root: root.clone(), id });
-            }
-        }
-    }
-    if !any {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Play histories appear here when you connect a USB drive that was played on CDJ/XDJ players.").size(11.0).color(DIM));
-    }
-}
-
 fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, history: Option<u32>) {
     if root.is_empty() {
         // The "Devices" / "Histories" item itself: an empty list, as in the original.
@@ -1351,16 +1345,21 @@ fn view_title(app: &App) -> String {
     match &app.view {
         View::Collection => "Collection".into(),
         View::Playlist(id) => app.node(*id).map(|n| n.name.clone()).unwrap_or_default(),
-        View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) => String::new(),
+        View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. } => String::new(),
+        View::History(id) => app.ext.histories.iter().find(|h| h.id == *id).map(|h| h.name.clone()).unwrap_or_else(|| "Histories".into()),
+        View::TagList => "Tag List".into(),
+        View::Matching => format!("Matching — {}", app.related_source().and_then(|id| app.track(id)).map(|t| t.display_title()).unwrap_or_else(|| "load or select a track".into())),
         View::Related => format!("Related Tracks — {}", app.related_source().and_then(|id| app.track(id)).map(|t| t.display_title()).unwrap_or_else(|| "load or select a track".into())),
         View::Category { field, value } => format!("{} › {}", ["Date Added", "Genre", "Artist", "Album"][*field as usize % 4], if value.is_empty() { "(none)" } else { value }),
     }
 }
 
 fn track_list(app: &mut App, ui: &mut Ui) {
-    if app.view == View::Related && app.related_built_for != app.related_source() {
+    if matches!(app.view, View::Related | View::Matching) && app.related_built_for != app.related_source() {
         app.list_dirty = true;
     }
+    let had_edit = app.ext.edit.is_some();
+    app.ext.edit_drawn = false;
     if app.list_dirty {
         app.rebuild_list();
     }
@@ -1375,20 +1374,45 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     p.line_segment([pos2(bar.min.x + 340.0, bar.min.y), pos2(bar.min.x + 340.0, bar.max.y)], Stroke::new(1.0, BG));
     // PLAYER A (load target; this app has one player)
     let pa = Rect::from_min_max(pos2(rx - 496.5, bar.min.y + 3.0), pos2(rx - 427.5, bar.max.y - 3.0));
-    p.text(pos2(pa.min.x + 4.0, pa.center().y), Align2::LEFT_CENTER, "PLAYER A", bold(10.0), WHITE);
+    let two = app.two_players();
+    p.text(pos2(pa.min.x + 4.0, pa.center().y), Align2::LEFT_CENTER, if two && app.load_target == 1 { "PLAYER B" } else { "PLAYER A" }, bold(10.0), WHITE);
     crate::icons::chevron_down(&p, Rect::from_center_size(pos2(pa.max.x - 6.0, pa.center().y), vec2(12.0, 10.0)), WHITE);
     let par = ui.interact(pa, ui.id().with("playera"), Sense::click());
     let par = if app.prefs.tooltips { par.on_hover_text("Player that double-click or Return loads tracks into.") } else { par };
     dropdown(ui, &par, "playera_menu", |ui| {
-        let _ = ui.selectable_label(true, "PLAYER A");
-        ui.label(RichText::new("Export mode has one player.").size(11.0).color(DIM));
+        // Load target: deck B exists in the 2 Players layout.
+        if ui.selectable_label(app.load_target == 0 || !two, "PLAYER A").clicked() {
+            app.load_target = 0;
+        }
+        if ui.add_enabled(two, egui::SelectableLabel::new(two && app.load_target == 1, "PLAYER B")).clicked() {
+            app.load_target = 1;
+        }
+        if !two {
+            ui.label(RichText::new("PLAYER B is available in the 2 Players layout.").size(11.0).color(DIM));
+        }
     });
+    // Playlist Palette switch, left of PLAYER A.
+    {
+        let pr = Rect::from_center_size(pos2(rx - 516.0, bar.center().y), vec2(18.0, 17.0));
+        let presp = ui.interact(pr, ui.id().with("palette_toggle"), Sense::click());
+        if app.prefs.palette_open {
+            p.rect_filled(pr, 2.0, BLUE);
+        } else {
+            p.rect_filled(pr, 2.0, if presp.hovered() { hex(0x3A3A3A) } else { BTN });
+        }
+        crate::ui_library_ext::icon_palette(&p, pr, WHITE);
+        let presp = if app.prefs.tooltips { presp.on_hover_text("Show/Hide Playlist Palette") } else { presp };
+        if presp.clicked() {
+            app.prefs.palette_open = !app.prefs.palette_open;
+            app.save_prefs();
+        }
+    }
     // View-mode icons: track list with artwork, track list without artwork, column browser and
     // sub-browser (the last two are not part of this version and say so).
     let with_art = app.prefs.columns.contains(&Col::Artwork);
     let vic: [(f32, IconFn, Option<bool>, &str); 4] = [
-        (394.5, crate::icons::view_art_list, Some(with_art), "Track list with artwork"),
-        (356.5, crate::icons::view_list, Some(!with_art), "Track list"),
+        (394.5, crate::icons::view_art_list, Some(with_art && !app.prefs.artwork_full), "Show the upper part of the artwork."),
+        (356.5, crate::icons::view_list, Some(with_art && app.prefs.artwork_full), "Show the entire artwork."),
         (297.5, crate::icons::view_columns, Some(app.prefs.column_browser), "Column browser"),
         (260.0, crate::icons::split_panes, Some(app.prefs.sub_browser), "Sub-browser"),
     ];
@@ -1410,12 +1434,16 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             app.colbrowse = Default::default();
             app.list_dirty = true;
             app.save_prefs();
-        } else if resp.clicked() && on == Some(false) && i < 2 {
-            if i == 0 {
-                let at = app.prefs.columns.iter().position(|c| *c == Col::Title).unwrap_or(0);
-                app.prefs.columns.insert(at, Col::Artwork);
-            } else {
+        } else if resp.clicked() && i < 2 {
+            // The lit mode again hides the Artwork column; the other one shows it that way.
+            if on == Some(true) {
                 app.prefs.columns.retain(|c| *c != Col::Artwork);
+            } else {
+                if !with_art {
+                    let at = app.prefs.columns.iter().position(|c| *c == Col::Title).unwrap_or(0);
+                    app.prefs.columns.insert(at, Col::Artwork);
+                }
+                app.prefs.artwork_full = i == 1;
             }
             app.save_prefs();
         }
@@ -1452,24 +1480,11 @@ fn track_list(app: &mut App, ui: &mut Ui) {
     ui.set_clip_rect(clip);
     dropdown(ui, &cm, "cols", |ui| {
         ui.label(RichText::new("Columns").strong());
-        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-            for c in ALL_COLS {
-                if c == Col::Status {
-                    continue;
-                }
-                let mut on = app.prefs.columns.contains(&c);
-                if ui.checkbox(&mut on, c.label()).changed() {
-                    if on {
-                        app.prefs.columns.push(c);
-                    } else {
-                        app.prefs.columns.retain(|x| *x != c);
-                    }
-                    app.save_prefs();
-                }
-            }
-        });
+        crate::ui_library_ext::column_checklist(app, ui);
         if ui.button("Auto-size all columns").clicked() {
-            app.prefs.widths.clear();
+            for col in app.prefs.columns.clone() {
+                crate::ui_library_ext::autosize_column(app, ui, col);
+            }
             app.save_prefs();
         }
     });
@@ -1478,7 +1493,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
         let fr = Rect::from_min_size(pos2(r.min.x, top), vec2(r.width(), 28.0));
         ui.painter().rect_filled(fr, 0.0, BG1);
         let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(fr.shrink2(vec2(10.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        filter_bar(app, &mut fui);
+        crate::ui_library_ext::filter_bar(app, &mut fui);
         top = fr.max.y;
     }
     if app.prefs.column_browser {
@@ -1591,16 +1606,7 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             }
             let c2 = *c;
             resp.context_menu(|ui| {
-                if ui.button("Auto-size this column").clicked() {
-                    app.prefs.widths.remove(&c2.key());
-                    app.save_prefs();
-                    ui.close_menu();
-                }
-                if c2 != Col::Status && ui.button("Hide this column").clicked() {
-                    app.prefs.columns.retain(|x| *x != c2);
-                    app.save_prefs();
-                    ui.close_menu();
-                }
+                crate::ui_library_ext::header_menu(app, ui, c2);
             });
             // resize handle
             let hr2 = Rect::from_min_max(pos2(cr.max.x - 3.0, cr.min.y), pos2(cr.max.x + 3.0, cr.max.y));
@@ -1666,23 +1672,98 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                     draw_cell(app, ui, *c, &t, cr, i);
                     x += cw;
                 }
-                // Rating column clicks
+                // The cell under the pointer.
+                let cell_at = |app: &App, px: f32| -> Option<(Col, Rect)> {
+                    let mut x = rr.min.x;
+                    for c in &all_cols {
+                        let cw = col_width(app, *c);
+                        if px >= x && px < x + cw {
+                            return Some((*c, Rect::from_min_size(pos2(x, rr.min.y), vec2(cw, rr.height()))));
+                        }
+                        x += cw;
+                    }
+                    None
+                };
+                let cell_of = |app: &App, col: Col| -> Option<Rect> {
+                    let mut x = rr.min.x;
+                    for c in &all_cols {
+                        let cw = col_width(app, *c);
+                        if *c == col {
+                            return Some(Rect::from_min_size(pos2(x, rr.min.y), vec2(cw, rr.height())));
+                        }
+                        x += cw;
+                    }
+                    None
+                };
+                // Quick preview button in the Artwork cell ("Preview : Play/Stop"), shown while the
+                // pointer is over the cell or this track is previewing.
+                let previewing = app.preview_status().map(|s| s.0) == Some(id);
+                let art_btn = cell_of(app, Col::Artwork).filter(|cr| previewing || ui.rect_contains_pointer(*cr)).map(|cr| Rect::from_center_size(pos2(cr.min.x + 10.0, cr.center().y), vec2(13.0, 13.0)));
+                if let Some(b) = art_btn {
+                    let pp = ui.painter();
+                    pp.circle_filled(b.center(), 6.5, Color32::from_black_alpha(190));
+                    pp.circle_stroke(b.center(), 5.8, Stroke::new(1.0, WHITE));
+                    if previewing {
+                        pp.rect_filled(Rect::from_center_size(b.center(), vec2(4.2, 4.2)), 0.0, WHITE);
+                    } else {
+                        pp.add(egui::Shape::convex_polygon(vec![b.center() + vec2(-1.8, -3.0), b.center() + vec2(3.2, 0.0), b.center() + vec2(-1.8, 3.0)], WHITE, Stroke::NONE));
+                    }
+                    if app.prefs.tooltips && ui.rect_contains_pointer(b) {
+                        ui.interact(b, ui.id().with(("pv_tip", i)), Sense::hover()).on_hover_text("Preview : Play/Stop");
+                    }
+                }
+                // In-place editor of this row's cell.
+                if !app.ext.edit_drawn {
+                    if let Some(col) = app.ext.edit.as_ref().filter(|e| e.track == id).map(|e| e.col) {
+                        match cell_of(app, col) {
+                            Some(cr) => crate::ui_library_ext::inline_editor(app, ui, cr),
+                            None => app.commit_cell_edit(),
+                        }
+                    }
+                }
+                let hit = resp.interact_pointer_pos().and_then(|pp| cell_at(app, pp.x).map(|(c, cr)| (c, cr, pp)));
                 if resp.clicked() {
-                    if let Some(pp) = resp.interact_pointer_pos() {
-                        let mut x = rr.min.x;
-                        for c in &all_cols {
-                            let cw = col_width(app, *c);
-                            if *c == Col::Rating && pp.x >= x && pp.x < x + cw {
-                                let s = (((pp.x - x - 3.5) / 15.5).floor() as i32 + 1).clamp(0, 5) as u8;
+                    let (cmd, shift) = ui.input(|inp| (inp.modifiers.command, inp.modifiers.shift));
+                    let now = ui.input(|inp| inp.time);
+                    let was_sole = sel && app.selected.len() == 1;
+                    let mut keep_preview = false;
+                    if let Some((c, cr, pp)) = hit {
+                        match c {
+                            Col::Rating => {
+                                let s = (((pp.x - cr.min.x - 3.5) / 15.5).floor() as i32 + 1).clamp(0, 5) as u8;
                                 if let Some(tm) = app.track_mut(id) {
                                     tm.rating = if tm.rating == s { 0 } else { s };
                                 }
                                 app.save_track(id);
                             }
-                            x += cw;
+                            // "Waveform Preview": play from the clicked position; a click in the
+                            // track already previewing skips to it ("Preview : Skip").
+                            Col::Preview => {
+                                let frac = ((pp.x - cr.min.x - 4.0) / (cr.width() - 8.0).max(1.0)).clamp(0.0, 1.0) as f64;
+                                app.preview_play(id, frac);
+                                keep_preview = true;
+                            }
+                            Col::Artwork if art_btn.map(|b| b.expand(2.0).contains(pp)).unwrap_or(false) => {
+                                keep_preview = true;
+                                if previewing {
+                                    app.preview_stop();
+                                } else {
+                                    app.preview_play(id, 0.0);
+                                }
+                            }
+                            Col::Color => app.ext.color_pick = Some((id, pos2(cr.min.x, rr.max.y), now)),
+                            // A click on a cell of the row already selected edits it in place
+                            // (after the double-click time, so a double-click still loads).
+                            c if crate::library_ext::editable(c) && was_sole && !cmd && !shift => {
+                                app.ext.edit_pending = Some((id, c, now));
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(360));
+                            }
+                            _ => {}
                         }
                     }
-                    let (cmd, shift) = ui.input(|inp| (inp.modifiers.command, inp.modifiers.shift));
+                    if !keep_preview {
+                        app.preview_stop();
+                    }
                     if shift {
                         let a = app.anchor.unwrap_or(i);
                         let (lo, hi) = (a.min(i), a.max(i));
@@ -1699,9 +1780,14 @@ fn track_list(app: &mut App, ui: &mut Ui) {
                     }
                 }
                 if resp.double_clicked() {
-                    app.load_track(id);
+                    app.ext.edit_pending = None;
+                    if !matches!(hit.map(|h| h.0), Some(Col::Preview | Col::Rating | Col::Color)) {
+                        app.preview_stop();
+                        app.load_track(id);
+                    }
                 }
                 if resp.drag_started() {
+                    app.ext.edit_pending = None;
                     if !app.selected.contains(&id) {
                         app.selected.clear();
                         app.selected.insert(id);
@@ -1740,6 +1826,51 @@ fn track_list(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+    // An edit whose row is no longer drawn (scrolled away, list changed) is committed.
+    if had_edit && app.ext.edit.is_some() && !app.ext.edit_drawn {
+        app.commit_cell_edit();
+    }
+    // A single click on a selected row's cell becomes an edit once it was not a double-click.
+    if let Some((id, c, t0)) = app.ext.edit_pending {
+        let now = ui.input(|i| i.time);
+        if now - t0 > 0.33 {
+            app.ext.edit_pending = None;
+            if app.selected.len() == 1 && app.selected.contains(&id) && app.drag.is_none() {
+                if let Some(t) = app.track(id) {
+                    let text = crate::library_ext::edit_text(t, c, app.prefs.key_alnum);
+                    app.ext.edit = Some(crate::library_ext::CellEdit { track: id, col: c, text, focused: false });
+                }
+            }
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    }
+    // Keys of the list (not while a text field is being typed in): Esc ends a preview, Delete
+    // removes from the Tag List or history shown, and Cut / Copy / Paste move tracks between
+    // playlists.
+    if !ui.ctx().wants_keyboard_input() {
+        let (esc, del, copy, cut, paste) = ui.input(|i| {
+            let ev = |f: &dyn Fn(&egui::Event) -> bool| i.events.iter().any(|e| f(e));
+            (i.key_pressed(egui::Key::Escape), (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) && i.modifiers.is_none(), ev(&|e| matches!(e, egui::Event::Copy)), ev(&|e| matches!(e, egui::Event::Cut)), ev(&|e| matches!(e, egui::Event::Paste(_))))
+        });
+        if esc {
+            app.preview_stop();
+        }
+        if del && !app.selected.is_empty() {
+            let sel: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
+            match app.view {
+                View::TagList => app.tag_list_remove(&sel),
+                View::History(h) => app.history_remove_tracks(h, &sel),
+                _ => {}
+            }
+        }
+        if copy || cut {
+            app.copy_tracks(cut);
+        }
+        if paste {
+            app.paste_tracks();
+        }
+    }
     // The fixed vertical scroll bar (stays put when the columns scroll sideways).
     if let Some((inner, off, content_h)) = vstate {
         let track = Rect::from_min_max(pos2(vbar_x, area.min.y + 13.5), pos2(r.max.x, inner.max.y));
@@ -1938,7 +2069,13 @@ fn column_browser(app: &mut App, ui: &mut Ui, r: Rect) {
 
 /// Track list row height: Preferences > View > Browse font size and line space.
 pub fn row_height(app: &App) -> f32 {
-    ROW_H + app.prefs.browse_font.min(4) as f32 * 1.5 + app.prefs.browse_line.min(4) as f32 * 2.5
+    let h = ROW_H + app.prefs.browse_font.min(4) as f32 * 1.5 + app.prefs.browse_line.min(4) as f32 * 2.5;
+    // "Show the entire artwork.": rows tall enough for a square picture.
+    if app.prefs.artwork_full && app.prefs.columns.contains(&Col::Artwork) {
+        h.max(34.0)
+    } else {
+        h
+    }
 }
 
 /// Track list text font (Preferences > View > Browse).
@@ -1962,44 +2099,11 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
     };
     match c {
         Col::Num => {
-            let n = if app.is_manual_playlist().is_some() && app.prefs.sort_col == Col::Num && app.search.is_empty() { row + 1 } else { row + 1 };
+            // Track Order: the track's stored position in the playlist, whatever the sort.
+            let n = app.ext.list_num.get(row).copied().unwrap_or(row + 1);
             txt(n.to_string());
         }
-        Col::Status => {
-            // Two 30 pt sub-columns as in the original: source/colour, then analysis state / ★CUE.
-            let a = Rect::from_min_size(r.min, vec2(30.0, r.height()));
-            let b = Rect::from_min_max(pos2(r.min.x + 30.0, r.min.y), r.max);
-            p.line_segment([pos2(a.max.x - 0.5, r.min.y), pos2(a.max.x - 0.5, r.max.y)], Stroke::new(1.0, BG));
-            if t.color > 0 {
-                p.rect_filled(Rect::from_center_size(a.center(), vec2(9.0, 9.0)), 1.0, label_color(t.color));
-            }
-            if t.missing {
-                p.text(a.center(), Align2::CENTER_CENTER, "!", FontId::proportional(11.0), CAUTION_TX);
-            }
-            let cued = app.cue_counts.get(&t.id).map(|(h, m)| h + m > 0).unwrap_or(false);
-            match t.analyzed {
-                3 => {
-                    let tt = app.ctx.input(|i| i.time) as f32;
-                    for k in 0..3 {
-                        let on = ((tt * 3.0) as i32 % 3) == k;
-                        p.circle_filled(pos2(b.min.x + 8.0 + k as f32 * 5.0, b.center().y), 1.6, if on { WHITE } else { DIM });
-                    }
-                    app.ctx.request_repaint_after(std::time::Duration::from_millis(300));
-                }
-                2 => {
-                    p.text(pos2(b.min.x + 6.0, b.center().y), Align2::LEFT_CENTER, "ERR", FontId::proportional(8.5), CAUTION_TX);
-                }
-                0 => {
-                    p.text(pos2(b.min.x + 5.0, b.center().y), Align2::LEFT_CENTER, "0%", FontId::proportional(9.5), DIM2);
-                }
-                _ => {
-                    star(&p, pos2(b.min.x + 8.0, b.center().y), 4.8, WHITE, true);
-                    if cued {
-                        p.text(pos2(b.min.x + 13.0, b.center().y), Align2::LEFT_CENTER, "CUE", FontId::proportional(9.5), WHITE);
-                    }
-                }
-            }
-        }
+        Col::Status => crate::ui_library_ext::status_cell(app, ui, t, r),
         Col::Preview => {
             if let Some(pv) = app.previews.get(&t.id) {
                 let n = (r.width() - 8.0).max(1.0) as usize;
@@ -2028,7 +2132,7 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
                     }
                 }
                 // Hot cue letters at their positions (as the original's preview shows them).
-                if let Some(hc) = app.hot_positions.get(&t.id) {
+                if let Some(hc) = app.hot_positions.get(&t.id).filter(|_| app.prefs.cue_markers_on_preview) {
                     let dur = t.duration.max(0.001);
                     for (start, slot, color) in hc {
                         let x = r.min.x + 4.0 + (*start / dur) as f32 * n as f32;
@@ -2038,13 +2142,37 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
                     }
                 }
             }
+            // Preview playback: the playhead moves across the cell (a pulsing bar while the
+            // file is being read).
+            if let Some((pid, frac)) = app.preview_status() {
+                if pid == t.id {
+                    match frac {
+                        Some(f) => {
+                            let x = r.min.x + 4.0 + f as f32 * (r.width() - 8.0);
+                            p.rect_filled(Rect::from_min_max(pos2(r.min.x + 4.0, r.min.y + 1.0), pos2(x, r.max.y - 1.0)), 0.0, Color32::from_black_alpha(110));
+                            p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.5, WHITE));
+                        }
+                        None => {
+                            let a = (app.ctx.input(|i| i.time) * 6.0).sin() as f32 * 0.5 + 0.5;
+                            p.rect_filled(Rect::from_min_size(pos2(r.min.x + 4.0, r.max.y - 3.0), vec2(r.width() - 8.0, 2.0)), 0.0, WHITE.gamma_multiply(0.3 + 0.6 * a));
+                        }
+                    }
+                }
+            }
         }
         Col::Artwork => {
-            // The artwork fills the cell, cropped around its middle band.
             if let Some(tex) = artwork_texture(app, &t.artwork) {
                 let cell = r.shrink2(vec2(0.0, 0.5));
-                let band = (cell.height() / cell.width()).min(1.0) / 2.0;
-                p.image(tex.id(), cell, Rect::from_min_max(pos2(0.0, 0.5 - band), pos2(1.0, 0.5 + band)), Color32::WHITE);
+                if app.prefs.artwork_full {
+                    // "Show the entire artwork.": the whole picture, square, in a taller row.
+                    let s = cell.height().min(cell.width());
+                    p.image(tex.id(), Rect::from_center_size(cell.center(), vec2(s, s)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                } else {
+                    // "Show the upper part of the artwork.": the cell's width of the picture, from
+                    // its top edge down.
+                    let band = (cell.height() / cell.width()).min(1.0);
+                    p.image(tex.id(), cell, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, band)), Color32::WHITE);
+                }
             }
         }
         Col::Title => txt(t.display_title()),
@@ -2092,75 +2220,7 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
             let n = app.cue_counts.get(&t.id).map(|c| c.0).unwrap_or(0);
             txt(if n > 0 { format!("{n}") } else { String::new() });
         }
-    }
-}
-
-fn filter_bar(app: &mut App, ui: &mut Ui) {
-    ui.label(RichText::new("BPM").size(11.0).color(DIM2));
-    let (mut lo, mut hi) = app.filter_bpm;
-    let a = ui.add(egui::DragValue::new(&mut lo).range(0.0..=300.0).speed(0.5).prefix("≥ "));
-    let b = ui.add(egui::DragValue::new(&mut hi).range(0.0..=300.0).speed(0.5).prefix("≤ "));
-    if a.changed() || b.changed() {
-        app.filter_bpm = (lo, hi);
-        app.list_dirty = true;
-    }
-    if let Some(t) = app.deck.track.and_then(|id| app.track(id)) {
-        let bpm = t.bpm;
-        let key = t.key;
-        if ui.small_button("±6% of loaded").clicked() && bpm > 0.0 {
-            app.filter_bpm = ((bpm * 0.94 * 100.0).round() / 100.0, (bpm * 1.06 * 100.0).round() / 100.0);
-            app.list_dirty = true;
-        }
-        if ui.small_button("Matching key").on_hover_text("Same key, ±1 on the key wheel, or relative major/minor").clicked() && key >= 0 {
-            app.filter_key = key;
-            app.list_dirty = true;
-        }
-    }
-    ui.separator();
-    ui.label(RichText::new("Key").size(11.0).color(DIM2));
-    let alnum = app.prefs.key_alnum;
-    egui::ComboBox::from_id_salt("fkey").width(64.0).selected_text(if app.filter_key < 0 { "Any".to_string() } else { key_name(app.filter_key, alnum) }).show_ui(ui, |ui| {
-        if ui.selectable_label(app.filter_key < 0, "Any").clicked() {
-            app.filter_key = -1;
-            app.list_dirty = true;
-        }
-        for k in 0..24 {
-            if ui.selectable_label(app.filter_key == k, format!("{}  ({})", key_name(k, alnum), key_name(k, !alnum))).clicked() {
-                app.filter_key = k;
-                app.list_dirty = true;
-            }
-        }
-    });
-    ui.separator();
-    ui.label(RichText::new("Rating ≥").size(11.0).color(DIM2));
-    let mut r = app.filter_rating as i32;
-    if ui.add(egui::DragValue::new(&mut r).range(0..=5)).changed() {
-        app.filter_rating = r as u8;
-        app.list_dirty = true;
-    }
-    ui.separator();
-    egui::ComboBox::from_id_salt("fcolor").width(80.0).selected_text(if app.filter_color == 0 { "Any color".to_string() } else { COLOR_NAMES[app.filter_color as usize].to_string() }).show_ui(ui, |ui| {
-        for i in 0..9u8 {
-            if ui.selectable_label(app.filter_color == i, if i == 0 { "Any color" } else { COLOR_NAMES[i as usize] }).clicked() {
-                app.filter_color = i;
-                app.list_dirty = true;
-            }
-        }
-    });
-    if !app.filter_tags.is_empty() {
-        ui.separator();
-        if ui.selectable_label(app.filter_tags_all, if app.filter_tags_all { "My Tag: all" } else { "My Tag: any" }).clicked() {
-            app.filter_tags_all = !app.filter_tags_all;
-            app.list_dirty = true;
-        }
-    }
-    if ui.small_button("Clear").clicked() {
-        app.filter_bpm = (0.0, 0.0);
-        app.filter_key = -1;
-        app.filter_rating = 0;
-        app.filter_color = 0;
-        app.filter_tags.clear();
-        app.list_dirty = true;
+        Col::DateCreated => txt(t.date_created.get(..10).unwrap_or(&t.date_created).to_string()),
     }
 }
 
@@ -2308,156 +2368,5 @@ fn mytag_panel(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn track_menu_items(app: &mut App, ui: &mut Ui, sel: &[i64]) {
-    if sel.is_empty() {
-        ui.label(RichText::new("No track selected").color(DIM));
-        return;
-    }
-    let one = sel.len() == 1;
-    if one && ui.button("Load to Player").clicked() {
-        app.load_track(sel[0]);
-        ui.close_menu();
-    }
-    ui.menu_button("Add To Playlist", |ui| {
-        let pls: Vec<PlaylistNode> = app.nodes.iter().filter(|n| n.kind == NodeKind::Playlist).cloned().collect();
-        if pls.is_empty() {
-            ui.label(RichText::new("No playlists yet").color(DIM));
-        }
-        for n in pls {
-            if ui.button(&n.name).clicked() {
-                app.add_to_playlist(n.id, sel);
-                ui.close_menu();
-            }
-        }
-        ui.separator();
-        if ui.button("Create New Playlist").clicked() {
-            let id = app.create_node(0, NodeKind::Playlist);
-            app.add_to_playlist(id, sel);
-            app.side = SideMode::Playlists;
-            ui.close_menu();
-        }
-    });
-    if ui.button(if one { "Export Track…" } else { "Export Tracks…" }).clicked() {
-        open_export(app, vec![], sel.to_vec());
-        ui.close_menu();
-    }
-    ui.separator();
-    if ui.button(if one { "Analyze Track" } else { "Analyze Tracks" }).clicked() {
-        app.reanalyze(sel);
-        ui.close_menu();
-    }
-    if ui.button(if one { "Analyze Key" } else { "Analyze Keys" }).clicked() {
-        app.analyze_key_tracks(sel);
-        ui.close_menu();
-    }
-    let locked = sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));
-    if ui.button(if locked { "Analysis Unlock" } else { "Analysis Lock" }).clicked() {
-        for id in sel {
-            if let Some(t) = app.track_mut(*id) {
-                t.grid_locked = !locked;
-            }
-            app.save_track(*id);
-        }
-        ui.close_menu();
-    }
-    if app.analysis_total > 0 && ui.button("Stop Analyzing").clicked() {
-        app.pool.stop();
-        ui.close_menu();
-    }
-    ui.separator();
-    ui.menu_button("Rating", |ui| {
-        for s in 0..=5u8 {
-            if ui.button(if s == 0 { "No rating".to_string() } else { "★".repeat(s as usize) }).clicked() {
-                for id in sel {
-                    if let Some(t) = app.track_mut(*id) {
-                        t.rating = s;
-                    }
-                    app.save_track(*id);
-                }
-                ui.close_menu();
-            }
-        }
-    });
-    ui.menu_button("Color", |ui| {
-        for i in 0..9u8 {
-            if ui.button(RichText::new(format!("■ {}", COLOR_NAMES[i as usize])).color(if i == 0 { DIM } else { label_color(i) })).clicked() {
-                for id in sel {
-                    if let Some(t) = app.track_mut(*id) {
-                        t.color = i;
-                    }
-                    app.save_track(*id);
-                }
-                ui.close_menu();
-            }
-        }
-    });
-    let auto = sel.iter().all(|id| app.track(*id).map(|t| t.autoload_hotcue).unwrap_or(false));
-    if ui.button(if auto { "Disable Auto Load Hot Cue" } else { "Enable Auto Load Hot Cue" }).clicked() {
-        for id in sel {
-            if let Some(t) = app.track_mut(*id) {
-                t.autoload_hotcue = !auto;
-            }
-            app.save_track(*id);
-        }
-        ui.close_menu();
-    }
-    if ui.button(if one { "Reload Tag" } else { "Reload Tags" }).clicked() {
-        app.reload_tags_from_files(sel);
-        ui.close_menu();
-    }
-    if ui.button("Reset DJ Play Count").clicked() {
-        for id in sel {
-            if let Some(t) = app.track_mut(*id) {
-                t.play_count = 0;
-            }
-            app.save_track(*id);
-        }
-        ui.close_menu();
-    }
-    if one && ui.button("Change Artwork…").clicked() {
-        if let Some(f) = rfd::FileDialog::new().add_filter("Image", &["jpg", "jpeg", "png"]).pick_file() {
-            let dest = crate::db::artwork_dir().join(format!("custom_{}.{}", sel[0], f.extension().and_then(|e| e.to_str()).unwrap_or("jpg")));
-            if std::fs::copy(&f, &dest).is_ok() {
-                app.textures.retain(|k, _| !k.contains(&format!("custom_{}", sel[0])));
-                if let Some(t) = app.track_mut(sel[0]) {
-                    t.artwork = dest.to_string_lossy().to_string();
-                }
-                app.save_track(sel[0]);
-            }
-        }
-        ui.close_menu();
-    }
-    if one && ui.button("Relocate…").on_hover_text("Point this track to a moved file").clicked() {
-        if let Some(f) = rfd::FileDialog::new().pick_file() {
-            app.relocate_track(sel[0], &f.to_string_lossy());
-        }
-        ui.close_menu();
-    }
-    if one && ui.button("Playlists including this track").clicked() {
-        let pls = app.db.playlists_containing(sel[0]).unwrap_or_default();
-        let names: Vec<String> = pls.iter().filter_map(|p| app.node(*p)).map(|n| n.name.clone()).collect();
-        app.toast(if names.is_empty() { "This track is not in any playlist.".to_string() } else { format!("In: {}", names.join(", ")) });
-        ui.close_menu();
-    }
-    if ui.button("Show in Finder").clicked() {
-        if let Some(t) = app.track(sel[0]) {
-            let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(&t.path).spawn();
-        }
-        ui.close_menu();
-    }
-    if one && ui.button("Property…").clicked() {
-        app.dialogs.info_track = app.track(sel[0]).cloned();
-        ui.close_menu();
-    }
-    ui.separator();
-    if let Some(pl) = app.is_manual_playlist() {
-        if ui.button("Remove from Playlist").clicked() {
-            let s: HashSet<i64> = sel.iter().copied().collect();
-            app.remove_from_playlist(pl, &s);
-            ui.close_menu();
-        }
-    }
-    if ui.button("Remove from Collection").clicked() {
-        app.dialogs.confirm_remove = Some(sel.to_vec());
-        ui.close_menu();
-    }
+    crate::ui_library_ext::track_menu(app, ui, sel);
 }

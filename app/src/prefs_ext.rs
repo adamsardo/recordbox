@@ -3,7 +3,6 @@
 //!
 //! Who reads which preference (all are fields of `Prefs` in app.rs):
 //! - `tree_items`: the icon strip in ui_browser.rs (`Prefs::tree_item(name)`).
-//! - `show_palette`: the playlist palette (library code).
 //! - `mytag_to_comments`: `App::set_tag` calls `sync_mytag_comments`.
 //! - `cue_markers_on_preview`: the Preview column in ui_browser.rs.
 //! - `wave_half`: the enlarged and overview waveforms in ui_player.rs.
@@ -16,7 +15,6 @@
 
 use crate::app::*;
 use crate::model::*;
-use eframe::egui;
 
 pub fn default_color_names() -> [String; 8] {
     std::array::from_fn(|i| COLOR_NAMES[i + 1].to_string())
@@ -31,7 +29,7 @@ pub fn tree_item_available(name: &str) -> bool {
     matches!(name, "Collection" | "Playlists" | "Related Tracks" | "Explorer" | "Devices" | "Histories") || TREE_ITEMS_EXTRA.contains(&name)
 }
 /// Sources added by the library code since (kept apart so adding one is a one-word edit).
-pub const TREE_ITEMS_EXTRA: &[&str] = &[];
+pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekordbox xml"];
 
 impl Prefs {
     /// Whether a Tree View source is shown. Collection always is.
@@ -393,6 +391,106 @@ pub fn memory_cue_at_first_beat(app: &mut App, id: i64, grid: &BeatGrid) {
     }
 }
 
+// ------------------------------------------------------------------ audio output
+
+/// Preferences > Audio, as the output stream reads them when it opens: (sample rate, buffer
+/// size in frames, first channel of the output pair); 0 = the device's default.
+pub static STREAM_OPTS: parking_lot::Mutex<(u32, u32, u16)> = parking_lot::Mutex::new((0, 0, 0));
+
+pub fn set_stream_opts(p: &Prefs) {
+    *STREAM_OPTS.lock() = (p.audio_rate, p.audio_buffer, p.audio_channel);
+}
+
+/// The stream configuration for a device: its default, with the chosen sample rate and
+/// buffer size where the device offers them, and the first channel of the output pair.
+pub fn stream_config(dev: &cpal::Device) -> anyhow::Result<(cpal::SupportedStreamConfig, cpal::StreamConfig, usize)> {
+    use cpal::traits::DeviceTrait;
+    let (rate, buffer, ch) = *STREAM_OPTS.lock();
+    let mut cfg = dev.default_output_config()?;
+    if rate != 0 && rate != cfg.sample_rate().0 {
+        if let Ok(mut ranges) = dev.supported_output_configs() {
+            let (fmt, chans) = (cfg.sample_format(), cfg.channels());
+            if let Some(r) = ranges.find(|r| r.sample_format() == fmt && r.channels() == chans && r.min_sample_rate().0 <= rate && rate <= r.max_sample_rate().0) {
+                cfg = r.with_sample_rate(cpal::SampleRate(rate));
+            }
+        }
+    }
+    let mut config: cpal::StreamConfig = cfg.clone().into();
+    if buffer != 0 {
+        let ok = match cfg.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => (*min..=*max).contains(&buffer),
+            cpal::SupportedBufferSize::Unknown => true,
+        };
+        if ok {
+            config.buffer_size = cpal::BufferSize::Fixed(buffer);
+        }
+    }
+    let first = if (ch as usize) + 1 < cfg.channels() as usize { ch as usize } else { 0 };
+    Ok((cfg, config, first))
+}
+
+/// Render stereo and place it on channels `first` and `first + 1` of a wider device; the
+/// other channels are silent.
+pub fn render_pair(out: &mut [f32], channels: usize, first: usize, tmp: &mut Vec<f32>, mut render: impl FnMut(&mut [f32])) {
+    let frames = out.len() / channels.max(1);
+    tmp.clear();
+    tmp.resize(frames * 2, 0.0);
+    render(tmp);
+    out.fill(0.0);
+    if first + 1 < channels {
+        for (f, s) in out.chunks_mut(channels).zip(tmp.chunks(2)) {
+            f[first] = s[0];
+            f[first + 1] = s[1];
+        }
+    }
+}
+
+/// What an output device offers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioCaps {
+    pub name: String,
+    pub default_rate: u32,
+    pub rates: Vec<u32>,
+    pub channels: u16,
+    /// Buffer sizes (frames) the device accepts, when it says.
+    pub buffer: Option<(u32, u32)>,
+}
+
+pub const COMMON_RATES: [u32; 6] = [44100, 48000, 88200, 96000, 176400, 192000];
+pub const BUFFER_SIZES: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+/// Ask a device (None: the default output) what it offers. Device queries can block on some
+/// systems, so this runs on its own thread and gives up after `timeout`.
+pub fn audio_caps_within(device: Option<String>, timeout: std::time::Duration) -> Option<AudioCaps> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let dev = device.and_then(|want| host.output_devices().ok().and_then(|mut it| it.find(|d| d.name().map(|n| n == want).unwrap_or(false)))).or_else(|| host.default_output_device());
+        let caps = dev.and_then(|d| {
+            let def = d.default_output_config().ok()?;
+            let mut c = AudioCaps { name: d.name().unwrap_or_default(), default_rate: def.sample_rate().0, channels: def.channels(), ..Default::default() };
+            if let cpal::SupportedBufferSize::Range { min, max } = def.buffer_size() {
+                c.buffer = Some((*min, *max));
+            }
+            for r in d.supported_output_configs().ok()? {
+                if r.sample_format() != def.sample_format() || r.channels() != def.channels() {
+                    continue;
+                }
+                for rate in COMMON_RATES {
+                    if r.min_sample_rate().0 <= rate && rate <= r.max_sample_rate().0 && !c.rates.contains(&rate) {
+                        c.rates.push(rate);
+                    }
+                }
+            }
+            c.rates.sort();
+            Some(c)
+        });
+        let _ = tx.send(caps);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
 // ------------------------------------------------------------------ menu helpers
 
 /// The menu-bar accelerator for a shortcut (None: the key loop handles it).
@@ -425,7 +523,7 @@ pub fn accelerator(sc: &Shortcut) -> Option<muda::accelerator::Accelerator> {
     if sc.shift {
         m |= Modifiers::SHIFT;
     }
-    Some(Accelerator::new(Some(m), code))
+    Some(Accelerator::new(m, code))
 }
 
 /// Window state added with the menu and Preferences work (a field of `Dialogs`).
@@ -452,90 +550,6 @@ pub struct DialogsExt {
     /// Full screen asked for from the menu or keyboard (applied by the main loop).
     pub toggle_fullscreen: bool,
     pub fullscreen: bool,
-}
-
-// ------------------------------------------------------------------ library functions
-// The library code is to provide App::import_playlist_file, export_playlist_file,
-// export_all_playlists_info, open_missing_file_manager and analyze_missing. Until it does,
-// the menus call these stand-ins (swap the bodies for the App methods when they exist).
-
-pub fn import_playlist_file(app: &mut App, path: &std::path::Path, _parent: i64) {
-    crate::ui_browser::import_m3u(app, path);
-}
-
-fn m3u8(app: &App, tracks: &[i64]) -> String {
-    let mut s = String::from("#EXTM3U\n");
-    for id in tracks {
-        if let Some(t) = app.track(*id) {
-            s.push_str(&format!("#EXTINF:{},{} - {}\n{}\n", t.duration.round() as i64, t.artist, t.title, t.path));
-        }
-    }
-    s
-}
-
-fn file_safe(name: &str) -> String {
-    let s: String = name.chars().map(|c| if matches!(c, '/' | ':' | '\\' | '\0') { '_' } else { c }).collect();
-    if s.trim().is_empty() { "Untitled Playlist".into() } else { s }
-}
-
-pub fn export_playlist_file(app: &mut App, node: i64, path: &std::path::Path) -> anyhow::Result<usize> {
-    let tracks = app.view_tracks_of(&View::Playlist(node));
-    std::fs::write(path, m3u8(app, &tracks))?;
-    Ok(tracks.len())
-}
-
-/// One .m3u8 per playlist, in folders that mirror the playlist tree. Returns the number of
-/// playlists written.
-pub fn export_all_playlists_info(app: &mut App, dir: &std::path::Path) -> anyhow::Result<usize> {
-    fn walk(app: &App, parent: i64, dir: &std::path::Path, n: &mut usize, depth: u8) -> anyhow::Result<()> {
-        if depth > 32 {
-            return Ok(());
-        }
-        let mut kids: Vec<PlaylistNode> = app.nodes.iter().filter(|x| x.parent == parent).cloned().collect();
-        kids.sort_by_key(|x| x.seq);
-        for k in kids {
-            if k.kind == NodeKind::Folder {
-                let d = dir.join(file_safe(&k.name));
-                std::fs::create_dir_all(&d)?;
-                walk(app, k.id, &d, n, depth + 1)?;
-            } else {
-                let tracks = app.view_tracks_of(&View::Playlist(k.id));
-                std::fs::write(dir.join(format!("{}.m3u8", file_safe(&k.name))), m3u8(app, &tracks))?;
-                *n += 1;
-            }
-        }
-        Ok(())
-    }
-    std::fs::create_dir_all(dir)?;
-    let mut n = 0;
-    walk(app, 0, dir, &mut n, 0)?;
-    Ok(n)
-}
-
-pub fn open_missing_file_manager(app: &mut App) {
-    app.side = SideMode::Collection;
-    app.set_view(View::Collection);
-    let missing: Vec<i64> = app.tracks.iter().filter(|t| t.missing).map(|t| t.id).collect();
-    app.toast(format!("{} missing file(s) in the collection", missing.len()));
-    app.selected = missing.into_iter().collect();
-}
-
-pub fn analyze_missing(app: &mut App, ids: &[i64]) {
-    app.analyze(ids, false);
-}
-
-/// Relocate > Auto Relocate: search the folders of Preferences > Advanced > Browse.
-pub fn auto_relocate(app: &mut App) {
-    let folders: Vec<String> = app.prefs.relocate_folders.iter().filter(|f| std::path::Path::new(f).is_dir()).cloned().collect();
-    match folders.first() {
-        Some(f) => {
-            if folders.len() > 1 {
-                app.toast(format!("Searching {f} first; run Auto Relocate again for the other folders."));
-            }
-            app.relocate_missing(std::path::Path::new(f));
-        }
-        None => app.toast_err("No folder to search. Add folders in Preferences > Advanced > Browse > Auto Relocate Search Folders."),
-    }
 }
 
 /// Playlist > Sort Items: the children of a folder (0 = the top level) by name.
@@ -617,7 +631,6 @@ mod tests {
         assert!(p.tree_item("Devices") && p.cue_markers_on_preview && p.high_precision_grid && !p.wave_half);
         p.tree_items.insert("Devices".into(), false);
         p.tree_items.insert("Collection".into(), false);
-        p.show_palette = true;
         p.mytag_to_comments = true;
         p.cue_markers_on_preview = false;
         p.wave_half = true;
@@ -658,6 +671,20 @@ mod tests {
         assert_eq!(comment_with_tags("great intro /* House */", &[]), "great intro");
         assert_eq!(comment_with_tags("/* House */", &[]), "");
         assert_eq!(comment_with_tags("a /* b */ c", &tags(&["X"])), "a /* b */ c /* X */");
+    }
+
+    #[test]
+    fn output_pair_placement() {
+        let mut out = vec![9.0f32; 8];
+        let mut tmp = vec![];
+        render_pair(&mut out, 4, 2, &mut tmp, |b| {
+            assert_eq!(b.len(), 4);
+            b.copy_from_slice(&[0.1, 0.2, 0.3, 0.4]);
+        });
+        assert_eq!(out, vec![0.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.3, 0.4]);
+        // A pair the device does not have leaves silence rather than writing out of range.
+        render_pair(&mut out, 4, 3, &mut tmp, |b| b.fill(1.0));
+        assert!(out.iter().all(|x| *x == 0.0));
     }
 
     #[test]

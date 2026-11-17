@@ -419,15 +419,10 @@ pub fn poll(app: &mut crate::app::App) {
 
 /// Everything the app holds in memory is read again from the restored database.
 fn reload_after_restore(app: &mut crate::app::App) {
-    {
-        let mut ps = app.player.state.lock();
-        ps.playing = false;
-        ps.audio = None;
-        ps.stems = None;
-        ps.loop_range = None;
+    // Both decks are emptied: their tracks may not exist in the restored library.
+    for d in 0..2u8 {
+        app.with_deck(d, |a| a.unload_track());
     }
-    app.deck = Default::default();
-    app.deck_backup = None;
     app.undo.clear();
     app.redo.clear();
     if let Some(p) = app.db.setting("prefs").and_then(|s| serde_json::from_str::<crate::app::Prefs>(&s).ok()) {

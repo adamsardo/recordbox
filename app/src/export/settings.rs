@@ -93,6 +93,9 @@ impl Default for UsbSettings {
     }
 }
 
+/// Type of the overview waveform on the players (DEVSETTING payload 9, WaveDispStyle):
+/// Half Waveform 1, Full Waveform 2.
+pub const DEV_OVERVIEW_TYPE: usize = 9;
 /// Waveform colour shown on the players (DEVSETTING payload 10): Blue 1, RGB 3, 3Band 4.
 pub const DEV_WAVEFORM_COLOR: usize = 10;
 /// Waveform current position on the players (DEVSETTING payload 13): Center 1, Left 2.
@@ -155,9 +158,9 @@ impl UsbSettings {
             (crc == crc16_xmodem(covered)).then(|| b[104..104 + len].to_vec())
         };
         let managed = |f: SettingFile| -> Vec<usize> {
-            let mut v: Vec<usize> = crate::export::settings_fields::MY_SETTINGS.iter().filter(|x| x.file == f).map(|x| x.offset).collect();
+            let mut v: Vec<usize> = crate::export::settings_fields::MY_SETTINGS.iter().chain(crate::export::settings_fields::DJM_SETTINGS).filter(|x| x.file == f).map(|x| x.offset).collect();
             if f == SettingFile::Dev {
-                v.extend([DEV_WAVEFORM_COLOR, DEV_WAVEFORM_POSITION]);
+                v.extend([DEV_OVERVIEW_TYPE, DEV_WAVEFORM_COLOR, DEV_WAVEFORM_POSITION]);
             }
             v
         };
@@ -237,6 +240,43 @@ mod tests {
         bad[n - 4] ^= 0xff;
         std::fs::write(dir.join("DEVSETTING.DAT"), bad).unwrap();
         assert_eq!(mine.merged_onto_drive(&dir).dev[20], UsbSettings::default().dev[20]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every option table matches the defaults rekordbox writes: each default byte is one of
+    /// the field's options, and no two fields share a byte.
+    #[test]
+    fn field_tables_cover_the_defaults() {
+        use crate::export::settings_fields::{DJM_SETTINGS, MY_SETTINGS};
+        let d = UsbSettings::default();
+        let mut seen = std::collections::HashSet::new();
+        for f in MY_SETTINGS.iter().chain(DJM_SETTINGS) {
+            let tag = match f.file {
+                SettingFile::My => 0,
+                SettingFile::My2 => 1,
+                SettingFile::Dev => 2,
+                SettingFile::Djm => 3,
+            };
+            assert!(seen.insert((tag, f.offset)), "{} shares its byte", f.name);
+            let cur = d.get(f.file, f.offset);
+            assert!(f.options.iter().any(|o| o.1 == cur), "{}: default {cur:#x} is not an option", f.name);
+        }
+        assert_eq!(DJM_SETTINGS.len(), 13);
+        // The overview type defaults to Half Waveform and survives a merge onto a drive.
+        assert_eq!(d.get(SettingFile::Dev, DEV_OVERVIEW_TYPE), 1);
+        let dir = std::env::temp_dir().join(format!("recordbox_settings_djm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut drive = UsbSettings::default();
+        drive.djm[30] = 0x33;
+        for (n, b) in drive.files() {
+            std::fs::write(dir.join(n), b).unwrap();
+        }
+        let mut mine = UsbSettings::default();
+        mine.set(SettingFile::Djm, 13, 0x80);
+        mine.set(SettingFile::Dev, DEV_OVERVIEW_TYPE, 2);
+        let merged = mine.merged_onto_drive(&dir);
+        assert_eq!((merged.djm[13], merged.djm[30], merged.dev[DEV_OVERVIEW_TYPE]), (0x80, 0x33, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

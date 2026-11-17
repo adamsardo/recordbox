@@ -45,6 +45,7 @@ impl eframe::App for Gui {
     /// pointer events, to check marker dragging end to end; the result goes to stderr.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
+        self.app.shot_player_events(frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
@@ -193,6 +194,10 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         }
         if app.deck.hot_preview.is_some() {
             app.hot_cue_up();
+        }
+        // A Search key held when the window lost focus is never seen released.
+        if app.searching() != 0 && !ctx.input(|i| i.pointer.any_down()) {
+            app.search(0);
         }
     }
     if app.deck.hot_preview.is_some() {

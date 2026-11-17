@@ -91,6 +91,13 @@ pub const COMMANDS: [(&str, &str, bool); 60] = [
     ("h_about", "About Recordbox", false),
 ];
 
+fn it<'a>(h: &'a Handles, id: &str) -> &'a dyn IsMenuItem {
+    match h.items.get(id).unwrap_or_else(|| panic!("menu item {id}")) {
+        Entry::Plain(i) => i,
+        Entry::Check(i) => i,
+    }
+}
+
 /// Accelerators that are not part of Preferences > Keyboard.
 fn fixed_accelerator(id: &str) -> Option<Accelerator> {
     let cmd = Modifiers::META;
@@ -100,7 +107,7 @@ fn fixed_accelerator(id: &str) -> Option<Accelerator> {
         "property" => (cmd, Code::KeyI),
         _ => return None,
     };
-    Some(Accelerator::new(Some(m), c))
+    Some(Accelerator::new(m, c))
 }
 
 pub fn build() -> Option<Menu> {
@@ -112,93 +119,87 @@ pub fn build() -> Option<Menu> {
     let sep = PredefinedMenuItem::separator;
     let menu = Menu::new();
     {
-        let it = |id: &str| -> &dyn IsMenuItem {
-            match h.items.get(id).unwrap_or_else(|| panic!("menu item {id}")) {
-                Entry::Plain(i) => i,
-                Entry::Check(i) => i,
-            }
-        };
         let app_menu = Submenu::new("Recordbox", true);
         app_menu
-            .append_items(&[it("about"), &sep(), it("prefs"), &sep(), &PredefinedMenuItem::hide(None), &PredefinedMenuItem::hide_others(None), &PredefinedMenuItem::show_all(None), &sep(), &PredefinedMenuItem::quit(None)])
+            .append_items(&[it(&h, "about"), &sep(), it(&h, "prefs"), &sep(), &PredefinedMenuItem::hide(None), &PredefinedMenuItem::hide_others(None), &PredefinedMenuItem::show_all(None), &sep(), &PredefinedMenuItem::quit(None)])
             .ok()?;
         let import = Submenu::new("Import", true);
-        import.append_items(&[it("import_track"), it("import_folder"), it("import_playlist")]).ok()?;
+        import.append_items(&[it(&h, "import_track"), it(&h, "import_folder"), it(&h, "import_playlist")]).ok()?;
         let library = Submenu::new("Library", true);
-        library.append_items(&[it("backup"), it("restore")]).ok()?;
+        library.append_items(&[it(&h, "backup"), it(&h, "restore")]).ok()?;
         let file = Submenu::new("File", true);
-        file.append_items(&[&import, &library, &sep(), it("missing"), &sep(), it("export_xml"), it("export_playlists_info"), &sep(), it("sync_rekordbox"), it("import_xml"), it("relocate_missing"), it("library_folder")]).ok()?;
+        file.append_items(&[&import, &library, &sep(), it(&h, "missing"), &sep(), it(&h, "export_xml"), it(&h, "export_playlists_info"), &sep(), it(&h, "sync_rekordbox"), it(&h, "import_xml"), it(&h, "relocate_missing"), it(&h, "library_folder")]).ok()?;
         let edit = Submenu::new("Edit", true);
-        edit.append_items(&[it("undo"), it("redo"), &sep(), &PredefinedMenuItem::cut(None), &PredefinedMenuItem::copy(None), &PredefinedMenuItem::paste(None), &PredefinedMenuItem::select_all(None)]).ok()?;
+        edit.append_items(&[it(&h, "undo"), it(&h, "redo"), &sep(), &PredefinedMenuItem::cut(None), &PredefinedMenuItem::copy(None), &PredefinedMenuItem::paste(None), &PredefinedMenuItem::select_all(None)]).ok()?;
         let view = Submenu::new("View", true);
         view.append_items(&[
-            it("fullscreen"),
+            it(&h, "fullscreen"),
             &sep(),
-            it("layout_player"),
-            it("layout_2players"),
-            it("layout_simple"),
-            it("layout_browser"),
+            it(&h, "layout_player"),
+            it(&h, "layout_2players"),
+            it(&h, "layout_simple"),
+            it(&h, "layout_browser"),
             &sep(),
-            it("mytag_window"),
-            it("related_window"),
-            it("info_window"),
-            it("sub_browser"),
+            it(&h, "mytag_window"),
+            it(&h, "related_window"),
+            it(&h, "info_window"),
+            it(&h, "sub_browser"),
             &sep(),
-            it("filter"),
-            it("wave_blue"),
-            it("wave_rgb"),
-            it("wave_3band"),
+            it(&h, "filter"),
+            it(&h, "wave_blue"),
+            it(&h, "wave_rgb"),
+            it(&h, "wave_3band"),
         ])
         .ok()?;
         let auto = Submenu::new("Auto Analysis", true);
-        auto.append_items(&[it("auto_on"), it("auto_off")]).ok()?;
+        auto.append_items(&[it(&h, "auto_on"), it(&h, "auto_off")]).ok()?;
         let relocate = Submenu::new("Relocate", true);
-        relocate.append_items(&[it("relocate"), it("auto_relocate")]).ok()?;
+        relocate.append_items(&[it(&h, "relocate"), it(&h, "auto_relocate")]).ok()?;
         let track = Submenu::new("Track", true);
         track
             .append_items(&[
-                it("t_import_track"),
+                it(&h, "t_import_track"),
                 &sep(),
-                it("analyze"),
-                it("analyze_missing"),
-                it("analyze_key"),
-                it("analysis_lock"),
+                it(&h, "analyze"),
+                it(&h, "analyze_missing"),
+                it(&h, "analyze_key"),
+                it(&h, "analysis_lock"),
                 &auto,
-                it("stop_analysis"),
+                it(&h, "stop_analysis"),
                 &sep(),
-                it("export_tracks"),
-                it("reload_tags"),
+                it(&h, "export_tracks"),
+                it(&h, "reload_tags"),
                 &relocate,
-                it("show_finder"),
-                it("remove_collection"),
+                it(&h, "show_finder"),
+                it(&h, "remove_collection"),
                 &sep(),
-                it("property"),
+                it(&h, "property"),
                 &sep(),
-                it("load"),
-                it("trash"),
+                it(&h, "load"),
+                it(&h, "trash"),
             ])
             .ok()?;
         let playlist = Submenu::new("Playlist", true);
         playlist
             .append_items(&[
-                it("p_import_playlist"),
+                it(&h, "p_import_playlist"),
                 &sep(),
-                it("new_playlist"),
-                it("new_smart"),
-                it("new_folder"),
-                it("delete_playlist"),
-                it("rename_playlist"),
+                it(&h, "new_playlist"),
+                it(&h, "new_smart"),
+                it(&h, "new_folder"),
+                it(&h, "delete_playlist"),
+                it(&h, "rename_playlist"),
                 &sep(),
-                it("export_playlist"),
-                it("sort_items"),
-                it("renumber"),
-                it("save_playlist_info"),
+                it(&h, "export_playlist"),
+                it(&h, "sort_items"),
+                it(&h, "renumber"),
+                it(&h, "save_playlist_info"),
                 &sep(),
-                it("export_device"),
+                it(&h, "export_device"),
             ])
             .ok()?;
         let help = Submenu::new("Help", true);
-        help.append_items(&[it("manual"), it("shortcuts"), &sep(), it("h_about")]).ok()?;
+        help.append_items(&[it(&h, "manual"), it(&h, "shortcuts"), &sep(), it(&h, "h_about")]).ok()?;
         menu.append_items(&[&app_menu, &file, &edit, &view, &track, &playlist, &help]).ok()?;
     }
     #[cfg(target_os = "macos")]
@@ -247,7 +248,7 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
     for (id, _, _) in COMMANDS {
         let v = match id {
             "backup" | "restore" => (!busy, false),
-            "missing" | "relocate_missing" | "auto_relocate" => (any_missing, false),
+            "relocate_missing" | "auto_relocate" => (any_missing, false),
             "export_xml" => (!app.tracks.is_empty(), false),
             "export_playlists_info" => (app.nodes.iter().any(|n| n.kind != NodeKind::Folder), false),
             "sync_rekordbox" => (app.rb_job.is_none(), false),
@@ -306,7 +307,7 @@ pub fn sync(app: &App) {
                 }
                 None => {}
             }
-            h.shown.insert(id, (*en, *on));
+            h.shown.insert(*id, (*en, *on));
         }
         // A click on a ticked item flips its tick natively; put back what the state says.
         for (id, e) in &h.items {
@@ -364,7 +365,10 @@ pub fn handle(app: &mut App, id: &str) {
         "import_playlist" | "p_import_playlist" => {
             if let Some(f) = rfd::FileDialog::new().set_title("Import Playlist").add_filter("Playlist", &["m3u", "m3u8", "pls", "txt"]).pick_file() {
                 let parent = crate::prefs_ext::current_parent(app);
-                crate::prefs_ext::import_playlist_file(app, &f, parent);
+                if let Some(id) = app.import_playlist_file(&f, parent) {
+                    app.side = SideMode::Playlists;
+                    app.set_view(View::Playlist(id));
+                }
             }
         }
         "backup" => {
@@ -382,13 +386,17 @@ pub fn handle(app: &mut App, id: &str) {
                 }
             }
         }
-        "missing" => crate::prefs_ext::open_missing_file_manager(app),
+        "missing" => app.open_missing_file_manager(),
         "relocate_missing" => {
             if let Some(d) = rfd::FileDialog::new().set_title("Folder to search for the missing files").pick_folder() {
                 app.relocate_missing(&d);
             }
         }
-        "auto_relocate" => crate::prefs_ext::auto_relocate(app),
+        "auto_relocate" => {
+            // The selected missing tracks, or every missing track when none is selected.
+            let picked: Vec<i64> = sel.iter().copied().filter(|id| app.track(*id).map(|t| t.missing).unwrap_or(false)).collect();
+            app.auto_relocate(if picked.is_empty() { None } else { Some(picked) });
+        }
         "relocate" => {
             if let Some(t) = sel.first().and_then(|t| app.track(*t)).cloned() {
                 let mut d = rfd::FileDialog::new().set_title(format!("Relocate {}", t.display_title())).add_filter("Audio", &AUDIO_EXT);
@@ -427,10 +435,7 @@ pub fn handle(app: &mut App, id: &str) {
         }
         "export_playlists_info" => {
             if let Some(d) = rfd::FileDialog::new().set_title("Export Playlists Information").pick_folder() {
-                match crate::prefs_ext::export_all_playlists_info(app, &d) {
-                    Ok(n) => app.toast(format!("{n} playlist(s) written to {}", d.display())),
-                    Err(e) => app.toast_err(format!("Export failed. {e}")),
-                }
+                app.export_all_playlists_info(&d);
             }
         }
         "library_folder" => {
@@ -479,7 +484,9 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "analyze" => app.reanalyze(&sel),
-        "analyze_missing" => crate::prefs_ext::analyze_missing(app, &sel),
+        "analyze_missing" => {
+            app.analyze_missing(&sel);
+        }
         "analyze_key" => app.analyze_key_tracks(&sel),
         "analysis_lock" => {
             let locked = sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));
@@ -573,11 +580,8 @@ pub fn handle(app: &mut App, id: &str) {
         }
         "save_playlist_info" => {
             if let Some(n) = current_node(app).cloned() {
-                if let Some(f) = rfd::FileDialog::new().set_title("Save Playlist Info").set_file_name(format!("{}.m3u8", n.name)).add_filter("M3U8 playlist", &["m3u8"]).save_file() {
-                    match crate::prefs_ext::export_playlist_file(app, n.id, &f) {
-                        Ok(k) => app.toast(format!("{k} track(s) written to {}", f.display())),
-                        Err(e) => app.toast_err(format!("Export failed. {e}")),
-                    }
+                if let Some(f) = rfd::FileDialog::new().set_title("Save Playlist Info").set_file_name(format!("{}.txt", n.name)).add_filter("Text (rekordbox)", &["txt"]).add_filter("M3U8 playlist", &["m3u8"]).add_filter("PLS playlist", &["pls"]).save_file() {
+                    app.export_playlist_file(n.id, &f);
                 }
             }
         }

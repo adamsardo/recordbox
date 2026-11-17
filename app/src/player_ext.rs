@@ -4,6 +4,7 @@
 
 use crate::app::*;
 use crate::model::*;
+use eframe::egui;
 
 /// Per-deck state added by this module (a field of `Deck`).
 #[derive(Default)]
@@ -663,5 +664,121 @@ mod tests {
         assert_eq!(jump_label(32.0, true), "8Bars");
         assert_eq!(beats_text(1.0 / 64.0), "1/64");
         assert_eq!(beats_text(512.0), "512");
+    }
+}
+
+// ---------------------------------------------------------------------- screenshot checks
+
+/// The PREPDECK_SHOT_PLAYER switches (comma separated, with --screenshot), for looking at
+/// player states: `2p` 2 Players with a second track on deck B · `simple` Simple Player ·
+/// `ma` manual loop buttons · `loop` a 4-beat loop · `adjust` loop-out adjust · `count1` /
+/// `count2` Beat Count Display modes · `metro` metronome on at volume 3 · `bars` beat jump
+/// in bars · `menu` the waveform's right-click menu. Combine with
+/// PREPDECK_SHOT_VIEW=grid for the GRID panel.
+fn shot_flags() -> Vec<String> {
+    std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default()
+}
+
+impl App {
+    /// Wait for the active deck's audio (screenshot runs only).
+    fn shot_wait_load(&mut self) {
+        if let Some(rx) = self.deck.loading.take() {
+            if let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(20)) {
+                let (tx2, rx2) = crossbeam_channel::bounded(1);
+                let _ = tx2.send(msg);
+                self.deck.loading = Some(rx2);
+                self.poll_load();
+            }
+        }
+    }
+
+    /// Put the player into the states PREPDECK_SHOT_PLAYER names (after the track is loaded).
+    pub fn shot_player_setup(&mut self) {
+        let flags = shot_flags();
+        let has = |f: &str| flags.iter().any(|x| x == f);
+        if flags.is_empty() {
+            return;
+        }
+        if has("2p") {
+            self.prefs.browser_only = false;
+            self.prefs.player_layout = 1;
+            let a = self.deck.track;
+            let second = self.tracks.iter().filter(|t| t.analyzed == 1 && !t.missing && Some(t.id) != a && t.duration > 60.0).map(|t| t.id).nth(3);
+            if let Some(id) = second {
+                self.load_track_to(1, id);
+                self.with_deck(1, |app| {
+                    app.shot_wait_load();
+                    let beats = app.deck.beats.clone();
+                    if let Some(b) = beats.get(64) {
+                        app.seek(b.time);
+                        app.hot_cue_down(0);
+                        app.deck.cue_point = b.time;
+                        app.memory_set();
+                    }
+                    if let Some(b) = beats.get(96) {
+                        app.seek(b.time);
+                        app.hot_cue_down(2);
+                        app.prefs.loop_auto = true;
+                        app.auto_loop(4.0);
+                    }
+                });
+            }
+        }
+        if has("simple") {
+            self.prefs.browser_only = false;
+            self.prefs.player_layout = 2;
+        }
+        if has("1p") {
+            self.prefs.browser_only = false;
+            self.prefs.player_layout = 0;
+        }
+        if has("ma") || has("adjust") {
+            self.prefs.loop_auto = false;
+        }
+        if has("loop") || has("adjust") {
+            let p = self.pos();
+            self.seek(p + 4.0);
+            self.auto_loop(4.0);
+            let p = self.pos();
+            self.seek(p + 0.6);
+        }
+        if has("adjust") {
+            self.deck.x.loop_adjust = 2;
+        }
+        if has("count1") {
+            self.prefs.beat_count_mode = 1;
+        }
+        if has("count2") {
+            self.prefs.beat_count_mode = 2;
+        }
+        if has("metro") {
+            self.deck.metronome = true;
+            self.prefs.metronome_vol = 3;
+            self.update_metronome();
+        }
+        if has("bars") {
+            self.prefs.beat_jump = 8.0;
+            self.prefs.beat_jump_bars = true;
+        }
+        if has("clickmode") {
+            self.prefs.wave_click_play_cue = true;
+        }
+    }
+
+    /// Pointer events for PREPDECK_SHOT_PLAYER=menu (right-click on the enlarged waveform,
+    /// 150 pt right of the playhead) and =padhover (pointer over hot cue pad A's corner).
+    pub fn shot_player_events(&self, frame: u32, raw: &mut egui::RawInput) {
+        let flags = shot_flags();
+        if flags.iter().any(|x| x == "menu") {
+            let Some((r, _, _)) = self.deck.detail_map else { return };
+            let at = egui::pos2(r.center().x + 150.0, r.center().y - 20.0);
+            let click = |pressed: bool| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+            match frame {
+                80 => raw.events.push(egui::Event::PointerMoved(at)),
+                82 => raw.events.push(click(true)),
+                83 => raw.events.push(click(false)),
+                _ => {}
+            }
+        }
     }
 }

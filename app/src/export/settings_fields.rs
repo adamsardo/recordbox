@@ -33,3 +33,21 @@ pub const MY_SETTINGS: &[Field] = &[
     Field { file: SettingFile::My2, offset: 10, name: "Waveform / Phase Meter", options: &[("WAVEFORM", 0x80), ("PHASE METER", 0x81)] },
     Field { file: SettingFile::My2, offset: 12, name: "Beat Jump Beat Value", options: &[("1/2 BEAT", 0x80), ("1 BEAT", 0x81), ("2 BEAT", 0x82), ("4 BEAT", 0x83), ("8 BEAT", 0x84), ("16 BEAT", 0x85), ("32 BEAT", 0x86), ("64 BEAT", 0x87)] },
 ];
+
+/// DJM mixer settings (DJMMYSETTING.DAT), from rekordcrate src/setting.rs (MIT): payload
+/// offsets 12..=24, in file order.
+pub const DJM_SETTINGS: &[Field] = &[
+    Field { file: SettingFile::Djm, offset: 12, name: "CH Fader Curve", options: &[("STEEP TOP", 0x80), ("LINEAR", 0x81), ("STEEP BOTTOM", 0x82)] },
+    Field { file: SettingFile::Djm, offset: 13, name: "Crossfader Curve", options: &[("CONSTANT POWER", 0x80), ("SLOW CUT", 0x81), ("FAST CUT", 0x82)] },
+    Field { file: SettingFile::Djm, offset: 14, name: "Headphones Pre EQ", options: &[("POST EQ", 0x80), ("PRE EQ", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 15, name: "Headphones Mono Split", options: &[("STEREO", 0x80), ("MONO SPLIT", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 16, name: "Beat FX Quantize", options: &[("OFF", 0x80), ("ON", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 17, name: "Mic Low Cut", options: &[("OFF", 0x80), ("ON", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 18, name: "Talk Over Mode", options: &[("ADVANCED", 0x80), ("NORMAL", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 19, name: "Talk Over Level", options: &[("-24dB", 0x80), ("-18dB", 0x81), ("-12dB", 0x82), ("-6dB", 0x83)] },
+    Field { file: SettingFile::Djm, offset: 20, name: "MIDI Channel", options: &[("1", 0x80), ("2", 0x81), ("3", 0x82), ("4", 0x83), ("5", 0x84), ("6", 0x85), ("7", 0x86), ("8", 0x87), ("9", 0x88), ("10", 0x89), ("11", 0x8A), ("12", 0x8B), ("13", 0x8C), ("14", 0x8D), ("15", 0x8E), ("16", 0x8F)] },
+    Field { file: SettingFile::Djm, offset: 21, name: "MIDI Button Type", options: &[("TOGGLE", 0x80), ("TRIGGER", 0x81)] },
+    Field { file: SettingFile::Djm, offset: 22, name: "Display Brightness", options: &[("WHITE", 0x80), ("1", 0x81), ("2", 0x82), ("3", 0x83), ("4", 0x84), ("5", 0x85)] },
+    Field { file: SettingFile::Djm, offset: 23, name: "Indicator Brightness", options: &[("1", 0x80), ("2", 0x81), ("3", 0x82)] },
+    Field { file: SettingFile::Djm, offset: 24, name: "CH Fader Curve (Long Fader)", options: &[("EXPONENTIAL", 0x80), ("SMOOTH", 0x81), ("LINEAR", 0x82)] },
+];

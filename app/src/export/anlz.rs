@@ -143,9 +143,74 @@ fn pqtz(beats: &[Beat]) -> Vec<u8> {
     for b in beats {
         body.extend_from_slice(&(b.beat as u16).to_be_bytes());
         body.extend_from_slice(&((b.bpm * 100.0).round() as u16).to_be_bytes());
-        body.extend_from_slice(&((b.time * 1000.0).round() as u32).to_be_bytes());
+        // Whole milliseconds, cut not rounded: the sub-millisecond part goes to PQT2 (in real
+        // files PQTZ time + PQT2 fraction gives evenly spaced beats; e.g. 1900.861 ms is
+        // stored as 1900 and 861).
+        body.extend_from_slice(&ms(b.time).to_be_bytes());
     }
     section(b"PQTZ", &h, &body)
+}
+
+/// The (beat number, tempo × 100, milliseconds) entries of a PQTZ section.
+pub fn pqtz_entries(sec: &[u8]) -> Vec<(u16, u16, u32)> {
+    if sec.len() < 24 || &sec[..4] != b"PQTZ" {
+        return vec![];
+    }
+    let n = u32::from_be_bytes(sec[20..24].try_into().unwrap()) as usize;
+    (0..n)
+        .filter_map(|i| sec.get(24 + 8 * i..32 + 8 * i))
+        .map(|e| (u16::from_be_bytes([e[0], e[1]]), u16::from_be_bytes([e[2], e[3]]), u32::from_be_bytes([e[4], e[5], e[6], e[7]])))
+        .collect()
+}
+
+/// Extended beat grid (PQT2, in the .EXT file), derived from the PQTZ entries of the same
+/// track. Layout established from 102 real files (rekordcrate's demo export and 100 local
+/// rekordbox 7 analysis files), every one of which this function reproduces byte for byte
+/// from its own PQTZ entries and fractions:
+///
+/// | offset | content |
+/// |---|---|
+/// | 12 | u32 0 |
+/// | 16 | u32 0x01000002 |
+/// | 20 | u32 0 |
+/// | 24 | the first PQTZ entry (beat u16, tempo u16, ms u32) |
+/// | 32 | the last PQTZ entry |
+/// | 40 | u32 number of beats |
+/// | 44 | u32 sum over all PQTZ entries of beat + tempo + ms |
+/// | 48 | 8 zero bytes |
+/// | 56 | one u16 per beat: the beat time's microseconds within its millisecond (0–999) |
+///
+/// `fractions` holds that last value per beat (missing ones are written as 0). Nothing in the
+/// section is left underived; files with several tempos were not among the real samples, so
+/// that the two header entries stay "first" and "last" there is an assumption.
+pub fn pqt2(entries: &[(u16, u16, u32)], fractions: &[u16]) -> Vec<u8> {
+    let mut h = vec![];
+    h.extend_from_slice(&0u32.to_be_bytes());
+    h.extend_from_slice(&0x0100_0002u32.to_be_bytes());
+    h.extend_from_slice(&0u32.to_be_bytes());
+    for e in [entries.first(), entries.last()] {
+        let (beat, tempo, time) = e.copied().unwrap_or((0, 0, 0));
+        h.extend_from_slice(&beat.to_be_bytes());
+        h.extend_from_slice(&tempo.to_be_bytes());
+        h.extend_from_slice(&time.to_be_bytes());
+    }
+    h.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    let sum = entries.iter().fold(0u32, |a, e| a.wrapping_add(e.0 as u32).wrapping_add(e.1 as u32).wrapping_add(e.2));
+    h.extend_from_slice(&sum.to_be_bytes());
+    h.extend_from_slice(&[0u8; 8]);
+    let mut body = Vec::with_capacity(entries.len() * 2);
+    for i in 0..entries.len() {
+        body.extend_from_slice(&fractions.get(i).copied().unwrap_or(0).min(999).to_be_bytes());
+    }
+    section(b"PQT2", &h, &body)
+}
+
+/// The per-beat microsecond fractions stored in a PQT2 section.
+pub fn pqt2_fractions(sec: &[u8]) -> Vec<u16> {
+    if sec.len() < 56 || &sec[..4] != b"PQT2" {
+        return vec![];
+    }
+    sec[56..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
 }
 
 fn pwav(w: &Waveform) -> Vec<u8> {
@@ -258,8 +323,38 @@ fn pwvc() -> Vec<u8> {
     section(b"PWVC", &[0, 0], &[0x00, 0x5b, 0x00, 0x8a, 0x01, 0x8c])
 }
 
+/// Whole milliseconds of a time, with the time first rounded to the microsecond (so 1.9 s is
+/// 1900, not 1899) and the rest cut off; [`micros`] is the part cut.
 fn ms(t: f64) -> u32 {
-    (t.max(0.0) * 1000.0).round() as u32
+    ((t.max(0.0) * 1e6).round() as u64 / 1000).min(u32::MAX as u64) as u32
+}
+
+/// Microseconds within the millisecond (0–999).
+fn micros(t: f64) -> u16 {
+    ((t.max(0.0) * 1e6).round() as u64 % 1000) as u16
+}
+
+/// A loop's length as a rekordbox beat-loop size (numerator, denominator), when it is one of
+/// the sizes the players and rekordbox offer (1/64 … 512 beats) at the grid's tempo there, to
+/// within a millisecond (and 2 % for the shortest). None for any other length: rekordbox
+/// writes 0/0 unless both parts are set.
+pub fn beat_loop_size(start: f64, end: f64, beats: &[Beat]) -> Option<(u16, u16)> {
+    if beats.is_empty() || end <= start {
+        return None;
+    }
+    let near = beats.iter().min_by(|a, b| (a.time - start).abs().partial_cmp(&(b.time - start).abs()).unwrap())?;
+    if near.bpm <= 0.0 {
+        return None;
+    }
+    let beat = 60.0 / near.bpm;
+    let len = end - start;
+    for p in -6i32..=9 {
+        let size = 2f64.powi(p) * beat;
+        if (len - size).abs() <= 0.0011_f64.min(size * 0.02).max(0.0002) {
+            return Some(if p >= 0 { (1 << p, 1) } else { (1, 1 << -p) });
+        }
+    }
+    None
 }
 
 /// Legacy cue list (PCOB with PCPT entries).
@@ -294,7 +389,19 @@ fn pcob(hot: bool, cues: &[&Cue]) -> Vec<u8> {
 }
 
 /// Extended cue list (PCO2 with PCP2 entries) carrying colours and comments.
-fn pco2(hot: bool, cues: &[&Cue]) -> Vec<u8> {
+///
+/// PCP2 record (88 bytes + comment), per rekordcrate and rekordbox-rea's
+/// cue-export-projection report: 12 slot, 16 type, 18 the constant 1000, 20 start ms, 24 end ms,
+/// 28 memory-cue colour, 29 the constant 1, 30/32 the microseconds within the millisecond of
+/// start and end (each 0–999), 34 zero, 36/38 beat-loop size numerator/denominator (both set
+/// or both zero), 40 comment byte count, then the comment, palette index + RGB, and 40 bytes
+/// of seek data (for each end: sample position and byte offset of the audio frame to seek to
+/// and its length). rekordbox copies the seek data only when its own decoder recorded it; it
+/// cannot be derived without that decoder, so it is written as zeros, which is also what
+/// rekordbox writes for a cue without it. The one real record available (rekordcrate's
+/// test, a cue at 287,479 ms) carries sample position 0xc17000, byte offset 0x2307761 and
+/// frame length 0x1000 there.
+fn pco2(hot: bool, cues: &[&Cue], beats: &[Beat]) -> Vec<u8> {
     let mut body = vec![];
     for c in cues {
         let mut e = vec![];
@@ -308,11 +415,13 @@ fn pco2(hot: bool, cues: &[&Cue]) -> Vec<u8> {
         // Memory cue colour (track colour ids 0..8); hot cues use the fields further on.
         // Byte 29 is always 1 in the original's converter.
         r.push(if hot { 0 } else { c.color });
-        r.extend_from_slice(&[1, 0, 0]);
-        r.extend_from_slice(&0u32.to_be_bytes());
-        // Quantized loop size (numerator / denominator) unknown here: 0/0.
+        r.push(1);
+        r.extend_from_slice(&micros(c.start).to_be_bytes());
+        r.extend_from_slice(&(if c.is_loop() { micros(c.end.unwrap()) } else { 0 }).to_be_bytes());
         r.extend_from_slice(&0u16.to_be_bytes());
-        r.extend_from_slice(&0u16.to_be_bytes());
+        let (num, den) = if c.is_loop() { beat_loop_size(c.start, c.end.unwrap(), beats).unwrap_or((0, 0)) } else { (0, 0) };
+        r.extend_from_slice(&num.to_be_bytes());
+        r.extend_from_slice(&den.to_be_bytes());
         let mut cm: Vec<u8> = vec![];
         if !c.comment.is_empty() {
             for u in c.comment.encode_utf16() {
@@ -331,7 +440,7 @@ fn pco2(hot: bool, cues: &[&Cue]) -> Vec<u8> {
         } else {
             r.extend_from_slice(&[0, 0, 0, 0]);
         }
-        // Remaining unknown fields (observed record: 40 bytes after the colour for an empty comment).
+        // Seek data (four u64, two u32): not derivable here, zero as for a cue without it.
         r.extend_from_slice(&[0u8; 40]);
         body.extend_from_slice(&section(b"PCP2", &e, &r));
     }
@@ -586,9 +695,21 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
         pcob(false, &mem),
     ];
     // Section order as rekordbox writes it: PPTH, PWV3, PCOB×2, PCO2×2, PQT2, PWV5, PWV4, PSSI.
-    let mut ext = vec![ppth(usb_path), or("PWV3", &|| pwv3(&frames)), pcob(true, &[]), pcob(false, &[]), pco2(true, &hot), pco2(false, &mem)];
-    if let Some(s) = take_grid("PQT2") {
-        ext.push(s);
+    let mut ext = vec![ppth(usb_path), or("PWV3", &|| pwv3(&frames)), pcob(true, &[]), pcob(false, &[]), pco2(true, &hot, beats), pco2(false, &mem, beats)];
+    // Extended grid: rekordbox's own while its grid still applies, else derived from the beat
+    // grid section this file set carries (always written for a track with beats).
+    match take_grid("PQT2") {
+        Some(s) => ext.push(s),
+        None => {
+            let entries = pqtz_entries(&dat[2]);
+            if !entries.is_empty() {
+                // Fractions come from Recordbox's own beat times when those are the beats
+                // written (same count); for rekordbox's grid without its PQT2 they are unknown: 0.
+                let own = take_grid("PQTZ").is_none();
+                let fr: Vec<u16> = if own && beats.len() == entries.len() { beats.iter().map(|b| micros(b.time)).collect() } else { vec![] };
+                ext.push(pqt2(&entries, &fr));
+            }
+        }
     }
     ext.push(or("PWV5", &|| pwv5(&frames)));
     ext.push(or("PWV4", &|| pwv4(wave)));

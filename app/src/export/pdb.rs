@@ -9,8 +9,26 @@ pub const PAGE: usize = 4096;
 const HEAP_START: usize = 0x28;
 const GROUP_BYTES: usize = 36;
 
-/// Encode a string the way DeviceSQL stores it.
+/// Longest string (in characters) Recordbox writes into a database row. The longest text in
+/// 3,886 real track rows (rekordcrate's `num_rows` export) is a 255-character comment; no
+/// longer string has been seen in a rekordbox-made export, so everything is cut there.
+pub const MAX_STRING_CHARS: usize = 255;
+
+/// Largest row a page can hold (heap minus one row group).
+pub const MAX_ROW_BYTES: usize = PAGE - HEAP_START - 6;
+
+/// `s` cut to at most `max` characters (never inside a character).
+pub fn clip_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// Encode a string the way DeviceSQL stores it. Text beyond [`MAX_STRING_CHARS`] is cut, so
+/// the 16-bit length of the long forms can never wrap.
 pub fn dstr(s: &str) -> Vec<u8> {
+    let s = clip_chars(s, MAX_STRING_CHARS);
     if s.is_ascii() && s.len() <= 126 {
         let mut v = vec![(((s.len() + 1) << 1) | 1) as u8];
         v.extend_from_slice(s.as_bytes());
@@ -28,7 +46,15 @@ pub fn dstr(s: &str) -> Vec<u8> {
 
 /// Force the UTF-16LE ("0x90") long form.
 pub fn dstr_ucs2(s: &str) -> Vec<u8> {
-    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut units: Vec<u16> = s.encode_utf16().collect();
+    // Two units per character at most: 255 characters always fit; anything longer handed in
+    // directly is cut at a character boundary below the 16-bit length.
+    if units.len() > 2 * MAX_STRING_CHARS {
+        units.truncate(2 * MAX_STRING_CHARS);
+        if units.last().map(|u| (0xd800..0xdc00).contains(u)).unwrap_or(false) {
+            units.pop();
+        }
+    }
     let mut v = vec![0x90u8];
     v.extend_from_slice(&((units.len() * 2 + 4) as u16).to_le_bytes());
     v.push(0);
@@ -36,6 +62,45 @@ pub fn dstr_ucs2(s: &str) -> Vec<u8> {
         v.extend_from_slice(&u.to_le_bytes());
     }
     v
+}
+
+/// The ISRC form of the track row's first string: kind 0x90, length = text + 6, a zero pad
+/// byte, the marker 0x03, the ASCII text and a terminating NUL (rekordcrate's
+/// `DeviceSQLString` ISRC variant; e.g. `90 12 00 00 03 "DEOQ91710032" 00` in a real export).
+/// An empty ISRC is the ordinary empty string.
+pub fn dstr_isrc(s: &str) -> Vec<u8> {
+    let s: String = s.chars().filter(|c| c.is_ascii() && !c.is_ascii_control()).take(64).collect();
+    if s.is_empty() {
+        return dstr("");
+    }
+    let mut v = vec![0x90u8];
+    v.extend_from_slice(&((s.len() + 6) as u16).to_le_bytes());
+    v.push(0);
+    v.push(3);
+    v.extend_from_slice(s.as_bytes());
+    v.push(0);
+    v
+}
+
+/// Whether the string at `data[pos..]` is stored in the ISRC form.
+pub fn is_isrc_form(data: &[u8], pos: usize) -> bool {
+    if data.get(pos) != Some(&0x90) || pos + 4 > data.len() {
+        return false;
+    }
+    let len = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+    match data.get(pos + 4..pos + len) {
+        Some(body) => isrc_body(body).is_some(),
+        None => false,
+    }
+}
+
+/// The text of an ISRC-form body (0x03, printable ASCII, NUL), or None for ordinary UTF-16.
+fn isrc_body(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 3 || body[0] != 3 || *body.last()? != 0 {
+        return None;
+    }
+    let text = &body[1..body.len() - 1];
+    text.iter().all(|b| (0x20..0x7f).contains(b)).then_some(text)
 }
 
 /// Decode a DeviceSQL string at `data[pos..]`.
@@ -60,9 +125,9 @@ pub fn read_dstr(data: &[u8], pos: usize) -> String {
     match h {
         0x40 => String::from_utf8_lossy(body).to_string(),
         0x90 => {
-            // ISRC variant starts with 0x03 and is a NUL terminated ASCII string.
-            if body.first() == Some(&3) && body.len() % 2 == 1 {
-                return String::from_utf8_lossy(&body[1..]).trim_end_matches('\0').to_string();
+            // ISRC variant: 0x03, ASCII text, NUL (any length, e.g. the usual 12 characters).
+            if let Some(text) = isrc_body(body) {
+                return String::from_utf8_lossy(text).to_string();
             }
             let units: Vec<u16> = body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             String::from_utf16_lossy(&units)
@@ -80,7 +145,9 @@ pub fn row_with_strings(fixed: &[u8], strings: &[Vec<u8>], wide_offsets: bool) -
     row.resize(table_pos + osz * (strings.len() + 1), 0);
     let mut offs = Vec::with_capacity(strings.len());
     for s in strings {
-        if s.first() == Some(&0x90) {
+        // Both long forms start on a 4-byte boundary in real exports (num_rows: all 1,225
+        // UTF-16 and all 50 long-ASCII strings of the track table).
+        if matches!(s.first(), Some(&0x90) | Some(&0x40)) {
             while row.len() % 4 != 0 {
                 row.push(0);
             }
@@ -97,13 +164,29 @@ pub fn row_with_strings(fixed: &[u8], strings: &[Vec<u8>], wide_offsets: bool) -
     } else {
         row[table_pos] = 3;
         for (i, o) in offs.iter().enumerate() {
-            row[table_pos + 1 + i] = *o as u8;
+            row[table_pos + 1 + i] = (*o).min(255) as u8;
         }
     }
     row
 }
 
+/// Whether a row built with 8-bit offsets from these parts keeps every string offset in a byte.
+pub fn fits_narrow(fixed_len: usize, strings: &[Vec<u8>]) -> bool {
+    let mut at = fixed_len + strings.len() + 1;
+    for s in strings {
+        if matches!(s.first(), Some(&0x90) | Some(&0x40)) {
+            at = (at + 3) & !3;
+        }
+        if at > 255 {
+            return false;
+        }
+        at += s.len();
+    }
+    true
+}
+
 /// One table to be written: its page type and its rows (already encoded).
+#[derive(Default)]
 pub struct TableSpec {
     pub page_type: u32,
     pub rows: Vec<Vec<u8>>,
@@ -111,6 +194,10 @@ pub struct TableSpec {
     pub index_entries: bool,
     /// Patch "index_shift" (bytes 2..4) to 0x20 * row index within the page.
     pub index_shift: bool,
+    /// Complete data pages written as they are after the rows' pages (only the page number
+    /// and the link to the next page are set): tables Recordbox does not manage keep their
+    /// rows byte for byte, deleted rows and flags included.
+    pub raw_pages: Vec<Vec<u8>>,
 }
 
 fn groups_bytes(n: usize) -> usize {
@@ -157,7 +244,15 @@ fn get_u32(b: &[u8], at: usize) -> u32 {
 
 /// Serialize a whole database. Pages are allocated table by table: index page, data pages,
 /// then an empty "candidate" page, all written to the file (blank pages are zero-filled).
-pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) -> Vec<u8> {
+pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) -> anyhow::Result<Vec<u8>> {
+    for t in tables {
+        if let Some(r) = t.rows.iter().find(|r| r.len() > MAX_ROW_BYTES) {
+            anyhow::bail!("a row of table {} is {} bytes, more than a database page holds ({MAX_ROW_BYTES})", t.page_type, r.len());
+        }
+        if t.raw_pages.iter().any(|p| p.len() != PAGE) {
+            anyhow::bail!("a kept page of table {} is not {PAGE} bytes", t.page_type);
+        }
+    }
     struct Plan {
         index: u32,
         data: Vec<u32>,
@@ -170,8 +265,8 @@ pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) 
         let groups = paginate(&t.rows);
         let index = next;
         next += 1;
-        let data: Vec<u32> = (0..groups.len() as u32).map(|k| next + k).collect();
-        next += groups.len() as u32;
+        let data: Vec<u32> = (0..(groups.len() + t.raw_pages.len()) as u32).map(|k| next + k).collect();
+        next += (groups.len() + t.raw_pages.len()) as u32;
         let empty = next;
         next += 1;
         plans.push(Plan { index, data, empty, groups });
@@ -272,8 +367,128 @@ pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) 
                 put_u16(pg, gbase - 2, flags);
             }
         }
+        // Kept pages, as they were, linked into this table's chain.
+        for (k, raw) in t.raw_pages.iter().enumerate() {
+            let k = p.groups.len() + k;
+            let pi = p.data[k];
+            let base = pi as usize * PAGE;
+            let pg = &mut out[base..base + PAGE];
+            pg.copy_from_slice(raw);
+            put_u32(pg, 4, pi);
+            put_u32(pg, 8, t.page_type);
+            put_u32(pg, 12, if k + 1 < p.data.len() { p.data[k + 1] } else { p.empty });
+        }
     }
-    out
+    Ok(out)
+}
+
+/// Rows of one data page with their extents: (offset in heap, length, present). A row runs to
+/// the next row's offset (or the end of the used heap), which is how much the page allots it.
+pub fn page_rows(pg: &[u8]) -> Vec<(usize, usize, bool)> {
+    if pg.len() < PAGE || pg[27] & 0x40 != 0 {
+        return vec![];
+    }
+    let packed = pg[24] as usize | (pg[25] as usize) << 8 | (pg[26] as usize) << 16;
+    let n = packed & 0x1fff;
+    let used = get_u16(pg, 30) as usize;
+    let mut offs = vec![];
+    for i in 0..n {
+        let (g, k) = (i / 16, i % 16);
+        let gbase = PAGE - g * GROUP_BYTES;
+        if gbase < HEAP_START + 6 + 2 * k {
+            break;
+        }
+        offs.push((get_u16(pg, gbase - 6 - 2 * k) as usize, get_u16(pg, gbase - 4) & (1 << k) != 0));
+    }
+    let mut sorted: Vec<usize> = offs.iter().map(|o| o.0).collect();
+    sorted.push(used);
+    sorted.sort_unstable();
+    offs.iter().map(|&(o, present)| (o, sorted.iter().find(|&&x| x > o).copied().unwrap_or(used).saturating_sub(o), present)).collect()
+}
+
+/// Flag every present row of a data page deleted (bytes and offsets stay), as rekordbox leaves
+/// superseded rows. A page that had present rows takes the 0x34 flags.
+pub fn retire_rows(pg: &mut [u8]) {
+    if pg.len() != PAGE || pg[27] & 0x40 != 0 {
+        return;
+    }
+    let packed = pg[24] as usize | (pg[25] as usize) << 8 | (pg[26] as usize) << 16;
+    let n = packed & 0x1fff;
+    if packed >> 13 == 0 {
+        return;
+    }
+    for g in 0..(n + 15) / 16 {
+        let gbase = PAGE - g * GROUP_BYTES;
+        let was = get_u16(pg, gbase - 4);
+        put_u16(pg, gbase - 4, 0);
+        put_u16(pg, gbase - 2, was);
+    }
+    pg[25] &= 0x1f;
+    pg[26] = 0;
+    pg[27] = 0x34;
+}
+
+/// A fresh data page (flags 0x24) holding nothing yet.
+pub fn blank_page(page_type: u32) -> Vec<u8> {
+    let mut pg = vec![0u8; PAGE];
+    put_u32(&mut pg, 8, page_type);
+    put_u32(&mut pg, 16, 1);
+    pg[27] = 0x24;
+    put_u16(&mut pg, 28, (PAGE - HEAP_START) as u16);
+    pg
+}
+
+/// Add `row` to a data page the way rekordbox adds a row to its history table at each
+/// synchronisation: the row goes at the end of the used heap with the next row offset, and with
+/// `retire_others` the rows present before are flagged deleted (their bytes stay) and the page
+/// takes the 0x34 flags real pages with deleted rows carry. The second flag word of a group
+/// lists the rows this change touched (observed: old and new row). Returns false, leaving the
+/// page untouched, when the row does not fit.
+pub fn append_row(pg: &mut [u8], row: &[u8], retire_others: bool) -> bool {
+    if pg.len() != PAGE || pg[27] & 0x40 != 0 {
+        return false;
+    }
+    let packed = pg[24] as usize | (pg[25] as usize) << 8 | (pg[26] as usize) << 16;
+    let n = packed & 0x1fff;
+    let mut present = packed >> 13;
+    let used = get_u16(pg, 30) as usize;
+    let len = (row.len() + 3) & !3;
+    if HEAP_START + used + len + groups_bytes(n + 1) > PAGE || n + 1 > 0x1fff {
+        return false;
+    }
+    let mut touched = vec![0u16; (n + 16) / 16];
+    if retire_others {
+        for g in 0..(n + 15) / 16 {
+            let gbase = PAGE - g * GROUP_BYTES;
+            touched[g] = get_u16(pg, gbase - 4);
+            put_u16(pg, gbase - 4, 0);
+            put_u16(pg, gbase - 2, touched[g]);
+        }
+        if present > 0 {
+            pg[27] = 0x34;
+        }
+        present = 0;
+    }
+    pg[HEAP_START + used..HEAP_START + used + len].fill(0);
+    pg[HEAP_START + used..HEAP_START + used + row.len()].copy_from_slice(row);
+    let (g, k) = (n / 16, n % 16);
+    let gbase = PAGE - g * GROUP_BYTES;
+    if k == 0 {
+        put_u16(pg, gbase - 4, 0);
+        put_u16(pg, gbase - 2, 0);
+    }
+    put_u16(pg, gbase - 6 - 2 * k, used as u16);
+    let flags = get_u16(pg, gbase - 4) | (1 << k);
+    put_u16(pg, gbase - 4, flags);
+    put_u16(pg, gbase - 2, if retire_others { touched[g] | (1 << k) } else { get_u16(pg, gbase - 2) | (1 << k) });
+    let (n, present) = (n + 1, present + 1);
+    let packed = (n & 0x1fff) | ((present & 0x7ff) << 13);
+    pg[24] = packed as u8;
+    pg[25] = (packed >> 8) as u8;
+    pg[26] = (packed >> 16) as u8;
+    put_u16(pg, 30, (used + len) as u16);
+    put_u16(pg, 28, (PAGE - HEAP_START - used - len - groups_bytes(n)) as u16);
+    true
 }
 
 fn tables_row(t: &TableSpec, r: usize, index_in_page: usize) -> Vec<u8> {
@@ -377,6 +592,39 @@ impl Database {
         out
     }
 
+    /// The data pages of a table that hold row offsets, in chain order, as whole pages.
+    pub fn data_pages(&self, page_type: u32) -> Vec<Vec<u8>> {
+        let mut out = vec![];
+        let Some(&(_, _, first, last)) = self.tables.iter().find(|t| t.0 == page_type) else {
+            return out;
+        };
+        let ps = self.page_size;
+        if ps != PAGE {
+            return out;
+        }
+        let mut page = first;
+        for _ in 0..100_000 {
+            let base = page as usize * ps;
+            if base + ps > self.bytes.len() {
+                break;
+            }
+            let pg = &self.bytes[base..base + ps];
+            let packed = pg[24] as u32 | (pg[25] as u32) << 8 | (pg[26] as u32) << 16;
+            if get_u32(pg, 8) == page_type && pg[27] & 0x40 == 0 && packed & 0x1fff != 0 {
+                out.push(pg.to_vec());
+            }
+            if page == last {
+                break;
+            }
+            let next = get_u32(pg, 12);
+            if next == page || next as usize * ps >= self.bytes.len() {
+                break;
+            }
+            page = next;
+        }
+        out
+    }
+
     pub fn row_bytes(&self, heap: usize, off: usize) -> &[u8] {
         let start = (heap + off).min(self.bytes.len());
         let page_end = ((heap - HEAP_START) + self.page_size).min(self.bytes.len());
@@ -435,7 +683,7 @@ mod tests {
             fixed.extend_from_slice(&(i + 1).to_le_bytes());
             row_with_strings(&fixed, &[dstr(&format!("Artist {i}"))], false)
         }).collect();
-        let db = write_database(&[TableSpec { page_type: 2, rows, index_entries: false, index_shift: true }], 5, 3);
+        let db = write_database(&[TableSpec { page_type: 2, rows, index_entries: false, index_shift: true, ..Default::default() }], 5, 3).unwrap();
         let parsed = Database::parse(db).unwrap();
         let rows = parsed.rows(2);
         assert_eq!(rows.len(), 40);

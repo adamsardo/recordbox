@@ -340,17 +340,18 @@ impl Player {
             Some(d) => d,
             None => host.default_output_device().ok_or_else(|| anyhow!("no audio output device"))?,
         };
-        let cfg = dev.default_output_config()?;
+        // Sample rate, buffer size and output channel pair from Preferences > Audio.
+        let (cfg, config, first_ch) = crate::prefs_ext::stream_config(&dev)?;
         let rate = cfg.sample_rate().0;
         let channels = cfg.channels() as usize;
-        let config: cpal::StreamConfig = cfg.clone().into();
         let st = state.clone();
         let stream = match cfg.sample_format() {
             cpal::SampleFormat::F32 => {
                 let lost = lost.clone();
+                let mut pair: Vec<f32> = Vec::with_capacity(8192);
                 dev.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| render(&st, data, channels, rate),
+                move |data: &mut [f32], _| if first_ch == 0 { render(&st, data, channels, rate) } else { crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)) },
                 move |e| {
                     eprintln!("audio error: {e}");
                     if matches!(e, cpal::StreamError::DeviceNotAvailable) {

@@ -250,8 +250,6 @@ pub struct Prefs {
     // ---- Preferences window (prefs_ext.rs documents each and who reads it) ----
     /// View > Layout > Tree View: source name -> shown (a missing name is shown).
     pub tree_items: std::collections::BTreeMap<String, bool>,
-    /// View > Layout: "Display the playlist palette".
-    pub show_palette: bool,
     /// View > Layout: Add "My Tag" to the "Comments".
     pub mytag_to_comments: bool,
     /// View > Layout: "Display Cue Markers on Preview".
@@ -275,11 +273,6 @@ pub struct Prefs {
     pub delete_history_after_import: bool,
     /// DJ System > Others: Hot Cue Auto Load switched on for tracks as they are imported.
     pub hot_cue_auto_load_on_import: bool,
-    /// Advanced > Browse: iTunes library file, rekordbox xml ("Imported Library"), and
-    /// the folders Auto Relocate searches.
-    pub itunes_xml: Option<String>,
-    pub rekordbox_xml_path: Option<String>,
-    pub relocate_folders: Vec<String>,
     /// Phrase analysis: shown in the player and written to USB exports.
     pub phrase_analysis: bool,
     /// Library (see library_ext.rs). Auto Relocate Search Folders: missing files are looked
@@ -683,7 +676,6 @@ impl Default for Prefs {
             sort_other: (Col::Num, true),
             columns_for_playlist: false,
             tree_items: Default::default(),
-            show_palette: false,
             mytag_to_comments: false,
             cue_markers_on_preview: true,
             wave_half: false,
@@ -696,9 +688,6 @@ impl Default for Prefs {
             device_bg_color: 0,
             delete_history_after_import: false,
             hot_cue_auto_load_on_import: true,
-            itunes_xml: None,
-            rekordbox_xml_path: None,
-            relocate_folders: vec![],
             phrase_analysis: true,
             relocate_folders: vec![],
             itunes_xml: None,
@@ -1079,6 +1068,7 @@ impl App {
                 Err(e) => eprintln!("loudness default migration postponed: {e}"),
             }
         }
+        crate::prefs_ext::set_stream_opts(&prefs);
         let audio_device = prefs.audio_device.clone();
         let pool = AnalysisPool::new(cc.egui_ctx.clone());
         let mut app = App {
@@ -1249,6 +1239,12 @@ impl App {
                         cc.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(format!("prefs_subtab_{t}")), st));
                     }
                     "mytag" => app.prefs.show_mytag = true,
+                    "shortcuts" => app.dialogs.ext.shortcuts_open = true,
+                    "backupask" => app.dialogs.ext.backup_ask = true,
+                    "prefsearch" => {
+                        app.dialogs.prefs_open = true;
+                        app.dialogs.ext.prefs_search = std::env::var("PREPDECK_SHOT_SEARCH").unwrap_or_else(|_| "waveform".into());
+                    }
                     "colbrowse" => {
                         app.prefs.column_browser = true;
                         app.list_dirty = true;
@@ -1428,6 +1424,8 @@ impl App {
                     app.seek(c + 2.0);
                 }
             }
+            // PREPDECK_SHOT_PLAYER=…: player layouts and states (player_ext.rs).
+            app.shot_player_setup();
         }
         app
     }

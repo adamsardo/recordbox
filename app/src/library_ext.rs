@@ -1517,9 +1517,9 @@ pub fn shot_view(app: &mut App, name: &str) {
                 _ => 0,
             };
             app.rebuild_list();
-            let n = if name == "infopanel_multi" { 3 } else { 1 };
+            // (The loaded track is selected by the screenshot setup: one track, or three.)
+            let n = if name == "infopanel_multi" { 2 } else { 0 };
             app.selected = app.list.iter().take(n).copied().collect();
-            std::env::set_var("PREPDECK_SHOT_KEEP_SEL", "1");
         }
         "filterbar" => {
             app.filter_open = true;
@@ -1538,7 +1538,6 @@ pub fn shot_view(app: &mut App, name: &str) {
                 for b in rest {
                     app.matching_set(*a, *b, true);
                 }
-                std::env::set_var("PREPDECK_SHOT_TRACK_ID", a.to_string());
             }
             app.side = SideMode::Related;
             app.set_view(View::Matching);
