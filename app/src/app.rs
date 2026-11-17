@@ -271,6 +271,9 @@ pub struct Prefs {
     pub device_bg_color: u8,
     /// DJ System > Device: "Delete from the device after importing the play history".
     pub delete_history_after_import: bool,
+    /// Folder that "Import To Collection" copies a device's music into (empty: the default,
+    /// see `App::device_import_dir`).
+    pub device_import_dir: String,
     /// DJ System > Others: Hot Cue Auto Load switched on for tracks as they are imported.
     pub hot_cue_auto_load_on_import: bool,
     /// Phrase analysis: shown in the player and written to USB exports.
@@ -687,6 +690,7 @@ impl Default for Prefs {
             audio_channel: 0,
             device_bg_color: 0,
             delete_history_after_import: false,
+            device_import_dir: String::new(),
             hot_cue_auto_load_on_import: true,
             phrase_analysis: true,
             relocate_folders: vec![],
@@ -1006,6 +1010,10 @@ pub struct App {
     pub import_count: usize,
     pub import_to_playlist: Option<i64>,
     pub export_job: Option<ExportJob>,
+    /// What the last export did (shown in the export window until it is closed).
+    pub export_report: Option<crate::export::usb::ExportReport>,
+    /// Device windows and per-device state (device_ext.rs).
+    pub device_ui: crate::device_ext::DeviceUi,
     /// Background snapshot + read of the rekordbox library, started at launch.
     pub rb_job: Option<crossbeam_channel::Receiver<anyhow::Result<Option<crate::rbimport::RbLibrary>>>>,
     pub devices: Vec<DeviceInfo>,
@@ -1122,6 +1130,8 @@ impl App {
             import_count: 0,
             import_to_playlist: None,
             export_job: None,
+            export_report: None,
+            device_ui: Default::default(),
             rb_job: None,
             devices: vec![],
             devices_scanned: None,
@@ -1270,7 +1280,7 @@ impl App {
                                 tracks.insert(*id, crate::export::usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
                             }
                         }
-                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { name: "Check".into(), folder: false, children: vec![], tracks: ids.clone() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false };
+                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { id: 0, name: "Check".into(), folder: false, children: vec![], tracks: ids.clone() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false, ..Default::default() };
                         let cancel = std::sync::atomic::AtomicBool::new(false);
                         match crate::export::usb::run_export(req, &|_| {}, &cancel) {
                             Ok(m) => eprintln!("shot export: {m}"),
@@ -1314,7 +1324,7 @@ impl App {
                         if let Some(t) = ids.first().and_then(|id| app.track(*id).cloned()) {
                             tracks.insert(t.id, crate::export::usb::ExportTrack { cues: vec![], grid: app.db.grid(t.id), wave: app.db.wave(t.id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
                         }
-                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { name: "Update Check".into(), folder: false, children: vec![], tracks: ids[..1].to_vec() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false };
+                        let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { id: 0, name: "Update Check".into(), folder: false, children: vec![], tracks: ids[..1].to_vec() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false, ..Default::default() };
                         let cancel = std::sync::atomic::AtomicBool::new(false);
                         let _ = crate::export::usb::run_export(req, &|_| {}, &cancel);
                         let r = root.to_string_lossy().to_string();
@@ -3816,7 +3826,14 @@ impl App {
         self.devices_scanned = Some(Instant::now());
         if self.prefs.import_device_history && self.screenshot.is_none() {
             self.import_device_histories();
+            // "Delete from the device after importing the play history".
+            if self.delete_imported_histories() > 0 {
+                for d in self.devices.iter_mut() {
+                    d.lib = crate::export::usb::read_device(std::path::Path::new(&d.root)).ok().filter(|_| crate::export::usb::pdb_path(std::path::Path::new(&d.root)).exists());
+                }
+            }
         }
+        self.offer_auto_sync();
         // Look for player cue edits once per connection of each drive.
         let roots: HashSet<String> = self.devices.iter().map(|d| d.root.clone()).collect();
         self.edits_checked.retain(|r| roots.contains(r));
@@ -4026,13 +4043,13 @@ impl App {
         // structure is kept and nothing new is added.
         fn insert(tree: &mut Vec<crate::export::usb::ExportNode>, path: &[String], tracks: Vec<i64>) {
             if path.len() == 1 {
-                tree.push(crate::export::usb::ExportNode { name: path[0].clone(), folder: false, children: vec![], tracks });
+                tree.push(crate::export::usb::ExportNode { id: 0, name: path[0].clone(), folder: false, children: vec![], tracks });
                 return;
             }
             let i = match tree.iter().position(|n| n.folder && n.name == path[0]) {
                 Some(i) => i,
                 None => {
-                    tree.push(crate::export::usb::ExportNode { name: path[0].clone(), folder: true, children: vec![], tracks: vec![] });
+                    tree.push(crate::export::usb::ExportNode { id: 0, name: path[0].clone(), folder: true, children: vec![], tracks: vec![] });
                     tree.len() - 1
                 }
             };
@@ -4143,13 +4160,13 @@ impl App {
             match n.kind {
                 NodeKind::Folder => {
                     let children: Vec<_> = app.nodes.iter().filter(|c| c.parent == id).filter_map(|c| build(app, c.id)).collect();
-                    Some(crate::export::usb::ExportNode { name: n.name.clone(), folder: true, children, tracks: vec![] })
+                    Some(crate::export::usb::ExportNode { id, name: n.name.clone(), folder: true, children, tracks: vec![] })
                 }
                 NodeKind::Smart => {
                     let tracks = n.smart.as_ref().map(|r| app.smart_tracks(r)).unwrap_or_default();
-                    Some(crate::export::usb::ExportNode { name: n.name.clone(), folder: false, children: vec![], tracks })
+                    Some(crate::export::usb::ExportNode { id, name: n.name.clone(), folder: false, children: vec![], tracks })
                 }
-                NodeKind::Playlist => Some(crate::export::usb::ExportNode { name: n.name.clone(), folder: false, children: vec![], tracks: app.db.playlist_tracks(id).unwrap_or_default() }),
+                NodeKind::Playlist => Some(crate::export::usb::ExportNode { id, name: n.name.clone(), folder: false, children: vec![], tracks: app.db.playlist_tracks(id).unwrap_or_default() }),
             }
         }
         // Children of a selected folder come with the folder.
@@ -4223,23 +4240,29 @@ impl App {
             .filter(|c| c.parent == 0)
             .map(|c| (c.name.clone(), self.mytags.iter().filter(|t| t.parent == c.id).map(|t| t.name.clone()).collect()))
             .collect();
-        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone(), browse: self.prefs.usb_browse.clone(), phrases: self.prefs.phrase_analysis };
+        let req = crate::export::usb::ExportRequest { root: std::path::PathBuf::from(root), nodes, tracks, tag_categories, skipped, analysis: settings, settings: self.prefs.usb_settings.clone(), browse: self.prefs.usb_browse.clone(), phrases: self.prefs.phrase_analysis, ..self.export_options(root) };
+        self.export_report = None;
         self.export_job = Some(spawn_export(req, self.ctx.clone()));
     }
 
     pub fn poll_export(&mut self) {
         let Some(job) = self.export_job.as_mut() else { return };
         let mut finished = None;
+        let mut report = None;
         let mut analyzed = vec![];
         while let Ok(p) = job.rx.try_recv() {
             match p {
                 crate::export::usb::Progress::Step { done, total, text } => job.last = (done, total, text),
                 crate::export::usb::Progress::Analyzed(id, r) => analyzed.push((id, *r)),
+                crate::export::usb::Progress::Report(r) => report = Some(r),
                 crate::export::usb::Progress::Finished(r) => finished = Some(r),
             }
         }
         for (id, r) in analyzed {
             self.apply_analysis(id, r);
+        }
+        if let Some(r) = report {
+            self.export_report = Some(r);
         }
         if let Some(r) = finished {
             self.export_job = None;

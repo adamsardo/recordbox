@@ -100,7 +100,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // track loaded #F4BC53, white text and a #282828 face.
     let face = if cr.hovered() { hex(0x2E2E2E) } else if loaded { hex(0x282828) } else { BG2 };
     p.circle_filled(cue_c, 18.5, face);
-    p.circle_stroke(cue_c, 18.5, Stroke::new(2.0, if cue_lit { hex(0xF4BC53) } else { hex(0x745D31) }));
+    p.circle_stroke(cue_c, 18.5, Stroke::new(2.0_f32, if cue_lit { hex(0xF4BC53) } else { hex(0x745D31) }));
     p.text(cue_c, Align2::CENTER_CENTER, "CUE", bold(10.5), if loaded { WHITE } else { hex(0x323232) });
     if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
         app.cue_down();
@@ -115,7 +115,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     p.circle_filled(play_c, 18.5, if pr.hovered() { hex(0x2A2A2A) } else { BG2 });
     // Stopped: dim green ring and a grey triangle (references 01/02).
     let ring = if playing { PLAY_GREEN } else { hex(0x38672C) };
-    p.circle_stroke(play_c, 18.5, Stroke::new(2.0, ring));
+    p.circle_stroke(play_c, 18.5, Stroke::new(2.0_f32, ring));
     if playing {
         for dx in [-3.5, 3.5] {
             p.rect_filled(Rect::from_center_size(play_c + vec2(dx, 0.0), vec2(3.5, 11.0)), 0.0, PLAY_GREEN);
@@ -150,7 +150,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let hy = my + 10.6;
     let track = app.deck.track.and_then(|id| app.track(id)).cloned();
     let dur = app.deck.duration;
-    let div = |x: f32| p.line_segment([pos2(x, hy - 7.5), pos2(x, hy + 7.5)], Stroke::new(1.0, OFF));
+    let div = |x: f32| p.line_segment([pos2(x, hy - 7.5), pos2(x, hy + 7.5)], Stroke::new(1.0_f32, OFF));
     let x_artist = sx(main, 733.0);
     let x_time = sx(main, 1011.0);
     let x_key = sx(main, 1168.0);
@@ -203,9 +203,9 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
             let tile = Rect::from_min_size(pos2(sx(main, 95.0), my + 11.0), vec2(47.5, 46.0));
             p.rect_filled(tile, 0.0, hex(0x0F0F0F));
             p.circle_filled(tile.center(), 19.5, hex(0x1E1E1E));
-            p.circle_stroke(tile.center(), 19.5, Stroke::new(1.0, hex(0x262626)));
+            p.circle_stroke(tile.center(), 19.5, Stroke::new(1.0_f32, hex(0x262626)));
             p.circle_filled(tile.center(), 3.0, hex(0x0F0F0F));
-            p.circle_stroke(tile.center(), 3.0, Stroke::new(1.0, hex(0x262626)));
+            p.circle_stroke(tile.center(), 3.0, Stroke::new(1.0_f32, hex(0x262626)));
         }
     }
 
@@ -244,8 +244,8 @@ pub(crate) fn split_time(t: f64) -> (String, String) {
 pub(crate) fn draw_note_icon(p: &egui::Painter, r: Rect) {
     let c = r.center();
     p.circle_filled(c + vec2(-4.0, 8.0), 5.0, OFF);
-    p.line_segment([c + vec2(0.5, 8.0), c + vec2(0.5, -12.0)], Stroke::new(2.0, OFF));
-    p.line_segment([c + vec2(0.5, -12.0), c + vec2(9.0, -8.0)], Stroke::new(2.0, OFF));
+    p.line_segment([c + vec2(0.5, 8.0), c + vec2(0.5, -12.0)], Stroke::new(2.0_f32, OFF));
+    p.line_segment([c + vec2(0.5, -12.0), c + vec2(9.0, -8.0)], Stroke::new(2.0_f32, OFF));
 }
 
 /// Colour + height for one waveform column according to the chosen display style.
@@ -306,7 +306,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             };
             for (h, col) in layers {
                 let col = if played { col.gamma_multiply(0.45) } else { col };
-                p.line_segment([pos2(x, base), pos2(x, base - h.min(1.0) * full_h)], Stroke::new(1.0, col));
+                p.line_segment([pos2(x, base), pos2(x, base - h.min(1.0) * full_h)], Stroke::new(1.0_f32, col));
             }
         }
     } else if app.deck.track.is_some() {
@@ -325,7 +325,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             if lvl > 0 {
                 let x = r.min.x + i as f32 + 0.5;
                 let col = hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0));
-                p.line_segment([pos2(x, r.min.y + 1.0), pos2(x, r.min.y + 3.5)], Stroke::new(1.0, col));
+                p.line_segment([pos2(x, r.min.y + 1.0), pos2(x, r.min.y + 3.5)], Stroke::new(1.0_f32, col));
             }
         }
     }
@@ -351,13 +351,13 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     }
     // progress rule and minute ticks (nothing at all on an empty deck, as in reference 01)
     if app.deck.track.is_some() {
-        p.line_segment([pos2(r.min.x, r.min.y + 33.0), pos2(r.max.x, r.min.y + 33.0)], Stroke::new(1.0, hex(0x5A5A5A)));
-        p.line_segment([pos2(r.min.x, r.min.y + 36.0), pos2(r.max.x, r.min.y + 36.0)], Stroke::new(1.0, hex(0x3A3A3A)));
+        p.line_segment([pos2(r.min.x, r.min.y + 33.0), pos2(r.max.x, r.min.y + 33.0)], Stroke::new(1.0_f32, hex(0x5A5A5A)));
+        p.line_segment([pos2(r.min.x, r.min.y + 36.0), pos2(r.max.x, r.min.y + 36.0)], Stroke::new(1.0_f32, hex(0x3A3A3A)));
         let minute = 60.0 / dur * r.width() as f64;
         let mut k = 1.0;
         while k * minute < r.width() as f64 {
             let x = r.min.x + (k * minute) as f32;
-            p.line_segment([pos2(x, r.min.y + 37.0), pos2(x, r.min.y + 39.0)], Stroke::new(1.0, DIM2));
+            p.line_segment([pos2(x, r.min.y + 37.0), pos2(x, r.min.y + 39.0)], Stroke::new(1.0_f32, DIM2));
             k += 1.0;
         }
         let x_of = |t: f64| r.min.x + (t / dur) as f32 * r.width();
@@ -379,14 +379,14 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 let lr = Rect::from_min_size(pos2(x - 4.0, r.min.y), vec2(10.0, 10.0));
                 p.rect_filled(lr, 0.0, col);
                 p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(8.0), WHITE);
-                p.line_segment([pos2(x, r.min.y), pos2(x, base)], Stroke::new(1.0, col));
+                p.line_segment([pos2(x, r.min.y), pos2(x, base)], Stroke::new(1.0_f32, col));
             }
         }
         // cue point
         tri_up(&p, pos2(x_of(app.deck.cue_point), base + 0.5), 6.0, CUE_MARK);
         // playhead
         let px = x_of(pos);
-        p.line_segment([pos2(px, r.min.y + 2.0), pos2(px, base)], Stroke::new(1.5, WHITE));
+        p.line_segment([pos2(px, r.min.y + 2.0), pos2(px, base)], Stroke::new(1.5_f32, WHITE));
     }
     let resp = ui.interact(r.expand2(vec2(0.0, 4.0)), ui.id().with("overview"), Sense::click_and_drag());
     if (resp.clicked() || resp.dragged()) && app.deck.audio.is_some() {
@@ -403,9 +403,6 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
 
 pub(crate) fn tri_up(p: &egui::Painter, tip: Pos2, s: f32, c: Color32) {
     p.add(Shape::convex_polygon(vec![tip, tip + vec2(s, s * 1.2), tip + vec2(-s, s * 1.2)], c, Stroke::NONE));
-}
-fn tri_down(p: &egui::Painter, tip: Pos2, s: f32, c: Color32) {
-    p.add(Shape::convex_polygon(vec![tip, tip + vec2(-s, -s * 1.2), tip + vec2(s, -s * 1.2)], c, Stroke::NONE));
 }
 
 pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
@@ -432,7 +429,7 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         let adj = app.deck.x.loop_adjust;
         if adj != 0 {
             let x = x_of(if adj == 1 { a } else { b });
-            p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(2.0, LOOP));
+            p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(2.0_f32, LOOP));
             let tag = Rect::from_min_size(pos2(if adj == 1 { x } else { x - 26.0 }, r.max.y - 13.0), vec2(26.0, 13.0));
             p.rect_filled(tag, 0.0, LOOP);
             p.text(tag.center(), Align2::CENTER_CENTER, if adj == 1 { "IN" } else { "OUT" }, bold(8.5), Color32::BLACK);
@@ -449,7 +446,7 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         let i0 = app.deck.beats.partition_point(|b| b.time < tl);
         for b in app.deck.beats[i0..].iter().take_while(|b| b.time <= tr) {
             let x = x_of(b.time);
-            p.line_segment([pos2(x, r.min.y + 5.0), pos2(x, r.max.y - 5.0)], Stroke::new(1.0, hex(0x4C4C4C)));
+            p.line_segment([pos2(x, r.min.y + 5.0), pos2(x, r.max.y - 5.0)], Stroke::new(1.0_f32, hex(0x4C4C4C)));
         }
     }
     if let Some(w) = &app.deck.wave {
@@ -490,10 +487,10 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                         let hh = h * half;
                         // Preferences > View > Color: Half Waveform draws the upper half only.
                         if app.prefs.wave_half {
-                            p.line_segment([pos2(x + 0.5, mid + half - 2.0 * hh), pos2(x + 0.5, mid + half)], Stroke::new(1.0, col));
+                            p.line_segment([pos2(x + 0.5, mid + half - 2.0 * hh), pos2(x + 0.5, mid + half)], Stroke::new(1.0_f32, col));
                             continue;
                         }
-                        p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0, col));
+                        p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0_f32, col));
                     }
                 }
             }
@@ -512,12 +509,12 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             // Bar: red 5 × 4 pt triangles at both ends, a white line between them.
             p.add(Shape::convex_polygon(vec![pos2(x - 2.5, r.min.y), pos2(x + 2.5, r.min.y), pos2(x, r.min.y + 4.0)], BAR_RED, Stroke::NONE));
             p.add(Shape::convex_polygon(vec![pos2(x - 2.5, r.max.y), pos2(x, r.max.y - 4.0), pos2(x + 2.5, r.max.y)], BAR_RED, Stroke::NONE));
-            p.line_segment([pos2(x, r.min.y + 4.5), pos2(x, r.max.y - 4.5)], Stroke::new(1.0, WHITE));
+            p.line_segment([pos2(x, r.min.y + 4.5), pos2(x, r.max.y - 4.5)], Stroke::new(1.0_f32, WHITE));
         } else {
             // Beat: a 3 pt grey cap and a short tick at both ends.
             for (y0, d) in [(r.min.y, 1.0f32), (r.max.y, -1.0)] {
-                p.line_segment([pos2(x - 1.5, y0 + d * 0.5), pos2(x + 1.5, y0 + d * 0.5)], Stroke::new(1.0, hex(0x7C7C7C)));
-                p.line_segment([pos2(x, y0), pos2(x, y0 + d * 4.0)], Stroke::new(1.0, hex(0x7C7C7C)));
+                p.line_segment([pos2(x - 1.5, y0 + d * 0.5), pos2(x + 1.5, y0 + d * 0.5)], Stroke::new(1.0_f32, hex(0x7C7C7C)));
+                p.line_segment([pos2(x, y0), pos2(x, y0 + d * 4.0)], Stroke::new(1.0_f32, hex(0x7C7C7C)));
             }
         }
     }
@@ -531,7 +528,7 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             let col = hotcue_color(c.color);
             // A 10 pt letter box centred on the cue, in the row above the beats (no comment
             // text: the original shows none there).
-            p.line_segment([pos2(x, r.min.y - 2.0), pos2(x, r.max.y)], Stroke::new(1.5, col));
+            p.line_segment([pos2(x, r.min.y - 2.0), pos2(x, r.max.y)], Stroke::new(1.5_f32, col));
             let lr = Rect::from_center_size(pos2(x, r.min.y - 7.0), vec2(10.0, 10.0));
             p.rect_filled(lr, 0.0, col);
             p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), bold(8.0), WHITE);
@@ -545,7 +542,7 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     }
     if app.deck.track.is_some() {
         // playhead
-        p.line_segment([pos2(cx, r.min.y - 4.0), pos2(cx, r.max.y + 4.0)], Stroke::new(1.5, WHITE));
+        p.line_segment([pos2(cx, r.min.y - 4.0), pos2(cx, r.max.y + 4.0)], Stroke::new(1.5_f32, WHITE));
         p.rect_filled(Rect::from_center_size(pos2(cx, r.min.y + 2.0), vec2(6.0, 6.0)), 0.0, BAR_RED);
         let mem: Vec<f64> = if app.prefs.beat_count_mode == 0 { vec![] } else { app.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).collect() };
         let label = crate::player_ext::beat_count_label(&app.deck.beats, &mem, pos, app.prefs.beat_count_mode);
@@ -865,7 +862,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         let resp = ui.interact(r, ui.id().with(("stem", i)), Sense::click());
         let lit = have && srcs.iter().all(|s| on[*s]);
         p.rect_filled(r, 3.0, if lit { col.gamma_multiply(0.85) } else if resp.hovered() { hex(0x2A2A2A) } else { hex(0x161616) });
-        p.rect_stroke(r, 3.0, Stroke::new(1.0, if have { *col } else { hex(0x3C3C3C) }), egui::StrokeKind::Inside);
+        p.rect_stroke(r, 3.0, Stroke::new(1.0_f32, if have { *col } else { hex(0x3C3C3C) }), egui::StrokeKind::Inside);
         p.text(r.center(), Align2::CENTER_CENTER, *label, bold(10.5), if have { WHITE } else { DIM });
         let resp = resp.on_hover_text(if have { "Switch this part on or off" } else { "Separate this track into parts first" });
         if resp.clicked() && loaded {
@@ -938,7 +935,7 @@ pub(crate) fn seg_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, on: boo
     let fill = if on { BLUE } else if r.hovered() { hex(0x2A2A2A) } else { BG2 };
     ui.painter().rect_filled(rect, 2.0, fill);
     if !on {
-        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, hex(0x3C3C3C)), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0_f32, hex(0x3C3C3C)), egui::StrokeKind::Inside);
     }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, bold(9.0), WHITE);
     r
@@ -953,7 +950,7 @@ pub(crate) fn hot_cue_menu(app: &mut App, ui: &mut Ui, c: &Cue) {
             let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
             ui.painter().rect_filled(r, 2.0, hotcue_color(idx));
             if c.color == idx {
-                ui.painter().rect_stroke(r, 2.0, Stroke::new(2.0, WHITE), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(r, 2.0, Stroke::new(2.0_f32, WHITE), egui::StrokeKind::Inside);
             }
             if resp.clicked() {
                 let mut n = c.clone();
@@ -1180,7 +1177,7 @@ fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
             let col = if i == 0 { BG2 } else { label_color(i) };
             ui.painter().rect_filled(rr, 2.0, col);
             if t.color == i {
-                ui.painter().rect_stroke(rr, 2.0, Stroke::new(1.5, WHITE), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(rr, 2.0, Stroke::new(1.5_f32, WHITE), egui::StrokeKind::Inside);
             }
             if resp.on_hover_text(app.prefs.color_name(i)).clicked() {
                 if let Some(tm) = app.track_mut(id) {
@@ -1217,7 +1214,7 @@ pub fn star(p: &egui::Painter, c: Pos2, r: f32, col: Color32, filled: bool) {
     } else {
         let mut closed = pts.clone();
         closed.push(pts[0]);
-        p.add(Shape::line(closed, Stroke::new(1.0, col)));
+        p.add(Shape::line(closed, Stroke::new(1.0_f32, col)));
     }
 }
 
@@ -1270,6 +1267,6 @@ mod marker_drag_tests {
 /// The list rows' close button: a cross of `size` pt with a 1.5 pt stroke.
 pub(crate) fn close_cross(p: &egui::Painter, c: Pos2, size: f32, col: Color32) {
     let h = size / 2.0;
-    p.line_segment([c + vec2(-h, -h), c + vec2(h, h)], Stroke::new(1.5, col));
-    p.line_segment([c + vec2(-h, h), c + vec2(h, -h)], Stroke::new(1.5, col));
+    p.line_segment([c + vec2(-h, -h), c + vec2(h, h)], Stroke::new(1.5_f32, col));
+    p.line_segment([c + vec2(-h, h), c + vec2(h, -h)], Stroke::new(1.5_f32, col));
 }

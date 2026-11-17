@@ -32,8 +32,8 @@ fn full_export_to_folder() {
         ];
         tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())], rb_anlz: None, grid_same: false, vocal: None });
     }
-    let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1] }], tracks: vec![] }];
-    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true };
+    let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1], ..Default::default() }], tracks: vec![], ..Default::default() }];
+    let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true, ..Default::default() };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let msg = run_export(req, &|_| {}, &cancel).unwrap();
     assert!(msg.contains("2 tracks"), "{msg}");
@@ -50,7 +50,7 @@ fn full_export_to_folder() {
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/Album_ One_/")));
     assert!(lib.tracks.values().any(|t| t.file_path.starts_with("/Contents/Test Artist/UnknownAlbum/")));
     // Exporting the same playlist again updates in place instead of duplicating.
-    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true };
+    let req2 = ExportRequest { root: root.clone(), nodes, tracks, tag_categories: vec![], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true, ..Default::default() };
     run_export(req2, &|_| {}, &cancel).unwrap();
     let lib2 = read_device(&root).unwrap();
     assert_eq!(lib2.tracks.len(), 2);
@@ -83,7 +83,7 @@ fn full_export_to_folder() {
     std::fs::write(base.join("LAST"), root.to_string_lossy().as_bytes()).unwrap();
 }
 
-fn demo_tracks(src_dir: &std::path::Path, n: usize) -> HashMap<i64, ExportTrack> {
+pub(super) fn demo_tracks(src_dir: &std::path::Path, n: usize) -> HashMap<i64, ExportTrack> {
     std::fs::create_dir_all(src_dir).unwrap();
     let mut tracks = HashMap::new();
     for (i, d) in crate::demo::DEMOS.iter().take(n).enumerate() {
@@ -102,7 +102,7 @@ fn demo_tracks(src_dir: &std::path::Path, n: usize) -> HashMap<i64, ExportTrack>
     tracks
 }
 
-fn copy_dir(a: &std::path::Path, b: &std::path::Path) {
+pub(super) fn copy_dir(a: &std::path::Path, b: &std::path::Path) {
     std::fs::create_dir_all(b).unwrap();
     for e in std::fs::read_dir(a).unwrap().flatten() {
         let to = b.join(e.file_name());
@@ -149,7 +149,7 @@ fn interrupted_export_recovers_to_before_or_after() {
     let tracks1: HashMap<i64, ExportTrack> = tracks2.iter().filter(|(id, _)| **id <= 2).map(|(k, v)| (*k, v.clone())).collect();
     let req = |root: &std::path::Path, tracks: &HashMap<i64, ExportTrack>, ids: Vec<i64>| ExportRequest {
         root: root.to_path_buf(),
-        nodes: vec![ExportNode { name: "Set".into(), folder: false, children: vec![], tracks: ids }],
+        nodes: vec![ExportNode { name: "Set".into(), folder: false, children: vec![], tracks: ids, ..Default::default() }],
         tracks: tracks.clone(),
         tag_categories: vec![],
         skipped: vec![],
@@ -157,6 +157,7 @@ fn interrupted_export_recovers_to_before_or_after() {
         settings: Default::default(),
         browse: Default::default(),
         phrases: true,
+        ..Default::default()
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let initial = work.join("initial");
@@ -244,7 +245,7 @@ fn missing_local_file_keeps_drive_copy_in_playlists() {
     std::fs::create_dir_all(&root).unwrap();
     let req = |tracks: &HashMap<i64, ExportTrack>| ExportRequest {
         root: root.clone(),
-        nodes: vec![ExportNode { name: "Set".into(), folder: false, children: vec![], tracks: vec![1, 2] }],
+        nodes: vec![ExportNode { name: "Set".into(), folder: false, children: vec![], tracks: vec![1, 2], ..Default::default() }],
         tracks: tracks.clone(),
         tag_categories: vec![],
         skipped: vec![],
@@ -252,6 +253,7 @@ fn missing_local_file_keeps_drive_copy_in_playlists() {
         settings: Default::default(),
         browse: Default::default(),
         phrases: false,
+        ..Default::default()
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     run_export(req(&tracks), &|_| {}, &cancel).unwrap();

@@ -503,6 +503,7 @@ pub fn accelerator(sc: &Shortcut) -> Option<muda::accelerator::Accelerator> {
     let code_name = match name {
         n if n.len() == 1 && n.as_bytes()[0].is_ascii_alphabetic() => format!("Key{}", n.to_ascii_uppercase()),
         n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => format!("Digit{n}"),
+        "Left" | "Right" | "Up" | "Down" => format!("Arrow{name}"),
         "Equals" => "Equal".into(),
         "OpenBracket" => "BracketLeft".into(),
         "CloseBracket" => "BracketRight".into(),
@@ -545,8 +546,6 @@ pub struct DialogsExt {
     pub backup_done: Option<(String, String)>,
     /// "Reset to defaults" waiting for confirmation: Some(page) for one page, Some(None) all.
     pub reset_ask: Option<Option<u8>>,
-    /// Customize Color Comments window.
-    pub color_comments: bool,
     /// Full screen asked for from the menu or keyboard (applied by the main loop).
     pub toggle_fullscreen: bool,
     pub fullscreen: bool,
@@ -590,7 +589,7 @@ mod tests {
             assert!(HELD_ACTIONS.contains(&id) || Act::parse(id).is_some(), "{id} has no handler");
             if !def.is_empty() {
                 let sc = Shortcut::parse(def).unwrap_or_else(|| panic!("{id}: {def} is not a shortcut"));
-                assert_eq!(sc.name(), def, "{id}: stored form");
+                assert_eq!(Shortcut::parse(&sc.name()), Some(sc), "{id}: stored form reads back");
                 if let Some(other) = keys.insert(def, id) {
                     panic!("{id} and {other} share {def}");
                 }

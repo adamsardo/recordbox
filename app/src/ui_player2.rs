@@ -95,6 +95,7 @@ fn wave_color_items(app: &mut App, ui: &mut Ui) -> bool {
 /// The rest of the ≡ menu of the CUE/LOOP strip: the waveform menu's settings (reachable
 /// here when right-click is CUE), loop export, mute and the Recordbox extras.
 pub fn strip_menu_extra(app: &mut App, ui: &mut Ui) {
+    ui.set_min_width(250.0);
     let has_loop = app.defined_loop().is_some();
     ui.separator();
     if ui.add_enabled(has_loop, egui::Button::new("Set Memory Loop")).clicked() {
@@ -132,7 +133,7 @@ pub fn strip_menu_extra(app: &mut App, ui: &mut Ui) {
 
 /// Auto beat loop sizes: picking one starts a loop of that length.
 pub fn loop_size_menu(app: &mut App, ui: &mut Ui) {
-    egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
         for v in LOOP_SIZES {
             if ui.selectable_label(app.prefs.loop_beats == v, format!("{} Beat Loop", beats_text(v))).clicked() {
                 app.pick_auto_loop(v);
@@ -206,7 +207,7 @@ pub fn drop_to_load(app: &mut App, ui: &mut Ui, rect: Rect) {
     if !rect.contains(pp) {
         return;
     }
-    ui.painter().rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, BLUE), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0_f32, BLUE), egui::StrokeKind::Inside);
     if ui.input(|i| i.pointer.any_released()) {
         if let Some(id) = ids.first() {
             app.load_track_here(*id);
@@ -248,7 +249,7 @@ fn grid_icon(p: &Painter, r: Rect, icon: GridIcon, c: Color32) {
     let bars = |x: f32, y0: f32, y1: f32, col: Color32| {
         for i in 0..3 {
             let xx = x + 3.0 * i as f32 + 0.5;
-            p.line_segment([m(xx, y0), m(xx, y1)], Stroke::new(1.0, col));
+            p.line_segment([m(xx, y0), m(xx, y1)], Stroke::new(1.0_f32, col));
         }
     };
     let grey = hex(0x646464);
@@ -351,7 +352,7 @@ pub fn grid_strip(app: &mut App, ui: &mut Ui, s: Rect, x0: f32) {
         *x += 28.0 + gap;
         let resp = icon_button(ui, r, id, Some(face), |p, r, c| grid_icon(p, r, icon, if loaded { c } else { OFF }));
         if selected {
-            ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, SKIN_BLUE), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0_f32, SKIN_BLUE), egui::StrokeKind::Inside);
         }
         tip(resp, app, tipt)
     };
@@ -455,7 +456,7 @@ pub fn grid_strip(app: &mut App, ui: &mut Ui, s: Rect, x0: f32) {
 /// an arrow with a shaft pointing at (or away from) a bar.
 fn track_icon(p: &Painter, r: Rect, c: Color32, dir: f32) {
     let m = r.center();
-    let s = Stroke::new(1.5, c);
+    let s = Stroke::new(1.5_f32, c);
     p.line_segment([m + vec2(-dir * 6.5, -4.0), m + vec2(-dir * 6.5, 4.0)], s);
     p.line_segment([m + vec2(-dir * 3.0, 0.0), m + vec2(dir * 3.5, 0.0)], s);
     p.add(Shape::convex_polygon(vec![m + vec2(dir * 7.0, 0.0), m + vec2(dir * 2.5, -3.5), m + vec2(dir * 2.5, 3.5)], c, Stroke::NONE));
@@ -475,13 +476,13 @@ fn speaker_icon(p: &Painter, r: Rect, c: Color32, muted: bool) {
     p.add(Shape::convex_polygon(vec![m + vec2(-6.0, -2.0), m + vec2(-3.0, -2.0), m + vec2(-3.0, 2.0), m + vec2(-6.0, 2.0)], c, Stroke::NONE));
     p.add(Shape::convex_polygon(vec![m + vec2(-3.0, -2.0), m + vec2(1.0, -5.5), m + vec2(1.0, 5.5), m + vec2(-3.0, 2.0)], c, Stroke::NONE));
     if muted {
-        let s = Stroke::new(1.5, hex(0xE04848));
+        let s = Stroke::new(1.5_f32, hex(0xE04848));
         p.line_segment([m + vec2(3.0, -3.0), m + vec2(8.0, 3.0)], s);
         p.line_segment([m + vec2(8.0, -3.0), m + vec2(3.0, 3.0)], s);
     } else {
         for rad in [3.0f32, 6.0] {
             let pts: Vec<Pos2> = (0..=8).map(|i| { let a = -0.9 + i as f32 * 0.225; m + vec2(1.5 + a.cos() * rad, a.sin() * rad) }).collect();
-            p.add(Shape::line(pts, Stroke::new(1.3, c)));
+            p.add(Shape::line(pts, Stroke::new(1.3_f32, c)));
         }
     }
 }
@@ -527,7 +528,7 @@ fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, key
     let cue_lit = loaded && (!playing || app.deck.cue_preview);
     let face = if cr.hovered() { hex(0x2E2E2E) } else if loaded { hex(0x282828) } else { BG2 };
     p.circle_filled(cue_c, rad, face);
-    p.circle_stroke(cue_c, rad, Stroke::new(2.0, if cue_lit { hex(0xF4BC53) } else { hex(0x745D31) }));
+    p.circle_stroke(cue_c, rad, Stroke::new(2.0_f32, if cue_lit { hex(0xF4BC53) } else { hex(0x745D31) }));
     p.text(cue_c, Align2::CENTER_CENTER, "CUE", bold(10.5 * (rad / 18.5).max(0.85)), if loaded { WHITE } else { hex(0x323232) });
     if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
         app.cue_down();
@@ -539,7 +540,7 @@ fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, key
     let _ = tip(cr, app, "Set a Cue point if you click during pause. \nMove to the Cue point if you click during playback.");
     let pr = ui.interact(Rect::from_center_size(play_c, size), ui.id().with("playbtn"), Sense::click());
     p.circle_filled(play_c, rad, if pr.hovered() { hex(0x2A2A2A) } else { BG2 });
-    p.circle_stroke(play_c, rad, Stroke::new(2.0, if playing { PLAY_GREEN } else { hex(0x38672C) }));
+    p.circle_stroke(play_c, rad, Stroke::new(2.0_f32, if playing { PLAY_GREEN } else { hex(0x38672C) }));
     if playing {
         for dx in [-3.5, 3.5] {
             p.rect_filled(Rect::from_center_size(play_c + vec2(dx, 0.0), vec2(3.5, 11.0)), 0.0, PLAY_GREEN);
@@ -572,7 +573,7 @@ fn artwork(app: &mut App, ui: &mut Ui, art: Rect, track: &Option<Track>) {
             p.rect_filled(art, 0.0, hex(0x0F0F0F));
             let rad = art.height().min(art.width()) * 0.42;
             p.circle_filled(art.center(), rad, hex(0x1E1E1E));
-            p.circle_stroke(art.center(), rad, Stroke::new(1.0, hex(0x262626)));
+            p.circle_stroke(art.center(), rad, Stroke::new(1.0_f32, hex(0x262626)));
             p.circle_filled(art.center(), 2.5, hex(0x0F0F0F));
         }
     }
@@ -622,7 +623,7 @@ pub fn two_players(app: &mut App, ui: &mut Ui) {
             activate = Some(n);
         }
     }
-    ui.painter().line_segment([pos2(full.min.x + half, full.min.y), pos2(full.min.x + half, full.max.y)], Stroke::new(1.0, hex(0x323232)));
+    ui.painter().line_segment([pos2(full.min.x + half, full.min.y), pos2(full.min.x + half, full.max.y)], Stroke::new(1.0_f32, hex(0x323232)));
     if let Some(n) = activate {
         app.activate_deck(n);
     }
@@ -678,7 +679,7 @@ fn small_deck(app: &mut App, ui: &mut Ui, d: Rect, n: u8, is_active: bool) {
         p.text(pos2((x_key + x_bpm) / 2.0, hy), Align2::CENTER_CENTER, t.key_label(app.prefs.key_alnum), FontId::proportional(12.5), WHITE);
     }
     for x in [x_artist, x_time, x_key, x_bpm] {
-        p.line_segment([pos2(x, hy - 7.5), pos2(x, hy + 7.5)], Stroke::new(1.0, OFF));
+        p.line_segment([pos2(x, hy - 7.5), pos2(x, hy + 7.5)], Stroke::new(1.0_f32, OFF));
     }
     times(app, ui, x_time + 8.0, hy, pos);
     if loaded {
@@ -866,7 +867,7 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
         let b = app.current_bpm();
         p.text(pos2(right - 68.0, cy + 9.0), Align2::CENTER_CENTER, if b > 0.0 { format!("{b:.2}") } else { "--.--".into() }, FontId::proportional(12.5), WHITE);
     }
-    p.line_segment([pos2(right - 100.0, cy - 16.0), pos2(right - 100.0, cy + 16.0)], Stroke::new(1.0, OFF));
+    p.line_segment([pos2(right - 100.0, cy - 16.0), pos2(right - 100.0, cy + 16.0)], Stroke::new(1.0_f32, OFF));
     mute_button(app, ui, Rect::from_center_size(pos2(right - 22.0, cy), vec2(26.0, 24.0)));
     drop_to_load(app, ui, full);
     if app.playing() || app.searching() != 0 || app.deck.loading.is_some() {

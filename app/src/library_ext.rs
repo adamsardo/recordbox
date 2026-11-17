@@ -1499,7 +1499,7 @@ pub fn month_name(mm: &str) -> &'static str {
 pub fn shot_view(app: &mut App, name: &str) {
     let some_tracks = |app: &App, n: usize| -> Vec<i64> { app.tracks.iter().filter(|t| !t.missing).take(n).map(|t| t.id).collect() };
     let ensure_playlist = |app: &mut App| -> i64 {
-        if let Some(n) = app.nodes.iter().find(|n| n.kind == NodeKind::Playlist) {
+        if let Some(n) = app.nodes.iter().filter(|n| n.kind == NodeKind::Playlist).max_by_key(|n| app.node_counts.get(&n.id).copied().unwrap_or(0)).filter(|n| app.node_counts.get(&n.id).copied().unwrap_or(0) > 1) {
             return n.id;
         }
         let p = app.db.create_node(0, "Warm Up", NodeKind::Playlist, None).unwrap_or(0);
@@ -1593,7 +1593,8 @@ pub fn shot_view(app: &mut App, name: &str) {
         }
         "preview" => {
             app.rebuild_list();
-            if let Some(id) = app.list.get(1).copied() {
+            let pick = app.list.iter().copied().find(|id| app.track(*id).map(|t| !t.missing && t.duration > 60.0).unwrap_or(false));
+            if let Some(id) = pick {
                 app.preview_play(id, 0.4);
             }
         }
@@ -1670,6 +1671,74 @@ pub fn shot_view(app: &mut App, name: &str) {
             if !app.prefs.columns.contains(&Col::Artwork) {
                 app.prefs.columns.insert(0, Col::Artwork);
             }
+        }
+        "libcheck" => {
+            // End-to-end check of the playlist files, Sort Items, the Tag List, histories and
+            // the clipboard on the scratch library; results go to stderr.
+            let p = ensure_playlist(app);
+            let dir = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_OUT").unwrap_or_else(|_| std::env::temp_dir().join("recordbox_libcheck").to_string_lossy().to_string()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let want = app.view_tracks_of(&View::Playlist(p));
+            let folder = app.db.create_node(0, "Round Trip", NodeKind::Folder, None).unwrap_or(0);
+            app.reload_playlists();
+            for ext in ["m3u8", "pls", "txt"] {
+                let f = dir.join(format!("check.{ext}"));
+                let ok = app.export_playlist_file(p, &f);
+                let back = app.import_playlist_file(&f, folder);
+                let got = back.map(|b| app.db.playlist_tracks(b).unwrap_or_default()).unwrap_or_default();
+                eprintln!("libcheck {ext}: wrote {ok}, {} bytes, read back {} of {} tracks, same order: {}", std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0), got.len(), want.len(), got == want);
+            }
+            let n = app.export_all_playlists_info(&dir.join("all"));
+            eprintln!("libcheck export all: {n} files");
+            let kids = |app: &App| -> Vec<String> { app.nodes.iter().filter(|n| n.parent == folder).map(|n| n.name.clone()).collect() };
+            let before = kids(app);
+            let last = app.nodes.iter().filter(|n| n.parent == folder).last().map(|n| n.id).unwrap_or(0);
+            let _ = app.db.rename_node(last, "Aardvark");
+            app.reload_playlists();
+            app.sort_node_children(folder);
+            eprintln!("libcheck sort items: {before:?} -> {:?}", kids(app));
+            let ids = some_tracks(app, 3);
+            app.tag_list_add(&ids);
+            app.tag_list_add(&ids);
+            let saved = app.tag_list_save_as_playlist().map(|pl| app.db.playlist_tracks(pl).unwrap_or_default());
+            eprintln!("libcheck tag list: {} entries, saved playlist same: {}", app.ext.tag_list.len(), saved.as_ref() == Some(&ids));
+            let plays = app.track(ids[0]).map(|t| t.play_count).unwrap_or(0);
+            app.history_add_now(ids[0]);
+            let h = app.ext.histories.first().cloned();
+            eprintln!("libcheck history: {:?}, play count {} -> {}", h.as_ref().map(|h| (&h.name, h.count)), plays, app.track(ids[0]).map(|t| t.play_count).unwrap_or(0));
+            if let Some(h) = h {
+                let pl = app.history_save_as_playlist(h.id);
+                eprintln!("libcheck history as playlist: {:?}", pl.map(|pl| app.db.playlist_tracks(pl).unwrap_or_default().len()));
+                app.history_delete(h.id);
+                eprintln!("libcheck histories after delete: {}", app.ext.histories.len());
+            }
+            // Copy three tracks from the playlist and paste them into a new one.
+            app.side = SideMode::Playlists;
+            app.set_view(View::Playlist(p));
+            app.rebuild_list();
+            app.selected = app.list.iter().take(3).copied().collect();
+            let copied: Vec<i64> = app.list.iter().take(3).copied().collect();
+            app.copy_tracks(false);
+            let dest = app.db.create_node(folder, "Pasted", NodeKind::Playlist, None).unwrap_or(0);
+            app.reload_playlists();
+            app.set_view(View::Playlist(dest));
+            app.rebuild_list();
+            app.selected.clear();
+            app.paste_tracks();
+            eprintln!("libcheck paste: {}", app.db.playlist_tracks(dest).unwrap_or_default() == copied);
+            // In-place edit through the Undo stack.
+            let id = copied[0];
+            let old = app.track(id).map(|t| t.comment.clone()).unwrap_or_default();
+            app.ext.edit = Some(CellEdit { track: id, col: Col::Comments, text: "edited in place".into(), focused: true });
+            app.commit_cell_edit();
+            let mid = app.db.track(id).map(|t| t.comment).unwrap_or_default();
+            app.undo_edit();
+            eprintln!("libcheck edit: {old:?} -> {mid:?} -> undo {:?}", app.db.track(id).map(|t| t.comment).unwrap_or_default());
+            app.matching_set(copied[0], copied[1], true);
+            eprintln!("libcheck matching: {:?} / {:?}", app.matching_of(copied[0]) == vec![copied[1]], app.matching_of(copied[1]) == vec![copied[0]]);
+            app.dialogs.rename = None;
+            app.expanded.insert(folder);
         }
         "datecreated" => {
             if !app.prefs.columns.contains(&Col::DateCreated) {

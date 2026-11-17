@@ -7,6 +7,7 @@ mod audio;
 mod backup;
 mod db;
 mod demo;
+mod device_ext;
 mod export;
 mod icons;
 mod importer;

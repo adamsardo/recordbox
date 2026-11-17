@@ -11,9 +11,9 @@
 //! uses frequency = 1. Transformer tokens are (tokens, channels) in (frequency, time) order.
 
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, CustomOp1, DType, Layout, MetalDevice, MetalStorage, Result, Shape, Storage, Tensor};
-use candle_metal_kernels::metal::{ComputePipeline, Library};
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use candle_core::{CpuStorage, CustomOp1, CustomOp2, DType, Layout, MetalDevice, MetalStorage, Result, Shape, Storage, Tensor};
+use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
+use objc2_metal::{MTLResourceOptions, MTLResourceUsage, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -121,6 +121,13 @@ kernel void tr_col2im(device const float *cols [[buffer(0)]], device const float
     out[(co * Fo + gid.y) * To + gid.x] = v;
 }
 
+// a + b, same size.
+kernel void add2(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *out [[buffer(2)]],
+                 constant uint *p [[buffer(3)]], uint3 gid [[thread_position_in_grid]]) {
+    uint o = gid.y * p[0] + gid.x;
+    if (o < p[1]) { out[o] = a[o] + b[o]; }
+}
+
 // x (C, F, T) + e (C, F).
 kernel void add_cf(device const float *x [[buffer(0)]], device const float *e [[buffer(1)]], device float *out [[buffer(2)]],
                    constant uint *p [[buffer(3)]], uint3 gid [[thread_position_in_grid]]) {
@@ -216,6 +223,105 @@ fn pipeline(dev: &MetalDevice, name: &'static str) -> Result<Arc<ComputePipeline
     Ok(pipe)
 }
 
+/// Output buffers of this module's operations. Candle's own pool releases every unused
+/// buffer each time it commits a command buffer (every 50 operations), so the large
+/// intermediates of a segment would be freed and allocated again several times per segment;
+/// keeping them here until `release_buffers` makes a segment about 20 % faster.
+static POOL: Mutex<Vec<Arc<Buffer>>> = Mutex::new(Vec::new());
+
+fn alloc(dev: &MetalDevice, elements: usize) -> Result<Arc<Buffer>> {
+    let bytes = elements.max(1) * 4;
+    let mut pool = POOL.lock().map_err(msg)?;
+    // A buffer nobody else holds is free: commands already encoded against it run before
+    // anything encoded later.
+    let free = pool.iter().filter(|b| Arc::strong_count(b) == 1 && b.length() >= bytes && b.length() <= bytes + bytes / 4 + 4096).min_by_key(|b| b.length());
+    if let Some(b) = free {
+        return Ok(b.clone());
+    }
+    let buffer = Arc::new(dev.metal_device().new_buffer(bytes, MTLResourceOptions::StorageModeShared).map_err(msg)?);
+    pool.push(buffer.clone());
+    Ok(buffer)
+}
+
+/// Give back the memory held for intermediates (call when a separation ends).
+pub fn release_buffers() {
+    if let Ok(mut pool) = POOL.lock() {
+        // Buffers still referenced by live tensors are freed with those tensors.
+        pool.clear();
+    }
+}
+
+/// Candle's matrix multiply kernel, writing into a pooled buffer. Operands (.., m, k) and
+/// (.., k, n) with the same leading dimensions; either may be a transposed view.
+struct Gemm;
+
+impl CustomOp2 for Gemm {
+    fn name(&self) -> &'static str {
+        "gemm"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("gemm runs on Metal only")
+    }
+    fn metal_fwd(&self, lhs: &MetalStorage, ll: &Layout, rhs: &MetalStorage, rl: &Layout) -> Result<(MetalStorage, Shape)> {
+        let (ld, rd) = (ll.dims(), rl.dims());
+        let rank = ld.len();
+        if rank < 2 || rd.len() != rank || ld[..rank - 2] != rd[..rank - 2] || ld[rank - 1] != rd[rank - 2] {
+            candle_core::bail!("gemm: shapes {ld:?} and {rd:?} do not multiply")
+        }
+        let (b, m, k, n) = (ld[..rank - 2].iter().product::<usize>(), ld[rank - 2], ld[rank - 1], rd[rank - 1]);
+        let dev = lhs.device().clone();
+        let out = alloc(&dev, b * m * n)?;
+        let enc = dev.command_encoder()?;
+        enc.set_label("gemm");
+        candle_metal_kernels::call_mlx_gemm(dev.metal_device(), &enc, dev.kernels(), candle_metal_kernels::GemmDType::F32, (b, m, n, k), ll.stride(), ll.start_offset() * 4, lhs.buffer(), rl.stride(), rl.start_offset() * 4, rhs.buffer(), &out)
+            .map_err(msg)?;
+        drop(enc);
+        let mut shape = ld[..rank - 2].to_vec();
+        shape.extend([m, n]);
+        Ok((MetalStorage::new(out, dev, b * m * n, DType::F32), Shape::from(shape)))
+    }
+}
+
+fn mm(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    a.apply_op2_no_bwd(b, &Gemm)
+}
+
+/// Candle's softmax-over-the-last-dimension kernel, writing into a pooled buffer.
+struct Softmax;
+
+impl CustomOp1 for Softmax {
+    fn name(&self) -> &'static str {
+        "softmax"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("softmax runs on Metal only")
+    }
+    fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
+        if !layout.is_contiguous() {
+            candle_core::bail!("softmax: input must be contiguous")
+        }
+        let dev = storage.device().clone();
+        let count = layout.shape().elem_count();
+        let last = *layout.dims().last().unwrap_or(&1);
+        let out = alloc(&dev, count)?;
+        let enc = dev.command_encoder()?;
+        enc.set_label("softmax");
+        candle_metal_kernels::call_last_softmax(dev.metal_device(), &enc, dev.kernels(), "softmax_f32", count, last, storage.buffer(), layout.start_offset() * 4, &out).map_err(msg)?;
+        drop(enc);
+        Ok((MetalStorage::new(out, dev, count, DType::F32), layout.shape().clone()))
+    }
+}
+
+/// a + b for contiguous tensors of the same shape.
+fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.dims() != b.dims() {
+        candle_core::bail!("add: shapes differ")
+    }
+    let n = a.elem_count();
+    let width = n.min(1 << 14);
+    run("add2", a, &[b], vec![width as u32, n as u32], a.dims(), (width, n.div_ceil(width), 1))
+}
+
 /// One kernel call: buffers are the input, then `extra`, then the output, then `params`.
 struct Kernel {
     name: &'static str,
@@ -239,7 +345,7 @@ impl CustomOp1 for Kernel {
         }
         let dev = storage.device().clone();
         let count: usize = self.out.iter().product();
-        let out = dev.new_buffer(count, DType::F32, self.name)?;
+        let out = alloc(&dev, count)?;
         let pipe = pipeline(&dev, self.name)?;
         // Hold the extra tensors' storage for the duration of the encoding.
         let extra: Vec<_> = self.extra.iter().map(|t| t.storage_and_layout()).collect();
@@ -352,16 +458,12 @@ impl Dconv {
         let mut x = x.clone();
         for (i, l) in self.0.iter().enumerate() {
             let geo = Geo { k: (1, 3), s: (1, 1), p: (0, l.dilation), d: (1, l.dilation) };
-            let dev = x.device().clone(); let mut tm = std::time::Instant::now();
-            let col = im2col(&x, geo, (f, t))?; mark(&dev, &mut tm, "dconv im2col");
-            let y = l.conv.matmul(&col)?; mark(&dev, &mut tm, "dconv gemm1");
+            let y = mm(&l.conv, &im2col(&x, geo, (f, t))?)?;
             let h = y.dim(0)?;
             let y = norm_act(&y.reshape((h, f, t))?, Some(Norm { cst: &l.norm1, per_f }), 1, None, true)?;
-            mark(&dev, &mut tm, "dconv norm_act1");
-            let z = l.expand.matmul(&y.reshape((h + 1, f * t))?)?; mark(&dev, &mut tm, "dconv gemm2");
+            let z = mm(&l.expand, &y.reshape((h + 1, f * t))?)?;
             let c2 = z.dim(0)?;
             x = norm_act(&z.reshape((c2, f, t))?, Some(Norm { cst: &l.norm2, per_f }), 2, Some(&x), ones && i + 1 == self.0.len())?;
-            mark(&dev, &mut tm, "dconv norm_act2");
         }
         Ok(x)
     }
@@ -451,34 +553,30 @@ impl Layer {
     /// q (L, C), k (S, C) for cross-attention -> (L, C [+1 ones]).
     fn forward(&self, q: &Tensor, k: Option<&Tensor>, ones: bool) -> Result<Tensor> {
         let (l, c) = q.dims2()?;
-        let dev = q.device().clone(); let mut tm = std::time::Instant::now();
-        let nq = ln_rows(q, &self.norm1, true)?; mark(&dev, &mut tm, "tf ln");
+        let nq = ln_rows(q, &self.norm1, true)?;
         let (qh, kt, vh) = match (k, &self.norm_k, &self.in_kv) {
             (Some(k), Some(norm_k), Some(in_kv)) => {
-                let qp = nq.matmul(&self.in_q)?;
-                let kv = ln_rows(k, norm_k, true)?.matmul(in_kv)?;
+                let qp = mm(&nq, &self.in_q)?;
+                let kv = mm(&ln_rows(k, norm_k, true)?, in_kv)?;
                 (split_heads(&qp, 0, c, false)?, split_heads(&kv, 0, c, true)?, split_heads(&kv, c, c, false)?)
             }
             _ => {
-                let p = nq.matmul(&self.in_q)?;
+                let p = mm(&nq, &self.in_q)?;
                 (split_heads(&p, 0, c, false)?, split_heads(&p, c, c, true)?, split_heads(&p, 2 * c, c, false)?)
             }
         };
-        mark(&dev, &mut tm, "tf inproj+split");
-        let sc = qh.matmul(&kt)?; mark(&dev, &mut tm, "tf scores");
-        let sm = candle_nn::ops::softmax_last_dim(&sc)?; mark(&dev, &mut tm, "tf softmax");
-        let attn = sm.matmul(&vh)?; mark(&dev, &mut tm, "tf attn out");
+        let attn = mm(&mm(&qh, &kt)?.apply_op1_no_bwd(&Softmax)?, &vh)?;
         let d = c / HEADS;
         let merged = run("merge_heads", &attn, &[], [l, HEADS, d].map(|v| v as u32).to_vec(), &[l, c + 1], (c + 1, l, 1))?;
-        let x = (q + merged.matmul(&self.out)?)?; mark(&dev, &mut tm, "tf merge+outproj");
-        let y = ln_rows(&x, &self.norm_ff, true)?.matmul(&self.lin1)?; mark(&dev, &mut tm, "tf ln+lin1");
+        let x = add(q, &mm(&merged, &self.out)?)?;
+        let y = mm(&ln_rows(&x, &self.norm_ff, true)?, &self.lin1)?;
         let h = y.dim(1)?;
-        let y = run("row_gelu", &y, &[], vec![h as u32], &[l, h + 1], (h + 1, l, 1))?.matmul(&self.lin2)?;
-        let x = (x + y)?; mark(&dev, &mut tm, "tf gelu+lin2");
+        let y = mm(&run("row_gelu", &y, &[], vec![h as u32], &[l, h + 1], (h + 1, l, 1))?, &self.lin2)?;
+        let x = add(&x, &y)?;
         // norm_out: group norm with one group over all tokens and channels.
         let st = run("row_stats", &x, &[], [l, 1, c, c, 1].map(|v| v as u32).to_vec(), &[2, l], (1, l, 1))?.sum_keepdim(1)?.flatten_all()?;
         let params = vec![c as u32, ones as u32, ((l * c) as f32).to_bits(), 1e-5f32.to_bits()];
-        let r = run("row_norm", &x, &[&st, &self.norm_out], params, &[l, c + ones as usize], (c + ones as usize, l, 1)); mark(&dev, &mut tm, "tf norm_out"); r
+        run("row_norm", &x, &[&st, &self.norm_out], params, &[l, c + ones as usize], (c + ones as usize, l, 1))
     }
 }
 
@@ -568,46 +666,40 @@ impl Fast {
     fn encode(&self, e: &Encoder, x: &Tensor, freq: bool, ones: bool) -> Result<Tensor> {
         let (_, f, t) = x.dims3()?;
         let (geo, out) = if freq { (Geo { k: (8, 1), s: (4, 1), p: (2, 0), d: (1, 1) }, (f / 4, t)) } else { (Geo { k: (1, 8), s: (1, 4), p: (0, 2), d: (1, 1) }, (1, t.div_ceil(4))) };
-        let dev = x.device().clone(); let mut tm = std::time::Instant::now();
-        let y = e.conv.matmul(&im2col(x, geo, out)?)?;
+        let y = mm(&e.conv, &im2col(x, geo, out)?)?;
         let c = y.dim(0)?;
-        let y = y.reshape((c, out.0, out.1))?.gelu_erf()?; mark(&dev, &mut tm, "enc conv+gelu");
-        let y = e.dconv.forward(&y, freq, true)?; tm = std::time::Instant::now();
-        let z = e.rewrite.matmul(&y.reshape((c + 1, out.0 * out.1))?)?;
-        let r = norm_act(&z.reshape((2 * c, out.0, out.1))?, None, 2, None, ones); mark(&dev, &mut tm, "enc rewrite+glu"); r
+        let y = norm_act(&y.reshape((c, out.0, out.1))?, None, 1, None, false)?;
+        let y = e.dconv.forward(&y, freq, true)?;
+        let z = mm(&e.rewrite, &y.reshape((c + 1, out.0 * out.1))?)?;
+        norm_act(&z.reshape((2 * c, out.0, out.1))?, None, 2, None, ones)
     }
 
     /// Decoder layer; `length` is the output size along the stride axis.
     fn decode(&self, d: &Decoder, x: &Tensor, skip: &Tensor, freq: bool, length: usize, last: bool) -> Result<Tensor> {
         let (c, f, t) = x.dims3()?;
-        let dev = x.device().clone(); let mut tm = std::time::Instant::now();
-        let y = (x + skip)?;
+        let y = add(x, skip)?;
         let geo = if freq { Geo { k: (3, 3), s: (1, 1), p: (1, 1), d: (1, 1) } } else { Geo { k: (1, 3), s: (1, 1), p: (0, 1), d: (1, 1) } };
-        let col = im2col(&y, geo, (f, t))?; mark(&dev, &mut tm, "dec im2col");
-        let z = d.rewrite.matmul(&col)?; mark(&dev, &mut tm, "dec rewrite gemm");
-        let z = norm_act(&z.reshape((2 * c, f, t))?, None, 2, None, false)?; mark(&dev, &mut tm, "dec glu");
-        let z = d.dconv.forward(&z, freq, false)?; tm = std::time::Instant::now();
-        let cols = d.tr.matmul(&z.reshape((c, f * t))?)?;
+        let z = mm(&d.rewrite, &im2col(&y, geo, (f, t))?)?;
+        let z = norm_act(&z.reshape((2 * c, f, t))?, None, 2, None, false)?;
+        let z = d.dconv.forward(&z, freq, false)?;
+        let cols = mm(&d.tr, &z.reshape((c, f * t))?)?;
         let co = cols.dim(0)? / 8;
         let (fo, to) = if freq { (length, t) } else { (1, length) };
         let params = [co, f, t, if freq { 0 } else { 1 }, fo, to, if last { 0 } else { 1 }].map(|v| v as u32).to_vec();
-        mark(&dev, &mut tm, "dec tr gemm");
-        let r = run("tr_col2im", &cols, &[&d.tr_bias], params, &[co, fo, to], (to, fo, co)); mark(&dev, &mut tm, "dec tr col2im"); r
+        run("tr_col2im", &cols, &[&d.tr_bias], params, &[co, fo, to], (to, fo, co))
     }
 
     /// The whole network between the transforms: x is the normalised spectrogram
     /// (4, 2048, frames), xt the normalised mix (2, 1, L). Returns the spectrogram branch
     /// (16, 2048, frames) and the time branch (8, 1, L), both still normalised.
     pub fn forward(&self, x: &Tensor, xt: &Tensor) -> Result<(Tensor, Tensor)> {
-        let dev = x.device().clone(); let mut tm = std::time::Instant::now();
-        mark(&dev, &mut tm, "top upload");
-        let (x, xt, saved, saved_t, lengths) = self.encoders(x, xt)?; mark(&dev, &mut tm, "top encoders");
+        let (x, xt, saved, saved_t, lengths) = self.encoders(x, xt)?;
         let (f, t) = (saved[3].dim(1)?, saved[3].dim(2)?);
-        let (x, xt) = self.transformer(&x, &xt, f, t)?; mark(&dev, &mut tm, "top transformer");
+        let (x, xt) = self.transformer(&x, &xt, f, t)?;
         // Tokens (L, 513) back to channels first through the downsamplers.
-        let x = self.down.matmul(&x.t()?)?.reshape((384, f, t))?;
-        let xt = self.down_t.matmul(&xt.t()?)?.reshape((384, 1, ()))?;
-        let r = self.decoders(&x, &xt, saved, saved_t, lengths); mark(&dev, &mut tm, "top decoders"); r
+        let x = mm(&self.down, &x.t()?)?.reshape((384, f, t))?;
+        let xt = mm(&self.down_t, &xt.t()?)?.reshape((384, 1, ()))?;
+        self.decoders(&x, &xt, saved, saved_t, lengths)
     }
 
     /// x (L, 512) tokens in (frequency, time) order, xt (T', 512). The results carry a last
@@ -632,8 +724,8 @@ impl Fast {
                 p
             }
         };
-        let mut x = (ln_rows(x, &self.norm_in, false)? + pos)?;
-        let mut xt = (ln_rows(xt, &self.norm_in_t, false)? + pos_t)?;
+        let mut x = add(&ln_rows(x, &self.norm_in, false)?, &pos)?;
+        let mut xt = add(&ln_rows(xt, &self.norm_in_t, false)?, &pos_t)?;
         for i in 0..5 {
             let last = i == 4;
             if i % 2 == 0 {
@@ -668,8 +760,8 @@ impl Fast {
             saved_t.push(xt.narrow(0, 0, c)?);
         }
         let (c1, f, t) = x.dims3()?;
-        let x = x.reshape((c1, f * t))?.t()?.matmul(&self.up)?;
-        let xt = xt.reshape((c1, ()))?.t()?.matmul(&self.up_t)?;
+        let x = mm(&x.reshape((c1, f * t))?.t()?, &self.up)?;
+        let xt = mm(&xt.reshape((c1, ()))?.t()?, &self.up_t)?;
         Ok((x, xt, saved, saved_t, lengths))
     }
 
@@ -684,20 +776,4 @@ impl Fast {
         }
         Ok((x, xt))
     }
-}
-
-// PROFILING (temporary)
-pub static PROF: Mutex<Vec<(String, f64, usize)>> = Mutex::new(Vec::new());
-pub fn mark(dev: &candle_core::Device, t: &mut std::time::Instant, name: &str) {
-    match std::env::var("PROF").as_deref() { Ok("1") => {} Ok("2") if name.starts_with("top ") => {} _ => return }
-    let _ = dev.synchronize();
-    let d = t.elapsed().as_secs_f64();
-    let mut s = PROF.lock().unwrap();
-    if let Some(e) = s.iter_mut().find(|e| e.0 == name) { e.1 += d; e.2 += 1 } else { s.push((name.to_string(), d, 1)) }
-    *t = std::time::Instant::now();
-}
-pub fn report() {
-    let s = PROF.lock().unwrap();
-    let total: f64 = s.iter().map(|e| e.1).sum();
-    for (n, d, c) in s.iter() { println!("  {n:<28} {d:8.3}s {:5.1}%  x{c}", 100.0 * d / total.max(1e-9)); }
 }

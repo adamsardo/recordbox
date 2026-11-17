@@ -197,7 +197,6 @@ pub(crate) fn pos2(f: usize, t: usize, c: usize) -> Vec<f32> {
 }
 
 /// One loaded HTDemucs network.
-pub fn fast_report() { metal_fast::report() }
 pub struct Graph {
     /// The checkpoint's tensors by name: the reference graph (any device).
     weights: HashMap<String, Tensor>,
@@ -220,6 +219,8 @@ impl Graph {
     }
 
     fn load_as(path: &Path, device: &Device, fast: bool) -> Result<Self> {
+        // Uploading weights encodes GPU work too.
+        let _gpu = GPU.lock();
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => candle_core::safetensors::load(path, device)?,
             _ => {
@@ -505,6 +506,12 @@ fn segment_at(audio: &[f32], len: usize, offset: usize) -> Vec<f32> {
     input
 }
 
+/// Free the GPU memory kept for intermediates between segments (call when a job ends).
+pub fn release_scratch() {
+    #[cfg(target_os = "macos")]
+    metal_fast::release_buffers();
+}
+
 /// Serialises GPU work between separation jobs (full stems, vocal detection, key analysis).
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -656,30 +663,24 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
             }
         });
         let mut run = || -> Result<()> {
-            let mut tw = std::time::Instant::now();
             for (k, p) in rx_in.iter().enumerate() {
-                metal_fast::mark(device, &mut tw, "top wait for prep");
                 let (spec, wave) = {
                     let _gpu = GPU.lock();
                     let x = Tensor::from_vec(p.spec, (4, freq, frames), device)?;
                     let xt = Tensor::from_vec(p.wave, (2, 1, segment), device)?;
-                    let te = std::time::Instant::now();
                     let (mut y, mut yt) = fast.forward(&x, &xt)?;
-                    if std::env::var("PROF").as_deref() == Ok("3") { eprintln!("encode {:.1} ms", te.elapsed().as_secs_f64() * 1e3); }
                     if let Some(s) = opts.source {
                         y = y.narrow(0, s * 4, 4)?;
                         yt = yt.narrow(0, s * 2, 2)?;
                     }
                     (y.flatten_all()?.to_vec1::<f32>()?, yt.flatten_all()?.to_vec1::<f32>()?)
                 };
-                metal_fast::mark(device, &mut tw, "top gpu total incl download");
                 if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
                     candle_core::bail!("stem post-processing stopped")
                 }
                 if !progress(k + 1, offsets.len()) {
                     candle_core::bail!("stopped")
                 }
-                metal_fast::mark(device, &mut tw, "top send to post");
             }
             Ok(())
         };
@@ -706,4 +707,196 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic values in [-1, 1).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+        }
+    }
+
+    /// A network with HTDemucs's exact tensor names and shapes and random values, so the two
+    /// implementations can be compared without a downloaded checkpoint.
+    fn random_weights(device: &Device) -> HashMap<String, Tensor> {
+        let mut rng = Lcg(7);
+        let mut w = HashMap::new();
+        // kind 0: weight scaled by fan-in; 1: norm weight near 1; 2: bias; 3: layer scale.
+        let mut put = |name: String, dims: &[usize], kind: u8| {
+            let n: usize = dims.iter().product();
+            let fan = (n / dims[0]).max(1) as f32;
+            let (mean, amp) = match kind {
+                0 => (0.0, (3.0 / fan).sqrt()),
+                1 => (1.0, 0.2),
+                2 => (0.0, 0.1),
+                _ => (0.3, 0.1),
+            };
+            let v: Vec<f32> = (0..n).map(|_| mean + amp * rng.next()).collect();
+            w.insert(name, Tensor::from_vec(v, dims, device).unwrap());
+        };
+        let mut dconv = |put: &mut dyn FnMut(String, &[usize], u8), name: String, c: usize| {
+            for l in 0..2 {
+                let (p, h) = (format!("{name}.layers.{l}"), c / 8);
+                put(format!("{p}.0.weight"), &[h, c, 3], 0);
+                put(format!("{p}.0.bias"), &[h], 2);
+                put(format!("{p}.1.weight"), &[h], 1);
+                put(format!("{p}.1.bias"), &[h], 2);
+                put(format!("{p}.3.weight"), &[2 * c, h, 1], 0);
+                put(format!("{p}.3.bias"), &[2 * c], 2);
+                put(format!("{p}.4.weight"), &[2 * c], 1);
+                put(format!("{p}.4.bias"), &[2 * c], 2);
+                put(format!("{p}.6.scale"), &[c], 3);
+            }
+        };
+        for (prefix, first, freq) in [("encoder", 4, true), ("tencoder", 2, false)] {
+            for i in 0..4 {
+                let c = 48 << i;
+                let cin = if i == 0 { first } else { c / 2 };
+                let name = format!("{prefix}.{i}");
+                put(format!("{name}.conv.weight"), &[c, cin, 8, 1][..if freq { 4 } else { 3 }], 0);
+                put(format!("{name}.conv.bias"), &[c], 2);
+                dconv(&mut put, format!("{name}.dconv"), c);
+                put(format!("{name}.rewrite.weight"), &[2 * c, c, 1, 1][..if freq { 4 } else { 3 }], 0);
+                put(format!("{name}.rewrite.bias"), &[2 * c], 2);
+            }
+        }
+        for (prefix, last, freq) in [("decoder", 16, true), ("tdecoder", 8, false)] {
+            for j in 0..4 {
+                let c = 384 >> j;
+                let cout = if j == 3 { last } else { c / 2 };
+                let name = format!("{prefix}.{j}");
+                put(format!("{name}.conv_tr.weight"), &[c, cout, 8, 1][..if freq { 4 } else { 3 }], 0);
+                put(format!("{name}.conv_tr.bias"), &[cout], 2);
+                dconv(&mut put, format!("{name}.dconv"), c);
+                put(format!("{name}.rewrite.weight"), &[2 * c, c, 3, 3][..if freq { 4 } else { 3 }], 0);
+                put(format!("{name}.rewrite.bias"), &[2 * c], 2);
+            }
+        }
+        put("freq_emb.embedding.weight".into(), &[512, 48], 2);
+        for t in ["", "_t"] {
+            put(format!("channel_upsampler{t}.weight"), &[512, 384, 1], 0);
+            put(format!("channel_upsampler{t}.bias"), &[512], 2);
+            put(format!("channel_downsampler{t}.weight"), &[384, 512, 1], 0);
+            put(format!("channel_downsampler{t}.bias"), &[384], 2);
+            put(format!("crosstransformer.norm_in{t}.weight"), &[512], 1);
+            put(format!("crosstransformer.norm_in{t}.bias"), &[512], 2);
+            for i in 0..5 {
+                let name = format!("crosstransformer.layers{t}.{i}");
+                let cross = i % 2 == 1;
+                let attn = format!("{name}.{}", if cross { "cross_attn" } else { "self_attn" });
+                put(format!("{attn}.in_proj_weight"), &[1536, 512], 0);
+                put(format!("{attn}.in_proj_bias"), &[1536], 2);
+                put(format!("{attn}.out_proj.weight"), &[512, 512], 0);
+                put(format!("{attn}.out_proj.bias"), &[512], 2);
+                put(format!("{name}.linear1.weight"), &[2048, 512], 0);
+                put(format!("{name}.linear1.bias"), &[2048], 2);
+                put(format!("{name}.linear2.weight"), &[512, 2048], 0);
+                put(format!("{name}.linear2.bias"), &[512], 2);
+                put(format!("{name}.gamma_1.scale"), &[512], 3);
+                put(format!("{name}.gamma_2.scale"), &[512], 3);
+                for n in ["norm1", "norm2", "norm_out"].into_iter().chain(cross.then_some("norm3")) {
+                    put(format!("{name}.{n}.weight"), &[512], 1);
+                    put(format!("{name}.{n}.bias"), &[512], 2);
+                }
+            }
+        }
+        w
+    }
+
+    /// Planar stereo test signal: tones, a sweep and noise, different in the two channels.
+    fn signal(len: usize) -> Vec<f32> {
+        let mut rng = Lcg(3);
+        (0..2 * len)
+            .map(|n| {
+                let (ch, i) = (n / len, (n % len) as f32);
+                let t = i / SAMPLE_RATE as f32;
+                0.3 * (2.0 * std::f32::consts::PI * (110.0 + 40.0 * ch as f32) * t).sin() + 0.2 * (2.0 * std::f32::consts::PI * (300.0 + 900.0 * t) * t).sin() + 0.1 * rng.next()
+            })
+            .collect()
+    }
+
+    fn snr_db(reference: &[f32], other: &[f32]) -> f64 {
+        let (mut s, mut e) = (0f64, 0f64);
+        for (a, b) in reference.iter().zip(other) {
+            s += (*a as f64).powi(2);
+            e += ((*a - *b) as f64).powi(2);
+        }
+        10.0 * (s / e.max(1e-30)).log10()
+    }
+
+    #[test]
+    fn transform_round_trip() {
+        let len = 20 * HOP + 300;
+        let x: Vec<f32> = signal(len)[..len].to_vec();
+        let stft = Stft::new();
+        let frames = Stft::frames(len);
+        let (mut re, mut im) = (vec![0f32; NFFT / 2 * frames], vec![0f32; NFFT / 2 * frames]);
+        stft.forward(&x, &mut re, &mut im);
+        let mut y = vec![0f32; len];
+        stft.inverse(&re, &im, frames, 1.0, 0.0, &stft.envelope(frames), &mut y);
+        // As upstream, the frames that hang over the ends are dropped, so only the interior
+        // comes back (and without the Nyquist bin).
+        let snr = snr_db(&x[NFFT..len - NFFT], &y[NFFT..len - NFFT]);
+        assert!(snr > 40.0, "round trip {snr:.1} dB");
+    }
+
+    #[test]
+    fn segments_cover_the_track() {
+        let len = 3 * TRAINING_FRAMES + 1000;
+        for overlap in [0.25, 0.1] {
+            let (offsets, weight) = plan(len, overlap);
+            assert_eq!(weight.len(), TRAINING_FRAMES);
+            assert_eq!(offsets[0], 0);
+            assert!(offsets.windows(2).all(|w| w[1] - w[0] <= TRAINING_FRAMES));
+            assert!(offsets.last().unwrap() + TRAINING_FRAMES >= len);
+        }
+        // A short last chunk is padded from the audio around it, centred.
+        let audio: Vec<f32> = (0..2 * len).map(|i| (i % len) as f32).collect();
+        let offset = 3 * TRAINING_FRAMES - 500;
+        let seg = segment_at(&audio, len, offset);
+        let crop = (TRAINING_FRAMES - (len - offset)) / 2;
+        assert_eq!(seg[crop], offset as f32);
+        assert_eq!(seg[TRAINING_FRAMES + crop], offset as f32);
+        assert_eq!(seg[0], (offset - crop) as f32);
+    }
+
+    /// The fused Metal kernels against the reference graph built from Candle's operations,
+    /// on the same (random) weights: outputs must agree far below audibility. Skipped where
+    /// there is no Metal device.
+    #[test]
+    fn metal_kernels_match_reference_graph() {
+        let Ok(device) = Device::new_metal(0) else { return };
+        let weights = random_weights(&device);
+        let reference = Graph::from_weights(weights.clone(), false).unwrap();
+        let fast = Graph::from_weights(weights, true).unwrap();
+        // One full segment and a short, padded one.
+        let len = TRAINING_FRAMES + SAMPLE_RATE as usize;
+        let audio = signal(len);
+        let opts = Options::default();
+        let a = separate(&reference, &device, &audio, len, &opts, &mut |_, _| true).unwrap();
+        let b = separate(&fast, &device, &audio, len, &opts, &mut |_, _| true).unwrap();
+        assert_eq!(a.len(), 8 * len);
+        for s in 0..4 {
+            let snr = snr_db(&a[s * 2 * len..(s + 1) * 2 * len], &b[s * 2 * len..(s + 1) * 2 * len]);
+            eprintln!("{}: fused kernels vs reference {snr:.1} dB", SOURCES[s]);
+            assert!(snr > 60.0, "{}: fused kernels differ from the reference ({snr:.1} dB)", SOURCES[s]);
+        }
+        // One source alone is the same signal as that source of the full result.
+        let one = separate(&fast, &device, &audio, len, &Options { source: Some(3), ..opts }, &mut |_, _| true).unwrap();
+        assert!(snr_db(&b[6 * len..], &one) > 100.0);
+        // Returning false from the progress callback stops the job.
+        let mut calls = 0;
+        let stopped = separate(&fast, &device, &audio, len, &opts, &mut |_, _| {
+            calls += 1;
+            false
+        });
+        assert!(stopped.is_err_and(|e| e.to_string().contains("stopped")) && calls == 1);
+        release_scratch();
+    }
 }

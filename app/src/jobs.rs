@@ -104,8 +104,9 @@ pub fn spawn_export(req: crate::export::usb::ExportRequest, ctx: egui::Context) 
             let _ = tx2.send(p);
             ctx2.request_repaint();
         };
-        let r = crate::export::usb::run_export(req, &progress, &c2);
-        let _ = tx.send(crate::export::usb::Progress::Finished(r.map_err(|e| e.to_string())));
+        // A panic anywhere in the export is reported as a failed export, not a hung window.
+        let r = crate::export::usb::run_guarded(|| crate::export::usb::run_export(req, &progress, &c2));
+        let _ = tx.send(crate::export::usb::Progress::Finished(r));
         ctx.request_repaint();
     });
     ExportJob { rx, cancel, last: (0, 0, String::new()) }

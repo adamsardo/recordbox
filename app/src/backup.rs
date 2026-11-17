@@ -400,7 +400,8 @@ pub fn poll(app: &mut crate::app::App) {
             match apply_restore(&mut app.db.conn, &staged, &safety_dir) {
                 Ok(safety) => {
                     reload_after_restore(app);
-                    let mut t = format!("Collection was restored.\n{} track(s).", app.tracks.len());
+                    let made = staged.manifest.created.get(..16).unwrap_or(&staged.manifest.created).replace('T', " ");
+                    let mut t = format!("Collection was restored.\n{} track(s), from the backup made {made}.", app.tracks.len());
                     if staged.music_restored > 0 {
                         t.push_str(&format!(" {} music file(s) put back.", staged.music_restored));
                     }

@@ -1,10 +1,15 @@
 pub mod anlz;
+pub mod device_import;
 pub mod pdb;
 pub mod settings;
 pub mod settings_fields;
 pub mod usb;
 #[cfg(test)]
 mod usb_test;
+#[cfg(test)]
+mod usb_fix_test;
+#[cfg(test)]
+mod device_feature_test;
 #[cfg(test)]
 mod anlz_compare;
 #[cfg(test)]

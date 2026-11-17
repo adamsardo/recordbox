@@ -3978,6 +3978,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
  "chrono",
  "cpal",
@@ -3987,6 +3988,7 @@ dependencies = [
  "image",
  "lofty",
  "muda",
+ "objc2-metal 0.3.2",
  "parking_lot",
  "quick-xml 0.41.0",
  "rand 0.8.8",

@@ -435,10 +435,10 @@ impl App {
 
     /// "Export Loop As Wav": the loop's audio as a 16-bit WAV file the user chooses.
     pub fn export_loop_wav(&mut self) {
-        let (Some((a, b)), Some(audio)) = (self.defined_loop(), self.deck.audio.clone()) else {
+        if self.defined_loop().is_none() || self.deck.audio.is_none() {
             self.toast_err("Set a loop first.");
             return;
-        };
+        }
         let t = self.deck.track.and_then(|id| self.track(id)).cloned();
         let title: String = t.as_ref().map(|t| t.display_title()).unwrap_or_else(|| "Loop".into()).chars().map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
         let Some(path) = rfd::FileDialog::new().set_title("Export Loop As Wav").add_filter("WAV File", &["wav"]).set_file_name(format!("{title} (Loop).wav")).save_file() else { return };
@@ -447,10 +447,18 @@ impl App {
             self.toast_err("Choose another name: that is the track's own file.");
             return;
         }
-        match write_wav16(&path, audio.sr, 2, loop_samples(&audio.samples, audio.sr, a, b)) {
+        match self.export_loop_to(&path) {
             Ok(()) => self.toast(format!("Loop exported: {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
             Err(e) => self.toast_err(format!("The loop could not be exported: {e}")),
         }
+    }
+
+    /// Write the defined loop's audio to `path` as a 16-bit WAV file.
+    pub fn export_loop_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let (Some((a, b)), Some(audio)) = (self.defined_loop(), self.deck.audio.clone()) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no loop is set"));
+        };
+        write_wav16(path, audio.sr, 2, loop_samples(&audio.samples, audio.sr, a, b))
     }
 
     // ------------------------------------------------------------------ loop buttons
@@ -673,8 +681,9 @@ mod tests {
 /// player states: `2p` 2 Players with a second track on deck B · `simple` Simple Player ·
 /// `ma` manual loop buttons · `loop` a 4-beat loop · `adjust` loop-out adjust · `count1` /
 /// `count2` Beat Count Display modes · `metro` metronome on at volume 3 · `bars` beat jump
-/// in bars · `menu` the waveform's right-click menu. Combine with
-/// PREPDECK_SHOT_VIEW=grid for the GRID panel.
+/// in bars · `clickmode` click-for-PLAY/CUE on · `menu` the waveform's right-click menu ·
+/// `padclear`, `dropload`, `selftest`: scripted checks that print to stderr (scratch library
+/// only). Combine with PREPDECK_SHOT_VIEW=grid for the GRID panel and PREPDECK_SHOT_CLICK.
 fn shot_flags() -> Vec<String> {
     std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default()
 }
@@ -763,20 +772,200 @@ impl App {
         if has("clickmode") {
             self.prefs.wave_click_play_cue = true;
         }
+        if has("selftest") {
+            self.shot_player_selftest();
+        }
+    }
+
+    /// PREPDECK_SHOT_PLAYER=selftest: run the player's operations on the loaded track (use a
+    /// scratch library) and print what happened to stderr.
+    fn shot_player_selftest(&mut self) {
+        let Some(tid) = self.deck.track else { return eprintln!("selftest: no track loaded") };
+        let beats = self.deck.beats.clone();
+        if beats.len() < 200 || self.deck.audio.is_none() {
+            return eprintln!("selftest: needs an analysed, decoded track");
+        }
+        let hot = |a: &App, slot: i32| a.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| (c.start, c.end));
+        let saved_hot = |a: &App, slot: i32| a.db.cues(tid).unwrap_or_default().into_iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| (c.start, c.end));
+        self.prefs.quantize = true;
+        self.prefs.quantize_div = 1;
+        // Waveform menu actions at a position 0.1 s after beat 40 (quantize snaps to the beat).
+        let (b40, b48) = (beats[40].time, beats[48].time);
+        self.set_cue_at(b40 + 0.1);
+        eprintln!("selftest: Set Cue(In) Point -> cue {:.3} (beat 40 at {:.3}), deck at {:.3}", self.deck.cue_point, b40, self.pos());
+        self.set_out_at(b48 + 0.1);
+        eprintln!("selftest: Set Out Point -> loop {:?} (beats 40..48 = {:.3}..{:.3})", self.loop_active(), b40, b48);
+        let u0 = self.undo_len();
+        self.set_hot_cue_at(1, beats[60].time + 0.05);
+        eprintln!("selftest: Set Hot Cue B -> deck {:?}, saved {:?} (beat 60 at {:.3}), undo +{}", hot(self, 1), saved_hot(self, 1), beats[60].time, self.undo_len() - u0);
+        self.set_hot_cue_at(1, beats[64].time);
+        eprintln!("selftest: Set Hot Cue B again -> {:?}, hot cues in slot B: {}", hot(self, 1), self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot && c.slot == 1).count());
+        self.undo_edit();
+        eprintln!("selftest: Undo -> B {:?}", saved_hot(self, 1));
+        self.set_hot_loop(2);
+        eprintln!("selftest: Set Hot Loop C -> {:?}", saved_hot(self, 2));
+        let m0 = self.memory_cues().len();
+        self.set_memory_loop();
+        self.set_memory_loop();
+        let ml = self.memory_cues().into_iter().find(|c| c.is_loop()).map(|c| (c.start, c.end));
+        eprintln!("selftest: Set Memory Loop (twice) -> {} new, {:?}", self.memory_cues().len() - m0, ml);
+        // Export Loop As Wav.
+        let wav = std::env::temp_dir().join(format!("recordbox-selftest-{}.wav", std::process::id()));
+        match self.export_loop_to(&wav).map_err(|e| e.to_string()).and_then(|_| crate::audio::decode_file(wav.to_str().unwrap_or_default()).map_err(|e| e.to_string())) {
+            Ok(d) => eprintln!("selftest: Export Loop As Wav -> {} bytes, {:.3} s at {} Hz (loop is {:.3} s)", std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0), d.duration(), d.sr, b48 - b40),
+            Err(e) => eprintln!("selftest: Export Loop As Wav FAILED: {e}"),
+        }
+        let _ = std::fs::remove_file(&wav);
+        // Loop adjust and Exit/Reloop.
+        self.loop_out_pressed();
+        self.loop_adjust_step(1, false);
+        eprintln!("selftest: OUT adjust, → -> loop {:?} (one beat longer: {:.3}), adjust {}", self.loop_active(), beats[49].time, self.deck.x.loop_adjust);
+        self.loop_adjust_step(-1, true);
+        eprintln!("selftest: Shift+← -> loop {:?}", self.loop_active());
+        self.loop_in_pressed();
+        self.loop_adjust_to(beats[42].time + 0.02);
+        eprintln!("selftest: IN adjust, drag to beat 42 -> loop {:?} ({:.3})", self.loop_active(), beats[42].time);
+        self.exit_reloop();
+        let off = self.loop_active();
+        self.exit_reloop();
+        eprintln!("selftest: Exit/Reloop -> {:?}, again -> {:?}, deck at {:.3}", off, self.loop_active(), self.pos());
+        self.exit_reloop();
+        self.pick_auto_loop(0.25);
+        eprintln!("selftest: 1/4 Beat Loop from the list -> {:?} (beat = {:.4} s)", self.loop_active().map(|(a, b)| b - a), self.beat_len());
+        self.loop_exit();
+        self.prefs.loop_beats = 4.0;
+        // Grid: Center, BPM entry and its limits, Undo.
+        let p = beats[80].time + 0.013;
+        self.seek(p);
+        let g0 = self.deck.grid.anchors.first().map(|a| a.time).unwrap_or(0.0);
+        self.grid_center();
+        let near = nearest_beat(&self.deck.beats, p).map(|b| b.time).unwrap_or(0.0);
+        eprintln!("selftest: grid Center at {:.3} -> nearest beat {:.3}, first anchor moved {:+.3} s", p, near, self.deck.grid.anchors.first().map(|a| a.time).unwrap_or(0.0) - g0);
+        self.grid_undo();
+        eprintln!("selftest: grid Undo -> first anchor back by {:+.3}", self.deck.grid.anchors.first().map(|a| a.time).unwrap_or(0.0) - g0);
+        let bpm0 = self.current_bpm();
+        self.grid_enter_bpm("30");
+        self.grid_enter_bpm("abc");
+        eprintln!("selftest: BPM 30 / abc refused -> {:.2} (was {:.2}), message: {:?}", self.current_bpm(), bpm0, self.toasts.last().map(|t| t.text.clone()));
+        self.grid_enter_bpm("126.5");
+        eprintln!("selftest: BPM 126.5 -> {:.2}", self.current_bpm());
+        self.grid_undo();
+        eprintln!("selftest: grid Undo -> {:.2}", self.current_bpm());
+        // Beat Count Display with the memory loop at beat 40.
+        let mem: Vec<f64> = self.memory_cues().iter().map(|c| c.start).collect();
+        eprintln!("selftest: Beat Count at beat 24: {} / {} / {}", beat_count_label(&self.deck.beats, &mem, beats[24].time, 0), beat_count_label(&self.deck.beats, &mem, beats[24].time, 1), beat_count_label(&self.deck.beats, &mem, beats[24].time, 2));
+        // Search: the audio callback moves the deck while the button is held.
+        let before = self.pos();
+        self.search(1);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        self.search(0);
+        eprintln!("selftest: Search Forward held 0.5 s -> moved {:+.2} s (audio device: {}), playing {}", self.pos() - before, self.player.error.clone().unwrap_or_else(|| "ok".into()), self.playing());
+        // Metronome volume reaches the audio state.
+        self.deck.metronome = true;
+        self.set_metronome_volume(3);
+        let (mv, mon) = { let s = self.player.state.lock(); (s.metronome_vol, s.metronome.is_some()) };
+        eprintln!("selftest: metronome on at volume 3 -> level {mv}, clicks {mon}");
+        self.deck.metronome = false;
+        self.set_metronome_volume(2);
+        // Tracks: Next, Previous (restart first), unload, and two decks.
+        self.rebuild_list();
+        let row = |a: &App| a.deck.track.and_then(|t| a.list.iter().position(|x| *x == t));
+        let r0 = row(self);
+        self.load_adjacent(1);
+        self.shot_wait_load();
+        let r1 = row(self);
+        self.seek(30.0);
+        self.previous_track();
+        let restarted = (row(self), self.pos());
+        self.previous_track();
+        self.shot_wait_load();
+        eprintln!("selftest: rows: start {:?}, Next Track {:?}, Previous Track at 30 s -> {:?} at {:.1} s, again -> {:?}", r0, r1, restarted.0, restarted.1, row(self));
+        self.prefs.player_layout = 1;
+        self.prefs.browser_only = false;
+        let other = self.list.iter().copied().find(|id| Some(*id) != self.deck.track && self.track(*id).map(|t| !t.missing && t.duration > 60.0).unwrap_or(false));
+        if let Some(id) = other {
+            self.load_target = 1;
+            self.load_track(id);
+            self.with_deck(1, |a| a.shot_wait_load());
+            self.with_deck(1, |a| a.set_playing(true));
+            self.set_playing(true);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let (pa, pb) = (self.pos(), self.with_deck(1, |a| a.pos()));
+            let (ta, tb) = (self.deck.track, self.px.other.track);
+            eprintln!("selftest: 2 Players: A track {:?} at {:.2} s playing {}, B track {:?} at {:.2} s playing {}, active {}", ta, pa, self.playing(), tb, pb, self.player.other.lock().playing, self.px.active);
+            self.activate_deck(1);
+            eprintln!("selftest: deck B active -> deck.track {:?}, other {:?}, active {}", self.deck.track, self.px.other.track, self.px.active);
+            self.prefs.player_layout = 0;
+            self.poll_decks();
+            eprintln!("selftest: back to 1 Player -> active {}, deck.track {:?}, B playing {}, load target {}", self.px.active, self.deck.track, self.player.other.lock().playing, self.load_target);
+            self.set_playing(false);
+        }
+        self.unload_track();
+        eprintln!("selftest: unload -> track {:?}, audio {}", self.deck.track, self.player.state.lock().audio.is_some());
     }
 
     /// Pointer events for PREPDECK_SHOT_PLAYER=menu (right-click on the enlarged waveform,
-    /// 150 pt right of the playhead) and =padhover (pointer over hot cue pad A's corner).
-    pub fn shot_player_events(&self, frame: u32, raw: &mut egui::RawInput) {
+    /// 150 pt right of the playhead), =padclear (click the clear cross of hot cue pad A) and
+    /// =dropload (release a dragged track over the player). Results go to stderr.
+    pub fn shot_player_events(&mut self, frame: u32, raw: &mut egui::RawInput) {
         let flags = shot_flags();
-        if flags.iter().any(|x| x == "menu") {
-            let Some((r, _, _)) = self.deck.detail_map else { return };
+        let has = |f: &str| flags.iter().any(|x| x == f);
+        let button = |pos: egui::Pos2, button: egui::PointerButton, pressed: bool| egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() };
+        // PREPDECK_SHOT_CLICK=x,y (window points; ",r" for the right button): one click at
+        // frame 100, to open a menu or press a button for the picture.
+        if let Ok(v) = std::env::var("PREPDECK_SHOT_CLICK") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if let (Some(Ok(x)), Some(Ok(y))) = (parts.first().map(|s| s.trim().parse::<f32>()), parts.get(1).map(|s| s.trim().parse::<f32>())) {
+                let b = if parts.get(2).map(|s| s.trim() == "r").unwrap_or(false) { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
+                match frame {
+                    98 => raw.events.push(egui::Event::PointerMoved(egui::pos2(x, y))),
+                    100 => raw.events.push(button(egui::pos2(x, y), b, true)),
+                    101 => raw.events.push(button(egui::pos2(x, y), b, false)),
+                    _ => {}
+                }
+            }
+        }
+        let Some((r, _, _)) = self.deck.detail_map else { return };
+        if has("menu") {
             let at = egui::pos2(r.center().x + 150.0, r.center().y - 20.0);
-            let click = |pressed: bool| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
             match frame {
                 80 => raw.events.push(egui::Event::PointerMoved(at)),
-                82 => raw.events.push(click(true)),
-                83 => raw.events.push(click(false)),
+                82 => raw.events.push(button(at, egui::PointerButton::Secondary, true)),
+                83 => raw.events.push(button(at, egui::PointerButton::Secondary, false)),
+                _ => {}
+            }
+        }
+        if has("padclear") {
+            // Pad A: centred 420.4 pt on the 1512 pt design, 22.6 pt into the strip that starts
+            // 121 pt below the waveform's top; its cross is in the top right corner.
+            let at = egui::pos2(r.min.x + (420.4 - 81.0) * (r.width() / 1219.0) + 9.5, r.min.y + 121.0 + 22.6 - 9.5);
+            let a = |app: &App| app.deck.cues.iter().filter(|c| c.kind == CueKind::Hot && c.slot == 0).count();
+            match frame {
+                80 => {
+                    eprintln!("padclear: hot cue A set: {}", a(self));
+                    raw.events.push(egui::Event::PointerMoved(at));
+                }
+                100 => raw.events.push(button(at, egui::PointerButton::Primary, true)),
+                101 => raw.events.push(button(at, egui::PointerButton::Primary, false)),
+                104 => eprintln!("padclear: after clicking the cross: {} (playing {})", a(self), self.playing()),
+                105 => {
+                    self.undo_edit();
+                    eprintln!("padclear: after Undo: {}", a(self));
+                }
+                _ => {}
+            }
+        }
+        if has("dropload") {
+            let at = r.center();
+            match frame {
+                80 => raw.events.push(egui::Event::PointerMoved(at)),
+                82 => {
+                    let other = self.tracks.iter().find(|t| Some(t.id) != self.deck.track && !t.missing && t.analyzed == 1).map(|t| t.id);
+                    eprintln!("dropload: loaded {:?}, dragging {:?}", self.deck.track, other);
+                    self.drag = other.map(|id| vec![id]);
+                }
+                100 => raw.events.push(button(at, egui::PointerButton::Primary, false)),
+                103 => eprintln!("dropload: after the drop: loaded {:?}, drag {:?}", self.deck.track, self.drag),
                 _ => {}
             }
         }

@@ -54,9 +54,57 @@ fn metal_device() -> Option<Device> {
     }
 }
 
-/// The device a model runs on: the Metal GPU when there is one, otherwise the CPU.
+/// The device a model runs on: the Metal GPU when there is one, otherwise the CPU. Made
+/// once and kept, so loaded models and compiled GPU kernels stay usable between tracks.
 pub fn device() -> Device {
-    metal_device().unwrap_or(Device::Cpu)
+    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+    DEVICE.get_or_init(|| metal_device().unwrap_or(Device::Cpu)).clone()
+}
+
+/// Share of each model segment that overlaps the next. Upstream's default; see
+/// checks/stem-speed-study.md for what lower values cost and save.
+pub const OVERLAP: f64 = 0.25;
+/// Overlap when the result is only analysed (vocal levels, key), never played: 17 % fewer
+/// segments; against known stems the separation quality is the same within 0.1 dB.
+pub const ANALYSIS_OVERLAP: f64 = 0.1;
+
+/// Loaded models stay in memory (about 170 MB each on the GPU) so that a second track, vocal
+/// detection or key analysis does not read and upload the checkpoint again.
+fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
+    static LOADED: std::sync::Mutex<Vec<(String, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+    let mut loaded = LOADED.lock().map_err(|_| anyhow!("model cache is unusable"))?;
+    if let Some(i) = loaded.iter().position(|(f, _)| f == file) {
+        // Most recently used last.
+        let entry = loaded.remove(i);
+        loaded.push(entry);
+    } else {
+        let g = htdemucs::Graph::load(&models_dir().join(file), &device()).map_err(|e| anyhow!("loading {file}: {e}"))?;
+        // Room for the four fine-tuned specialists.
+        while loaded.len() >= 4 {
+            loaded.remove(0);
+        }
+        loaded.push((file.to_string(), std::sync::Arc::new(g)));
+    }
+    Ok(loaded.last().unwrap().1.clone())
+}
+
+/// Planar stereo (left samples, then right) at 44.1 kHz from interleaved stereo at `sr`.
+fn planar_44k(samples: &[f32], sr: u32) -> (Vec<f32>, usize) {
+    let resampled;
+    let inter = if sr == htdemucs::SAMPLE_RATE {
+        samples
+    } else {
+        resampled = resample_to_44k(samples, sr);
+        &resampled
+    };
+    let len = inter.len() / 2;
+    let mut planar = vec![0f32; 2 * len];
+    let (l, r) = planar.split_at_mut(len);
+    for (i, f) in inter.chunks_exact(2).enumerate() {
+        l[i] = f[0];
+        r[i] = f[1];
+    }
+    (planar, len)
 }
 
 /// One downloadable separation model.
@@ -80,7 +128,8 @@ pub struct ModelSpec {
 
 pub const ROOT_URL: &str = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/";
 
-/// Best first. Both are open HTDemucs models (MIT licence) from facebookresearch/demucs.
+/// Both are open HTDemucs models (MIT licence) from facebookresearch/demucs; `choose` picks
+/// the recommended one.
 pub const CATALOG: [ModelSpec; 2] = [
     ModelSpec {
         id: "htdemucs_ft",
@@ -89,7 +138,7 @@ pub const CATALOG: [ModelSpec; 2] = [
         per_source: true,
         min_ram_gb: 15.0,
         needs_gpu: true,
-        about: "Four models, each fine-tuned for one stem: the best quality, about 4× the work.",
+        about: "Four models, each fine-tuned for one stem: a little better on benchmark music, 4× the time.",
         // Hashes of the published files (their name prefixes match), pinned on 2026-11-17.
         sha256: &[
             Some("ba3fe64ae8ef66ac9a4857222ce48efbdc5eb3ad375cb79dd13debee5aaa4066"),
@@ -107,16 +156,25 @@ pub const CATALOG: [ModelSpec; 2] = [
         per_source: false,
         min_ram_gb: 4.0,
         needs_gpu: false,
-        about: "One model for all four stems: good quality, runs on any computer.",
+        about: "One model for all four stems: recommended. Four times faster, and the parts add back up to the track more exactly.",
         sha256: &[None],
         licence: "MIT",
         source: "facebookresearch/demucs (Hybrid Transformer Demucs)",
     },
 ];
 
-/// The most capable model this machine runs well.
-pub fn choose(hw: &Hardware) -> &'static ModelSpec {
-    CATALOG.iter().find(|m| hw.ram_gb >= m.min_ram_gb && (!m.needs_gpu || hw.gpu)).unwrap_or(&CATALOG[CATALOG.len() - 1])
+/// The recommended model: HTDemucs, on every machine. The fine-tuned set takes four times as
+/// long for about +0.2 dB SDR on the MUSDB benchmark (9.0 -> 9.2, upstream's figures); on
+/// the tracks tried here it was not better and its four parts add back up to the mix less
+/// exactly (checks/stem-speed-study.md), so it stays a choice in Preferences rather than
+/// the default.
+pub fn choose(_hw: &Hardware) -> &'static ModelSpec {
+    &CATALOG[1]
+}
+
+/// Whether this machine can run model `m` at all.
+pub fn runs_on(m: &ModelSpec, hw: &Hardware) -> bool {
+    hw.ram_gb >= m.min_ram_gb && (!m.needs_gpu || hw.gpu)
 }
 
 pub fn spec(id: &str) -> Option<&'static ModelSpec> {
@@ -241,27 +299,27 @@ fn resample_to_44k(samples: &[f32], sr: u32) -> Vec<f32> {
 /// Separate a decoded track with model `m` (which must be downloaded).
 pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Stems> {
     let device = device();
-    let inter = resample_to_44k(samples, sr);
-    let len = inter.len() / 2;
-    let mut planar = vec![0f32; 2 * len];
-    for i in 0..len {
-        planar[i] = inter[2 * i];
-        planar[len + i] = inter[2 * i + 1];
-    }
+    let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
-    let mut out = vec![0f32; 8 * len];
-    for (k, f) in m.files.iter().enumerate() {
-        let graph = htdemucs::Graph::load(&models_dir().join(f), &device).map_err(|e| anyhow!("loading {f}: {e}"))?;
-        let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
-        let y = htdemucs::separate(&graph, &device, &planar, len, &mut cb).map_err(|e| anyhow!("{e}"))?;
-        if m.per_source {
-            // Model k is the specialist for source k (weights matrix is the identity).
-            out[k * 2 * len..(k + 1) * 2 * len].copy_from_slice(&y[k * 2 * len..(k + 1) * 2 * len]);
-        } else {
-            out.copy_from_slice(&y);
+    let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
+        if !m.per_source {
+            let g = graph(m.files[0])?;
+            let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
+            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb).map_err(|e| anyhow!("{e}"));
         }
-    }
-    Ok(Stems { len, data: out })
+        // Model k is the specialist for source k (upstream's weights matrix is the identity),
+        // so only that source is taken from it.
+        let mut out = Vec::with_capacity(8 * len);
+        for (k, f) in m.files.iter().enumerate() {
+            let g = graph(f)?;
+            let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
+            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb).map_err(|e| anyhow!("{e}"))?);
+        }
+        Ok(out)
+    };
+    let data = run(progress);
+    htdemucs::release_scratch();
+    Ok(Stems { len, data: data? })
 }
 
 /// The vocal stem alone (mono, 44.1 kHz): the vocals specialist of HTDemucs fine-tuned when
@@ -276,18 +334,13 @@ pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn 
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
     let device = device();
-    let inter = resample_to_44k(samples, sr);
-    let len = inter.len() / 2;
-    let mut planar = vec![0f32; 2 * len];
-    for i in 0..len {
-        planar[i] = inter[2 * i];
-        planar[len + i] = inter[2 * i + 1];
-    }
-    let graph = htdemucs::Graph::load(&models_dir().join(file), &device).map_err(|e| anyhow!("loading {file}: {e}"))?;
+    let (planar, len) = planar_44k(samples, sr);
+    let g = graph(file)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-    let y = htdemucs::separate(&graph, &device, &planar, len, &mut cb).map_err(|e| anyhow!("{e}"))?;
-    let (l, r) = (&y[source * 2 * len..(source * 2 + 1) * len], &y[(source * 2 + 1) * len..(source * 2 + 2) * len]);
-    Ok(l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect())
+    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb).map_err(|e| anyhow!("{e}"));
+    htdemucs::release_scratch();
+    let y = y?;
+    Ok(y[..len].iter().zip(&y[len..]).map(|(a, b)| 0.5 * (a + b)).collect())
 }
 
 /// Samples per vocal level (rekordbox's PVDI uses 1024 at 22,050 Hz: the same 46.4 ms).
@@ -447,8 +500,15 @@ pub fn save(path: &Path, s: &Stems) -> Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
     f.write_all(MAGIC)?;
     f.write_all(&(s.len as u64).to_le_bytes())?;
-    for v in &s.data {
-        f.write_all(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())?;
+    // Converted a block at a time: one write per sample made this the slowest step after the
+    // model itself.
+    let mut block = Vec::with_capacity(2 << 16);
+    for chunk in s.data.chunks(1 << 16) {
+        block.clear();
+        for v in chunk {
+            block.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+        }
+        f.write_all(&block)?;
     }
     // On disk before it gets its final name, so a crash can't leave a short cache file that
     // looks complete.
@@ -495,9 +555,68 @@ mod tests {
         let big = Hardware { cpu: String::new(), cores: 10, ram_gb: 32.0, apple_silicon: true, gpu: true };
         let small = Hardware { cpu: String::new(), cores: 4, ram_gb: 8.0, apple_silicon: false, gpu: false };
         let no_gpu = Hardware { gpu: false, ..big.clone() };
-        assert_eq!(choose(&big).id, "htdemucs_ft");
+        // The single model is recommended everywhere; the fine-tuned set is an option where
+        // it can run.
+        assert_eq!(choose(&big).id, "htdemucs");
         assert_eq!(choose(&small).id, "htdemucs");
         assert_eq!(choose(&no_gpu).id, "htdemucs");
+        let ft = spec("htdemucs_ft").unwrap();
+        assert!(runs_on(ft, &big) && !runs_on(ft, &small) && !runs_on(ft, &no_gpu));
+    }
+
+    #[test]
+    fn cache_file_round_trip() {
+        let s = Stems { len: 70_000, data: (0..8 * 70_000).map(|i| ((i % 2001) as f32 / 1000.0 - 1.0) * 1.2).collect() };
+        let path = std::env::temp_dir().join(format!("recordbox-stems-test-{}.stems", std::process::id()));
+        save(&path, &s).unwrap();
+        let back = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.len, s.len);
+        // 16-bit, clipped to full scale.
+        assert!(s.data.iter().zip(&back.data).all(|(a, b)| (a.clamp(-1.0, 1.0) - b).abs() < 1.0 / 32000.0));
+    }
+
+    /// End-to-end timing on a real track, per stage, as the app runs it. Set
+    /// PREPDECK_STEM_TEST_AUDIO to an audio file and optionally PREPDECK_STEM_MODEL
+    /// (htdemucs / htdemucs_ft; the model must be in the models folder). Nothing is written
+    /// to the stems cache. Run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn bench_full_track() {
+        let audio = std::env::var("PREPDECK_STEM_TEST_AUDIO").unwrap_or_default();
+        if audio.is_empty() {
+            return;
+        }
+        let m = std::env::var("PREPDECK_STEM_MODEL").ok().and_then(|id| spec(&id)).unwrap_or_else(|| choose(&assess()));
+        if !model_ready(m) {
+            println!("{} is not downloaded", m.id);
+            return;
+        }
+        let t = std::time::Instant::now();
+        let dec = crate::audio::decode_file(&audio).unwrap();
+        let secs = dec.samples.len() as f64 / 2.0 / dec.sr as f64;
+        println!("{}: {secs:.1} s of audio, device {:?}", m.id, device());
+        println!("decode            {:6.2} s", t.elapsed().as_secs_f64());
+        for pass in ["first (loads the model)", "second (model resident)"] {
+            let t = std::time::Instant::now();
+            let st = separate(m, &dec.samples, dec.sr, &mut |_| true).unwrap();
+            let d = t.elapsed().as_secs_f64();
+            println!("separate, {pass:<24} {d:6.2} s = {:.1}x real time", secs / d);
+            if pass.starts_with("second") {
+                let path = std::env::temp_dir().join(format!("recordbox-stems-bench-{}.stems", std::process::id()));
+                let t = std::time::Instant::now();
+                save(&path, &st).unwrap();
+                println!("cache write       {:6.2} s", t.elapsed().as_secs_f64());
+                let t = std::time::Instant::now();
+                let back = load(&path).unwrap();
+                println!("cache read        {:6.2} s", t.elapsed().as_secs_f64());
+                let _ = std::fs::remove_file(&path);
+                assert_eq!(back.len, st.len);
+            }
+        }
+        let t = std::time::Instant::now();
+        let v = separate_vocals(&dec.samples, dec.sr, &mut |_| true).unwrap();
+        println!("vocal stem only   {:6.2} s ({} samples)", t.elapsed().as_secs_f64(), v.len());
     }
 
     /// Separates 20 s of a real track with the local HTDemucs checkpoint (from the research
@@ -514,6 +633,7 @@ mod tests {
         println!("device: {:?}", device);
         let t0 = std::time::Instant::now();
         let graph = htdemucs::Graph::load(&th, &device).unwrap();
+        let opts = htdemucs::Options::default();
         println!("loaded .th in {:.1}s", t0.elapsed().as_secs_f64());
         let dec = crate::audio::decode_file(&audio).unwrap();
         assert_eq!(dec.sr, 44100);
@@ -526,7 +646,7 @@ mod tests {
             planar[len + i] = seg[2 * i + 1];
         }
         let t1 = std::time::Instant::now();
-        let y = htdemucs::separate(&graph, &device, &planar, len, &mut |d, t| {
+        let y = htdemucs::separate(&graph, &device, &planar, len, &opts, &mut |d, t| {
             println!("chunk {d}/{t} at {:.1}s", t1.elapsed().as_secs_f64());
             true
         })

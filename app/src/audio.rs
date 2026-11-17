@@ -281,6 +281,7 @@ pub struct Player {
 }
 
 impl Player {
+    #[allow(dead_code)]
     pub fn new() -> Player {
         Self::with_device(None)
     }

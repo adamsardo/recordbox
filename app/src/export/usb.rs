@@ -771,6 +771,11 @@ pub struct ExportRequest {
     pub remove_nodes: Vec<u32>,
     /// With `remove_nodes`: also remove their tracks that no remaining playlist uses.
     pub delete_unreferenced: bool,
+    /// Tracks already on the drive keep the cues the drive has (Sync Manager without
+    /// "including cue points"); new tracks always get the library's cues.
+    pub keep_device_cues: bool,
+    /// Text for table 19's device label (None keeps the drive's).
+    pub device_name: Option<String>,
     pub root: PathBuf,
     pub nodes: Vec<ExportNode>,
     pub tracks: HashMap<i64, ExportTrack>,
@@ -988,7 +993,7 @@ pub fn recover_device(root: &Path) -> Option<String> {
     Some(msg.to_string())
 }
 
-fn sha256_file(p: &Path) -> Result<[u8; 32]> {
+pub(crate) fn sha256_file(p: &Path) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut f = std::fs::File::open(p)?;
@@ -1037,7 +1042,7 @@ fn next_anlz_name(dir: &Path, reserved: Option<&i32>) -> String {
 }
 
 /// "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT" -> "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000".
-fn anlz_base(analyze_path: &str) -> Option<String> {
+pub fn anlz_base(analyze_path: &str) -> Option<String> {
     let p = analyze_path.strip_suffix(".DAT").or_else(|| analyze_path.strip_suffix(".dat"))?;
     if p.starts_with("/PIONEER/USBANLZ/") || p.starts_with("/.PIONEER/USBANLZ/") {
         Some(p.to_string())
@@ -1482,8 +1487,11 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                 device.insert(e, anlz::read_valid_section_list(&b.with_extension(e)));
             }
         }
+        // Without "including cue points" a track that is already on the drive keeps its cues.
+        let device_cues: Option<Vec<Cue>> = (req.keep_device_cues && lib.tracks.contains_key(&dev_id)).then(|| anlz::parse_cues(device.get("EXT").map(Vec::as_slice).unwrap_or(&[]), device.get("DAT").map(Vec::as_slice).unwrap_or(&[]))).filter(|_| device.values().any(|l| !l.is_empty()));
+        let cues: &[Cue] = device_cues.as_deref().unwrap_or(&et.cues);
         let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device, pvdi: et.vocal.as_deref().map(anlz::pvdi) });
-        let files = anlz::build_with(&usb_path, &beats, &wave, &et.cues, t.raw_samples, t.sample_rate, ov.as_ref());
+        let files = anlz::build_with(&usb_path, &beats, &wave, cues, t.raw_samples, t.sample_rate, ov.as_ref());
         let base = match anlz_base(&prev.analyze_path) {
             Some(b) => b,
             None => {
@@ -1614,6 +1622,9 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         }
     }
     node_ids.retain(|_, dev| lib.nodes.iter().any(|n| n.id == *dev));
+    if let Some(name) = &req.device_name {
+        lib.device_name = pdb::clip_chars(name.trim(), 63).to_string();
+    }
     if let Some(names) = &req.color_names {
         if names.len() == 8 {
             lib.color_names = names.iter().map(|n| pdb::clip_chars(n.trim(), 63).to_string()).collect();
@@ -1727,7 +1738,7 @@ fn read_artwork_record(root: &Path) -> BTreeMap<String, String> {
     std::fs::read_to_string(artwork_record_path(root)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-fn hex(b: [u8; 32]) -> String {
+pub(crate) fn hex(b: [u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -1747,7 +1758,8 @@ fn drop_nodes(lib: &mut DeviceLibrary, ids: &[u32]) -> Vec<u32> {
     let mut i = 0;
     while i < doomed.len() {
         let p = doomed[i];
-        doomed.extend(lib.nodes.iter().filter(|n| n.parent == p && !doomed.contains(&n.id)).map(|n| n.id));
+        let kids: Vec<u32> = lib.nodes.iter().filter(|n| n.parent == p && !doomed.contains(&n.id)).map(|n| n.id).collect();
+        doomed.extend(kids);
         i += 1;
     }
     let mut tracks: Vec<u32> = lib.nodes.iter().filter(|n| doomed.contains(&n.id)).flat_map(|n| n.entries.clone()).collect();
@@ -1827,14 +1839,31 @@ pub const ANLZ_EXTS: [&str; 4] = ["DAT", "EXT", "2EX", "3EX"];
 /// cut short by a crash or a pulled drive is finished the next time the drive is seen, and an
 /// interruption before publication changes nothing.
 pub fn change_device(root: &Path, change: impl FnOnce(&mut DeviceLibrary) -> Result<Vec<PathBuf>>) -> Result<DeviceLibrary> {
+    change_device_with(root, |lib| Ok((change(lib)?, vec![])))
+}
+
+/// [`change_device`] that also writes files (player settings) inside the same journal:
+/// `change` returns (files to delete afterwards, files to write as (path, bytes)). The files
+/// are written before the databases are published and restored if the change is undone.
+pub fn change_device_with(root: &Path, change: impl FnOnce(&mut DeviceLibrary) -> Result<(Vec<PathBuf>, Vec<(PathBuf, Vec<u8>)>)>) -> Result<DeviceLibrary> {
     if !root.is_dir() {
         return Err(anyhow!("The device is not available"));
     }
     recover_device(root);
     let mut lib = read_device(root).map_err(|e| anyhow!("Device library is corrupted ({e}). Nothing was changed."))?;
-    let gone = change(&mut lib)?;
+    let (gone, write) = change(&mut lib)?;
     let mut created = Created::begin(root)?;
     backup_device_db(root);
+    for (p, bytes) in &write {
+        if !p.starts_with(root) {
+            return Err(anyhow!("{} is not on the device", p.display()));
+        }
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        created.will_replace(p)?;
+        write_atomic(p, bytes)?;
+    }
     for f in &gone {
         created.will_delete(f)?;
     }
@@ -1889,7 +1918,7 @@ pub fn set_device_name(root: &Path, name: &str) -> Result<()> {
 }
 
 /// Write via a temporary file that is flushed to the device before it replaces `path`.
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     write_tmp(path, data)?;
     publish_tmp(path)
 }

@@ -87,9 +87,9 @@ fn ring(p: &egui::Painter, c: egui::Pos2, rad: f32, from: f32, sweep: f32, s: St
 
 /// The "CUE" mark of tracks with hot cues or memory cues.
 fn icon_cue(p: &egui::Painter, left_center: egui::Pos2, col: Color32) {
-    let r = Rect::from_min_size(left_center + vec2(0.0, -4.5), vec2(20.0, 9.0));
+    let r = Rect::from_min_size(left_center + vec2(0.0, -4.5), vec2(16.5, 9.0));
     p.rect_stroke(r, 1.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
-    p.text(r.center() + vec2(0.0, 0.2), Align2::CENTER_CENTER, "CUE", bold(7.0), col);
+    p.text(r.center() + vec2(0.0, 0.2), Align2::CENTER_CENTER, "CUE", bold(6.5), col);
 }
 
 /// Attribute column (60 pt, two 30 pt halves as in the original): left half now playing,
@@ -149,7 +149,7 @@ pub fn status_cell(app: &mut App, ui: &mut Ui, t: &Track, r: Rect) {
         _ => star(&p, ic, 4.8, WHITE, true),
     }
     if cued && t.analyzed != 3 {
-        icon_cue(&p, pos2(b.min.x + 14.0, cy), if t.analyzed == 1 { hex(0xC8C8C8) } else { DIM });
+        icon_cue(&p, pos2(b.min.x + 13.0, cy), if t.analyzed == 1 { hex(0xC8C8C8) } else { DIM });
         tips.push("Track has Hot Cue/Memory Cue");
     }
     if !tips.is_empty() && app.prefs.tooltips && ui.rect_contains_pointer(r) {
@@ -528,8 +528,10 @@ pub fn add_to_playlist_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
     level(app, ui, 0, sel, 0);
 }
 
-fn check(on: bool, label: &str) -> String {
-    format!("{} {label}", if on { "✔" } else { "   " })
+/// A menu entry with a tick box (rekordbox's checkmark entries); true when clicked.
+fn check_item(ui: &mut Ui, on: bool, label: &str) -> egui::Response {
+    let mut v = on;
+    ui.checkbox(&mut v, label)
 }
 
 /// The track context menu (also the menu bar's Track menu).
@@ -575,7 +577,7 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         ui.close_menu();
     }
     let locked = sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));
-    if ui.button(check(locked, "Analysis Lock")).clicked() {
+    if check_item(ui, locked, "Analysis Lock").clicked() {
         for id in sel {
             if let Some(t) = app.track_mut(*id) {
                 t.grid_locked = !locked;
@@ -619,7 +621,7 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         let auto = sel.iter().all(|id| app.track(*id).map(|t| t.autoload_hotcue).unwrap_or(false));
         let none = sel.iter().all(|id| app.track(*id).map(|t| !t.autoload_hotcue).unwrap_or(false));
         for (on, label, now) in [(true, "Enable Auto Load Hot Cue", auto), (false, "Disable Auto Load Hot Cue", none)] {
-            if ui.button(check(now, label)).clicked() {
+            if check_item(ui, now, label).clicked() {
                 for id in sel {
                     if let Some(t) = app.track_mut(*id) {
                         t.autoload_hotcue = on;
@@ -686,7 +688,7 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         let others: Vec<i64> = sel.iter().copied().filter(|t| *t != src).collect();
         let linked = others.iter().all(|t| app.is_match(src, *t));
         ui.menu_button("Matching", |ui| {
-            if ui.button(check(linked, &format!("Good match with \"{name}\""))).on_hover_text("Set a good match combination of tracks.\nSee also Related Track List window.(Matching)").clicked() {
+            if check_item(ui, linked, &format!("Good match with \"{name}\"")).on_hover_text("Set a good match combination of tracks.\nSee also Related Track List window.(Matching)").clicked() {
                 for t in &others {
                     app.matching_set(src, *t, !linked);
                 }
@@ -895,6 +897,7 @@ pub fn tree_search_field(app: &mut App, ui: &mut Ui) {
 /// are added to `drop` (Tag List as -1).
 pub fn tree_top_rows(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
     let n = app.ext.tag_list.len();
+    if app.prefs.tree_item("Tag List") {
     let r = tree_row(ui, 1, "Tag List", Some(n), app.view == View::TagList, TreeIcon::Note, 15.0);
     {
         // The tag-list glyph over the note placeholder.
@@ -916,6 +919,7 @@ pub fn tree_top_rows(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
             ui.close_menu();
         }
     });
+    }
     // Shortcuts (up to 8), behind an open/close row.
     if !app.prefs.shortcuts.is_empty() {
         let open = app.prefs.shortcuts_open;
@@ -1030,7 +1034,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
         app.scan_devices();
     }
     ui.add_space(1.0);
-    let root = tree_row(ui, 1, "Histories", None, matches!(app.view, View::History(0)), TreeIcon::Open, 17.0);
+    let root = tree_row(ui, 0, "Histories", None, matches!(app.view, View::History(0)), TreeIcon::Open, 17.0);
     if root.clicked() {
         app.set_view(View::History(0));
     }
@@ -1054,7 +1058,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
             let yk = egui::Id::new(("hist_year", year.clone()));
             let ydef = newest.as_ref().map(|n| n.0 == year).unwrap_or(false);
             let yopen = ui.ctx().data(|d| d.get_temp::<bool>(yk)).unwrap_or(ydef);
-            if tree_row(ui, 2, &year, None, false, if yopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
+            if tree_row(ui, 1, &year, None, false, if yopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(yk, !yopen));
             }
             if !yopen {
@@ -1064,7 +1068,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
                 let mk = egui::Id::new(("hist_month", year.clone(), month.clone()));
                 let mdef = newest.as_ref().map(|n| n.0 == year && n.1 == month).unwrap_or(false);
                 let mopen = ui.ctx().data(|d| d.get_temp::<bool>(mk)).unwrap_or(mdef);
-                if tree_row(ui, 3, month_name(&month), None, false, if mopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
+                if tree_row(ui, 2, month_name(&month), None, false, if mopen { TreeIcon::FolderOpen } else { TreeIcon::FolderClosed }, 16.0).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(mk, !mopen));
                 }
                 if !mopen {
@@ -1072,7 +1076,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
                 }
                 for h in list {
                     let sel = app.view == View::History(h.id);
-                    let r = tree_row(ui, 4, &h.name, Some(h.count), sel, TreeIcon::Playlist, 15.0);
+                    let r = tree_row(ui, 3, &h.name, Some(h.count), sel, TreeIcon::Playlist, 15.0);
                     if r.clicked() {
                         app.set_view(View::History(h.id));
                     }
@@ -1097,7 +1101,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
             if hist.is_empty() {
                 continue;
             }
-            let dr = tree_row(ui, 2, &name, None, false, TreeIcon::Device, 17.0);
+            let dr = tree_row(ui, 1, &name, None, false, TreeIcon::Device, 17.0);
             dr.context_menu(|ui| {
                 if ui.button("Import All Histories").clicked() {
                     app.import_device_histories();
@@ -1106,7 +1110,7 @@ pub fn history_tree(app: &mut App, ui: &mut Ui) {
             });
             for (id, hname, n) in hist {
                 let sel = app.view == View::DeviceHistory { root: root.clone(), id };
-                let r = tree_row(ui, 3, &hname, Some(n), sel, TreeIcon::Playlist, 15.0);
+                let r = tree_row(ui, 2, &hname, Some(n), sel, TreeIcon::Playlist, 15.0);
                 if r.clicked() {
                     app.set_view(View::DeviceHistory { root: root.clone(), id });
                 }
@@ -1166,10 +1170,12 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
         }
         r.context_menu(|ui| related_menu(app, ui, Some(i)));
     }
-    let m = tree_row(ui, 2, "Matching", None, app.view == View::Matching, TreeIcon::None, 15.0);
-    let m = if app.prefs.tooltips { m.on_hover_text("Show tracks based on good match combinations.") } else { m };
-    if m.clicked() {
-        app.set_view(View::Matching);
+    if app.prefs.tree_item("Matching") {
+        let m = tree_row(ui, 2, "Matching", None, app.view == View::Matching, TreeIcon::None, 15.0);
+        let m = if app.prefs.tooltips { m.on_hover_text("Show tracks based on good match combinations.") } else { m };
+        if m.clicked() {
+            app.set_view(View::Matching);
+        }
     }
     ui.add_space(6.0);
     let src = app.related_source();
@@ -1196,7 +1202,7 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
     }
     // Criteria.
     let open = app.ext.criteria_open;
-    let cr = ui.add(egui::Button::new(RichText::new(format!("{} Criteria", if open { "▾" } else { "▸" })).size(11.5).color(WHITE)).fill(BTN));
+    let cr = ui.add(egui::Button::new(RichText::new("Criteria").size(11.5).color(WHITE)).fill(if open { BLUE } else { BTN }));
     let cr = if app.prefs.tooltips { cr.on_hover_text("Customize the criteria") } else { cr };
     if cr.clicked() {
         app.ext.criteria_open = !open;

@@ -42,6 +42,10 @@ zip = { version = "7", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
+# The stem model's own Metal kernels (src/stems/metal_fast.rs) are built with the same Metal
+# wrappers Candle uses; both crates are already in the tree through candle-core.
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
 
 [profile.dev]
 opt-level = 2

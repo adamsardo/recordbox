@@ -282,6 +282,8 @@ fn smart_window(app: &mut App, ctx: &Context) {
 }
 
 fn export_window(app: &mut App, ctx: &Context) {
+    // Device windows (Property, Sync Manager, import progress, confirmations): device_ext.rs.
+    crate::device_ext::windows(app, ctx);
     if !app.dialogs.export_open {
         return;
     }
@@ -290,13 +292,33 @@ fn export_window(app: &mut App, ctx: &Context) {
         if let Some(job) = &app.export_job {
             let (d, t, txt) = job.last.clone();
             ui.label(RichText::new("Write to the device").strong());
-            ui.add(egui::ProgressBar::new(if t > 0 { d as f32 / t as f32 } else { 0.0 }).text(format!("{d} / {t}")));
+            ui.add(egui::ProgressBar::new(if t > 0 { d as f32 / t as f32 } else { 0.0 }).text(format!("{d} / {t}  ({} remaining)", t.saturating_sub(d))));
             ui.label(RichText::new(txt).size(11.0).color(DIM));
             if ui.button("Stop").clicked() {
                 job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             ui.ctx().request_repaint();
             return;
+        }
+        // What the last export did, until it is dismissed.
+        if let Some(rep) = app.export_report.clone() {
+            ui.label(RichText::new("Export completed").strong());
+            ui.label(format!("{} track(s) copied to the device, {} already there updated. The device now has {} tracks and {} playlists.", rep.copied, rep.updated, rep.tracks_on_device, rep.playlists_on_device));
+            if rep.removed_lists > 0 || rep.removed_tracks > 0 {
+                ui.label(format!("Removed from the device: {} list(s), {} track(s).", rep.removed_lists, rep.removed_tracks));
+            }
+            if !rep.skipped.is_empty() {
+                ui.label(RichText::new(format!("{} track(s) were not exported:", rep.skipped.len())).color(CAUTION_TX));
+                egui::ScrollArea::vertical().id_salt("export_skipped").max_height(140.0).show(ui, |ui| {
+                    for s in &rep.skipped {
+                        ui.label(RichText::new(s).size(11.0));
+                    }
+                });
+            }
+            if ui.button("OK").clicked() {
+                app.export_report = None;
+            }
+            ui.separator();
         }
         ui.horizontal(|ui| {
             ui.label("Device");
@@ -334,6 +356,15 @@ fn export_window(app: &mut App, ctx: &Context) {
             }
         }
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Export").strong());
+            if ui.radio(!app.device_ui.export_tracks_only, "Selected playlists with their folders").on_hover_text("The ticked playlists and folders are created on the device, with their tracks.").clicked() {
+                app.device_ui.export_tracks_only = false;
+            }
+            if ui.radio(app.device_ui.export_tracks_only, "Tracks only").on_hover_text("Only the tracks of the ticked playlists go to the device (its track list); no playlists are created or changed.").clicked() {
+                app.device_ui.export_tracks_only = true;
+            }
+        });
         ui.label(RichText::new("Playlists to export").strong());
         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
             fn rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize) {
@@ -381,7 +412,8 @@ fn export_window(app: &mut App, ctx: &Context) {
                 let root = app.dialogs.export_root.clone().unwrap();
                 let sel: Vec<i64> = app.dialogs.export_sel.iter().copied().collect();
                 let tracks = app.dialogs.export_tracks.clone();
-                app.start_export(&root, &sel, &tracks);
+                // Free space is checked first; the reason is shown when there is not enough.
+                app.export_from_dialog(&root, &sel, &tracks);
             }
             if ui.button("Close").clicked() {
                 app.dialogs.export_open = false;

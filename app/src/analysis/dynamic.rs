@@ -75,7 +75,19 @@ pub fn tempo_and_grid_dynamic(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64)
     for t in times.iter_mut() {
         *t -= lag;
     }
-    let segs = merge_similar(&times, merge_short(&times, segments(&times, FIT_TOL)), FIT_TOL);
+    // A steady track stays steady: when one tempo already explains four beats in five, the
+    // rest are stretches with nothing to track (breakdowns, intros), not tempo changes.
+    let explained = times.iter().filter(|t| crate::model::nearest_beat(&const_beats, **t).map(|b| (b.time - **t).abs() < 0.02).unwrap_or(false)).count();
+    if explained * 5 >= times.len() * 4 {
+        return (bpm0, Some(grid0));
+    }
+    let segs = bridge_drift(merge_similar(&times, merge_short(&times, segments(&times, FIT_TOL)), FIT_TOL));
+    // Runs at the track's overall tempo that together hold 85 % of the beats: the short
+    // remainder is the tracker wandering where there was nothing to follow.
+    let at_main: usize = segs.iter().filter(|s| ((60.0 / s.2) / bpm0 - 1.0).abs() < 0.0015).map(|s| s.1 - s.0 + 1).sum();
+    if at_main * 100 >= times.len() * 85 {
+        return (bpm0, Some(grid0));
+    }
     if segs.len() <= 1 {
         // One tempo explains every beat: Normal mode's grid has the finer phase.
         let fits = segs.first().map(|s| (60.0 / s.2 - bpm0).abs() < 0.5).unwrap_or(true);
@@ -348,6 +360,34 @@ fn merge_short(ts: &[f64], mut segs: Vec<(usize, usize, f64, f64)>) -> Vec<(usiz
         segs[a] = (start, end, period, t0);
         segs.remove(b);
     }
+}
+
+/// A run that leaves a tempo and comes back to it exactly in phase was the tracker drifting
+/// through a passage without beats: when a later run has the same tempo as an earlier one and
+/// starts a whole number of that tempo's beats after it, everything between joins the earlier run.
+fn bridge_drift(mut segs: Vec<(usize, usize, f64, f64)>) -> Vec<(usize, usize, f64, f64)> {
+    let mut i = 0;
+    while i < segs.len() {
+        let (_, _, p, t0) = segs[i];
+        let mut joined = false;
+        for k in (i + 1..segs.len()).rev() {
+            let (_, kend, kp, kt0) = segs[k];
+            if (kp / p - 1.0).abs() > 0.0015 {
+                continue;
+            }
+            let n = (kt0 - t0) / p;
+            if (n - n.round()).abs() * p <= 0.015 {
+                segs[i].1 = kend;
+                segs.drain(i + 1..=k);
+                joined = true;
+                break;
+            }
+        }
+        if !joined {
+            i += 1;
+        }
+    }
+    segs
 }
 
 /// Neighbouring runs that one tempo explains nearly as well (within 1.5 x the tolerance)

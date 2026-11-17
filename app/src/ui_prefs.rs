@@ -180,6 +180,12 @@ fn toggle_if(ui: &mut Ui, wired: bool, on: &mut bool, label: &str, why: &str) {
     }
 }
 
+/// A shortcut as the window shows it. The app's font has no ⌃ or ⌥ glyph, so those two are
+/// spelled out.
+fn key_text(sc: &Shortcut) -> String {
+    sc.label().replace('⌃', "Ctrl ").replace('⌥', "Opt ").replace('⇧', "Shift ")
+}
+
 fn radio(ui: &mut Ui, on: bool, label: &str) -> bool {
     ui.radio(on, RichText::new(label).size(14.0)).clicked()
 }
@@ -903,8 +909,8 @@ fn dual_list(app: &mut App, ui: &mut Ui, is_cat: bool) {
                     let up = ui.add_enabled(can_up, egui::Button::new(" ").min_size(vec2(22.0, 22.0))).on_hover_text("Up");
                     let r = up.rect.shrink(5.0);
                     let c = if can_up { WHITE } else { OFF };
-                    ui.painter().line_segment([egui::pos2(r.min.x, r.max.y - 2.0), egui::pos2(r.center().x, r.min.y + 2.0)], egui::Stroke::new(1.5, c));
-                    ui.painter().line_segment([egui::pos2(r.center().x, r.min.y + 2.0), egui::pos2(r.max.x, r.max.y - 2.0)], egui::Stroke::new(1.5, c));
+                    ui.painter().line_segment([egui::pos2(r.min.x, r.max.y - 2.0), egui::pos2(r.center().x, r.min.y + 2.0)], egui::Stroke::new(1.5_f32, c));
+                    ui.painter().line_segment([egui::pos2(r.center().x, r.min.y + 2.0), egui::pos2(r.max.x, r.max.y - 2.0)], egui::Stroke::new(1.5_f32, c));
                     if up.clicked() {
                         if let Some(i) = pos {
                             next.swap(i, i - 1);
@@ -953,7 +959,7 @@ fn setting_rows(app: &mut App, ui: &mut Ui, id: &str, fields: &[crate::export::s
     });
 }
 
-fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
+pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
             card(ui, "Background Color", |ui| {
@@ -1073,7 +1079,7 @@ const RESERVED: [&str; 9] = ["Cmd+N", "Cmd+E", "Cmd+I", "Cmd+Z", "Shift+Cmd+Z", 
 fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
     let cat = ACTION_CATEGORIES[tab.min(ACTION_CATEGORIES.len() - 1)];
     card(ui, cat, |ui| {
-        ui.label(RichText::new("Click a shortcut, then press the new key for that action, with ⌃ ⌥ ⇧ ⌘ if you like (Esc cancels, Delete clears).").size(12.0).color(DIM2));
+        ui.label(RichText::new("Click a shortcut, then press the new key for that action, with Ctrl, Opt, Shift or ⌘ if you like (Esc cancels, Delete clears).").size(12.0).color(DIM2));
         let wait_id = egui::Id::new("key_wait");
         let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
         if let Some(action) = &waiting {
@@ -1089,7 +1095,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                 } else if plain && matches!(sc.key, egui::Key::Delete | egui::Key::Backspace) && action != "remove" {
                     app.prefs.keymap.insert(action.clone(), String::new());
                 } else if RESERVED.contains(&sc.name().as_str()) {
-                    app.toast_err(format!("{} is kept by the menus.", sc.label()));
+                    app.toast_err(format!("{} is kept by the menus.", key_text(&sc)));
                 } else {
                     // A shortcut belongs to one action: take it away from any other.
                     let name = sc.name();
@@ -1108,12 +1114,12 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                     continue;
                 }
                 ui.label(RichText::new(label).size(13.0));
-                let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.shortcut_for(id).map(|k| k.label()).unwrap_or_else(|| "—".into()) };
+                let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.shortcut_for(id).map(|k| key_text(&k)).unwrap_or_else(|| "—".into()) };
                 if ui.add(egui::Button::new(RichText::new(shown).size(13.0)).min_size(vec2(140.0, 22.0))).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(wait_id, Some(id.to_string())));
                 }
                 let changed = app.prefs.keymap.contains_key(id);
-                if ui.add_enabled(changed, egui::Button::new(RichText::new("Default").size(11.0))).on_hover_text(if def.is_empty() { "Not assigned".to_string() } else { Shortcut::parse(def).map(|s| s.label()).unwrap_or_default() }).clicked() {
+                if ui.add_enabled(changed, egui::Button::new(RichText::new("Default").size(11.0))).on_hover_text(if def.is_empty() { "Not assigned".to_string() } else { Shortcut::parse(def).map(|s| key_text(&s)).unwrap_or_default() }).clicked() {
                     app.prefs.keymap.remove(id);
                 }
                 ui.end_row();
@@ -1142,7 +1148,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                 app.dialogs.ext.shortcuts_open = true;
             }
         });
-        note(ui, "⌘ and ⌃ shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
+        note(ui, "⌘ and Ctrl shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
     });
 }
 
@@ -1316,7 +1322,7 @@ fn shortcuts_window(app: &mut App, ctx: &Context) {
                         }
                         ui.label(RichText::new(label).size(12.5));
                         match app.prefs.shortcut_for(id) {
-                            Some(k) => ui.label(RichText::new(k.label()).size(12.5).color(WHITE)),
+                            Some(k) => ui.label(RichText::new(key_text(&k)).size(12.5).color(WHITE)),
                             None => ui.label(RichText::new("—").size(12.5).color(OFF)),
                         };
                         ui.end_row();

@@ -670,7 +670,7 @@ mod tests {
     use super::*;
     #[test]
     fn strings_roundtrip() {
-        for s in ["", "Pink", "Ünïcødé ✓", &"x".repeat(300)] {
+        for s in ["", "Pink", "Ünïcødé ✓", &"x".repeat(200), &"x".repeat(126), &"x".repeat(127), &"x".repeat(255)] {
             let e = dstr(s);
             assert_eq!(read_dstr(&e, 0), s);
         }

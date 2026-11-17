@@ -989,6 +989,23 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         if resp.clicked() && !ejected {
             app.set_view(View::Device { root: root.clone(), node: None });
         }
+        // Background Color of the device (Property window), as a marker on its row.
+        if let Some(bg) = app.device_ui.bg.get(&root).copied().filter(|b| (1..=8).contains(b)) {
+            ui.painter().rect_filled(Rect::from_min_size(pos2(resp.rect.min.x + 2.0, resp.rect.min.y + 3.0), vec2(3.0, resp.rect.height() - 6.0)), 1.0, label_color(bg));
+        }
+        // Tracks or a playlist dragged from the library and dropped on the device open the
+        // export for them.
+        if app.drag.is_some() || app.node_drag.is_some() {
+            if let Some(pp) = ui.ctx().pointer_latest_pos().filter(|p| resp.rect.contains(*p)) {
+                ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.5, BLUE), egui::StrokeKind::Inside);
+                if ui.input(|i| i.pointer.any_released()) {
+                    let _ = pp;
+                    let (lists, tracks) = (app.node_drag.take().into_iter().collect::<Vec<i64>>(), app.drag.take().unwrap_or_default());
+                    open_export(app, lists, tracks);
+                    app.dialogs.export_root = Some(root.clone());
+                }
+            }
+        }
         let r2 = root.clone();
         resp.context_menu(|ui| {
             if ui.button("Export to this device…").clicked() {
@@ -1001,6 +1018,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 app.update_device_playlists(&r2);
                 ui.close_menu();
             }
+            crate::device_ext::device_row_menu(app, ui, &r2);
             if ui.button("Clean Up Unused Files…").on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
@@ -1043,7 +1061,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 }
                 ui.close_menu();
             }
-            if fs == "folder" && ui.button("Remove from list").clicked() {
+            if fs == "folder" && ui.button("Remove USB Device").on_hover_text("Take this folder off the device list. Nothing in the folder is deleted.").clicked() {
                 app.prefs.devices_extra.retain(|d| d != &r2);
                 app.save_prefs();
                 app.scan_devices();
@@ -1066,13 +1084,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                     if resp.clicked() {
                         app.set_view(View::Device { root: root.to_string(), node: Some(n.id) });
                     }
-                    let (r, id, name) = (root.to_string(), n.id, n.name.clone());
-                    resp.context_menu(|ui| {
-                        if ui.button(if n.folder { "Delete Folder from device" } else { "Delete Playlist from device" }).clicked() {
-                            app.dialogs.device_remove = Some((r.clone(), id, name.clone()));
-                            ui.close_menu();
-                        }
-                    });
+                    resp.context_menu(|ui| crate::device_ext::device_node_menu(app, ui, root, n));
                     if n.folder {
                         rows(app, ui, root, nodes, n.id, depth + 1);
                     }
@@ -1313,8 +1325,35 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(&mut body, ROW_H, tracks.len(), |ui, range| {
         for i in range {
             let t = &tracks[i];
-            let (rr, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-            ui.painter().rect_filled(rr, 0.0, if i % 2 == 0 { BG1 } else { BG2 });
+            let (rr, row) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+            if app.device_ui.sel_root != root {
+                app.device_ui.sel_root = root.to_string();
+                app.device_ui.sel.clear();
+                app.device_ui.anchor = None;
+            }
+            // Click selects; ⌘ adds or removes one; ⇧ extends from the last clicked row.
+            if row.clicked() || (row.secondary_clicked() && !app.device_ui.sel.contains(&t.id)) {
+                let m = ui.input(|i| i.modifiers);
+                if m.shift && app.device_ui.anchor.is_some() && !row.secondary_clicked() {
+                    let a = app.device_ui.anchor.unwrap().min(tracks.len() - 1);
+                    app.device_ui.sel = tracks[a.min(i)..=a.max(i)].iter().map(|x| x.id).collect();
+                } else if m.command && !row.secondary_clicked() {
+                    if !app.device_ui.sel.remove(&t.id) {
+                        app.device_ui.sel.insert(t.id);
+                    }
+                    app.device_ui.anchor = Some(i);
+                } else {
+                    app.device_ui.sel = [t.id].into();
+                    app.device_ui.anchor = Some(i);
+                }
+            }
+            let selected = app.device_ui.sel.contains(&t.id);
+            ui.painter().rect_filled(rr, 0.0, if selected { SELECT } else if i % 2 == 0 { BG1 } else { BG2 });
+            let r3 = root.to_string();
+            row.context_menu(|ui| {
+                let ids: Vec<u32> = app.device_ui.sel.iter().copied().collect();
+                crate::device_ext::device_track_menu(app, ui, &r3, &ids);
+            });
             let vals = [
                 t.title.clone(),
                 t.artist.clone(),
