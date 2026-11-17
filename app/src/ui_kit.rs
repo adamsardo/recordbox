@@ -171,12 +171,12 @@ pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 pub fn card_help(ui: &mut Ui, title: &str, tip: Option<&str>, add: impl FnOnce(&mut Ui)) {
-    card_x(ui, title, 25.0, tip, add)
+    card_x(ui, title, vec2(0.0, 0.0), tip, add)
 }
 
-/// A card whose heading starts `x` pt from its left edge (25 everywhere but Audio > Metronome,
-/// which the original sets 8 pt further left).
-pub fn card_x(ui: &mut Ui, title: &str, x: f32, tip: Option<&str>, add: impl FnOnce(&mut Ui)) {
+/// A card whose heading is moved by `shift` from its usual place (the original sets the
+/// heading of Audio > Metronome 8 pt further left and 5 pt higher than every other one).
+pub fn card_x(ui: &mut Ui, title: &str, shift: Vec2, tip: Option<&str>, add: impl FnOnce(&mut Ui)) {
     let w = ui.available_width().min(CARD_W);
     egui::Frame::default().fill(BG2).show(ui, |ui| {
         ui.set_width(w);
@@ -184,7 +184,7 @@ pub fn card_x(ui: &mut Ui, title: &str, x: f32, tip: Option<&str>, add: impl FnO
         ui.add_space(20.0);
         set_flow(ui, Flow { prev: Kind::Title, indent: 52.0 });
         let (r, _) = ui.allocate_exact_size(vec2(w, 23.0), Sense::hover());
-        let tr = paint_text(ui, pos2(r.min.x + x, r.center().y - 0.5), Align2::LEFT_CENTER, title, inter_bold(17.0), WHITE, 0.17);
+        let tr = paint_text(ui, pos2(r.min.x + 25.0 + shift.x, r.center().y - 0.5 + shift.y), Align2::LEFT_CENTER, title, inter_bold(17.0), WHITE, 0.17);
         if let Some(tip) = tip {
             help_in(ui, Rect::from_min_size(pos2(tr.max.x + HELP_GAP, r.center().y - 7.0), vec2(14.0, 12.0)), tip);
         }
@@ -259,13 +259,37 @@ pub fn paint_text(ui: &Ui, pos: egui::Pos2, align: Align2, s: &str, font: FontId
 }
 
 fn label_galley(ui: &Ui, s: &str, size: f32, color: Color32, tracking: f32) -> std::sync::Arc<egui::Galley> {
-    // Labels in capitals ("BLUE", "CENTER", "OFF") are set wider in the original.
-    let tracking = if s.chars().any(|c| c.is_lowercase()) { tracking } else { 0.8 };
-    let mut job = egui::text::LayoutJob::simple(s.to_string(), inter(size), color, f32::INFINITY);
-    for sec in &mut job.sections {
-        sec.format.line_height = Some((size * 16.0 / 14.0).round());
-        sec.format.extra_letter_spacing = tracking;
+    let mut job = egui::text::LayoutJob::default();
+    let mut add = |text: &str, tracking: f32| {
+        let mut f = egui::TextFormat::simple(inter(size), color);
+        f.line_height = Some((size * 16.0 / 14.0).round());
+        f.extra_letter_spacing = tracking;
+        job.append(text, 0.0, f);
+    };
+    if !s.chars().any(|c| c.is_lowercase()) {
+        // Labels in capitals ("BLUE", "CENTER", "OFF") are set wider in the original.
+        add(s, 0.8);
+    } else {
+        // In mixed labels the original's capitals are wider and its small letters closer than
+        // the kit's font sets them; how much was measured per kind of control (the kinds are
+        // told apart by their base tracking) on the 7.2.19 pages.
+        let (low, cap) = if tracking > 0.0 { (-0.16, 0.4) } else if tracking < -0.1 { (-0.25, 0.75) } else { (-0.08, 0.2) };
+        let mut run = String::new();
+        let mut run_cap = false;
+        for c in s.chars() {
+            let is_cap = c.is_uppercase();
+            if is_cap != run_cap && !run.is_empty() {
+                add(&run, if run_cap { cap } else { low });
+                run.clear();
+            }
+            run_cap = is_cap;
+            run.push(c);
+        }
+        if !run.is_empty() {
+            add(&run, if run_cap { cap } else { low });
+        }
     }
+    job.wrap.max_width = f32::INFINITY;
     ui.painter().layout_job(job)
 }
 
@@ -441,10 +465,19 @@ pub fn help(ui: &mut Ui, space: f32, tip: &str) {
 }
 
 pub fn chevron(ui: &Ui, rect: Rect, _v: &egui::style::WidgetVisuals, _open: bool, _ab: egui::AboveOrBelow) {
+    let c = if ui.is_enabled() { ARROW } else { hex(0x4A4A4A) };
+    chevron_col(ui, rect, c)
+}
+
+/// The arrow of a dropdown that is shown greyed.
+pub fn chevron_dim(ui: &Ui, rect: Rect, _v: &egui::style::WidgetVisuals, _open: bool, _ab: egui::AboveOrBelow) {
+    chevron_col(ui, rect, hex(0x2E2E2E))
+}
+
+fn chevron_col(ui: &Ui, rect: Rect, c: Color32) {
     // 15 x 6.5 pt arrow, its right end 2.5 pt from the field's right edge.
     let right = rect.max.x + ui.spacing().button_padding.x - 2.75;
     let y = rect.center().y + 0.75;
-    let c = if ui.is_enabled() { ARROW } else { hex(0x4A4A4A) };
     ui.painter().add(egui::Shape::line(vec![pos2(right - 14.5, y - 2.6), pos2(right - 7.25, y + 2.6), pos2(right, y - 2.6)], Stroke::new(1.6, c)));
 }
 

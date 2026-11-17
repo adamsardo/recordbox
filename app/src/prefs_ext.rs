@@ -47,7 +47,7 @@ pub const TREE_ITEMS_OWN: [&str; 5] = ["Playlists", "Matching", "Tag List", "Dev
 pub fn media_absent_reason(name: &str) -> String {
     match name {
         "Apple Music" | "SoundCloud" | "Tidal" | "Spotify" | "Beatport" | "Inflyte" => format!("Recordbox has no streaming services, so there is no {name} source."),
-        "Track Suggestion" => "Recordbox has no Track Suggestion; Related Tracks finds matching tracks.".to_string(),
+        "Track Suggestion" => "Track Suggestion is not available.".to_string(),
         "CloudDirectPlay Filter" => "Recordbox has no cloud service, so there is nothing to filter.".to_string(),
         "SEARCH MOBILE button" => "Recordbox has no mobile device search.".to_string(),
         _ => format!("Recordbox has no {name} source yet."),
@@ -60,7 +60,7 @@ pub fn tree_item_available(name: &str) -> bool {
     matches!(name, "Collection" | "Playlists" | "Related Tracks" | "Explorer" | "Devices" | "Histories") || TREE_ITEMS_EXTRA.contains(&name)
 }
 /// Sources added by the library code since (kept apart so adding one is a one-word edit).
-pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekordbox xml", "Hot Cue Bank List"];
+pub const TREE_ITEMS_EXTRA: &[&str] = &["Matching", "Tag List", "iTunes", "rekordbox xml", "Hot Cue Bank List", "Track Suggestion"];
 
 impl Prefs {
     /// Whether a Tree View source is shown. Collection always is.

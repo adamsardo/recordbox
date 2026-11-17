@@ -439,12 +439,6 @@ pub fn atom(p: &Painter, c: Pos2, rx: f32, ry: f32, w: f32, col: Color32) {
     p.circle_filled(c, w * 1.1, col);
 }
 
-/// Track Suggestion source tile (skin brows_trackSuggestion_icon, 15 x 14): an atom.
-pub fn suggestion(p: &Painter, r: Rect, c: Color32, _bg: Color32) {
-    let k = r.width().min(r.height()) / 18.0;
-    atom(p, r.center(), 7.0 * k, 2.6 * k, 1.25 * k, c);
-}
-
 /// CUE Analysis Playlist (skin brows_treeicon_cuplaylist, 12 x 13): a sheet with two rows
 /// whose lower right corner gives way to a downward triangle.
 pub fn tree_cue_list(p: &Painter, c: Pos2, col: Color32) {
@@ -478,16 +472,16 @@ pub fn plus_disc(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
 
 /// Skin brws_setting (14 x 14): a gear with eight teeth and a round hole.
 pub fn gear(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
-    p.circle_filled(c, 5.2, col);
+    p.circle_filled(c, 5.6, col);
     for k in 0..8 {
         let a = k as f32 * std::f32::consts::FRAC_PI_4;
         let (dx, dy) = (a.cos(), a.sin());
         let (nx, ny) = (-dy, dx);
         let tip = c + vec2(dx, dy) * 7.0;
-        let base = c + vec2(dx, dy) * 4.6;
-        p.add(Shape::convex_polygon(vec![base + vec2(nx, ny) * 1.75, tip + vec2(nx, ny) * 1.5, tip - vec2(nx, ny) * 1.5, base - vec2(nx, ny) * 1.75], col, Stroke::NONE));
+        let base = c + vec2(dx, dy) * 5.0;
+        p.add(Shape::convex_polygon(vec![base + vec2(nx, ny) * 1.9, tip + vec2(nx, ny) * 1.6, tip - vec2(nx, ny) * 1.6, base - vec2(nx, ny) * 1.9], col, Stroke::NONE));
     }
-    p.circle_filled(c, 2.9, bg);
+    p.circle_filled(c, 3.5, bg);
 }
 
 /// Skin subBrows_related_note_icon (14 x 14): an eighth note.

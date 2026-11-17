@@ -21,15 +21,15 @@ const HISTORY_DELETE_WIRED: bool = true;
 const BG_COLOR_WRITTEN: bool = false;
 // The player (ui_player.rs) is to act on these; set each to true once it does.
 /// The enlarged waveform draws the phrases when `prefs.phrase_enlarged`.
-const PHRASE_ENLARGED_WIRED: bool = false;
+const PHRASE_ENLARGED_WIRED: bool = true;
 /// The phrase display shows phrase types always (`prefs.phrase_types_always`) or on hover.
-const PHRASE_TYPES_WIRED: bool = false;
+const PHRASE_TYPES_WIRED: bool = true;
 /// The enlarged waveform draws the vocal positions when `prefs.vocal_enlarged`.
-const VOCAL_ENLARGED_WIRED: bool = false;
+const VOCAL_ENLARGED_WIRED: bool = true;
 /// The stem strip's part buttons call `prefs_ext::stem_part_click` (MUTE / SOLO mode).
-const STEM_SOLO_WIRED: bool = false;
+const STEM_SOLO_WIRED: bool = true;
 /// The waveforms show only the parts that sound when `prefs.stem_waveform`.
-const STEM_WAVEFORM_WIRED: bool = false;
+const STEM_WAVEFORM_WIRED: bool = true;
 
 /// Categories the original has and Recordbox does not (no subscription, no cloud): shown
 /// dimmed at their places so the list reads the same.
@@ -636,6 +636,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
 fn page_layout(app: &mut App, ui: &mut Ui) {
     card(ui, "Layout", |ui| {
         sub(ui, "Media Browser");
+        ui.add_space(2.0);
         let [left, right] = crate::prefs_ext::MEDIA_BROWSER;
         for i in 0..left.len() {
             kit::row(ui, 16.0, |ui| {
@@ -658,17 +659,25 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
         }
         separator(ui);
         sub(ui, "Browser panel");
-        kit::checkbox_off(ui, "CUE Analysis Playlist", "Recordbox has no CUE Analysis playlists; Preferences > Analysis > CUE Analysis sets cues for every track.");
+        // Shows or hides the CUE Analysis Playlist row (and its [Start] button) in the tree.
+        let mut cue_pl = app.prefs.tree_item("CUE Analysis Playlist");
+        if kit::checkbox(ui, &mut cue_pl, "CUE Analysis Playlist").changed() {
+            app.prefs.tree_items.insert("CUE Analysis Playlist".to_string(), cue_pl);
+            app.save_prefs();
+        }
         kit::checkbox(ui, &mut app.prefs.palette_enabled, "Playlist Palette");
         kit::checkbox(ui, &mut app.prefs.cue_markers_on_preview, "Display Cue Markers on Preview");
         kit::checkbox(ui, &mut app.prefs.playlist_search_filter, "Playlist search filter");
         kit::checkbox(ui, &mut app.prefs.all_tracks_in_playlists, "Display All Tracks in the Playlists");
         kit::checkbox(ui, &mut app.prefs.playlist_track_counts, "Display the number of tracks in a playlist on the Tree View");
+        ui.add_space(3.0);
         separator(ui);
         sub(ui, "Deck");
-        kit::checkbox_off(ui, "Display SYNC RATE", "Recordbox has no Beat Sync, so there is no sync rate to show.");
+        kit::checkbox_off(ui, "Display SYNC RATE", "Recordbox does not show a sync rate next to BEAT SYNC yet.");
+        ui.add_space(3.0);
         separator(ui);
         sub(ui, "Phrases");
+        ui.add_space(-4.0);
         if PHRASE_ENLARGED_WIRED {
             kit::checkbox(ui, &mut app.prefs.phrase_enlarged, "Phrase (Enlarged Waveform)");
         } else {
@@ -677,8 +686,10 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
         kit::checkbox(ui, &mut app.prefs.show_phrase_bar, "Phrase (Full Waveform)");
         ui.add_space(3.0);
         toggle_if(app, ui, PHRASE_TYPES_WIRED, |p| &mut p.phrase_types_always, "Always show types of phrases", "Recordbox shows phrases as coloured blocks without their type names, so far.");
+        ui.add_space(3.0);
         separator(ui);
         sub(ui, "Vocal");
+        ui.add_space(-4.0);
         if VOCAL_ENLARGED_WIRED {
             kit::checkbox(ui, &mut app.prefs.vocal_enlarged, "Vocal (Enlarged Waveform)");
         } else {
@@ -786,7 +797,7 @@ fn page_audio(app: &mut App, ui: &mut Ui, tab: usize) {
             ui.add_space(4.0);
             // rekordbox opens the device driver's own settings here; on a Mac those are in
             // Audio MIDI Setup.
-            if ui.add(btn("Driver").exact(vec2(148.0, 22.0)).font_size(12.0)).on_hover_text("Open Audio MIDI Setup, where macOS keeps the settings of audio devices.").clicked() {
+            if ui.add(btn("Driver").exact(vec2(148.0, 22.0)).font_size(11.5)).on_hover_text("Open Audio MIDI Setup, where macOS keeps the settings of audio devices.").clicked() {
                 let _ = std::process::Command::new("/usr/bin/open").args(["-a", "Audio MIDI Setup"]).spawn();
             }
         });
@@ -825,7 +836,7 @@ fn page_audio(app: &mut App, ui: &mut Ui, tab: usize) {
                 });
             }
         });
-        ui.add_space(-12.0);
+        ui.add_space(8.0);
     });
     card(ui, "Sample Rate", |ui| {
         let rate_text = |r: u32| format!("{} Hz", r);
@@ -858,7 +869,7 @@ fn page_audio(app: &mut App, ui: &mut Ui, tab: usize) {
         } else {
             format!("{b} samples ({:.1} ms)", b as f64 / app.player.device_rate.max(1) as f64 * 1000.0)
         };
-        ui.add_space(0.5);
+        ui.add_space(1.0);
         kit::row_at(ui, kit::Kind::Ctl, 16.0, 57.5, |ui| {
             let r = ui.max_rect();
             kit::paint_text(ui, pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, &label, inter(14.0), WHITE, 0.1);
@@ -884,7 +895,7 @@ fn page_audio(app: &mut App, ui: &mut Ui, tab: usize) {
         ui.ctx().data_mut(|d| d.insert_temp(drag_id, pending));
         resp.on_hover_text("64 to 2048 samples. A larger buffer avoids drop-outs; a smaller one reacts sooner. \"Reset to defaults\" goes back to the device's own setting.");
     });
-    kit::card_x(ui, "Metronome", 17.0, None, |ui| {
+    kit::card_x(ui, "Metronome", vec2(-8.0, -5.0), None, |ui| {
         for (i, n) in ["Click Sound 01", "Click Sound 02", "Click Sound 03"].iter().enumerate() {
             if radio(ui, app.prefs.metronome_sound == i as u8, n) {
                 app.prefs.metronome_sound = i as u8;
@@ -902,7 +913,6 @@ fn page_audio(app: &mut App, ui: &mut Ui, tab: usize) {
         }
     });
     card(ui, "Preview Volume", |ui| {
-        ui.add_space(7.0);
         let mut t = app.prefs.preview_volume.clamp(0.0, 1.0);
         if kit::slider(ui, &mut t).on_hover_text("How loud tracks play from the Preview column. In the middle they play at the master volume.").changed() {
             app.prefs.preview_volume = t;
@@ -926,19 +936,18 @@ fn audio_io(app: &mut App, ui: &mut Ui, info: &AudioInfo) {
                 let (r, _) = ui.allocate_exact_size(vec2(40.5, 22.0), egui::Sense::hover());
                 kit::paint_text(ui, pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, label, inter(14.0), WHITE, 0.0);
                 let shown = if chans >= 2 { name(cur + side as u16) } else if side == 0 { name(0) } else { "-".to_string() };
-                ui.add_enabled_ui(chans > 2, |ui| {
-                    kit::combo(("audio_ch", side), 340.0, shown, 14.0).show_ui(ui, |ui| {
-                        let mut first = 0;
-                        while first + 1 < chans {
-                            if ui.selectable_label(cur == first, name(first + side as u16)).clicked() {
-                                new_ch = Some(first);
-                            }
-                            first += 2;
+                kit::combo(("audio_ch", side), 340.0, shown, 14.0).show_ui(ui, |ui| {
+                    let mut first = 0;
+                    while first + 1 < chans {
+                        if ui.selectable_label(cur == first, name(first + side as u16)).clicked() {
+                            new_ch = Some(first);
                         }
-                    });
-                })
-                .response
-                .on_disabled_hover_text("This device has one stereo output.");
+                        first += 2;
+                    }
+                    if chans <= 2 {
+                        ui.label(kit::text("This device has one stereo output.", 11.0).color(DIM));
+                    }
+                });
             });
         }
     });
@@ -1558,7 +1567,7 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
 fn page_stems(app: &mut App, ui: &mut Ui) {
     // The switch above the cards, on the window's black: 43 pt band, the switch 20 pt in.
     let (band, _) = ui.allocate_exact_size(vec2(ui.available_width().min(kit::CARD_W), 43.0), egui::Sense::hover());
-    let mut head = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(band.min.x + 20.0, band.min.y + 14.0), band.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let mut head = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(band.min.x + 20.0, band.min.y + 13.0), band.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
     kit::toggle_raw(&mut head, &mut app.prefs.show_stems, "Enable the STEMS Function");
     card(ui, "STEMS mode", |ui| {
         if radio(ui, app.prefs.stem_parts == 3, "3 Stems(VOCAL, INST, DRUMS)") {
@@ -1572,7 +1581,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
     let cur = app.stem.model.clone().or_else(|| app.prefs.stem_model.clone()).unwrap_or_default();
     let tip = format!("Prioritize sound quality: {} — {}\nPrioritize speed: {} — {}", quality.name, quality.about, speed.name, speed.about);
     kit::card_help(ui, "STEMS Analysis Process", Some(&tip), |ui| {
-        ui.add_space(-3.0);
+        ui.add_space(-2.0);
         let able = app.stem.hw.as_ref().map(|hw| crate::stems::runs_on(quality, hw)).unwrap_or(true);
         let mut pick = None;
         if able || cur == quality.id {
@@ -1582,9 +1591,10 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         } else {
             kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} needs a GPU and {:.0} GB of memory, which this computer does not have.", quality.name, quality.min_ram_gb));
         }
-        if radio(ui, cur == speed.id, "Prioritize speed") {
+        if radio(ui, cur != quality.id, "Prioritize speed") {
             pick = Some(speed);
         }
+        ui.add_space(2.0);
         if let Some(m) = pick.filter(|m| m.id != cur) {
             app.prefs.stem_model = Some(m.id.to_string());
             app.stem.model = Some(m.id.to_string());
@@ -1597,15 +1607,12 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         let why = "Recordbox has one layout for the part buttons, in the player's STEMS strip.";
         radio(ui, true, "Auto");
         kit::radio_off(ui, false, "Customize", why);
-        ui.add_space(-0.5);
         kit::combo_row(ui, 22.0, |ui| {
-            ui.add_enabled_ui(false, |ui| {
-                kit::combo("stem_layout", 520.0 - 13.0, "CUSTOM3", 14.0).show_ui(ui, |_| {});
-            })
-            .response
-            .on_disabled_hover_text(why);
+            // Greyed as in the original while "Customize" is not chosen: it opens on nothing.
+            egui::ComboBox::from_id_salt("stem_layout").width(520.0).selected_text(RichText::new("CUSTOM3").font(inter_bold(14.0)).color(hex(0x878787))).icon(kit::chevron_dim).show_ui(ui, |ui| {
+                ui.label(kit::text(why, 12.0).color(DIM));
+            });
         });
-        ui.add_space(-0.5);
         kit::radio_off(ui, false, "Do not display", "Switch \"Enable the STEMS Function\" off to hide the part buttons.");
     });
     kit::card_help(ui, "STEM Waveform Display", Some("When enabled, the waveform shows the parts that sound. When disabled, the original waveform is always shown."), |ui| {

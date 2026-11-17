@@ -47,6 +47,10 @@ pub struct DeckExt {
     pub gain_drag: Option<(f32, f32)>,
     /// Seconds the enlarged waveform was scrubbed or scrolled this frame (for the waveform link).
     pub scrub: f64,
+    /// STEM Waveform Display: the waveform of the parts that sound (which parts, waveform),
+    /// and the one being worked out in the background.
+    pub stem_wave: Option<([bool; 4], Waveform)>,
+    pub stem_wave_rx: Option<(i64, [bool; 4], crossbeam_channel::Receiver<Waveform>)>,
 }
 
 impl DeckExt {
@@ -685,6 +689,59 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------ stem waveform
+    /// The waveforms show the parts that sound instead of the whole mix (Preferences > STEMS >
+    /// STEM Waveform Display, with a part switched off and its waveform ready).
+    pub fn stem_wave_shown(&self) -> bool {
+        if !self.prefs.stem_waveform {
+            return false;
+        }
+        let on = self.player.state.lock().stem_on;
+        self.deck.x.stem_wave.as_ref().map(|w| w.0 == on).unwrap_or(false) && !on.iter().all(|x| *x)
+    }
+
+    /// Keep the active deck's stem waveform in step with its part switches: worked out on a
+    /// background thread from the audible stems whenever the set of parts changes.
+    pub fn poll_stem_wave(&mut self) {
+        let (stems, on) = {
+            let s = self.player.state.lock();
+            (s.stems.clone(), s.stem_on)
+        };
+        let (Some(stems), Some(tid), true, false) = (stems, self.deck.track, self.prefs.stem_waveform, on.iter().all(|x| *x)) else {
+            self.deck.x.stem_wave_rx = None;
+            return;
+        };
+        if let Some((id, key, rx)) = &self.deck.x.stem_wave_rx {
+            if let Ok(w) = rx.try_recv() {
+                if *id == tid {
+                    self.deck.x.stem_wave = Some((*key, w));
+                }
+                self.deck.x.stem_wave_rx = None;
+            }
+        }
+        let have = self.deck.x.stem_wave.as_ref().map(|w| w.0 == on).unwrap_or(false);
+        let running = self.deck.x.stem_wave_rx.as_ref().map(|j| j.1 == on && j.0 == tid).unwrap_or(false);
+        if !have && !running {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                let n = stems.len;
+                let mut mono = vec![0.0f32; n];
+                for (src, on) in on.iter().enumerate() {
+                    if *on {
+                        let (l, r) = (&stems.data[src * 2 * n..(src * 2 + 1) * n], &stems.data[(src * 2 + 1) * n..(src * 2 + 2) * n]);
+                        for i in 0..n {
+                            mono[i] += 0.5 * (l[i] + r[i]);
+                        }
+                    }
+                }
+                let _ = tx.send(crate::analysis::waveform(&mono, crate::stems::htdemucs::SAMPLE_RATE as f64));
+                ctx.request_repaint();
+            });
+            self.deck.x.stem_wave_rx = Some((tid, on, rx));
+        }
+    }
+
     // ------------------------------------------------------------------ phrase edit
     fn phrase_key(id: i64) -> String {
         format!("phrase_edit:{id}")
@@ -1160,6 +1217,64 @@ mod tests {
     }
 
     #[test]
+    fn key_shift_and_key_sync() {
+        let k = |n: &str| parse_key(n);
+        // One semitone up from A minor is B flat minor; an octave is the same key.
+        assert_eq!(shift_key(k("Am"), 1), k("Bbm"));
+        assert_eq!(shift_key(k("Am"), -2), k("Gm"));
+        assert_eq!(shift_key(k("C"), 7), k("G"));
+        assert_eq!(shift_key(k("Am"), 12), k("Am"));
+        assert_eq!(shift_key(-1, 3), -1);
+        // Compatible: same key, relative major / minor, a fifth either way.
+        assert!(keys_compatible(k("Am"), k("Am")) && keys_compatible(k("Am"), k("C")) && keys_compatible(k("Am"), k("Em")) && keys_compatible(k("Am"), k("Dm")));
+        assert!(!keys_compatible(k("Am"), k("Bm")) && !keys_compatible(k("Am"), k("G")));
+        // KEY SYNC: already compatible keys stay; otherwise the smallest shift that fits.
+        assert_eq!(key_sync_shift(k("Am"), k("Am")), 0);
+        assert_eq!(key_sync_shift(k("Em"), k("Am")), 0);
+        assert_eq!(key_sync_shift(k("Bbm"), k("Am")), -1);
+        assert_eq!(key_sync_shift(k("Abm"), k("Am")), 1);
+        // G minor: +2 reaches A minor itself, -2 only its neighbour... both two away: the master's key wins.
+        assert_eq!(key_sync_shift(k("Bm"), k("Am")), -2);
+        for own in 0..24 {
+            for master in 0..24 {
+                let d = key_sync_shift(own, master);
+                assert!((-6..=6).contains(&d) && keys_compatible(shift_key(own, d), master), "{own} {master} {d}");
+            }
+        }
+        assert_eq!(key_sync_shift(-1, 3), 0);
+        assert_eq!(shift_text(0), "±0");
+        assert_eq!(shift_text(3), "+3");
+        assert_eq!(shift_text(-2), "-2");
+    }
+
+    #[test]
+    fn tempo_at_and_gain_knob() {
+        let b = grid(8);
+        assert_eq!(bpm_at(&b, 0.0), 120.0);
+        assert_eq!(bpm_at(&b, 2.0), 120.0);
+        assert_eq!(bpm_at(&[], 2.0), 0.0);
+        assert_eq!(gain_angle(0.0), 0.0);
+        assert_eq!(gain_angle(-GAIN_RANGE_DB), -135.0);
+        assert_eq!(gain_angle(99.0), 135.0);
+        assert!((gain_angle(-2.6) + 17.55).abs() < 0.01);
+    }
+
+    #[test]
+    fn edited_phrases_reach_the_usb_analysis_file() {
+        use crate::phrase::*;
+        // A track whose phrases were cut and relabelled: the EXT file's PSSI section is the edit.
+        let beats = grid(128);
+        let mut st = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }], end_beat: 128 };
+        assert!(cut(&mut st, 49) && set_kind(&mut st, 49, DOWN));
+        let ov = crate::export::anlz::Overrides { sections: Default::default(), grid_same: false, pssi: Some(pssi(&st)), device: Default::default(), pvdi: None };
+        let files = crate::export::anlz::build_with("/Contents/a.mp3", &beats, &Waveform::default(), &[], 0, 44100, Some(&ov));
+        let ext = crate::export::anlz::section_list(&files.ext);
+        let sec = ext.iter().find(|(t, _)| t == "PSSI").map(|(_, b)| b.clone()).expect("PSSI written");
+        assert!(is_masked(&sec));
+        assert_eq!(parse(&sec), Some(st));
+    }
+
+    #[test]
     fn captions() {
         assert_eq!(jump_label(4.0, false), "4Beats");
         assert_eq!(jump_label(0.5, false), "1/2Beat");
@@ -1233,6 +1348,39 @@ impl App {
             self.prefs.browser_only = false;
             self.prefs.player_layout = 2;
         }
+        // `2pa` / `dual`: the two-deck layouts with deck B empty (references 05 and 06);
+        // `dualb`: Dual Player with a second track; `syncb`: BEAT SYNC lit on deck B.
+        if has("2pa") {
+            self.prefs.browser_only = false;
+            self.prefs.player_layout = 1;
+        }
+        if has("dual") || has("dualb") {
+            self.prefs.browser_only = false;
+            self.prefs.player_layout = 3;
+        }
+        if has("dualb") {
+            let a = self.deck.track;
+            if let Some(id) = self.tracks.iter().filter(|t| t.analyzed == 1 && !t.missing && Some(t.id) != a && t.duration > 60.0).map(|t| t.id).nth(3) {
+                self.load_track_to(1, id);
+                self.with_deck(1, |app| app.shot_wait_load());
+            }
+        }
+        if has("syncb") {
+            self.px.other.x.beat_sync = true;
+        }
+        // `plain`: without Recordbox's own additions (STEMS button, phrase bar, vocal marks).
+        if has("plain") {
+            self.prefs.show_stems = false;
+            self.prefs.show_phrase_bar = false;
+            self.prefs.show_vocal = false;
+        }
+        // `gridtab`: the GRID panel, nothing else changed.
+        if has("gridtab") {
+            self.deck.ctrl_tab = 1;
+        }
+        if has("ctltest") {
+            self.shot_controls_selftest();
+        }
         // `empty`: nothing on the deck (the state of reference 01).
         if has("empty") {
             self.unload_track();
@@ -1275,6 +1423,136 @@ impl App {
         if has("selftest") {
             self.shot_player_selftest();
         }
+    }
+
+    /// PREPDECK_SHOT_PLAYER=ctltest: run the two-deck controls and PHRASE EDIT on real tracks
+    /// (use a scratch library) and print what happened to stderr.
+    fn shot_controls_selftest(&mut self) {
+        let Some(tid) = self.deck.track else { return eprintln!("ctltest: no track loaded") };
+        self.prefs.browser_only = false;
+        self.prefs.player_layout = 3;
+        let other = self.tracks.iter().filter(|t| t.analyzed == 1 && !t.missing && t.id != tid && t.duration > 60.0 && t.bpm > 0.0).map(|t| t.id).nth(3);
+        let Some(oid) = other else { return eprintln!("ctltest: needs a second analysed track") };
+        self.load_track_to(1, oid);
+        self.with_deck(1, |a| a.shot_wait_load());
+        self.poll_decks();
+        let (ba, bb) = (self.current_bpm(), self.with_deck(1, |a| a.current_bpm()));
+        eprintln!("ctltest: deck A {:.2} BPM, deck B {:.2} BPM, device {}", ba, bb, self.player.error.clone().unwrap_or_else(|| "ok".into()));
+        // Tempo steps, typed BPM, range, reset.
+        for _ in 0..10 {
+            self.tempo_step(1);
+        }
+        eprintln!("ctltest: TEMPO + ×10 -> speed {:.4}, {:.2} BPM", self.deck_speed(), self.effective_bpm());
+        self.tempo_enter_bpm(&format!("{:.2}", ba * 1.05));
+        eprintln!("ctltest: typed {:.2} -> speed {:.4}", ba * 1.05, self.deck_speed());
+        self.tempo_enter_bpm(&format!("{:.2}", ba * 1.5));
+        eprintln!("ctltest: typed {:.2} (out of range) -> speed {:.4}, message {:?}", ba * 1.5, self.deck_speed(), self.toasts.last().map(|t| t.text.clone()));
+        // Playing at +5 % with and without Master Tempo: the position moves 5 % faster.
+        self.toggle_master_tempo();
+        let p0 = self.pos();
+        self.set_playing(true);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        self.set_playing(false);
+        let mt = self.player.state.lock().master_tempo;
+        eprintln!("ctltest: 1 s at +5 % with MT -> moved {:.3} s of track (MT {})", self.pos() - p0, mt);
+        self.tempo_reset();
+        eprintln!("ctltest: RST -> speed {:.4}", self.deck_speed());
+        // BEAT SYNC: B follows A (the master).
+        self.with_deck(1, |a| a.toggle_beat_sync());
+        let (ot, of) = {
+            let o = self.player.other.lock();
+            (o.tempo, o.sync_follow)
+        };
+        eprintln!("ctltest: BEAT SYNC on B -> B speed {:.4} ({:.2} BPM, master {:.2}), follower {}", ot, bb * ot, ba, of);
+        self.tempo_step(1);
+        self.poll_decks();
+        let ot = self.player.other.lock().tempo;
+        eprintln!("ctltest: A +0.1 % -> B {:.2} BPM", bb * ot);
+        self.with_deck(1, |a| a.tempo_step(1));
+        eprintln!("ctltest: TEMPO + on the follower -> {:?}", self.toasts.last().map(|t| t.text.clone()));
+        self.set_playing(true);
+        self.with_deck(1, |a| {
+            let t = a.deck.beats.get(40).map(|b| b.time + 0.11).unwrap_or(5.0);
+            a.seek(t);
+            a.play_pause_synced();
+        });
+        let err = |a: &App| -> Option<f64> {
+            let (m, f) = (a.player.state.lock(), a.player.other.lock());
+            crate::audio::phase_error(f.grid.as_ref()?, f.pos / f.audio.as_ref()?.sr as f64, m.grid.as_ref()?, m.pos / m.audio.as_ref()?.sr as f64)
+        };
+        let e0 = err(self);
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        eprintln!("ctltest: both playing, B started 0.11 s off a beat -> phase error at start {:?}, after 3 s {:?} beats", e0, err(self));
+        self.set_playing(false);
+        self.with_deck(1, |a| a.set_playing(false));
+        // MASTER to B, KEY SYNC, key shift.
+        self.with_deck(1, |a| a.set_master());
+        eprintln!("ctltest: MASTER on B -> master {}", self.px.master);
+        self.with_deck(0, |a| a.set_master());
+        let keys = (self.track(tid).map(|t| t.key_label(false)).unwrap_or_default(), self.track(oid).map(|t| t.key_label(false)).unwrap_or_default());
+        self.with_deck(1, |a| a.toggle_key_sync());
+        self.poll_decks();
+        eprintln!("ctltest: keys A {} / B {}; KEY SYNC on B -> shift {} = {}", keys.0, keys.1, shift_text(self.px.other.x.key_shift), self.with_deck(1, |a| a.result_key_label()));
+        self.with_deck(1, |a| {
+            a.key_shift_step(1);
+            a.key_shift_step(1);
+        });
+        let ks = self.player.other.lock().key_shift;
+        eprintln!("ctltest: key shift ›› on B -> {} = {}, audio key_shift {}, KEY SYNC {}", shift_text(self.px.other.x.key_shift), self.with_deck(1, |a| a.result_key_label()), ks, self.px.other.x.key_sync);
+        self.with_deck(1, |a| a.key_reset());
+        // Crossfader, isolator, gain.
+        self.set_crossfader(0.0);
+        let faders = |a: &App| {
+            let x = a.player.state.lock().fader;
+            let y = a.player.other.lock().fader;
+            (x, y)
+        };
+        let f = faders(self);
+        self.set_crossfader(0.5);
+        eprintln!("ctltest: crossfader at A -> gains {:?}; centre -> {:?}", f, faders(self));
+        self.toggle_eq_kill(0);
+        let eq = {
+            let st = self.player.state.lock();
+            (st.eq_gain, st.eq_on)
+        };
+        eprintln!("ctltest: LOW off on A -> eq {:?} (on {})", eq.0, eq.1);
+        self.toggle_eq_kill(0);
+        let g0 = self.gain_db();
+        self.set_gain_db(g0 + 1.5, true);
+        eprintln!("ctltest: A-GAIN {:.1} dB -> {:.1} dB, stored {:.1}", g0, self.gain_db(), self.db.track(tid).map(|t| t.gain_db).unwrap_or(f32::NAN));
+        self.undo_edit();
+        // PHRASE EDIT.
+        self.seek(self.deck.beats.get(48).map(|b| b.time + 0.05).unwrap_or(20.0));
+        for _ in 0..200 {
+            if self.deck.phrases.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.poll_phrases();
+        }
+        let show = |a: &App| a.deck.phrases.as_ref().map(|s| s.phrases.iter().take(5).map(|p| format!("{}:{}", p.beat, crate::phrase::label(s.mood, p.kind))).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "none".into());
+        eprintln!("ctltest: phrases {} … at beat {}: {:?}", show(self), crate::phrase::beat_number(&self.deck.beats, self.pos()), self.current_phrase());
+        let u0 = self.undo_len();
+        self.phrase_cut();
+        eprintln!("ctltest: CUT -> {} … (edited {}, stored {}, undo +{})", show(self), self.deck.x.phrases_edited, self.stored_phrases(tid).is_some(), self.undo_len() - u0);
+        self.phrase_set_kind(crate::phrase::DOWN);
+        eprintln!("ctltest: type Down -> {} …, current {:?}", show(self), self.current_phrase());
+        self.undo_edit();
+        eprintln!("ctltest: Undo -> {} …", show(self));
+        self.redo_edit();
+        // What a USB export would write for this track.
+        let pssi = self.stored_phrases(tid).map(|s| crate::phrase::pssi(&s));
+        eprintln!("ctltest: Redo -> {} …; PSSI for export parses back equal: {:?}", show(self), pssi.as_ref().and_then(|b| crate::phrase::parse(b)) == self.stored_phrases(tid));
+        self.phrase_clear();
+        for _ in 0..200 {
+            if self.deck.phrases.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.poll_phrases();
+        }
+        eprintln!("ctltest: CLEAR -> {} … (edited {}, stored {})", show(self), self.deck.x.phrases_edited, self.stored_phrases(tid).is_some());
+        self.seek(0.3);
     }
 
     /// PREPDECK_SHOT_PLAYER=selftest: run the player's operations on the loaded track (use a

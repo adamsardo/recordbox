@@ -1593,10 +1593,13 @@ pub fn shot_view(app: &mut App, name: &str) {
         }
         "missing" => {
             // Mark a few tracks missing in memory only (nothing is moved or saved).
-            for t in app.tracks.iter_mut().take(4) {
-                t.missing = true;
+            if !app.tracks.iter().any(|t| t.missing) {
+                for t in app.tracks.iter_mut().take(4) {
+                    t.missing = true;
+                }
             }
             app.open_missing_file_manager();
+            app.ext.missing_sel = app.tracks.iter().filter(|t| t.missing).take(1).map(|t| t.id).collect();
         }
         "palette" => {
             let p = ensure_playlist(app);
@@ -1777,6 +1780,24 @@ pub fn shot_view(app: &mut App, name: &str) {
         }
         // Browser states of the 7.2.19 references (combine with commas after "playlists").
         "tree364" => app.prefs.bx.tree_w = 364.0,
+        "refcols" => {
+            // Column widths of the 7.2.19 reference screenshots.
+            for (c, w) in [(Col::Preview, 200.0), (Col::Artwork, 80.0), (Col::Title, 245.0), (Col::Artist, 128.0), (Col::Genre, 128.0), (Col::Bpm, 80.0), (Col::Time, 79.0)] {
+                app.prefs.widths.insert(c.key(), w);
+            }
+        }
+        "rbroot" => {
+            // The synced rekordbox tree without its "rekordbox" folder (scratch libraries only),
+            // as the references show the original's own tree.
+            if let Some(f) = app.nodes.iter().find(|n| n.parent == 0 && n.kind == NodeKind::Folder && n.name == "rekordbox").map(|n| n.id) {
+                let kids: Vec<i64> = app.nodes.iter().filter(|n| n.parent == f).map(|n| n.id).collect();
+                for (i, k) in kids.iter().enumerate() {
+                    let _ = app.db.move_node(*k, 0, i as i64);
+                }
+                let _ = app.db.delete_node(f);
+                app.reload_playlists();
+            }
+        }
         "row2" => {
             app.rebuild_list();
             if let Some(id) = app.list.get(1).copied() {

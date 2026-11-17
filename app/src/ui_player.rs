@@ -101,6 +101,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let main = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(full.max.x - 212.0, full.max.y));
     p.rect_filled(left, 0.0, BG2);
 
+    app.poll_stem_wave();
     let pos = app.pos();
     let playing = app.playing();
     let loaded = app.deck.track.is_some();
@@ -327,7 +328,8 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     // white minute ticks from 8 to 10 pt under it.
     let base = r.min.y + 30.0;
     let full_h = 24.0;
-    if let Some(w) = &app.deck.wave {
+    let stem_view = app.stem_wave_shown();
+    if let Some(w) = app.deck.x.stem_wave.as_ref().filter(|_| stem_view).map(|s| &s.1).or(app.deck.wave.as_ref()) {
         let n = r.width().max(1.0) as usize;
         let cols = w.columns(n);
         // the overview fills its height at the track's loudest column
@@ -347,7 +349,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 // overview values; the values come from the model fitted to its files.
                 let [lo, mi, hi] = match &app.deck.rb_wave {
                     // rekordbox's own overview values for this file, when available.
-                    Some(rw) if !rw.1.is_empty() => rw.1[(i * rw.1.len() / n.max(1)).min(rw.1.len() - 1)],
+                    Some(rw) if !rw.1.is_empty() && !stem_view => rw.1[(i * rw.1.len() / n.max(1)).min(rw.1.len() - 1)],
                     _ => crate::export::anlz::three_band_overview(c),
                 };
                 let (b, o, w) = (lo as f32 * 0.25 / full_h, mi as f32 * 0.115 / full_h, hi as f32 * 0.085 / full_h);
@@ -389,14 +391,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             let t1 = st.phrases.get(k + 1).map(|n| beat_t(n.beat)).unwrap_or_else(|| beat_t(st.end_beat));
             let x0 = r.min.x + (t0 / dur) as f32 * r.width();
             let x1 = r.min.x + (t1 / dur) as f32 * r.width();
-            let col = match ph.kind {
-                crate::phrase::INTRO => hex(0x3E7BD6),
-                crate::phrase::UP => hex(0xD6A23E),
-                crate::phrase::DOWN => hex(0x5AA05A),
-                crate::phrase::CHORUS => hex(0xC8464B),
-                crate::phrase::OUTRO => hex(0x8A62C8),
-                _ => hex(0x606060),
-            };
+            let col = hex(crate::phrase::color(st.mood, ph.kind));
             p.rect_filled(Rect::from_min_max(pos2(x0 + 0.5, y0), pos2((x1 - 0.5).max(x0 + 1.0), y0 + 3.0)), 0.0, col);
         }
     }
@@ -526,11 +521,16 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         let i0 = app.deck.beats.partition_point(|b| b.time < tl);
         let (y0, y1) = if half_mode { (fy(r.min.y + 4.0), fy(r.max.y)) } else { (r.min.y + 5.0, r.max.y - 5.0) };
         for b in app.deck.beats[i0..].iter().take_while(|b| b.time <= tr) {
+            // In the half modes a bar has no dim line (only its white one, with the waveform).
+            if half_mode && b.beat == 1 {
+                continue;
+            }
             let x = x_of(b.time);
             p.line_segment([pos2(x, y0), pos2(x, y1)], Stroke::new(1.0_f32, hex(0x4C4C4C)));
         }
     }
-    if let Some(w) = &app.deck.wave {
+    let stem_view = app.stem_wave_shown();
+    if let Some(w) = app.deck.x.stem_wave.as_ref().filter(|_| stem_view).map(|s| &s.1).or(app.deck.wave.as_ref()) {
         let fps = WAVE_FPS;
         let n = w.frames.len();
         let mut x = r.min.x;
@@ -552,7 +552,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                         // high drawn over it (the original's layering), from the fitted model.
                         let [lo, mi, hi] = match &app.deck.rb_wave {
                             // rekordbox's own detail values (150 per second), when available.
-                            Some(rw) if !rw.0.is_empty() => {
+                            Some(rw) if !rw.0.is_empty() && !stem_view => {
                                 let ia = ((t0.max(0.0) * 150.0) as usize).min(rw.0.len() - 1);
                                 let ib = ((t1.max(0.0) * 150.0).ceil() as usize).clamp(ia + 1, rw.0.len());
                                 rw.0[ia..ib].iter().fold([0u8; 3], |acc, v| [acc[0].max(v[0]), acc[1].max(v[1]), acc[2].max(v[2])])
@@ -585,6 +585,48 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         }
     } else if app.deck.track.is_some() {
         p.text(r.center() + vec2(60.0, 0.0), Align2::LEFT_CENTER, if app.deck.loading.is_some() { "Loading…" } else { "Analyzing…" }, FontId::proportional(12.0), DIM);
+    }
+    // Preferences > View: vocal positions and phrases on the enlarged waveform. Vocals are a
+    // thin band just inside the beat marks; phrases a band along the other edge, each with
+    // its type in a tag at its start (always, or under the pointer).
+    if let (true, Some(v)) = (app.prefs.vocal_enlarged, &app.deck.vocal) {
+        let (step, levels) = (v.0, &v.1);
+        let (y0, y1) = (fy(r.min.y + 5.0), fy(r.min.y + 7.0));
+        let mut x = r.min.x;
+        while x < r.max.x {
+            let t0 = t_of(x);
+            if t0 >= 0.0 && t0 <= dur {
+                let a = (t0 / step) as usize;
+                let b = ((t_of(x + 1.0) / step) as usize).max(a + 1);
+                let lvl = levels.get(a.min(levels.len())..b.min(levels.len())).and_then(|s| s.iter().max().copied()).unwrap_or(0);
+                if lvl > 0 {
+                    p.rect_filled(Rect::from_two_pos(pos2(x, y0), pos2(x + 1.0, y1)), 0.0, hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0)));
+                }
+            }
+            x += 1.0;
+        }
+    }
+    if let (true, Some(st), false) = (app.prefs.phrase_enlarged, &app.deck.phrases, app.deck.beats.is_empty()) {
+        let beat_t = |b: u16| app.deck.beats.get((b.max(1) - 1) as usize).map(|x| x.time).unwrap_or(dur);
+        let hover = ui.ctx().pointer_latest_pos().filter(|pp| r.expand(8.0).contains(*pp));
+        let (y0, y1) = if half_mode { (fy(r.max.y - 3.0), fy(r.max.y)) } else { (r.max.y + 2.0, r.max.y + 5.0) };
+        for (k, ph) in st.phrases.iter().enumerate() {
+            let t0 = beat_t(ph.beat);
+            let t1 = st.phrases.get(k + 1).map(|n| beat_t(n.beat)).unwrap_or_else(|| beat_t(st.end_beat));
+            let (x0, x1) = (x_of(t0), x_of(t1));
+            if x1 < r.min.x || x0 > r.max.x {
+                continue;
+            }
+            let col = hex(crate::phrase::color(st.mood, ph.kind));
+            p.rect_filled(Rect::from_two_pos(pos2(x0.max(r.min.x) + 0.5, y0), pos2((x1.min(r.max.x) - 0.5).max(x0 + 1.0), y1)), 0.0, col);
+            let hovered = hover.map(|pp| pp.x >= x0 && pp.x < x1).unwrap_or(false);
+            if (app.prefs.phrase_types_always || hovered) && x0 >= r.min.x - 60.0 {
+                let name = crate::phrase::label(st.mood, ph.kind);
+                let tag = Rect::from_min_size(pos2(x0 + 1.0, if half_mode { fy(r.max.y - 9.0) - if flip { 0.0 } else { 5.5 } } else { r.max.y - 16.0 }), vec2(name.len() as f32 * 5.2 + 7.0, 11.0));
+                p.rect_filled(tag, 1.0, col);
+                p.text(tag.center(), Align2::CENTER_CENTER, name, FontId::proportional(8.5), Color32::BLACK);
+            }
+        }
     }
     // beat grid
     let tl = t_of(r.min.x);
@@ -1006,13 +1048,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         p.text(r.center(), Align2::CENTER_CENTER, *label, bold(10.5), if have { WHITE } else { DIM });
         let resp = resp.on_hover_text(if have { "Switch this part on or off" } else { "Separate this track into parts first" });
         if resp.clicked() && loaded {
-            // Every source of the part goes to the same new state.
-            let target = !srcs.iter().all(|s| on[*s]);
-            for s in srcs {
-                if on[*s] != target {
-                    app.toggle_stem(*s);
-                }
-            }
+            // MUTE or SOLO, as chosen in Preferences > STEMS > ACTIVE STEM Setting.
+            crate::prefs_ext::stem_part_click(app, srcs);
         }
     }
     // Status and actions.

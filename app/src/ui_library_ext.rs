@@ -1233,7 +1233,8 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
     related_criteria(app, ui);
 }
 
-pub const INFO_TAB_FONT: f32 = 13.5;
+pub const INFO_TAB_FONT: f32 = 14.25;
+pub const INFO_LABEL_FONT: f32 = 12.5;
 pub const INFO_ROW_FONT: f32 = 14.0;
 pub const INFO_SMALL_FONT: f32 = 11.5;
 pub const INFO_VALUE_FONT: f32 = 13.5;
@@ -1688,7 +1689,7 @@ fn date_dmy(s: &str) -> String {
     if parts.len() == 3 { format!("{}/{}/{}", parts[2], parts[1], parts[0]) } else { d.to_string() }
 }
 
-pub const INFO_LABEL: Color32 = hex(0x8A8A8A);
+pub const INFO_LABEL: Color32 = hex(0x828282);
 
 /// Information window at the right of the browser (reference 13), 445 pt wide on #1E1E1E:
 /// Summary / Info / Artwork tabs 21 pt high from 8.5 pt down (the chosen one blue with dark
@@ -1785,7 +1786,7 @@ pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let y = t + 168.0 + 24.0 * i as f32;
                 p.rect_filled(Rect::from_min_max(pos2(l + 9.5, y), pos2(line_right, y + 1.0)), 0.0, hex(0x313131));
                 p.rect_filled(Rect::from_min_max(pos2(vx - 4.5, y + 3.5), pos2(vx - 3.5, y + 21.5)), 0.0, hex(0x313131));
-                p.text(pos2(l + 9.5, y + 12.5), Align2::LEFT_CENTER, *label, font.clone(), INFO_LABEL);
+                p.text(pos2(l + 9.5, y + 12.5), Align2::LEFT_CENTER, *label, rb(INFO_LABEL_FONT), INFO_LABEL);
                 p.text(pos2(vx, y + 12.5), Align2::LEFT_CENTER, value, font.clone(), WHITE);
             }
             let y = t + 168.0 + 24.0 * rows.len() as f32;
@@ -2173,7 +2174,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-pub const MFM_FONT: f32 = 13.5;
+pub const MFM_FONT: f32 = 14.0;
 
 /// Folders Auto Relocate looks in.
 fn search_folders_menu(app: &mut App, ui: &mut Ui) {

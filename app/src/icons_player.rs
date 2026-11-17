@@ -224,9 +224,9 @@ pub fn bend(p: &Painter, c: Pos2, k: f32, dir: f32, col: Color32) {
 
 /// TEMPO − / +: a 12 × 2 bar, crossed for plus.
 pub fn tempo_sign(p: &Painter, c: Pos2, plus: bool, col: Color32) {
-    p.rect_filled(Rect::from_center_size(c, vec2(12.0, if plus { 1.5 } else { 2.0 })), 0.0, col);
+    p.rect_filled(Rect::from_center_size(c, if plus { vec2(11.0, 1.5) } else { vec2(10.0, 2.0) }), 0.0, col);
     if plus {
-        p.rect_filled(Rect::from_center_size(c, vec2(1.5, 12.0)), 0.0, col);
+        p.rect_filled(Rect::from_center_size(c, vec2(1.5, 11.0)), 0.0, col);
     }
 }
 
@@ -235,39 +235,39 @@ pub fn link(p: &Painter, c: Pos2, k: f32, col: Color32) {
     let arc = |o: Pos2, a0: f32, a1: f32| {
         let pts: Vec<Pos2> = (0..=20).map(|i| {
             let a = (a0 + (a1 - a0) * i as f32 / 20.0).to_radians();
-            o + vec2(a.cos(), a.sin()) * 3.2 * k
+            o + vec2(a.cos(), a.sin()) * 3.5 * k
         }).collect();
         p.add(Shape::line(pts, Stroke::new(1.45 * k, col)));
     };
     // Each ring is open where the other passes through it.
-    arc(c + vec2(-2.0, 0.6) * k, 20.0, 320.0);
-    arc(c + vec2(2.0, -0.6) * k, 200.0, 500.0);
+    arc(c + vec2(-2.2, 1.7) * k, -10.0, 290.0);
+    arc(c + vec2(2.2, -1.7) * k, 170.0, 470.0);
 }
 
 /// Dual control (dualControllOff / On, 23 × 21 grid): two 12.5 × 8.5 frames, apart and white
 /// when off, overlapping and blue when on.
 pub fn dual_control(p: &Painter, c: Pos2, on: bool) {
-    let g = |x: f32, y: f32| c + vec2(x - 11.5, y - 10.5);
+    let g = |x: f32, y: f32| c + vec2(x - 11.5, y - 10.5) * 1.13;
     let (a, b, col) = if on { (g(2.75, 3.75), g(7.75, 8.75), Color32::from_rgb(0x14, 0x73, 0xEB)) } else { (g(0.75, 0.75), g(9.75, 11.75), Color32::WHITE) };
     for o in [a, b] {
-        p.rect_stroke(Rect::from_min_size(o, vec2(12.5, 8.5)).expand(0.75), 0.0, Stroke::new(1.5, col), egui::StrokeKind::Inside);
+        p.rect_stroke(Rect::from_min_size(o, vec2(12.5, 8.5) * 1.13).expand(0.75), 0.0, Stroke::new(1.5, col), egui::StrokeKind::Inside);
     }
 }
 
 /// The A-GAIN knob: a dark 18 pt cap, a blue arc from straight up to the pointer and a white
 /// 2 × 5 pointer mark at `deg` degrees from straight up. `lit`: a track is loaded.
 pub fn gain_knob(p: &Painter, c: Pos2, deg: f32, lit: bool) {
-    p.circle_filled(c, 9.0, Color32::from_rgb(0x19, 0x19, 0x19));
+    p.circle_filled(c, 10.0, Color32::from_rgb(0x19, 0x19, 0x19));
     let at = |d: f32, r: f32| {
         let a = (d - 90.0).to_radians();
         c + vec2(a.cos(), a.sin()) * r
     };
     if lit && deg.abs() > 1.0 {
         let n = (deg.abs() / 4.0).ceil().max(2.0) as usize;
-        let pts: Vec<Pos2> = (0..=n).map(|i| at(deg * i as f32 / n as f32, 10.0)).collect();
+        let pts: Vec<Pos2> = (0..=n).map(|i| at(deg * i as f32 / n as f32, 8.75)).collect();
         p.add(Shape::line(pts, Stroke::new(2.5, Color32::from_rgb(0x14, 0x73, 0xEB))));
     }
-    p.line_segment([at(deg, 7.5), at(deg, 12.5)], Stroke::new(2.0, if lit { Color32::WHITE } else { Color32::from_rgb(0xC8, 0xC8, 0xC8) }));
+    p.line_segment([at(deg, 4.5), at(deg, 10.0)], Stroke::new(2.0, if lit { Color32::WHITE } else { Color32::from_rgb(0xC8, 0xC8, 0xC8) }));
 }
 
 /// PHRASE EDIT's scissors-free CUT uses text; its list arrow is the pull-down chevron.

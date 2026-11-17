@@ -126,7 +126,7 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     app.reload_tags();
                 }
             } else {
-                ui.painter().with_clip_rect(hr).text(pos2(hr.min.x + 7.5, hr.center().y), Align2::LEFT_CENTER, &c.name, rb(MYTAG_FONT), DIM);
+                ui.painter().with_clip_rect(hr).text(pos2(hr.min.x + 7.5, hr.center().y + 0.75), Align2::LEFT_CENTER, &c.name, rb(MYTAG_FONT), DIM);
             }
             if hresp.double_clicked() {
                 app.dialogs.rename_tag = Some((c.id, c.name.clone()));
@@ -198,7 +198,7 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 } else if partial {
                     pt.rect_filled(Rect::from_center_size(bx.center(), vec2(6.0, 1.5)), 0.0, DIM2);
                 }
-                pt.with_clip_rect(Rect::from_min_max(rr.min, pos2(rr.max.x - 24.0, rr.max.y))).text(pos2(rr.min.x + 28.5, rr.center().y), Align2::LEFT_CENTER, &tg.name, rb(MYTAG_FONT), if filtering { CUE_ORANGE } else { WHITE });
+                pt.with_clip_rect(Rect::from_min_max(rr.min, pos2(rr.max.x - 24.0, rr.max.y))).text(pos2(rr.min.x + 28.5, rr.center().y + 0.75), Align2::LEFT_CENTER, &tg.name, rb(MYTAG_FONT), if filtering { CUE_ORANGE } else { WHITE });
                 if resp.clicked() && !plus_clicked {
                     if ui.input(|i| i.modifiers.alt) {
                         if !app.filter_tags.insert(tg.id) {
@@ -416,7 +416,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
         let resp = ui.interact(br, ui.id().with(("relwin_src", which, k)), Sense::click());
         let on = src_now == k;
         p.rect_stroke(br, 2.0, Stroke::new(1.0, if on { BLUE } else if resp.hovered() { hex(0x8C8C8C) } else { OFF }), egui::StrokeKind::Inside);
-        p.text(br.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, label, rb_bold(9.75), if k >= 2 { BLUE } else { WHITE });
+        p.text(br.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, label, rb_bold(if k >= 2 { 9.75 } else { 9.0 }), if k >= 2 { BLUE } else { WHITE });
         let resp = if tips { resp.on_hover_text(tip) } else { resp };
         if resp.clicked() {
             if which == 0 {
@@ -429,9 +429,9 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
         }
     }
     let src = app.panel_source(src_now);
-    crate::icons_src::sub_note(&p, Rect::from_min_size(pos2(right - 76.5, t + 33.0), vec2(14.0, 14.0)), WHITE);
+    crate::icons_src::sub_note(&p, Rect::from_min_size(pos2(right - 78.5, t + 33.0), vec2(14.0, 14.0)), WHITE);
     let src_name = src.and_then(|id| app.track(id)).map(|x| x.display_title()).unwrap_or_default();
-    p.text(pos2(right - 60.0, t + 40.0), Align2::LEFT_CENTER, format!(": {src_name}"), rb(SUB_NAME_FONT), WHITE);
+    p.text(pos2(right - 62.0, t + 40.0), Align2::LEFT_CENTER, format!(": {src_name}"), rb(SUB_NAME_FONT), WHITE);
     // Row 3: where to look and what to show.
     let tt = Rect::from_min_size(pos2(l + 11.0, t + 58.0), vec2(18.0, 18.0));
     let target = if which == 0 { app.prefs.bx.related_target } else { app.prefs.bx.suggest_target };
@@ -509,7 +509,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
             // The right-hand value: BPM and key (Auto) or another column; the window's right
             // edge is 12 pt past the row (BPM ends 70 pt and the key starts 59.5 pt before it).
             let edge = rr.max.x + 12.0;
-            let y = rr.min.y + 21.5;
+            let y = rr.min.y + 22.25;
             match info {
                 0 => {
                     if tr.bpm > 0.0 {
@@ -688,6 +688,13 @@ pub fn column_view(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
     bar_style(&mut aui);
     aui.spacing_mut().item_spacing = vec2(0.0, 0.0);
     let n_cols = cols.len();
+    // A newly shown node brings the last column into view.
+    let last_key = egui::Id::new("cv_last_shown");
+    let last: Option<i64> = ui.ctx().data(|d| d.get_temp(last_key)).unwrap_or(None);
+    if last != shown {
+        ui.ctx().data_mut(|d| d.insert_temp(last_key, shown));
+        app.ext.cv_scroll_end = true;
+    }
     let scroll_end = std::mem::take(&mut app.ext.cv_scroll_end);
     let mut sa = egui::ScrollArea::horizontal().id_salt("cv_h").auto_shrink([false, false]);
     if scroll_end {

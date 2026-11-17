@@ -1120,11 +1120,11 @@ mod dsp_tests {
         let mut buf = vec![0.0f32; 1024];
         let total = (secs * 44100.0) as usize;
         while all.len() < total {
-            buf.iter_mut().for_each(|v| *v = 0.0);
-            render_deck(s, &mut buf, 2, 44100);
-            all.extend(buf.chunks(2).map(|f| f[0]));
+            let n = (total - all.len()).min(512);
+            buf[..n * 2].iter_mut().for_each(|v| *v = 0.0);
+            render_deck(s, &mut buf[..n * 2], 2, 44100);
+            all.extend(buf[..n * 2].chunks(2).map(|f| f[0]));
         }
-        all.truncate(total);
         all
     }
 

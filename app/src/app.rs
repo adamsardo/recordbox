@@ -1471,7 +1471,10 @@ impl App {
             }
             if let Some(t) = first {
                 app.load_track(t);
-                app.selected.insert(t);
+                // ("row2" keeps its own selection: the second row of the list.)
+                if !std::env::var("PREPDECK_SHOT_VIEW").map(|v| v.contains("row2")).unwrap_or(false) {
+                    app.selected.insert(t);
+                }
                 // PREPDECK_SHOT_STEMS=1: show the stems strip; =separate: separate the whole
                 // track first (synchronously, model from PREPDECK_STEM_MODEL) and mute vocals.
                 if let Ok(v) = std::env::var("PREPDECK_SHOT_STEMS") {
@@ -2203,7 +2206,7 @@ impl App {
         if self.view != v {
             self.view = v;
             self.colbrowse = Default::default();
-            let manual = matches!(self.view, View::History(_) | View::TagList) || matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
+            let manual = matches!(self.view, View::History(_) | View::TagList | View::Suggest(_)) || matches!(self.view, View::Playlist(id) if self.node(id).map(|n| n.kind == NodeKind::Playlist).unwrap_or(false));
             // Switch to the other column set and sort when moving between playlists and the
             // rest; each keeps the user's own choices.
             if manual != self.prefs.columns_for_playlist {
