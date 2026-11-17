@@ -161,7 +161,8 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // ---------------- enlarged waveform (drawn first; the zoom buttons sit on top of it):
     // beats from y 88 to 202, the playhead 692.5 pt from the window's left edge.
     let det = Rect::from_min_max(pos2(main.min.x, my + 88.0), pos2(main.max.x, my + 202.0));
-    draw_detail_at(app, ui, det, pos, 2.5 * (main.width() / 1220.0));
+    let mode = if app.deck.ctrl_tab == 1 { DetailMode::GridEdit } else { DetailMode::Full };
+    draw_detail_at(app, ui, det, pos, 2.5 * (main.width() / 1220.0), mode);
 
     // ---------------- zoom column (overlaid on the left of the enlarged waveform), on an opaque
     // black strip so the waveform never shows through the buttons.
@@ -187,8 +188,10 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let x_key = sx(main, 1168.0);
     let x_bpm = sx(main, 1224.0);
     if let Some(t) = &track {
-        let clip = p.with_clip_rect(Rect::from_min_max(pos2(sx(main, 179.0), my), pos2(x_artist - 8.0, my + 21.0)));
-        clip.text(pos2(sx(main, 179.0), my + HDR_TITLE_Y), Align2::LEFT_CENTER, t.display_title(), bold(15.5), WHITE);
+        // The title starts at x 156.5 (rekordbox puts a streaming service's mark before it,
+        // which moves it to 179; local files have none).
+        let clip = p.with_clip_rect(Rect::from_min_max(pos2(sx(main, 156.5), my), pos2(x_artist - 8.0, my + 21.0)));
+        clip.text(pos2(sx(main, 156.5), my + HDR_TITLE_Y), Align2::LEFT_CENTER, t.display_title(), bold(15.5), WHITE);
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(x_artist, my), pos2(x_time - 8.0, my + 21.0)));
         clip.text(pos2(x_artist + 16.5, my + HDR_TEXT_Y), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.25), DIM);
     }
@@ -218,12 +221,13 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         p.text(pos2(sx(main, 1263.0), my + HDR_TEXT_Y - 0.5), Align2::CENTER_CENTER, if b > 0.0 { format!("{b:.2}") } else { "--.--".into() }, FontId::proportional(13.0), WHITE);
     }
 
-    // ---------------- artwork: 48 × 33 pt at x 95, y 18.5 (an empty deck shows a 48 pt tile from y 11)
-    let art = Rect::from_min_size(pos2(sx(main, 95.0), my + 18.5), vec2(48.0, 33.0));
+    // ---------------- artwork: a 48 pt box at x 95, y 11; the picture keeps its shape inside it
+    // (an empty deck shows a 48 pt tile there)
+    let art = Rect::from_min_size(pos2(sx(main, 95.0), my + 11.0), vec2(48.0, 48.0));
     match &track {
         Some(t) => {
             if let Some(tex) = crate::ui_browser::artwork_texture(app, &t.artwork) {
-                p.image(tex.id(), art, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                p.image(tex.id(), fit_rect(art, tex.size_vec2()), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             } else {
                 p.rect_filled(art, 0.0, hex(0x141414));
                 draw_note_icon(&p, art);
@@ -257,7 +261,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     control_strip(app, ui, strip, main);
 
     // ---------------- right sub panel
-    side_panel(app, ui, right);
+    side_panel(app, ui, right, &PANEL_1P);
 
     // A track dragged from the list and dropped on the player is loaded.
     crate::ui_player2::drop_to_load(app, ui, full);
@@ -265,6 +269,15 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     if playing || app.searching() != 0 || app.deck.loading.is_some() {
         ui.ctx().request_repaint();
     }
+}
+
+/// The largest rectangle of a picture's proportions centred in `bx`.
+pub(crate) fn fit_rect(bx: Rect, size: egui::Vec2) -> Rect {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return bx;
+    }
+    let k = (bx.width() / size.x).min(bx.height() / size.y);
+    Rect::from_center_size(bx.center(), size * k)
 }
 
 /// Vertical centres of the header row's texts (from the player's top edge).
@@ -446,16 +459,36 @@ pub(crate) fn tri_up(p: &egui::Painter, tip: Pos2, s: f32, c: Color32) {
     p.add(Shape::convex_polygon(vec![tip, tip + vec2(s, s * 1.2), tip + vec2(-s, s * 1.2)], c, Stroke::NONE));
 }
 
-pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
-    draw_detail_at(app, ui, r, pos, 0.0)
+/// How the enlarged waveform is drawn.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum DetailMode {
+    /// 1 Player: the waveform mirrored about the middle, beat marks at both edges.
+    Full,
+    /// 1 Player with the GRID tab open: as Full, with blue beat lines and red bar lines.
+    GridEdit,
+    /// Deck A of the two-deck layouts: the upper half of the waveform standing on the bottom
+    /// edge of `r`, beat marks along the top.
+    HalfUp,
+    /// Deck B: the same hanging from the top edge, beat marks along the bottom.
+    HalfDown,
 }
 
 /// The enlarged waveform in `r`, with the playhead `cx_off` pt right of the middle of `r`
 /// (rekordbox's 1 Player layout has it 2.5 pt right of the middle).
-pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_off: f32) {
+pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_off: f32, mode: DetailMode) {
     // `r` is the beat/waveform area; the 19 pt row above it holds the bar.beat readout and the
     // hot cue letters (measured on reference 02).
-    let p = ui.painter_at(Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 6.0)));
+    let half_mode = matches!(mode, DetailMode::HalfUp | DetailMode::HalfDown);
+    let flip = mode == DetailMode::HalfDown;
+    let grid_edit = mode == DetailMode::GridEdit;
+    // In the half modes everything is laid out for deck A and mirrored for deck B.
+    let fy = |y: f32| if flip { r.min.y + r.max.y - y } else { y };
+    let dir = if flip { -1.0f32 } else { 1.0 };
+    let p = ui.painter_at(match mode {
+        DetailMode::HalfUp => Rect::from_min_max(r.min - vec2(0.0, 27.0), r.max + vec2(0.0, 0.5)),
+        DetailMode::HalfDown => Rect::from_min_max(r.min - vec2(0.0, 0.5), r.max + vec2(0.0, 27.0)),
+        _ => Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 6.0)),
+    });
     let span = ZOOMS[app.prefs.zoom.min(ZOOMS.len() - 1)];
     let px_per_s = r.width() as f64 / span;
     let cx = r.center().x + cx_off;
@@ -484,16 +517,17 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
     }
     for c in &app.deck.cues {
         if let Some(e) = c.end.filter(|e| *e > c.start) {
-            p.rect_filled(Rect::from_min_max(pos2(x_of(c.start), r.max.y - 6.0), pos2(x_of(e), r.max.y)), 0.0, LOOP.gamma_multiply(0.6));
+            p.rect_filled(Rect::from_two_pos(pos2(x_of(c.start), fy(r.max.y - 6.0)), pos2(x_of(e), fy(r.max.y))), 0.0, LOOP.gamma_multiply(0.6));
         }
     }
     // Beat lines run behind the waveform in dim grey (bars get a white line on top, below).
-    {
+    if !grid_edit {
         let (tl, tr) = (t_of(r.min.x), t_of(r.max.x));
         let i0 = app.deck.beats.partition_point(|b| b.time < tl);
+        let (y0, y1) = if half_mode { (fy(r.min.y + 4.0), fy(r.max.y)) } else { (r.min.y + 5.0, r.max.y - 5.0) };
         for b in app.deck.beats[i0..].iter().take_while(|b| b.time <= tr) {
             let x = x_of(b.time);
-            p.line_segment([pos2(x, r.min.y + 5.0), pos2(x, r.max.y - 5.0)], Stroke::new(1.0_f32, hex(0x4C4C4C)));
+            p.line_segment([pos2(x, y0), pos2(x, y1)], Stroke::new(1.0_f32, hex(0x4C4C4C)));
         }
     }
     if let Some(w) = &app.deck.wave {
@@ -532,6 +566,12 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                     };
                     for (h, col) in bars {
                         let hh = h * half;
+                        if half_mode {
+                            // Half of the waveform, from this deck's edge of the shared area.
+                            let hh = h * (r.height() - 10.0);
+                            p.line_segment([pos2(x + 0.5, fy(r.max.y)), pos2(x + 0.5, fy(r.max.y - hh))], Stroke::new(1.0_f32, col));
+                            continue;
+                        }
                         // Preferences > View > Color: Half Waveform draws the upper half only.
                         if app.prefs.wave_half {
                             p.line_segment([pos2(x + 0.5, mid + half - 2.0 * hh), pos2(x + 0.5, mid + half)], Stroke::new(1.0_f32, col));
@@ -553,6 +593,34 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
     for b in app.deck.beats[i0..].iter().take_while(|b| b.time <= tr) {
         // Lines sit on whole points so that they stay 1 pt wide.
         let x = (x_of(b.time) - 0.5).round() + 0.5;
+        if half_mode {
+            // Marks along this deck's outer edge only; the lines run to the shared middle.
+            if b.beat == 1 {
+                crate::icons_player::bar_cap(&p, x, fy(r.min.y), dir, BAR_RED);
+                if app.deck.wave.is_some() {
+                    p.rect_filled(Rect::from_two_pos(pos2(x - 0.5, fy(r.min.y + 4.0)), pos2(x + 0.5, fy(r.max.y))), 0.0, WHITE);
+                }
+            } else {
+                crate::icons_player::beat_cap(&p, x, fy(r.min.y), dir, hex(0x7C7C7C));
+            }
+            continue;
+        }
+        if grid_edit {
+            // GRID: every beat is a line to drag the eye along: light blue, red on bars, with
+            // a dark edge, between the marks at both ends.
+            let (core, edge) = if b.beat == 1 { (hex(0xD43024), hex(0x450F0B)) } else { (hex(0x52B1E1), hex(0x04263A)) };
+            let line = Rect::from_min_max(pos2(x - 0.5, r.min.y + 4.0), pos2(x + 0.5, r.max.y - 5.0));
+            p.rect_filled(line.expand2(vec2(0.5, 0.0)), 0.0, edge);
+            p.rect_filled(line, 0.0, core);
+            if b.beat == 1 {
+                crate::icons_player::bar_cap(&p, x, r.min.y - 1.0, 1.0, BAR_RED);
+                crate::icons_player::bar_cap(&p, x, r.max.y, -1.0, BAR_RED);
+            } else {
+                crate::icons_player::beat_cap(&p, x, r.min.y - 1.0, 1.0, hex(0x7C7C7C));
+                crate::icons_player::beat_cap(&p, x, r.max.y, -1.0, hex(0x7C7C7C));
+            }
+            continue;
+        }
         if b.beat == 1 {
             // Bar: red 5 × 4 pt triangles at both ends, a white line between them.
             crate::icons_player::bar_cap(&p, x, r.min.y, 1.0, BAR_RED);
@@ -568,7 +636,8 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         // bar.beat readout, ending 2 pt left of the playhead (hot cue letters cover its end)
         let mem: Vec<f64> = if app.prefs.beat_count_mode == 0 { vec![] } else { app.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).collect() };
         let label = crate::player_ext::beat_count_label(&app.deck.beats, &mem, pos, app.prefs.beat_count_mode);
-        p.text(pos2(cx - 2.0, r.min.y - 10.2), Align2::RIGHT_CENTER, label, bold(14.0), BEAT_BLUE);
+        let ly = if half_mode { fy(r.min.y + 6.5) } else { r.min.y - 10.2 };
+        p.text(pos2(cx - 2.0, ly), Align2::RIGHT_CENTER, label, bold(14.0), BEAT_BLUE);
     }
     // cues
     for c in &app.deck.cues {
@@ -581,15 +650,28 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
             // An 11 pt letter box centred on the cue, in the row above the beats, with a black
             // letter (no comment text: the original shows none there).
             p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0_f32, col));
-            let lr = Rect::from_min_size(pos2(x - 5.5, r.min.y - 10.5), vec2(11.0, 11.0));
+            let lr = if half_mode { Rect::from_center_size(pos2(x, fy(r.min.y - 6.0)), vec2(11.0, 11.0)) } else { Rect::from_min_size(pos2(x - 5.5, r.min.y - 10.5), vec2(11.0, 11.0)) };
             p.rect_filled(lr, 0.0, col);
             p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(10.0), Color32::BLACK);
         } else {
             let col = if c.color > 0 { label_color(c.color) } else { BAR_RED };
-            tri_up(&p, pos2(x, r.max.y - 9.0), 6.0, col);
+            if half_mode {
+                let tip = pos2(x, fy(r.max.y - 7.2));
+                p.add(Shape::convex_polygon(vec![tip, pos2(x + 6.0, fy(r.max.y)), pos2(x - 6.0, fy(r.max.y))], col, Stroke::NONE));
+            } else {
+                tri_up(&p, pos2(x, r.max.y - 9.0), 6.0, col);
+            }
         }
     }
-    if app.deck.track.is_some() {
+    if app.deck.track.is_some() && half_mode {
+        // current cue: a 10 pt triangle standing on the waveform's base line
+        let x = x_of(app.deck.cue_point);
+        p.add(Shape::convex_polygon(vec![pos2(x, fy(r.max.y - 10.0)), pos2(x + 6.3, fy(r.max.y)), pos2(x - 6.3, fy(r.max.y))], CUE_MARK, Stroke::NONE));
+        // playhead: from just outside the beat marks to the base line
+        let ph = Rect::from_two_pos(pos2(cx - 0.5, fy(r.min.y - 2.0)), pos2(cx + 0.5, fy(r.max.y)));
+        p.rect_filled(ph.expand2(vec2(1.0, 0.0)), 0.0, Color32::from_black_alpha(128));
+        p.rect_filled(ph, 0.0, hex(0xE0E0E0));
+    } else if app.deck.track.is_some() {
         // current cue: an 11.5 pt triangle whose base is 4.5 pt under the beats
         crate::icons_player::cue_tri(&p, pos2(x_of(app.deck.cue_point), r.max.y - 7.0), 11.5, CUE_MARK);
         // playhead: a 1 pt #E0E0E0 line with a 1 pt half-black edge on both sides
@@ -599,7 +681,14 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
     }
     // interaction: drag a cue marker to move it, drag elsewhere to scrub, scroll to move,
     // ctrl/cmd + scroll to zoom
-    let resp = ui.interact(Rect::from_min_max(r.min - vec2(0.0, 19.0), r.max), ui.id().with("detail"), Sense::click_and_drag());
+    let hit_rect = match mode {
+        DetailMode::HalfUp => Rect::from_min_max(r.min - vec2(0.0, 27.0), r.max),
+        DetailMode::HalfDown => Rect::from_min_max(r.min, r.max + vec2(0.0, 27.0)),
+        _ => Rect::from_min_max(r.min - vec2(0.0, 19.0), r.max),
+    };
+    let resp = ui.interact(hit_rect, ui.id().with("detail"), Sense::click_and_drag());
+    // Markers are found as they are laid out for deck A (deck B's are mirrored).
+    let cue_marker_hit = |cues: &[Cue], pp: Pos2, r: Rect, x_of: &dyn Fn(f64) -> f32| cue_marker_hit(cues, pos2(pp.x, fy(pp.y)), r, x_of);
     let dur = app.deck.duration;
     // Right-click menu, acting at the clicked position. With "Click on the waveform for PLAY
     // and CUE" on, a left click is PLAY/PAUSE and the right button is CUE (held: cue preview);
@@ -630,7 +719,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
     if app.deck.audio.is_some() {
         if app.deck.cue_drag.is_none() {
             if let Some(hp) = resp.hover_pos() {
-                if cue_marker_hit(&app.deck.cues, hp, r, x_of).is_some() {
+                if cue_marker_hit(&app.deck.cues, hp, r, &x_of).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
             }
@@ -640,7 +729,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
             // moved a few pixels, and the marker under the press is the one being dragged.
             let pp = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
             let adj = app.deck.x.loop_adjust;
-            match pp.and_then(|pp| cue_marker_hit(&app.deck.cues, pp, r, x_of).map(|id| (id, pp))) {
+            match pp.and_then(|pp| cue_marker_hit(&app.deck.cues, pp, r, &x_of).map(|id| (id, pp))) {
                 // Loop adjust: the drag moves the loop edge.
                 _ if adj != 0 && app.loop_active().is_some() => {
                     let (a, b) = app.loop_active().unwrap_or((0.0, 0.0));
@@ -679,6 +768,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         } else if resp.dragged() {
             if let (Some((x0, p0)), Some(pp)) = (app.deck.drag_origin, resp.interact_pointer_pos()) {
                 let t = p0 - (pp.x - x0) as f64 / px_per_s;
+                app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
                 app.seek(t);
             }
         }
@@ -701,6 +791,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
             } else if scroll.x.abs() > 0.5 || scroll.y.abs() > 0.5 {
                 let d = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
                 let t = pos - d as f64 / px_per_s;
+                app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
                 app.seek(t);
             }
         }
@@ -747,7 +838,6 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     }
     // Every control is centred 24 pt below the strip's top; buttons are 20 pt tall.
     let y = s.min.y + 24.0;
-    let x0 = sx(main, 407.9);
     let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 20.0));
     if app.deck.ctrl_tab == 0 {
         // hot cue pads: 28 pt #0F0F0F squares on a 33 pt pitch from x = 407; a set cue shows
@@ -888,7 +978,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     } else if app.deck.ctrl_tab == 2 {
         stems_strip(app, ui, s, main);
     } else {
-        crate::ui_player2::grid_strip(app, ui, s, x0);
+        crate::ui_player2::grid_strip(app, ui, s, main);
     }
 }
 
@@ -1021,14 +1111,28 @@ pub(crate) fn hot_cue_menu(app: &mut App, ui: &mut Ui, c: &Cue) {
     }
 }
 
-fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
+/// Heights of the MEMORY / HOT CUE / INFO panel: the pitch of the ten memory rows and the
+/// eight hot cue rows, where the list ends and where the tabs are (from the panel's top).
+pub(crate) struct PanelGeom {
+    pub mem_pitch: f32,
+    pub hot_pitch: f32,
+    pub list_bottom: f32,
+    pub tabs_y: f32,
+}
+
+/// 1 Player: MEMORY 10 × 21 pt on a 22 pt pitch, HOT CUE 8 × 26 pt on a 27 pt pitch, tabs at y 230.
+pub(crate) const PANEL_1P: PanelGeom = PanelGeom { mem_pitch: 22.0, hot_pitch: 27.0, list_bottom: 225.0, tabs_y: 230.0 };
+/// 2 Players / Dual Player (one panel per deck, 186 pt tall): MEMORY 10 × 14 pt on a 15 pt
+/// pitch, the eight hot cues in the same height, tabs at y 162.
+pub(crate) const PANEL_2P: PanelGeom = PanelGeom { mem_pitch: 15.0, hot_pitch: 18.75, list_bottom: 155.0, tabs_y: 162.0 };
+
+pub(crate) fn side_panel(app: &mut App, ui: &mut Ui, r: Rect, g: &PanelGeom) {
     let p = ui.painter().clone();
     // Reference 01/03: a #1E1E1E panel (x 1303..1509, from 1 pt below the player's top) holding
-    // the list (x 1311..1501, from y 6) as separate rounded rows: MEMORY 10 × 21 pt on a 22 pt
-    // pitch, HOT CUE 8 × 26 pt on a 27 pt pitch; three 62 × 18 pt tabs at y 230.
-    let tabs_y = r.min.y + 230.0;
+    // the list (x 1311..1501, from y 6) as separate rounded rows; three 62 × 18 pt tabs below.
+    let tabs_y = r.min.y + g.tabs_y;
     p.rect_filled(Rect::from_min_max(pos2(r.min.x - 7.0, r.min.y + 1.0), pos2(r.max.x - 3.0, r.max.y)), 0.0, hex(0x1E1E1E));
-    let list = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 6.0), pos2(r.max.x - 11.0, r.min.y + 225.0));
+    let list = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 6.0), pos2(r.max.x - 11.0, r.min.y + g.list_bottom));
     for (i, name) in ["MEMORY", "HOT CUE", "INFO"].iter().enumerate() {
         let tr = Rect::from_min_size(pos2(r.min.x + 1.0 + i as f32 * 64.0, tabs_y), vec2(62.0, 18.0));
         let tipt = ["Show MEMORY Panel", "Show HOT CUE Panel", "Show INFO Panel"][i];
@@ -1036,7 +1140,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
             app.deck.panel_tab = i as u8;
         }
     }
-    let row_h = 22.0;
+    let row_h = g.mem_pitch;
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
     match app.deck.panel_tab {
         0 => {
@@ -1133,7 +1237,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
         }
         1 => {
             for slot in 0..8 {
-                let rr = Rect::from_min_size(pos2(list.min.x, list.min.y + slot as f32 * 27.0), vec2(list.width(), 26.0));
+                let rr = Rect::from_min_size(pos2(list.min.x, list.min.y + slot as f32 * g.hot_pitch), vec2(list.width(), g.hot_pitch - 1.0));
                 p.rect_filled(rr, 2.0, hex(0x0F0F0F));
                 let c = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned();
                 let chip = Rect::from_center_size(pos2(rr.min.x + 15.5, rr.center().y - 0.5), vec2(11.0, 11.0));
@@ -1196,7 +1300,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
 /// INFO panel (reference 04): a #0F0F0F sheet with a 3 pt scroll bar at its right and three
 /// ruled rows: rating (31 pt), colour (30 pt) and comment (47 pt). My Tag and the file's
 /// format follow underneath.
-fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
+pub(crate) fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
     let sheet = Rect::from_min_max(r.min, pos2(r.max.x - 5.0, r.max.y));
     p.rect_filled(sheet, 0.0, hex(0x0F0F0F));

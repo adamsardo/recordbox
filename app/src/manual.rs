@@ -45,7 +45,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <ul>
 <li>Click a column header to sort; right-click it to choose columns; drag the edges to resize. Playlists and the Collection keep separate column sets.</li>
 <li>The search field filters the list (the magnifier menu chooses which field is searched). <i>View &gt; Filter</i> opens the Track Filter: BPM range, key, rating, colour and My Tags.</li>
-<li>The <b>column browser</b> (Genre / Artist / Album) and the <b>Sub-Browser Window</b> (a second list under the main one) are switched in <i>View</i> and Preferences &gt; View &gt; Layout.</li>
+<li>The <b>column browser</b> (Genre / Artist / Album) and the <b>Sub-Browser Window</b> (a second list under the main one) are switched in <i>View</i> and Preferences &gt; View &gt; Recordbox.</li>
 <li>Right-click a track for its menu: load, analyse, add to playlist, colour, rating, My Tag, Property, Show in Finder, Remove from Collection.</li>
 <li><i>Track &gt; Property</i> edits a track's information. <i>Track &gt; Reload Tag</i> reads the tags from the file again.</li>
 <li>Removed tracks can be brought back for 30 days: <i>Track &gt; Restore Removed Tracks…</i></li>
@@ -65,14 +65,14 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li><i>Export Playlist</i> and <i>Export to USB Device…</i> send playlists to a drive (see Exporting).</li>
 </ul>
 <h3>My Tag</h3>
-<p><i>View &gt; My Tag Configuration Window</i> shows your tag categories; tick tags for the selected tracks. With Preferences &gt; View &gt; Layout &gt; Add "My Tag" to the "Comments", a track's tags are also written at the end of its comment as <code>/* Tag / Tag */</code>.</p>
+<p><i>View &gt; My Tag Configuration Window</i> shows your tag categories; tick tags for the selected tracks. With Preferences &gt; Advanced &gt; Browse &gt; Add "My Tag" to the "Comments", a track's tags are also written at the end of its comment as <code>/* Tag / Tag */</code>.</p>
 <h3>Related Tracks</h3>
 <p>The Related Tracks source lists tracks that go with the loaded track by the rules you tick: BPM range, same or related key, genre, colour, rating, My Tag.</p>
 "#),
     ("player", "The player", r#"
 <ul>
 <li>Load a track with a double-click, Return, or by dragging it onto the player.</li>
-<li><b>Overview</b> (whole track) and <b>enlarged waveform</b>: click or drag to move; Zoom In / Zoom Out / Reset Zoom change the enlarged waveform's scale. Waveform colour (BLUE, RGB, 3Band) and Full / Half Waveform are in Preferences &gt; View &gt; Color.</li>
+<li><b>Overview</b> (whole track) and <b>enlarged waveform</b>: click or drag to move; Zoom In / Zoom Out / Reset Zoom change the enlarged waveform's scale. Waveform colour (BLUE, RGB, 3Band) is in Preferences &gt; View &gt; Color, Full / Half Waveform in Preferences &gt; View &gt; Display Type.</li>
 <li><b>Play/Pause</b> and <b>Cue</b>: Cue while paused sets the cue point; holding it previews from the cue point.</li>
 <li><b>Search</b> buttons scan through the track while held; <b>Previous / Next Track</b> load the neighbouring row of the list.</li>
 <li><b>Quantize</b> snaps cues and loops to the beat grid (resolution in Preferences &gt; View &gt; Recordbox).</li>
@@ -101,7 +101,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 "#),
     ("stems", "Stems", r#"
-<p>Recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Advanced &gt; Others &gt; Stem separation). Separated stems are kept so each track is only split once. The stem pads mute and unmute parts; Preferences &gt; View &gt; Recordbox chooses 4 or 3 parts. The same model detects vocal positions, shown above the overview.</p>
+<p>Recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Advanced &gt; STEMS). Separated stems are kept so each track is only split once. The stem pads mute and unmute parts; Preferences &gt; Advanced &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
 "#),
     ("export", "Exporting to USB", r#"
 <ol>
@@ -131,12 +131,12 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
     ("prefs", "Preferences", r#"
 <p>Open with ⌘, (or Recordbox &gt; Preferences…). The field above the categories searches all settings by name. <b>Reset to defaults</b> asks first, and keeps your keyboard shortcuts and column layout.</p>
 <ul>
-<li><b>View</b> — <i>Display Type</i>: tooltips, list font size and line space, key format (Classic / Alphanumeric). <i>Layout</i>: which sources the Tree View shows, the playlist palette, My Tag in comments, cue markers on previews, My Tag window, column browser, sub-browser. <i>Color</i>: waveform colour, Full / Half Waveform, Color comments (your names for the eight track colours). <i>Recordbox</i>: time mode, quantize resolution, stems, vocal display.</li>
-<li><b>Audio</b> — output device, sample rate, buffer size, output channels.</li>
+<li><b>View</b> — <i>Display Type</i>: tooltips, list font size and line space, key format (Classic / Alphanumeric). Full / Half Waveform, Beat Count Display. <i>Layout</i>: which sources the Media Browser shows, the playlist palette, cue markers on previews, the playlist search filter, All Tracks and track counts in the playlist tree, phrases and vocal positions on the full waveform. <i>Color</i>: waveform colour. <i>Recordbox</i>: time mode, quantize resolution, the other source tiles, My Tag window, column browser, sub-browser.</li>
+<li><b>Audio</b> — <i>Configuration</i>: output device, sample rate, buffer size, metronome click sound and volume, preview volume. <i>Input/Output</i>: output channels.</li>
 <li><b>Analysis</b> — <i>Track Analysis</i>: high precision BeatGrid analysis, Analysis Mode, BPM Range, what is analysed, Auto Analysis, Auto Gain. <i>CUE Analysis</i>: cues set automatically on first analysis.</li>
 <li><b>DJ System</b> — everything written to USB drives: General, Category, Sort, Column, My Settings, Device, Others.</li>
 <li><b>Keyboard</b> — every shortcut, by category. Click one and press the new keys; Esc cancels. Profiles can be exported and imported.</li>
-<li><b>Advanced</b> — <i>Database</i>: where the library is, backup and restore. <i>Browse</i>: iTunes library file, rekordbox xml, folders for Auto Relocate. <i>Others</i>: stem separation model, rekordbox library sync.</li>
+<li><b>Advanced</b> — <i>Database</i>: where the library is, backup and restore. <i>Browse</i>: iTunes library file, rekordbox xml, My Tag in comments, Color comments (your names for the eight track colours), folders for Auto Relocate. <i>Others</i>: rekordbox library sync. <i>STEMS</i>: the STEMS function, 3 or 4 parts, sound quality or speed, resetting muted parts on load, the separation model.</li>
 </ul>
 "#),
     ("trouble", "Troubleshooting", r#"

@@ -30,7 +30,7 @@ fn full_export_to_folder() {
             Cue { id: 1, track_id: t.id, kind: CueKind::Hot, slot: 0, start: 1.0, end: None, color: 43, comment: "Intro".into(), active_loop: false },
             Cue { id: 2, track_id: t.id, kind: CueKind::Memory, slot: -1, start: 8.0, end: Some(12.0), color: 3, comment: String::new(), active_loop: false },
         ];
-        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())], rb_anlz: None, grid_same: false, vocal: None });
+        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![("Genre".into(), "Techno".into())], rb_anlz: None, grid_same: false, vocal: None, phrases: None });
     }
     let nodes = vec![ExportNode { name: "Sets".into(), folder: true, children: vec![ExportNode { name: "Friday".into(), folder: false, children: vec![], tracks: vec![2, 1], ..Default::default() }], tracks: vec![], ..Default::default() }];
     let req = ExportRequest { root: root.clone(), nodes: nodes.clone(), tracks: tracks.clone(), tag_categories: vec![("Genre".into(), vec!["Techno".into(), "House".into()])], skipped: vec![], analysis: Default::default(), settings: Default::default(), browse: Default::default(), phrases: true, ..Default::default() };
@@ -97,7 +97,7 @@ pub(super) fn demo_tracks(src_dir: &std::path::Path, n: usize) -> HashMap<i64, E
         let r = crate::analysis::analyze_file(&t.path, &Default::default()).unwrap();
         t.bpm = r.bpm;
         let cues = vec![Cue { id: 1, track_id: t.id, kind: CueKind::Hot, slot: 0, start: 1.0, end: None, color: 43, comment: "Intro".into(), active_loop: false }];
-        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+        tracks.insert(t.id, ExportTrack { track: t, cues, grid: r.grid, wave: Some(r.wave), tags: vec![], rb_anlz: None, grid_same: false, vocal: None, phrases: None });
     }
     tracks
 }

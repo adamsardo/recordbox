@@ -152,9 +152,9 @@ impl eframe::App for Gui {
             // The header is 28 pt and 1 Player / 2 Players 256 pt tall with no rule between them
             // (measured on rekordbox: the player ends 284 pt below the window top); the Simple
             // Player is one 58 pt row.
-            let h = if app.prefs.player_layout == 2 { ui_player2::SIMPLE_HEIGHT } else { 256.0 };
-            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(2)))).exact_height(h).show_separator_line(false).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
-                1 => ui_player2::two_players(app, ui),
+            let h = app.player_height();
+            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(3)))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+                1 | 3 => ui_player2::two_players(app, ui),
                 2 => ui_player2::simple_player(app, ui),
                 _ => ui_player::player_panel(app, ui),
             });

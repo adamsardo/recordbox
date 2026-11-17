@@ -28,7 +28,7 @@ thread_local! {
 }
 
 /// Every menu command: (id, label, ticked item). The order here is not the menu order.
-pub const COMMANDS: [(&str, &str, bool); 64] = [
+pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("edit_cut", "Cut", false),
     ("edit_copy", "Copy", false),
     ("edit_paste", "Paste", false),
@@ -52,6 +52,7 @@ pub const COMMANDS: [(&str, &str, bool); 64] = [
     ("fullscreen", "Full screen", true),
     ("layout_player", "1 Player", true),
     ("layout_2players", "2 Players", true),
+    ("layout_dual", "Dual Player", true),
     ("layout_simple", "Simple Player", true),
     ("layout_browser", "Full Browser", true),
     ("mytag_window", "My Tag Configuration Window", true),
@@ -163,6 +164,7 @@ pub fn build() -> Option<Menu> {
             &sep(),
             it(&h, "layout_player"),
             it(&h, "layout_2players"),
+            it(&h, "layout_dual"),
             it(&h, "layout_simple"),
             it(&h, "layout_browser"),
             &sep(),
@@ -283,8 +285,9 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
             "fullscreen" => (true, app.dialogs.ext.fullscreen),
             "layout_player" => (true, layout == 0),
             "layout_2players" => (true, layout == 1),
-            "layout_simple" => (true, layout == 2),
-            "layout_browser" => (true, layout == 3),
+            "layout_dual" => (true, layout == 2),
+            "layout_simple" => (true, layout == 3),
+            "layout_browser" => (true, layout == 4),
             "mytag_window" => (true, app.prefs.show_mytag),
             "related_window" => (true, app.view == View::Related),
             "info_window" => (layout != 3, layout != 3 && app.deck.panel_tab == 2),
@@ -479,8 +482,9 @@ pub fn handle(app: &mut App, id: &str) {
         "fullscreen" => app.dialogs.ext.toggle_fullscreen = true,
         "layout_player" => app.set_player_layout(0),
         "layout_2players" => app.set_player_layout(1),
-        "layout_simple" => app.set_player_layout(2),
-        "layout_browser" => app.set_player_layout(3),
+        "layout_dual" => app.set_player_layout(2),
+        "layout_simple" => app.set_player_layout(3),
+        "layout_browser" => app.set_player_layout(4),
         "mytag_window" => {
             app.prefs.show_mytag = !app.prefs.show_mytag;
             app.save_prefs();

@@ -164,3 +164,115 @@ pub fn bubble(p: &Painter, o: Pos2, col: Color32) {
     p.rect_filled(Rect::from_min_size(o, vec2(12.0, 7.0)), 2.0, col);
     fill(p, vec![o + vec2(2.0, 6.5), o + vec2(6.5, 6.5), o + vec2(2.0, 10.0)], col);
 }
+
+/// The header's layout mark for a layout in menu order (0 = 1 Player, 1 = 2 Players,
+/// 2 = Dual Player, 3 = Simple Player, 4 = Full Browser), centred on `c`: 1.5 pt frames.
+pub fn layout_mark(p: &Painter, c: Pos2, kind: u8, col: Color32) {
+    let frame = |r: Rect| {
+        p.rect_stroke(r, 0.0, Stroke::new(1.5, col), egui::StrokeKind::Inside);
+    };
+    match kind {
+        1 => {
+            // Two decks one above the other, each with its block.
+            for dy in [-4.25f32, 4.25] {
+                let r = Rect::from_center_size(c + vec2(0.0, dy), vec2(18.0, 7.0));
+                p.rect_stroke(r, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
+                p.rect_filled(Rect::from_min_size(r.min + vec2(2.5, 2.5), vec2(2.0, 2.0)), 0.0, col);
+            }
+        }
+        2 => {
+            // Two frames overlapping.
+            frame(Rect::from_min_size(c + vec2(-9.0, -7.0), vec2(14.0, 10.0)));
+            frame(Rect::from_min_size(c + vec2(-5.0, -3.0), vec2(14.0, 10.0)));
+        }
+        3 => frame(Rect::from_center_size(c, vec2(18.0, 9.0))),
+        4 => {
+            let r = Rect::from_center_size(c, vec2(18.0, 13.0));
+            frame(r);
+            p.rect_filled(Rect::from_min_size(r.min + vec2(1.5, 2.5), vec2(15.0, 1.0)), 0.0, col);
+        }
+        _ => layout(p, c, col),
+    }
+}
+
+/// Grid buttons of the two-deck layouts (Grid_Export2_Button_*, 18 × 18 grid centred on
+/// `c`): three 2 × 10 beat bars with an arrow head at the side they move to (`dir` -1 left,
+/// 1 right).
+pub fn grid2_move(p: &Painter, c: Pos2, dir: f32, col: Color32) {
+    // Grid coordinates of the "move right" glyph, mirrored for left.
+    let g = |x: f32, y: f32| c + vec2(dir * (x - 9.0), y - 9.0);
+    for x in [3.75, 6.75, 9.75] {
+        p.rect_filled(Rect::from_two_pos(g(x, 4.0), g(x + 2.0, 14.0)), 0.0, col);
+    }
+    fill(p, vec![g(12.75, 7.0), g(15.75, 9.0), g(12.75, 11.0)], col);
+}
+
+/// Grid_Export2_Button_Center: one beat bar, white above and red below.
+pub fn grid2_center(p: &Painter, c: Pos2, col: Color32, red: Color32) {
+    p.rect_filled(Rect::from_min_max(c + vec2(-1.0, -5.0), c + vec2(1.0, 0.0)), 0.0, col);
+    p.rect_filled(Rect::from_min_max(c + vec2(-1.0, 0.0), c + vec2(1.0, 5.0)), 0.0, red);
+}
+
+/// Pitch bend wedges (bendLeft / bendRight, 10 × 10 grid at `k` pt per unit): a shaft with a
+/// barb rising to the side it bends to (`dir` -1 slower, 1 faster).
+pub fn bend(p: &Painter, c: Pos2, k: f32, dir: f32, col: Color32) {
+    // bendRight: M10 6.5 L5.5 2.5 L6 5 H0 V6.5 Z
+    let g = |x: f32, y: f32| c + vec2(dir * (x - 5.0), y - 4.5) * k;
+    p.rect_filled(Rect::from_two_pos(g(0.0, 5.0), g(10.0, 6.5)), 0.0, col);
+    fill(p, vec![g(10.0, 6.5), g(5.5, 2.5), g(6.0, 5.0)], col);
+}
+
+/// TEMPO − / +: a 12 × 2 bar, crossed for plus.
+pub fn tempo_sign(p: &Painter, c: Pos2, plus: bool, col: Color32) {
+    p.rect_filled(Rect::from_center_size(c, vec2(12.0, if plus { 1.5 } else { 2.0 })), 0.0, col);
+    if plus {
+        p.rect_filled(Rect::from_center_size(c, vec2(1.5, 12.0)), 0.0, col);
+    }
+}
+
+/// The waveform link (link.svg, 12 × 8 at `k` pt per unit): two rings hooked into each other.
+pub fn link(p: &Painter, c: Pos2, k: f32, col: Color32) {
+    let arc = |o: Pos2, a0: f32, a1: f32| {
+        let pts: Vec<Pos2> = (0..=20).map(|i| {
+            let a = (a0 + (a1 - a0) * i as f32 / 20.0).to_radians();
+            o + vec2(a.cos(), a.sin()) * 3.2 * k
+        }).collect();
+        p.add(Shape::line(pts, Stroke::new(1.45 * k, col)));
+    };
+    // Each ring is open where the other passes through it.
+    arc(c + vec2(-2.0, 0.6) * k, 20.0, 320.0);
+    arc(c + vec2(2.0, -0.6) * k, 200.0, 500.0);
+}
+
+/// Dual control (dualControllOff / On, 23 × 21 grid): two 12.5 × 8.5 frames, apart and white
+/// when off, overlapping and blue when on.
+pub fn dual_control(p: &Painter, c: Pos2, on: bool) {
+    let g = |x: f32, y: f32| c + vec2(x - 11.5, y - 10.5);
+    let (a, b, col) = if on { (g(2.75, 3.75), g(7.75, 8.75), Color32::from_rgb(0x14, 0x73, 0xEB)) } else { (g(0.75, 0.75), g(9.75, 11.75), Color32::WHITE) };
+    for o in [a, b] {
+        p.rect_stroke(Rect::from_min_size(o, vec2(12.5, 8.5)).expand(0.75), 0.0, Stroke::new(1.5, col), egui::StrokeKind::Inside);
+    }
+}
+
+/// The A-GAIN knob: a dark 18 pt cap, a blue arc from straight up to the pointer and a white
+/// 2 × 5 pointer mark at `deg` degrees from straight up. `lit`: a track is loaded.
+pub fn gain_knob(p: &Painter, c: Pos2, deg: f32, lit: bool) {
+    p.circle_filled(c, 9.0, Color32::from_rgb(0x19, 0x19, 0x19));
+    let at = |d: f32, r: f32| {
+        let a = (d - 90.0).to_radians();
+        c + vec2(a.cos(), a.sin()) * r
+    };
+    if lit && deg.abs() > 1.0 {
+        let n = (deg.abs() / 4.0).ceil().max(2.0) as usize;
+        let pts: Vec<Pos2> = (0..=n).map(|i| at(deg * i as f32 / n as f32, 10.0)).collect();
+        p.add(Shape::line(pts, Stroke::new(2.5, Color32::from_rgb(0x14, 0x73, 0xEB))));
+    }
+    p.line_segment([at(deg, 7.5), at(deg, 12.5)], Stroke::new(2.0, if lit { Color32::WHITE } else { Color32::from_rgb(0xC8, 0xC8, 0xC8) }));
+}
+
+/// PHRASE EDIT's scissors-free CUT uses text; its list arrow is the pull-down chevron.
+pub fn hamburger(p: &Painter, c: Pos2, col: Color32) {
+    for dy in [-5.0f32, 0.0, 5.0] {
+        p.rect_filled(Rect::from_center_size(c + vec2(0.0, dy), vec2(13.0, 2.0)), 0.0, col);
+    }
+}

@@ -12,14 +12,14 @@ pub const DOWN: u16 = 3;
 pub const CHORUS: u16 = 5;
 pub const OUTRO: u16 = 6;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Phrase {
     /// 1-based beat number (index into the track's beats) where the phrase starts.
     pub beat: u16,
     pub kind: u16,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Structure {
     /// 1 High, 2 Mid, 3 Low.
     pub mood: u16,
@@ -152,6 +152,87 @@ fn params() -> (f64, f64, f64) {
     (g("PREPDECK_PHRASE_NOV", 8.0), g("PREPDECK_PHRASE_DOWN", 18.0), g("PREPDECK_PHRASE_UP", 2.5))
 }
 
+/// The phrase types PHRASE EDIT offers for a mood, as (kind, name): High has Intro / Up /
+/// Down / Chorus / Outro; Mid and Low have Intro / Verse / Bridge / Chorus / Outro (six verses
+/// in Mid; Low numbers its two verses 2 and 5, each with two variants after it).
+pub fn kinds(mood: u16) -> &'static [(u16, &'static str)] {
+    match mood {
+        2 => &[(1, "Intro"), (2, "Verse 1"), (3, "Verse 2"), (4, "Verse 3"), (5, "Verse 4"), (6, "Verse 5"), (7, "Verse 6"), (8, "Bridge"), (9, "Chorus"), (10, "Outro")],
+        3 => &[(1, "Intro"), (2, "Verse 1"), (5, "Verse 2"), (8, "Bridge"), (9, "Chorus"), (10, "Outro")],
+        _ => &[(INTRO, "Intro"), (UP, "Up"), (DOWN, "Down"), (CHORUS, "Chorus"), (OUTRO, "Outro")],
+    }
+}
+
+/// Name of a phrase kind in its mood.
+pub fn label(mood: u16, kind: u16) -> &'static str {
+    match (mood, kind) {
+        (2 | 3, 1) => "Intro",
+        (2, 2..=7) => ["Verse 1", "Verse 2", "Verse 3", "Verse 4", "Verse 5", "Verse 6"][kind as usize - 2],
+        (3, 2..=4) => "Verse 1",
+        (3, 5..=7) => "Verse 2",
+        (2 | 3, 8) => "Bridge",
+        (2 | 3, 9) => "Chorus",
+        (2 | 3, 10) => "Outro",
+        (2 | 3, _) => "Phrase",
+        _ => kind_name(kind),
+    }
+}
+
+/// Colour of a phrase block in the phrase bar (0xRRGGBB).
+pub fn color(mood: u16, kind: u16) -> u32 {
+    match label(mood, kind) {
+        "Intro" => 0x3E7BD6,
+        "Up" | "Bridge" => 0xD6A23E,
+        "Down" => 0x5AA05A,
+        "Chorus" => 0xC8464B,
+        "Outro" => 0x8A62C8,
+        l if l.starts_with("Verse") => 0x3CAAB4,
+        _ => 0x606060,
+    }
+}
+
+/// Index of the phrase that contains 1-based beat number `beat`.
+pub fn index_at(s: &Structure, beat: u16) -> Option<usize> {
+    if s.phrases.is_empty() || beat > s.end_beat.max(s.phrases.last().map(|p| p.beat).unwrap_or(0)) {
+        return None;
+    }
+    let i = s.phrases.partition_point(|p| p.beat <= beat);
+    Some(i.saturating_sub(1))
+}
+
+/// PHRASE EDIT > CUT: split the phrase containing `beat` so that a new phrase of the same
+/// type starts there. False (nothing changed) when a phrase already starts on that beat or
+/// the beat is outside the phrases.
+pub fn cut(s: &mut Structure, beat: u16) -> bool {
+    if beat < 1 || beat >= s.end_beat || s.phrases.iter().any(|p| p.beat == beat) {
+        return false;
+    }
+    let Some(i) = index_at(s, beat) else { return false };
+    if s.phrases[i].beat > beat {
+        return false;
+    }
+    let kind = s.phrases[i].kind;
+    s.phrases.insert(i + 1, Phrase { beat, kind });
+    true
+}
+
+/// PHRASE EDIT's type list: give the phrase containing `beat` another type. False when it
+/// already has it or there is no phrase there.
+pub fn set_kind(s: &mut Structure, beat: u16, kind: u16) -> bool {
+    match index_at(s, beat) {
+        Some(i) if s.phrases[i].kind != kind => {
+            s.phrases[i].kind = kind;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 1-based number of the beat at or nearest before `t` (1 before the first beat).
+pub fn beat_number(beats: &[Beat], t: f64) -> u16 {
+    beats.partition_point(|b| b.time <= t + 1e-4).clamp(1, u16::MAX as usize) as u16
+}
+
 const KEY: [u8; 19] = [0xCB, 0xE1, 0xEE, 0xFA, 0xE5, 0xEE, 0xAD, 0xEE, 0xE9, 0xD2, 0xE9, 0xEB, 0xE1, 0xE9, 0xF3, 0xE8, 0xE9, 0xF4, 0xE1];
 
 /// XOR the data part of a PSSI section (everything after the entry count) with rekordbox 6's
@@ -250,6 +331,47 @@ pub fn parse(section: &[u8]) -> Option<Structure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phrase_edits() {
+        let mut s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }], end_beat: 129 };
+        // CUT inside the Up phrase: a second Up phrase starts at the cut.
+        assert!(cut(&mut s, 49));
+        assert_eq!(s.phrases.iter().map(|p| (p.beat, p.kind)).collect::<Vec<_>>(), vec![(1, INTRO), (33, UP), (49, UP), (65, CHORUS)]);
+        // On an existing boundary, before the start or at the end: nothing happens.
+        assert!(!cut(&mut s, 49));
+        assert!(!cut(&mut s, 33));
+        assert!(!cut(&mut s, 0));
+        assert!(!cut(&mut s, 129));
+        assert!(!cut(&mut s, 400));
+        assert_eq!(s.phrases.len(), 4);
+        // The type list changes the phrase under the playhead only.
+        assert!(set_kind(&mut s, 50, DOWN));
+        assert!(!set_kind(&mut s, 64, DOWN));
+        assert_eq!(s.phrases[2], Phrase { beat: 49, kind: DOWN });
+        assert_eq!(s.phrases[1].kind, UP);
+        assert_eq!(index_at(&s, 1), Some(0));
+        assert_eq!(index_at(&s, 128), Some(3));
+        // The edited structure is what the PSSI section carries.
+        assert_eq!(parse(&pssi(&s)), Some(s.clone()));
+        // It survives being stored as JSON (how edits are kept per track).
+        let j = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Structure>(&j).unwrap(), s);
+        // Type lists per mood.
+        assert_eq!(kinds(1).iter().map(|k| k.1).collect::<Vec<_>>(), vec!["Intro", "Up", "Down", "Chorus", "Outro"]);
+        assert_eq!(kinds(2).len(), 10);
+        assert_eq!(kinds(3).iter().map(|k| k.1).collect::<Vec<_>>(), vec!["Intro", "Verse 1", "Verse 2", "Bridge", "Chorus", "Outro"]);
+        assert_eq!(label(1, 5), "Chorus");
+        assert_eq!(label(2, 5), "Verse 4");
+        assert_eq!(label(3, 6), "Verse 2");
+        assert_eq!(label(2, 8), "Bridge");
+        // Beat numbers from times.
+        let beats: Vec<Beat> = (0..16).map(|i| Beat { time: 1.0 + i as f64 * 0.5, bpm: 120.0, beat: (i % 4) as u8 + 1, index: i }).collect();
+        assert_eq!(beat_number(&beats, 0.0), 1);
+        assert_eq!(beat_number(&beats, 1.0), 1);
+        assert_eq!(beat_number(&beats, 1.6), 2);
+        assert_eq!(beat_number(&beats, 99.0), 16);
+    }
 
     #[test]
     fn pssi_roundtrip_and_mask() {

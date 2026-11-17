@@ -98,8 +98,10 @@ fn icon_cue(p: &egui::Painter, left_center: egui::Pos2, col: Color32) {
 pub fn status_cell(app: &mut App, ui: &mut Ui, t: &Track, r: Rect) {
     let p = ui.painter().with_clip_rect(r);
     let a = Rect::from_min_size(r.min, vec2(30.0, r.height()));
-    let b = Rect::from_min_max(pos2(r.min.x + 30.0, r.min.y), r.max);
+    // Three 30 pt cells: state, (rekordbox's cloud status, not used here), attributes.
+    let b = Rect::from_min_max(pos2((r.max.x - 30.0).max(r.min.x + 30.0), r.min.y), r.max);
     p.line_segment([pos2(a.max.x - 0.5, r.min.y), pos2(a.max.x - 0.5, r.max.y)], Stroke::new(1.0, BG));
+    p.line_segment([pos2(b.min.x - 0.5, r.min.y), pos2(b.min.x - 0.5, r.max.y)], Stroke::new(1.0, BG));
     let cy = r.center().y;
     let mut tips: Vec<&str> = vec![];
     let loaded = app.deck.track == Some(t.id);
@@ -1228,6 +1230,16 @@ pub fn related_panel(app: &mut App, ui: &mut Ui) {
         }).size(10.5).color(DIM));
         return;
     }
+    related_criteria(app, ui);
+}
+
+pub const INFO_TAB_FONT: f32 = 13.5;
+pub const INFO_ROW_FONT: f32 = 14.0;
+pub const INFO_SMALL_FONT: f32 = 11.5;
+pub const INFO_VALUE_FONT: f32 = 13.5;
+
+/// The criteria of the selected "Related Tracks" list.
+pub fn related_criteria(app: &mut App, ui: &mut Ui) {
     let before = app.prefs.related.clone();
     let r = &mut app.prefs.related;
     ui.add_space(2.0);
@@ -1627,70 +1639,198 @@ fn common_of<T: PartialEq + Clone>(app: &App, ids: &[i64], f: impl Fn(&Track) ->
     it.all(|s| s == first).then_some(first)
 }
 
-/// Information window docked at the right of the browser: Summary / Info / Artwork for the
-/// selected track(s), or the track in the player when nothing is selected.
-pub fn info_panel(app: &mut App, ui: &mut Ui) {
+/// A value of the Summary page that can be typed over: click to edit, Return or a click
+/// elsewhere applies it to the shown track(s), Esc leaves it.
+fn summary_value(app: &mut App, ui: &mut Ui, r: Rect, col: Col, ids: &[i64], font: FontId) {
+    let common = common_text(app, ids, col);
+    let editing = matches!(&app.ext.info_edit, Some((c, _)) if *c == col);
+    if editing {
+        let mut s = app.ext.info_edit.as_ref().map(|x| x.1.clone()).unwrap_or_default();
+        let resp = ui.put(r, egui::TextEdit::singleline(&mut s).font(font).margin(egui::Margin::symmetric(2, 0)));
+        // Whether the field just gave up focus must be read before focus is asked for again.
+        let gave_up = resp.lost_focus();
+        if !gave_up {
+            resp.request_focus();
+            app.ext.info_edit = Some((col, s));
+        } else {
+            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            app.ext.info_edit = None;
+            if !esc {
+                commit_info(app, ids, col, &s);
+            }
+        }
+        return;
+    }
+    let resp = ui.interact(r, ui.id().with(("summary_value", col)), Sense::click());
+    ui.painter().with_clip_rect(r.intersect(ui.clip_rect())).text(pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, common.clone().unwrap_or_default(), font, WHITE);
+    if resp.clicked() && !ids.is_empty() {
+        app.ext.info_edit = Some((col, common.unwrap_or_default()));
+        ui.ctx().request_repaint();
+    }
+}
+
+fn file_type_name(t: &Track) -> String {
+    match t.file_type.to_lowercase().as_str() {
+        "mp3" => "MP3 File".to_string(),
+        "m4a" | "mp4" => "M4A File".to_string(),
+        "wav" => "WAV File".to_string(),
+        "aif" | "aiff" => "AIFF File".to_string(),
+        "aac" => "AAC File".to_string(),
+        "flac" => "FLAC File".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+/// "2026-10-18…" as rekordbox shows a date: 18/10/2026.
+fn date_dmy(s: &str) -> String {
+    let d = s.get(..10).unwrap_or(s);
+    let parts: Vec<&str> = d.split('-').collect();
+    if parts.len() == 3 { format!("{}/{}/{}", parts[2], parts[1], parts[0]) } else { d.to_string() }
+}
+
+pub const INFO_LABEL: Color32 = hex(0x8A8A8A);
+
+/// Information window at the right of the browser (reference 13), 445 pt wide on #1E1E1E:
+/// Summary / Info / Artwork tabs 21 pt high from 8.5 pt down (the chosen one blue with dark
+/// text, the others #323232 with grey text) and the reload mark 17 pt from the right. Summary:
+/// the artwork in a 111 pt box 9.5 pt in and 42 pt down; Track Title, Artist and Album 174 pt
+/// in on a 39 pt pitch, each a grey label over its value with a #313131 line under it; then
+/// 24 pt rows between #313131 lines from 168 pt down, labels at the left, values 174 pt in
+/// behind a short divider. Shown for the selected track(s), or the track in the player.
+pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
+    let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
+    p.rect_filled(r, 0.0, BG2);
+    let (l, t, right) = (r.min.x, r.min.y, r.max.x);
     let sel: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
     let mut seen = HashSet::new();
     let sel: Vec<i64> = sel.into_iter().filter(|t| seen.insert(*t)).collect();
-    let (ids, heading) = if !sel.is_empty() {
-        let h = if sel.len() == 1 { "Selected track".to_string() } else { format!("Selected tracks ({})", sel.len()) };
-        (sel, h)
-    } else if let Some(t) = app.deck.track {
-        (vec![t], "Track playing".to_string())
-    } else {
-        (vec![], String::new())
-    };
+    let ids: Vec<i64> = if !sel.is_empty() { sel } else { app.deck.track.into_iter().collect() };
     // Tabs.
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        let w = (ui.available_width() - 4.0) / 3.0;
-        for (i, name) in ["Summary", "Info", "Artwork"].iter().enumerate() {
-            let on = app.ext.info_tab == i as u8;
-            let (rr, resp) = ui.allocate_exact_size(vec2(w, 19.0), Sense::click());
-            ui.painter().rect_filled(rr, 0.0, if on { BLUE } else if resp.hovered() { hex(0x3A3A3A) } else { hex(0x323232) });
-            ui.painter().text(rr.center(), Align2::CENTER_CENTER, *name, FontId::proportional(11.5), if on { WHITE } else { DIM2 });
-            if resp.clicked() {
-                app.ext.info_tab = i as u8;
-                app.ext.info_edit = None;
-            }
+    let (x0, x1, gap) = (l + 13.5, right - 37.0, 3.75);
+    let w = (x1 - x0 - 2.0 * gap) / 3.0;
+    for (i, name) in ["Summary", "Info", "Artwork"].iter().enumerate() {
+        let on = app.ext.info_tab == i as u8;
+        let rr = Rect::from_min_size(pos2(x0 + i as f32 * (w + gap), t + 8.5), vec2(w, 21.0));
+        let resp = ui.interact(rr, ui.id().with(("info_tab", i)), Sense::click());
+        p.rect_filled(rr, 0.0, if on { BLUE } else if resp.hovered() { hex(0x3A3A3A) } else { hex(0x323232) });
+        p.text(rr.center(), Align2::CENTER_CENTER, *name, rb(INFO_TAB_FONT), if on { hex(0x00021E) } else { DIM });
+        if resp.clicked() {
+            app.ext.info_tab = i as u8;
+            app.ext.info_edit = None;
         }
-    });
-    ui.add_space(4.0);
-    if ids.is_empty() {
-        ui.label(RichText::new("Information").strong().color(WHITE));
-        ui.label(RichText::new("Select a track to see its information.").size(11.0).color(DIM));
+    }
+    // Reload Tags (skin brws_refresh).
+    let rc = pos2(right - 17.0, t + 19.0);
+    let rresp = ui.interact(Rect::from_center_size(rc, vec2(18.0, 20.0)), ui.id().with("info_reload"), Sense::click());
+    crate::icons_src::refresh(&p, rc, if rresp.hovered() { WHITE } else { hex(0xDCDCDC) });
+    let rresp = if app.prefs.tooltips { rresp.on_hover_text("Reload Tags") } else { rresp };
+    if rresp.clicked() && !ids.is_empty() {
+        app.reload_tags_from_files(&ids);
+    }
+    let first = ids.first().and_then(|id| app.track(*id)).cloned().unwrap_or_default();
+    let multi = ids.len() > 1;
+    let art = common_of(app, &ids, |t| t.artwork.clone()).unwrap_or_default();
+    let body = Rect::from_min_max(pos2(l + 3.0, t + 34.0), pos2(right, r.max.y - 3.0));
+    let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("info_body"));
+    bui.set_clip_rect(body.intersect(ui.clip_rect()));
+    bui.spacing_mut().scroll = egui::style::ScrollStyle { floating: false, bar_width: 8.0, bar_inner_margin: 2.0, bar_outer_margin: 2.0, foreground_color: false, dormant_background_opacity: 1.0, active_background_opacity: 1.0, interact_background_opacity: 1.0, dormant_handle_opacity: 1.0, active_handle_opacity: 1.0, interact_handle_opacity: 1.0, ..egui::style::ScrollStyle::solid() };
+    bui.visuals_mut().extreme_bg_color = Color32::BLACK;
+    bui.visuals_mut().widgets.inactive.bg_fill = hex(0x323232);
+    bui.visuals_mut().widgets.hovered.bg_fill = hex(0x4A4A4A);
+    bui.visuals_mut().widgets.active.bg_fill = hex(0x5A5A5A);
+    if app.ext.info_tab == 0 {
+        let ro = |f: &dyn Fn(&Track) -> String| if ids.is_empty() { String::new() } else { common_of(app, &ids, |t| f(t)).unwrap_or_default() };
+        let rows: [(&str, String); 8] = [
+            ("Time", ro(&|t| if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() })),
+            ("File Type", ro(&|t| file_type_name(t))),
+            ("Size", ro(&|t| if t.file_size > 0 { format!("{:.1} MB", t.file_size as f64 / 1048576.0) } else { String::new() })),
+            ("Date Created", ro(&|t| date_dmy(&t.date_created))),
+            ("Sample Rate", ro(&|t| if t.sample_rate > 0 { format!("{} Hz", t.sample_rate) } else { String::new() })),
+            ("Bitrate", ro(&|t| if t.bitrate > 0 { format!("{} kbps", t.bitrate) } else { String::new() })),
+            ("DJ Play Count", ro(&|t| t.play_count.to_string())),
+            ("Location", ro(&|t| t.path.clone())),
+        ];
+        let font = rb(INFO_ROW_FONT);
+        let widest = rows.iter().map(|(_, v)| ui.painter().layout_no_wrap(v.clone(), font.clone(), WHITE).size().x).fold(0.0, f32::max);
+        let content_w = (171.0 + widest + 8.0).max(body.width());
+        egui::ScrollArea::horizontal().id_salt("info_summary_h").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(&mut bui, |ui| {
+            let (cr, _) = ui.allocate_exact_size(vec2(content_w, ui.available_height()), Sense::hover());
+            let p = ui.painter().clone();
+            // Coordinates below are from the window's corner as measured.
+            let (l, t) = (cr.min.x - 3.0, cr.min.y - 34.0);
+            let line_right = cr.max.x;
+            let ar = Rect::from_min_size(pos2(l + 9.5, t + 42.0), vec2(111.0, 111.0));
+            p.rect_filled(ar, 0.0, hex(0x101010));
+            match artwork_large(app, &art) {
+                Some(tex) => {
+                    p.image(tex.id(), ar.shrink(1.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => {
+                    // The original's "no artwork" record.
+                    p.circle_filled(ar.center(), 48.5, hex(0x1E1E1E));
+                    p.circle_filled(ar.center(), 14.0, hex(0x101010));
+                }
+            }
+            p.rect_stroke(ar, 0.0, Stroke::new(1.0, hex(0x4C4C4C)), egui::StrokeKind::Inside);
+            let vx = l + 174.0;
+            for (i, (label, col)) in [("Track Title", Col::Title), ("Artist", Col::Artist), ("Album", Col::Album)].into_iter().enumerate() {
+                let y = t + 49.5 + 39.0 * i as f32;
+                p.text(pos2(vx, y), Align2::LEFT_CENTER, label, rb(INFO_SMALL_FONT), INFO_LABEL);
+                summary_value(app, ui, Rect::from_min_max(pos2(vx, y + 8.5), pos2(line_right, y + 27.0)), col, &ids, rb(INFO_VALUE_FONT));
+                if i < 2 {
+                    p.rect_filled(Rect::from_min_max(pos2(vx, y + 29.0), pos2(line_right, y + 30.0)), 0.0, hex(0x313131));
+                }
+            }
+            for (i, (label, value)) in rows.iter().enumerate() {
+                let y = t + 168.0 + 24.0 * i as f32;
+                p.rect_filled(Rect::from_min_max(pos2(l + 9.5, y), pos2(line_right, y + 1.0)), 0.0, hex(0x313131));
+                p.rect_filled(Rect::from_min_max(pos2(vx - 4.5, y + 3.5), pos2(vx - 3.5, y + 21.5)), 0.0, hex(0x313131));
+                p.text(pos2(l + 9.5, y + 12.5), Align2::LEFT_CENTER, *label, font.clone(), INFO_LABEL);
+                p.text(pos2(vx, y + 12.5), Align2::LEFT_CENTER, value, font.clone(), WHITE);
+            }
+            let y = t + 168.0 + 24.0 * rows.len() as f32;
+            p.rect_filled(Rect::from_min_max(pos2(l + 9.5, y), pos2(line_right, y + 1.0)), 0.0, hex(0x313131));
+            if multi {
+                p.text(pos2(l + 9.5, y + 14.0), Align2::LEFT_CENTER, format!("{} tracks selected", ids.len()), rb(11.0), DIM);
+            }
+        });
         return;
     }
-    ui.label(RichText::new(heading).size(11.0).color(DIM2));
-    ui.add_space(2.0);
-    let first = app.track(ids[0]).cloned().unwrap_or_default();
-    let multi = ids.len() > 1;
-    let field_w = (ui.available_width() - 92.0).max(80.0);
-    let art = common_of(app, &ids, |t| t.artwork.clone()).unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    let pad = Rect::from_min_max(pos2(body.min.x + 6.5, body.min.y + 6.0), pos2(body.max.x, body.max.y));
+    let mut pui = bui.new_child(egui::UiBuilder::new().max_rect(pad));
+    let ui = &mut pui;
+    let field_w = (ui.available_width() - 130.0).max(80.0);
     egui::ScrollArea::vertical().id_salt("info_panel").auto_shrink([false, false]).show(ui, |ui| {
         match app.ext.info_tab {
-            0 => {
-                // Summary: artwork, the main fields, rating, colour and comments.
-                let size = 110.0;
-                let (ar, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-                match artwork_large(app, &art) {
-                    Some(tex) => {
-                        ui.painter().image(tex.id(), ar, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            1 => {
+                egui::Grid::new("info_fields").num_columns(2).spacing(vec2(6.0, 3.0)).show(ui, |ui| {
+                    for (label, col) in [
+                        ("Title", Col::Title),
+                        ("Artist", Col::Artist),
+                        ("Album", Col::Album),
+                        ("Album Artist", Col::AlbumArtist),
+                        ("Genre", Col::Genre),
+                        ("Comments", Col::Comments),
+                        ("Key", Col::Key),
+                        ("BPM", Col::Bpm),
+                        ("Label", Col::Label),
+                        ("Remixer", Col::Remixer),
+                        ("Original Artist", Col::OriginalArtist),
+                        ("Composer", Col::Composer),
+                        ("Lyricist", Col::Lyricist),
+                        ("Mix Name", Col::MixName),
+                        ("Grouping", Col::Grouping),
+                        ("Year", Col::Year),
+                        ("Release Date", Col::ReleaseDate),
+                        ("Track number", Col::TrackNumber),
+                        ("Disc number", Col::DiscNumber),
+                        ("Message", Col::Message),
+                    ] {
+                        info_field(app, ui, label, col, &ids, field_w);
                     }
-                    None => {
-                        ui.painter().rect_filled(ar, 0.0, BG);
-                        ui.painter().text(ar.center(), Align2::CENTER_CENTER, "No Artwork", FontId::proportional(10.5), DIM);
-                    }
-                }
-                ui.add_space(4.0);
-                egui::Grid::new("info_summary").num_columns(2).spacing(vec2(6.0, 3.0)).show(ui, |ui| {
-                    info_field(app, ui, "Track Title", Col::Title, &ids, field_w);
-                    info_field(app, ui, "Artist", Col::Artist, &ids, field_w);
-                    info_field(app, ui, "Album", Col::Album, &ids, field_w);
-                    info_field(app, ui, "Genre", Col::Genre, &ids, field_w);
-                    info_field(app, ui, "BPM", Col::Bpm, &ids, field_w);
-                    info_field(app, ui, "Key", Col::Key, &ids, field_w);
                     // Rating
                     ui.label(RichText::new("Rating").size(11.0).color(DIM2));
                     let rating = common_of(app, &ids, |t| t.rating);
@@ -1738,50 +1878,10 @@ pub fn info_panel(app: &mut App, ui: &mut Ui) {
                         }
                     });
                     ui.end_row();
-                    info_field(app, ui, "Comments", Col::Comments, &ids, field_w);
-                    if !multi {
-                        info_readonly(ui, "Duration", if first.duration > 0.0 { fmt_time(first.duration, false) } else { String::new() });
-                        info_readonly(ui, "DJ Play Count", first.play_count.to_string());
-                    }
-                });
-            }
-            1 => {
-                egui::Grid::new("info_fields").num_columns(2).spacing(vec2(6.0, 3.0)).show(ui, |ui| {
-                    for (label, col) in [
-                        ("Title", Col::Title),
-                        ("Artist", Col::Artist),
-                        ("Album", Col::Album),
-                        ("Album Artist", Col::AlbumArtist),
-                        ("Genre", Col::Genre),
-                        ("Comments", Col::Comments),
-                        ("Key", Col::Key),
-                        ("BPM", Col::Bpm),
-                        ("Label", Col::Label),
-                        ("Remixer", Col::Remixer),
-                        ("Original Artist", Col::OriginalArtist),
-                        ("Composer", Col::Composer),
-                        ("Lyricist", Col::Lyricist),
-                        ("Mix Name", Col::MixName),
-                        ("Grouping", Col::Grouping),
-                        ("Year", Col::Year),
-                        ("Release Date", Col::ReleaseDate),
-                        ("Track number", Col::TrackNumber),
-                        ("Disc number", Col::DiscNumber),
-                        ("Message", Col::Message),
-                    ] {
-                        info_field(app, ui, label, col, &ids, field_w);
-                    }
                     // File fields: fixed.
                     let ro = |f: &dyn Fn(&Track) -> String| common_of(app, &ids, |t| f(t)).unwrap_or_default();
                     info_readonly(ui, "Duration", ro(&|t| if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }));
-                    info_readonly(ui, "File Type", ro(&|t| match t.file_type.to_lowercase().as_str() {
-                        "mp3" => "MP3 File".to_string(),
-                        "m4a" | "mp4" => "M4A File".to_string(),
-                        "wav" => "WAV File".to_string(),
-                        "aif" | "aiff" => "AIFF File".to_string(),
-                        "aac" => "AAC File".to_string(),
-                        other => other.to_uppercase(),
-                    }));
+                    info_readonly(ui, "File Type", ro(&|t| file_type_name(t)));
                     info_readonly(ui, "Size", ro(&|t| format!("{:.1} MB", t.file_size as f64 / 1e6)));
                     info_readonly(ui, "Sample Rate", ro(&|t| if t.sample_rate > 0 { format!("{} Hz", t.sample_rate) } else { String::new() }));
                     info_readonly(ui, "Bitrate", ro(&|t| if t.bitrate > 0 { format!("{} kbps", t.bitrate) } else { String::new() }));
@@ -1935,6 +2035,13 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
 
 /// Missing File Manager: every track whose file is gone, with Relocate / Auto Relocate /
 /// Delete for one, the ticked ones, or all, and the Auto Relocate Search Folders.
+/// Missing File Manager (reference 16): a 602 x 528 pt window on #1E1E1E. A black table from
+/// 4 pt in (Track Title, artist, album in 120 pt columns, then location; 27 pt header with grey
+/// labels, 25 pt rows, the chosen ones #294C6A) with its scroll bar along the bottom; the
+/// number of tracks at the right under it; then Auto Relocate, Relocate and Delete (108 x 28 pt
+/// from 15 pt in, 15.5 pt apart) and OK at the right. The buttons act on the chosen rows
+/// (Auto Relocate on all of them when none is chosen); the search folders are in the table's
+/// right-click menu.
 fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     if !app.ext.missing_open {
         return;
@@ -1944,114 +2051,155 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     let ids: HashSet<i64> = missing.iter().map(|t| t.id).collect();
     app.ext.missing_sel.retain(|t| ids.contains(t));
     let busy = app.ext.reloc_rx.is_some() || app.relocate_rx.is_some();
-    kit::dialog(ctx, "Missing File Manager").open(&mut open).default_size([820.0, 430.0]).min_width(640.0).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-        kit::apply_style(ui);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(if missing.is_empty() { "All files exist.".to_string() } else { format!("{} missing file(s)", missing.len()) }).color(WHITE));
-            if busy {
-                ui.spinner();
-                ui.label(RichText::new("Searching…").size(11.0).color(DIM2));
+    kit::dialog(ctx, "Missing File Manager").open(&mut open).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).frame(egui::Frame::window(&ctx.style()).fill(BG2).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(602.0, 528.0), Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_filled(r, 0.0, BG2);
+        let table = Rect::from_min_max(pos2(r.min.x + 4.0, r.min.y + 4.5), pos2(r.max.x - 4.0, r.min.y + 453.5));
+        p.rect_filled(table, 0.0, BG);
+        let font = rb(MFM_FONT);
+        let loc_w = missing.iter().map(|t| p.layout_no_wrap(t.path.clone(), font.clone(), WHITE).size().x).fold(0.0, f32::max);
+        let content_w = (360.0 + loc_w + 16.0).max(table.width());
+        let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(table).id_salt("mfm_table"));
+        tui.set_clip_rect(table);
+        crate::ui_browser_ext::bar_style(&mut tui);
+        tui.spacing_mut().scroll.bar_width = 4.0;
+        tui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        let cmd = ui.input(|i| i.modifiers.command);
+        let bg = tui.interact(table, tui.id().with("mfm_bg"), Sense::click());
+        egui::ScrollArea::horizontal().id_salt("mfm_h").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(&mut tui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            let cols: [(&str, f32); 4] = [("Track Title", 120.0), ("artist", 120.0), ("album", 120.0), ("location", content_w - 360.0)];
+            let (hr, _) = ui.allocate_exact_size(vec2(content_w, 27.0), Sense::hover());
+            ui.painter().rect_filled(hr, 0.0, hex(0x1A1A1A));
+            let mut x = hr.min.x;
+            for (i, (label, cw)) in cols.iter().enumerate() {
+                if i > 0 {
+                    ui.painter().rect_filled(Rect::from_min_max(pos2(x - 1.0, hr.min.y), pos2(x, hr.max.y)), 0.0, BG);
+                }
+                ui.painter().text(pos2(x + 7.0, hr.center().y), Align2::LEFT_CENTER, *label, font.clone(), DIM);
+                x += cw;
             }
-        });
-        ui.label(RichText::new("File can not be found at the registered location.\nSelect [Relocate] from the right-click menu to register it again.").size(10.5).color(DIM));
-        ui.add_space(4.0);
-        // Header.
-        let w = ui.available_width();
-        let (tw, aw) = (w * 0.24, w * 0.16);
-        let btn_w = 250.0;
-        let lw = (w - 24.0 - tw - aw - btn_w).max(120.0);
-        let (hr, _) = ui.allocate_exact_size(vec2(w, 15.0), Sense::hover());
-        ui.painter().rect_filled(hr, 0.0, BG2);
-        let mut x = hr.min.x + 24.0;
-        for (label, cw) in [("Track Title", tw), ("Artist", aw), ("Location", lw)] {
-            ui.painter().text(pos2(x + 4.0, hr.center().y), Align2::LEFT_CENTER, label, FontId::proportional(11.0), WHITE);
-            x += cw;
-        }
-        let list_h = (ui.available_height() - 150.0).max(120.0);
-        egui::ScrollArea::vertical().id_salt("missing_rows").max_height(list_h).auto_shrink([false, false]).show_rows(ui, 20.0, missing.len(), |ui, range| {
-            for i in range {
-                let t = &missing[i];
-                let (rr, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
-                ui.painter().rect_filled(rr, 0.0, if i % 2 == 0 { BG1 } else { BG2 });
-                let mut on = app.ext.missing_sel.contains(&t.id);
-                if ui.put(Rect::from_min_size(pos2(rr.min.x + 3.0, rr.min.y + 1.0), vec2(18.0, 18.0)), kit::Check(&mut on)).changed() {
+            egui::ScrollArea::vertical().id_salt("mfm_rows").auto_shrink([false, false]).show_rows(ui, 25.0, missing.len(), |ui, range| {
+                for i in range {
+                    let t = &missing[i];
+                    let (rr, resp) = ui.allocate_exact_size(vec2(content_w, 25.0), Sense::click());
+                    let on = app.ext.missing_sel.contains(&t.id);
                     if on {
-                        app.ext.missing_sel.insert(t.id);
-                    } else {
-                        app.ext.missing_sel.remove(&t.id);
+                        ui.painter().rect_filled(Rect::from_min_max(pos2(rr.min.x, rr.min.y + 0.5), rr.max), 0.0, ROW_SEL);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rr, 0.0, BG1);
                     }
-                }
-                let mut x = rr.min.x + 24.0;
-                for (v, cw, col) in [(t.display_title(), tw, TEXT), (t.artist.clone(), aw, TEXT), (t.path.clone(), lw, CAUTION_TX)] {
-                    let cr = Rect::from_min_size(pos2(x, rr.min.y), vec2(cw - 4.0, rr.height()));
-                    ui.painter().with_clip_rect(cr).text(pos2(cr.min.x + 4.0, cr.center().y), Align2::LEFT_CENTER, v, FontId::proportional(11.5), col);
-                    x += cw;
-                }
-                let mut bx = rr.max.x - btn_w + 4.0;
-                for (k, (label, bw)) in [("Relocate", 70.0), ("Auto Relocate", 98.0), ("Delete", 60.0)].into_iter().enumerate() {
-                    let br = Rect::from_min_size(pos2(bx, rr.min.y + 1.5), vec2(bw, 17.0));
-                    if ui.put(br, btn(label).exact(br.size()).font_size(10.5)).clicked() {
-                        match k {
-                            0 => {
-                                if let Some(f) = rfd::FileDialog::new().set_title("Relocate").pick_file() {
-                                    app.relocate_to(t.id, &f);
-                                }
+                    let mut x = rr.min.x;
+                    for (k, (v, (_, cw))) in [t.display_title(), t.artist.clone(), t.album.clone(), t.path.clone()].into_iter().zip(cols.iter()).enumerate() {
+                        if k > 0 && on {
+                            ui.painter().rect_filled(Rect::from_min_max(pos2(x - 1.0, rr.min.y), pos2(x, rr.max.y)), 0.0, hex(0x1F3A52));
+                        }
+                        let cr = Rect::from_min_size(pos2(x, rr.min.y), vec2(*cw - 2.0, rr.height()));
+                        ui.painter().with_clip_rect(cr.intersect(ui.clip_rect())).text(pos2(cr.min.x + 5.0, cr.center().y), Align2::LEFT_CENTER, v, font.clone(), WHITE);
+                        x += cw;
+                    }
+                    if resp.clicked() {
+                        if cmd {
+                            if !app.ext.missing_sel.remove(&t.id) {
+                                app.ext.missing_sel.insert(t.id);
                             }
-                            1 => app.auto_relocate(Some(vec![t.id])),
-                            _ => app.dialogs.confirm_remove = Some(vec![t.id]),
+                        } else {
+                            app.ext.missing_sel.clear();
+                            app.ext.missing_sel.insert(t.id);
                         }
                     }
-                    bx += bw + 6.0;
+                    let id = t.id;
+                    resp.context_menu(|ui| {
+                        if !app.ext.missing_sel.contains(&id) {
+                            app.ext.missing_sel.clear();
+                            app.ext.missing_sel.insert(id);
+                        }
+                        if ui.button("Relocate").clicked() {
+                            ui.close_menu();
+                            if let Some(f) = rfd::FileDialog::new().set_title("Relocate").pick_file() {
+                                app.relocate_to(id, &f);
+                            }
+                        }
+                        if ui.button("Auto Relocate").clicked() {
+                            app.auto_relocate(Some(vec![id]));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        search_folders_menu(app, ui);
+                    });
+                }
+            });
+        });
+        bg.context_menu(|ui| search_folders_menu(app, ui));
+        // Count, and what is going on.
+        let n = missing.len();
+        p.text(pos2(r.max.x - 15.5, r.min.y + 473.0), Align2::RIGHT_CENTER, format!("{n} Track{}", if n == 1 { "" } else { "s" }), font.clone(), hex(0xDCDCDC));
+        if busy {
+            p.text(pos2(r.min.x + 15.0, r.min.y + 473.0), Align2::LEFT_CENTER, "Searching…", font.clone(), DIM);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        let picked: Vec<i64> = missing.iter().map(|t| t.id).filter(|t| app.ext.missing_sel.contains(t)).collect();
+        let all: Vec<i64> = missing.iter().map(|t| t.id).collect();
+        let target = if picked.is_empty() { all } else { picked.clone() };
+        for (k, (label, x)) in [("Auto Relocate", 15.0), ("Relocate", 138.5), ("Delete", 262.5), ("OK", 474.5)].into_iter().enumerate() {
+            let br = Rect::from_min_size(pos2(r.min.x + x, r.min.y + 489.0), vec2(108.5, 28.0));
+            let enabled = match k {
+                0 => !target.is_empty() && !busy,
+                1 => picked.len() == 1,
+                2 => !picked.is_empty(),
+                _ => true,
+            };
+            let resp = ui.interact(br, ui.id().with(("mfm_btn", k)), if enabled { Sense::click() } else { Sense::hover() });
+            p.rect_filled(br, 2.0, hex(0x141414));
+            p.rect_filled(br.shrink(1.0), 1.5, if enabled && resp.is_pointer_button_down_on() { hex(0x2E2E2E) } else if enabled && resp.hovered() { hex(0x4A4A4A) } else { hex(0x3C3C3C) });
+            p.text(br.center(), Align2::CENTER_CENTER, label, font.clone(), if enabled { hex(0xC8C8C8) } else { hex(0x787878) });
+            if resp.clicked() {
+                match k {
+                    0 => app.auto_relocate(Some(target.clone())),
+                    1 => {
+                        if let Some(f) = rfd::FileDialog::new().set_title("Relocate").pick_file() {
+                            app.relocate_to(picked[0], &f);
+                        }
+                    }
+                    2 => app.dialogs.confirm_remove = Some(picked.clone()),
+                    _ => app.ext.missing_open = false,
                 }
             }
-        });
-        ui.separator();
-        // Search folders.
-        ui.label(RichText::new("Auto Relocate Search Folders").size(11.5).color(WHITE));
+        }
+    });
+    if !open {
+        app.ext.missing_open = false;
+    }
+}
+
+pub const MFM_FONT: f32 = 13.5;
+
+/// Folders Auto Relocate looks in.
+fn search_folders_menu(app: &mut App, ui: &mut Ui) {
+    ui.menu_button("Auto Relocate Search Folders", |ui| {
         let folders = app.prefs.relocate_folders.clone();
         if folders.is_empty() {
             ui.label(RichText::new("none").size(11.0).color(DIM));
         }
         for (i, f) in folders.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.add(btn("Remove").small()).clicked() {
+                if ui.small_button("Remove").clicked() {
                     app.prefs.relocate_folders.remove(i);
                     app.save_prefs();
                 }
                 ui.label(RichText::new(f).size(11.0).color(if std::path::Path::new(f).is_dir() { TEXT } else { CAUTION_TX }));
             });
         }
-        ui.horizontal(|ui| {
-            if ui.add(btn("Add Folder…")).clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_title("Auto Relocate Search Folders").pick_folder() {
-                    let s = d.to_string_lossy().to_string();
-                    if !app.prefs.relocate_folders.contains(&s) {
-                        app.prefs.relocate_folders.push(s);
-                        app.save_prefs();
-                    }
+        if ui.button("Add Folder…").clicked() {
+            ui.close_menu();
+            if let Some(d) = rfd::FileDialog::new().set_title("Auto Relocate Search Folders").pick_folder() {
+                let s = d.to_string_lossy().to_string();
+                if !app.prefs.relocate_folders.contains(&s) {
+                    app.prefs.relocate_folders.push(s);
+                    app.save_prefs();
                 }
             }
-        });
-        ui.add_space(4.0);
-        let picked: Vec<i64> = missing.iter().map(|t| t.id).filter(|t| app.ext.missing_sel.contains(t)).collect();
-        let some = !picked.is_empty();
-        let target: Vec<i64> = if some { picked } else { missing.iter().map(|t| t.id).collect() };
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(if some { format!("{} selected:", target.len()) } else { "All:".to_string() }).size(11.5).color(DIM2));
-            if ui.add_enabled(!target.is_empty() && !busy, btn("Auto Relocate")).clicked() {
-                app.auto_relocate(Some(target.clone()));
-            }
-            if ui.add_enabled(!target.is_empty(), btn("Delete")).on_hover_text("Remove from Collection (the files are not deleted)").clicked() {
-                app.dialogs.confirm_remove = Some(target.clone());
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(btn("Close")).clicked() {
-                    app.ext.missing_open = false;
-                }
-            });
-        });
+        }
     });
-    if !open {
-        app.ext.missing_open = false;
-    }
 }

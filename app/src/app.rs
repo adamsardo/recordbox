@@ -149,7 +149,7 @@ impl Col {
         match self {
             // Default widths measured on the original's Collection view (pt).
             Col::Num => 60.0,
-            Col::Status => 60.0,
+            Col::Status => 90.0,
             Col::Preview => 141.0,
             Col::Artwork => 80.0,
             Col::Title | Col::Artist | Col::Album | Col::Genre => 128.0,
@@ -780,6 +780,8 @@ pub enum Edit {
     Cues { track: i64, before: Vec<Cue> },
     Track { before: Track },
     Grid { track: i64, before: BeatGrid },
+    /// PHRASE EDIT: the track's edited phrases before the change (None: no edits yet).
+    Phrases { track: i64, before: Option<crate::phrase::Structure> },
 }
 
 pub enum StemMsg {
@@ -835,6 +837,9 @@ pub enum View {
     TagList,
     /// Good matches registered for the loaded (or selected) track.
     Matching,
+    /// Track Suggestion for the loaded (or selected) track: 0 Rank, 1 Era, 2 Mood,
+    /// 3 Association (browser_ext.rs).
+    Suggest(u8),
     /// An outside library (kind 0 iTunes, 1 rekordbox xml): node "" is All Tracks, else the
     /// playlist's key (see `SourceLib::node`). Its tracks are not collection tracks.
     Source { kind: u8, node: String },
@@ -847,6 +852,8 @@ pub enum SideMode {
     Devices,
     History,
     Related,
+    /// Track Suggestion.
+    Suggest,
     Explorer,
     Itunes,
     RekordboxXml,
@@ -1350,7 +1357,7 @@ impl App {
                         let mut tracks = HashMap::new();
                         for id in &ids {
                             if let Some(t) = app.track(*id).cloned() {
-                                tracks.insert(*id, crate::export::usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+                                tracks.insert(*id, crate::export::usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None, phrases: None });
                             }
                         }
                         let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { id: 0, name: "Check".into(), folder: false, children: vec![], tracks: ids.clone() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false, ..Default::default() };
@@ -1395,7 +1402,7 @@ impl App {
                         app.reload_playlists();
                         let mut tracks = HashMap::new();
                         if let Some(t) = ids.first().and_then(|id| app.track(*id).cloned()) {
-                            tracks.insert(t.id, crate::export::usb::ExportTrack { cues: vec![], grid: app.db.grid(t.id), wave: app.db.wave(t.id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+                            tracks.insert(t.id, crate::export::usb::ExportTrack { cues: vec![], grid: app.db.grid(t.id), wave: app.db.wave(t.id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None, phrases: None });
                         }
                         let req = crate::export::usb::ExportRequest { root: root.clone(), nodes: vec![crate::export::usb::ExportNode { id: 0, name: "Update Check".into(), folder: false, children: vec![], tracks: ids[..1].to_vec() }], tracks, tag_categories: vec![], skipped: vec![], analysis: app.analysis_settings(), settings: Default::default(), browse: Default::default(), phrases: false, ..Default::default() };
                         let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -1519,6 +1526,12 @@ impl App {
     }
 
     pub fn save_prefs(&self) {
+        // While the sub-browser's own columns and sort are swapped in, nothing is written
+        // (ui_browser_ext.rs saves afterwards).
+        if self.ext.in_sub {
+            self.ext.sub_save_wanted.set(true);
+            return;
+        }
         if let Ok(s) = serde_json::to_string(&self.prefs) {
             self.db.set_setting("prefs", &s);
         }
@@ -1702,6 +1715,7 @@ impl App {
             View::TagList => self.ext.tag_list.iter().copied().filter(|t| self.index.contains_key(t)).collect(),
             View::Matching => self.related_source().map(|s| self.matching_of(s)).unwrap_or_default(),
             View::Related => self.related_tracks(),
+            View::Suggest(kind) => self.related_source().map(|s| self.suggestions(s, 0, *kind).into_iter().map(|x| x.0).collect()).unwrap_or_default(),
             View::Category { field, value } => self
                 .tracks
                 .iter()
@@ -1974,10 +1988,17 @@ impl App {
     /// Phrases for the loaded track, worked out on a background thread: rekordbox's own while
     /// its grid is unchanged, else analysed from the decoded audio on the current grid.
     fn start_deck_phrases(&mut self, a: Arc<Decoded>) {
+        let Some(id) = self.deck.track else { return };
+        // Phrases edited with PHRASE EDIT take the place of analysed ones.
+        if let Some(st) = self.stored_phrases(id) {
+            self.deck.phrases = Some(st);
+            self.deck.x.phrases_edited = true;
+            return;
+        }
+        self.deck.x.phrases_edited = false;
         if !self.prefs.phrase_analysis {
             return;
         }
-        let Some(id) = self.deck.track else { return };
         let Some(path) = self.track(id).map(|t| t.path.clone()) else { return };
         let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let base = map.get(&path).map(std::path::PathBuf::from);
@@ -3071,7 +3092,8 @@ impl App {
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
         let metronome = self.deck.metronome;
-        let old = std::mem::replace(&mut self.deck, Deck { ctrl_tab: ctrl, panel_tab: panel, metronome, ..Deck::default() });
+        let x = self.deck.x.carried();
+        let old = std::mem::replace(&mut self.deck, Deck { ctrl_tab: ctrl, panel_tab: panel, metronome, x, ..Deck::default() });
         // Keep the last successfully loaded deck (not a deck that is itself still loading).
         if old.audio.is_some() {
             self.deck_backup = Some((old, old_pos, old_gain));
@@ -3296,11 +3318,27 @@ impl App {
             Edit::Cues { track, .. } => Some(Edit::Cues { track: *track, before: self.db.cues(*track).unwrap_or_default() }),
             Edit::Track { before } => self.db.track(before.id).map(|t| Edit::Track { before: t }),
             Edit::Grid { track, .. } => Some(Edit::Grid { track: *track, before: self.db.grid(*track).unwrap_or_default() }),
+            Edit::Phrases { track, .. } => Some(Edit::Phrases { track: *track, before: self.stored_phrases(*track) }),
+        }
+    }
+
+    /// Remember a track's edited phrases before a PHRASE EDIT change (for Undo).
+    pub fn record_phrases(&mut self, track: i64) {
+        let before = self.stored_phrases(track);
+        self.record(Edit::Phrases { track, before });
+    }
+
+    /// Work out the active deck's phrases again (after its phrase edits were removed).
+    pub fn reanalyse_deck_phrases(&mut self) {
+        self.deck.phrases = None;
+        if let Some(a) = self.deck.audio.clone() {
+            self.start_deck_phrases(a);
         }
     }
 
     fn restore(&mut self, e: Edit) {
         match e {
+            Edit::Phrases { track, before } => self.store_phrases(track, before),
             Edit::Cues { track, before } => {
                 let _ = self.db.replace_cues(track, &before);
                 if self.deck.track == Some(track) {
@@ -4324,7 +4362,7 @@ impl App {
             let grid = self.db.grid(*id);
             let rb_anlz = rb_anlz.get(&t.path).map(std::path::PathBuf::from).filter(|b| b.with_extension("DAT").is_file());
             // Whether the grid still matches rekordbox's is worked out on the export thread.
-            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same: false, vocal: self.db.vocal(*id) });
+            tracks.insert(*id, crate::export::usb::ExportTrack { cues: self.db.cues(*id).unwrap_or_default(), grid, wave: self.db.wave(*id), track: t, tags, rb_anlz, grid_same: false, vocal: self.db.vocal(*id), phrases: self.stored_phrases(*id) });
         }
         // Tracks without analysis are analysed by the export job itself (off the UI thread).
         let tag_categories: Vec<(String, Vec<String>)> = self

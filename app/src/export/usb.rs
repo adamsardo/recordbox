@@ -707,12 +707,14 @@ pub struct ExportTrack {
     /// Recordbox's vocal detection (levels 0–4 per 46.4 ms), written as PVDI when rekordbox's
     /// own is not available.
     pub vocal: Option<Vec<u8>>,
+    /// Phrases the user edited (PHRASE EDIT): written instead of any analysed ones.
+    pub phrases: Option<crate::phrase::Structure>,
 }
 
 impl ExportTrack {
     /// rekordbox's own phrase section can be used (its grid is unchanged and it has one).
     fn has_rb_phrases(&self) -> bool {
-        self.grid_same && self.rb_anlz.as_ref().map(|b| anlz::read_sections(&b.with_extension("EXT")).contains_key("PSSI")).unwrap_or(false)
+        self.phrases.is_none() && self.grid_same && self.rb_anlz.as_ref().map(|b| anlz::read_sections(&b.with_extension("EXT")).contains_key("PSSI")).unwrap_or(false)
     }
 }
 
@@ -1317,8 +1319,9 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     }
 
     // Phrases for tracks without rekordbox's own (computed on the track's grid).
-    let mut phrases: HashMap<i64, crate::phrase::Structure> = HashMap::new();
-    let todo: Vec<i64> = if req.phrases { req.tracks.values().filter(|t| t.grid.is_some() && !t.has_rb_phrases()).map(|t| t.track.id).collect() } else { vec![] };
+    // Phrases edited by the user are written as they are.
+    let mut phrases: HashMap<i64, crate::phrase::Structure> = req.tracks.values().filter_map(|t| t.phrases.clone().map(|p| (t.track.id, p))).collect();
+    let todo: Vec<i64> = if req.phrases { req.tracks.values().filter(|t| t.grid.is_some() && t.phrases.is_none() && !t.has_rb_phrases()).map(|t| t.track.id).collect() } else { vec![] };
     let n_todo = todo.len();
     for (i, id) in todo.into_iter().enumerate() {
         if cancel.load(Relaxed) {
@@ -1478,6 +1481,10 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             for e in ["2EX", "EXT", "DAT"] {
                 sections.extend(anlz::read_sections(&b.with_extension(e)));
             }
+        }
+        // The user's own phrases (PHRASE EDIT) are written, not rekordbox's for this file.
+        if et.phrases.is_some() {
+            sections.remove("PSSI");
         }
         let prev = lib.tracks.get(&dev_id).cloned().unwrap_or_default();
         let mut device = std::collections::HashMap::new();

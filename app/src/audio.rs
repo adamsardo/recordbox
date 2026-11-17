@@ -240,9 +240,30 @@ pub struct PlayState {
     pub search: f64,
     /// Master mute (the level is kept).
     pub muted: bool,
+    /// Playing speed: 1.0 = the track's own tempo (TEMPO − / +, typed BPM, BEAT SYNC).
+    pub tempo: f64,
+    /// Pitch bend: added to `tempo` while a bend button is held.
+    pub bend: f64,
+    /// Master Tempo (key lock): speed changes leave the pitch alone.
+    pub master_tempo: bool,
+    /// Key shift in semitones (KEY SYNC, key shift ‹ ›), independent of the tempo.
+    pub key_shift: f32,
+    /// Crossfader gain of this deck (1.0 outside the two-deck layouts).
+    pub fader: f32,
+    /// The 3-band isolator is in the signal path (Dual Player), with these band gains
+    /// (low, mid, high; 0.0 = killed).
+    pub eq_on: bool,
+    pub eq_gain: [f32; 3],
+    /// Beat times of the loaded track (seconds), for BEAT SYNC.
+    pub grid: Option<Arc<Vec<f64>>>,
+    /// BEAT SYNC: this deck follows the other deck's beat phase while both play.
+    pub sync_follow: bool,
+    /// Speed correction the audio callback applies to hold the beat phase (BEAT SYNC).
+    pub sync_bend: f64,
     click_phase: usize,
     next_click: usize,
     search_count: usize,
+    dsp: Box<DeckDsp>,
 }
 
 impl Default for PlayState {
@@ -260,9 +281,20 @@ impl Default for PlayState {
             stem_on: [true; 4],
             search: 0.0,
             muted: false,
+            tempo: 1.0,
+            bend: 0.0,
+            master_tempo: false,
+            key_shift: 0.0,
+            fader: 1.0,
+            eq_on: false,
+            eq_gain: [1.0; 3],
+            grid: None,
+            sync_follow: false,
+            sync_bend: 0.0,
             click_phase: usize::MAX,
             next_click: 0,
             search_count: 0,
+            dsp: Box::new(DeckDsp::new()),
         }
     }
 }
@@ -400,15 +432,395 @@ fn cubic(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     ((a * t + b) * t + c) * t + y1
 }
 
+// ---------------------------------------------------------------------- deck DSP
+
+/// Crossfader law for a position `x` from 0.0 (deck A's end) to 1.0 (deck B's end): both decks
+/// at full level in the middle, the far deck falling smoothly (a quarter sine) to silence over
+/// its half of the travel. Returns (gain of A, gain of B).
+pub fn crossfader_gains(x: f32) -> (f32, f32) {
+    let x = x.clamp(0.0, 1.0);
+    let g = |d: f32| (std::f32::consts::FRAC_PI_2 * (2.0 * d).clamp(0.0, 1.0)).sin();
+    (g(1.0 - x), g(x))
+}
+
+/// How far through its beat a deck is at `t` seconds: 0.0 on a beat, 0.5 halfway to the
+/// next. Before the first and after the last beat the nearest interval is continued. None
+/// without at least two beats.
+pub fn beat_phase(beats: &[f64], t: f64) -> Option<f64> {
+    if beats.len() < 2 {
+        return None;
+    }
+    let n = beats.len();
+    let i = beats.partition_point(|b| *b <= t);
+    let (a, len) = if i == 0 {
+        (beats[0], beats[1] - beats[0])
+    } else if i >= n {
+        (beats[n - 1], beats[n - 1] - beats[n - 2])
+    } else {
+        (beats[i - 1], beats[i] - beats[i - 1])
+    };
+    if len <= 0.0 {
+        return None;
+    }
+    Some(((t - a) / len).rem_euclid(1.0))
+}
+
+/// Beat phase of the follower minus the master's, wrapped to -0.5..0.5 beats (positive: the
+/// follower is ahead).
+pub fn phase_error(follower: &[f64], t_f: f64, master: &[f64], t_m: f64) -> Option<f64> {
+    let e = beat_phase(follower, t_f)? - beat_phase(master, t_m)?;
+    Some((e + 0.5).rem_euclid(1.0) - 0.5)
+}
+
+/// Speed correction (fraction of normal speed) that pulls a phase error of `e` beats back to
+/// zero: proportional, at most 8 %, nothing inside a 0.3 % dead zone.
+pub fn sync_correction(e: f64) -> f64 {
+    if e.abs() < 0.003 {
+        0.0
+    } else {
+        (-e).clamp(-0.08, 0.08)
+    }
+}
+
+/// The speed at which a track of `own_bpm` plays at `master_bpm`. When the tempos are nearer
+/// an octave apart the half or double speed is matched instead (a 70 BPM track against 140).
+pub fn sync_rate(master_bpm: f64, own_bpm: f64) -> f64 {
+    if master_bpm <= 0.0 || own_bpm <= 0.0 {
+        return 1.0;
+    }
+    let r = master_bpm / own_bpm;
+    [r, r * 2.0, r / 2.0].into_iter().min_by(|a, b| a.ln().abs().total_cmp(&b.ln().abs())).unwrap_or(1.0)
+}
+
+/// One second-order filter section for both channels (transposed direct form II).
+#[derive(Clone, Copy, Default)]
+struct Biquad {
+    b: [f32; 3],
+    a: [f32; 2],
+    z1: [f32; 2],
+    z2: [f32; 2],
+}
+
+impl Biquad {
+    /// kind: 0 low-pass, 1 high-pass, 2 all-pass; Butterworth Q.
+    fn set(&mut self, kind: u8, f: f32, rate: f32) {
+        let w = 2.0 * std::f32::consts::PI * (f / rate).min(0.45);
+        let (sn, cs) = w.sin_cos();
+        let alpha = sn / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let a0 = 1.0 + alpha;
+        let b = match kind {
+            0 => [(1.0 - cs) / 2.0, 1.0 - cs, (1.0 - cs) / 2.0],
+            1 => [(1.0 + cs) / 2.0, -(1.0 + cs), (1.0 + cs) / 2.0],
+            _ => [1.0 - alpha, -2.0 * cs, 1.0 + alpha],
+        };
+        self.b = [b[0] / a0, b[1] / a0, b[2] / a0];
+        self.a = [-2.0 * cs / a0, (1.0 - alpha) / a0];
+    }
+    #[inline]
+    fn run(&mut self, ch: usize, x: f32) -> f32 {
+        let y = self.b[0] * x + self.z1[ch];
+        self.z1[ch] = self.b[1] * x - self.a[0] * y + self.z2[ch];
+        self.z2[ch] = self.b[2] * x - self.a[1] * y;
+        y
+    }
+}
+
+/// Crossover frequencies of the isolator (Hz): LOW below the first, HIGH above the second.
+pub const ISO_LOW_HZ: f32 = 250.0;
+pub const ISO_HIGH_HZ: f32 = 2500.0;
+
+/// 3-band isolator: fourth-order Linkwitz-Riley crossovers, whose bands add back to the
+/// input's level at every frequency (the low band passes an all-pass matching the upper
+/// crossover's phase), so with all three bands on it is inaudible and each band can be
+/// switched off completely.
+#[derive(Clone, Copy, Default)]
+pub struct Iso3 {
+    rate: u32,
+    lp1: [Biquad; 2],
+    hp1: [Biquad; 2],
+    lp2: [Biquad; 2],
+    hp2: [Biquad; 2],
+    ap: Biquad,
+    /// Band gains in use (moving toward the deck's `eq_gain`).
+    g: [f32; 3],
+}
+
+impl Iso3 {
+    pub fn new() -> Iso3 {
+        Iso3 { g: [1.0; 3], ..Default::default() }
+    }
+    fn prepare(&mut self, rate: u32) {
+        if self.rate == rate {
+            return;
+        }
+        *self = Iso3 { rate, g: self.g, ..Default::default() };
+        let r = rate as f32;
+        for k in 0..2 {
+            self.lp1[k].set(0, ISO_LOW_HZ, r);
+            self.hp1[k].set(1, ISO_LOW_HZ, r);
+            self.lp2[k].set(0, ISO_HIGH_HZ, r);
+            self.hp2[k].set(1, ISO_HIGH_HZ, r);
+        }
+        self.ap.set(2, ISO_HIGH_HZ, r);
+    }
+    /// One sample of channel `ch` with the band gains `g`.
+    #[inline]
+    fn run(&mut self, ch: usize, x: f32) -> f32 {
+        let low = self.lp1[0].run(ch, x);
+        let low = self.lp1[1].run(ch, low);
+        let rest = self.hp1[0].run(ch, x);
+        let rest = self.hp1[1].run(ch, rest);
+        let mid = self.lp2[0].run(ch, rest);
+        let mid = self.lp2[1].run(ch, mid);
+        let high = self.hp2[0].run(ch, rest);
+        let high = self.hp2[1].run(ch, high);
+        self.g[0] * self.ap.run(ch, low) + self.g[1] * mid + self.g[2] * high
+    }
+    /// A mono signal through the isolator at fixed band gains (tests and offline use).
+    #[allow(dead_code)]
+    pub fn process(rate: u32, gains: [f32; 3], x: &[f32]) -> Vec<f32> {
+        let mut iso = Iso3::new();
+        iso.prepare(rate);
+        iso.g = gains;
+        x.iter().map(|v| iso.run(0, *v)).collect()
+    }
+}
+
+/// The loaded audio as the callback reads it: the original mix, or the audible stems summed.
+struct Src<'a> {
+    audio: &'a Decoded,
+    frames: usize,
+    stems: Option<&'a crate::stems::Stems>,
+    stem_on: [bool; 4],
+    stem_ratio: f64,
+}
+
+impl Src<'_> {
+    /// Left and right at source frame `p` (fractional).
+    #[inline]
+    fn at(&self, p: f64) -> (f32, f32) {
+        let p = p.max(0.0);
+        match self.stems {
+            // Some stems muted: sum the audible ones at the same position.
+            Some(st) if st.len > 1 => {
+                let sp = p * self.stem_ratio;
+                let si = (sp as usize).min(st.len - 2);
+                let sf = (sp - si as f64) as f32;
+                let (mut l, mut r) = (0.0f32, 0.0f32);
+                let n = st.len as isize;
+                for (src, on) in self.stem_on.iter().enumerate() {
+                    if *on {
+                        let lb = src * 2 * st.len;
+                        let rb = lb + st.len;
+                        let at = |base: usize, k: isize| st.data[base + k.clamp(0, n - 1) as usize];
+                        let k = si as isize;
+                        l += cubic(at(lb, k - 1), at(lb, k), at(lb, k + 1), at(lb, k + 2), sf);
+                        r += cubic(at(rb, k - 1), at(rb, k), at(rb, k + 1), at(rb, k + 2), sf);
+                    }
+                }
+                (l, r)
+            }
+            // 4-point cubic (Catmull-Rom) between frames: exact at whole positions, far less
+            // high-frequency loss than linear interpolation when the file's rate differs from
+            // the device's (e.g. 44.1 kHz files on a 48 kHz output).
+            _ => {
+                let i = p as usize;
+                let fr = (p - i as f64) as f32;
+                let frames = self.frames as isize;
+                let at = |k: isize, c: usize| self.audio.samples[(k.clamp(0, frames - 1) as usize) * 2 + c];
+                let ii = i as isize;
+                (cubic(at(ii - 1, 0), at(ii, 0), at(ii + 1, 0), at(ii + 2, 0), fr), cubic(at(ii - 1, 1), at(ii, 1), at(ii + 1, 1), at(ii + 2, 1), fr))
+            }
+        }
+    }
+    /// Left + right of whole source frame `i` (for aligning grains).
+    #[inline]
+    fn mono(&self, i: isize) -> f32 {
+        let k = i.clamp(0, self.frames as isize - 1) as usize * 2;
+        self.audio.samples[k] + self.audio.samples[k + 1]
+    }
+}
+
+const ST_WIN: usize = 16384;
+const ST_TMPL: usize = 1024;
+
+/// Time stretcher (WSOLA: waveform-similarity overlap-add). The output is made of 40 ms
+/// grains of the source, read at the wanted pitch and cross-faded every 20 ms; each new grain
+/// starts where the play position says, moved by up to ±12 ms to the place where it best
+/// continues the grain before it, so periodic material stays in phase across the joins. The
+/// play position itself advances at exactly the wanted speed. It reads the source directly
+/// (nothing is queued, no latency) and its buffers are allocated once, off the audio thread.
+struct Stretch {
+    active: bool,
+    /// Source frame where the grain fading in began, and the one fading out.
+    cur: f64,
+    prev: f64,
+    /// The two grains are the same stretch of audio (nothing to cross-fade).
+    same: bool,
+    /// Output frames into the current hop, and the hop length.
+    n: usize,
+    hop: usize,
+    /// Source frames per output frame the grains are read at.
+    ps: f64,
+    /// The play position after the last frame, to notice seeks and loop jumps.
+    expect: f64,
+    win: Vec<f32>,
+    tmpl: Vec<f32>,
+    off: Vec<u32>,
+}
+
+impl Stretch {
+    fn new() -> Stretch {
+        Stretch { active: false, cur: 0.0, prev: 0.0, same: true, n: 0, hop: 882, ps: 1.0, expect: 0.0, win: vec![0.0; ST_WIN], tmpl: vec![0.0; ST_TMPL], off: vec![0; ST_TMPL] }
+    }
+
+    /// Where the next grain starts: near `nominal`, at the offset (within ±12 ms) whose audio
+    /// best matches what follows the current grain (`natural`).
+    fn pick(&mut self, src: &Src, nominal: f64, natural: f64) -> f64 {
+        let sr = src.audio.sr as f64;
+        let mut dec = 4usize;
+        while self.hop / dec > ST_TMPL {
+            dec *= 2;
+        }
+        let d = self.ps * dec as f64;
+        let mut m = (self.hop / dec).max(1);
+        let delta = ((0.012 * sr) as usize).clamp(8, ST_WIN / 4);
+        while m > 8 && 2 * delta + (m as f64 * d) as usize + 4 > ST_WIN {
+            m /= 2;
+        }
+        let span = 2 * delta + ((m - 1) as f64 * d).round() as usize + 2;
+        if span > ST_WIN {
+            return nominal;
+        }
+        let base = nominal.floor() as isize - delta as isize;
+        for (i, w) in self.win[..span].iter_mut().enumerate() {
+            *w = src.mono(base + i as isize);
+        }
+        let mut te = 0.0f32;
+        for j in 0..m {
+            let o = j as f64 * d;
+            self.off[j] = o.round() as u32;
+            let v = src.mono((natural + o).round() as isize);
+            self.tmpl[j] = v;
+            te += v * v;
+        }
+        if te < 1e-9 {
+            return nominal;
+        }
+        let (tmpl, off, win) = (&self.tmpl[..m], &self.off[..m], &self.win[..span]);
+        let score = |k: usize| -> f32 {
+            let (mut c, mut e) = (0.0f32, 0.0f32);
+            for j in 0..m {
+                let v = win[k + off[j] as usize];
+                c += tmpl[j] * v;
+                e += v * v;
+            }
+            c / (e + 1e-9).sqrt()
+        };
+        let (mut best, mut best_k) = (f32::MIN, delta);
+        let mut k = 0;
+        while k <= 2 * delta {
+            let sc = score(k);
+            if sc > best {
+                best = sc;
+                best_k = k;
+            }
+            k += 2;
+        }
+        for k in [best_k.saturating_sub(1), (best_k + 1).min(2 * delta)] {
+            let sc = score(k);
+            if sc > best {
+                best = sc;
+                best_k = k;
+            }
+        }
+        (base + best_k as isize) as f64 + (nominal - nominal.floor())
+    }
+
+    /// One output frame with the play position at source frame `pos`, read at `ps` source
+    /// frames per output frame (the pitch); `hop` output frames per grain step.
+    #[inline]
+    fn frame(&mut self, src: &Src, pos: f64, ps: f64, hop: usize) -> (f32, f32) {
+        let h = hop as f64;
+        if !self.active || self.hop != hop {
+            // Start: both grains are the audio from here on.
+            self.active = true;
+            self.hop = hop;
+            self.ps = ps;
+            self.cur = pos;
+            self.prev = pos - h * ps;
+            self.same = true;
+            self.n = 0;
+        } else if (pos - self.expect).abs() > 0.5 {
+            // The position was moved (seek, loop, hot cue): fade from what was sounding into
+            // the new place.
+            self.prev = self.cur + (self.n as f64 - h) * self.ps;
+            self.ps = ps;
+            self.cur = pos;
+            self.same = false;
+            self.n = 0;
+        } else if self.n >= hop {
+            let natural = self.cur + h * self.ps;
+            self.prev = self.cur;
+            self.cur = if (ps - self.ps).abs() < 1e-12 { self.pick(src, pos, natural) } else { pos };
+            // The grain fading out keeps the pitch it was started with.
+            self.prev += h * (self.ps - ps);
+            self.ps = ps;
+            self.same = (self.cur - natural).abs() < 1e-6;
+            self.n = 0;
+        }
+        let n = self.n as f64;
+        self.n += 1;
+        let i = src.at(self.cur + n * self.ps);
+        if self.same {
+            return i;
+        }
+        let o = src.at(self.prev + (h + n) * self.ps);
+        let w = 0.5 - 0.5 * (std::f32::consts::PI * ((n as f32 + 0.5) / h as f32)).cos();
+        (o.0 + (i.0 - o.0) * w, o.1 + (i.1 - o.1) * w)
+    }
+}
+
+/// Per-deck signal processing state owned by the audio callback.
+struct DeckDsp {
+    st: Stretch,
+    eq: Iso3,
+    /// Crossfader gain in use (moving toward the deck's `fader`).
+    fader: f32,
+}
+
+impl DeckDsp {
+    fn new() -> DeckDsp {
+        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0 }
+    }
+}
+
+/// BEAT SYNC, on the audio thread where both decks' positions are read at the same instant:
+/// the speed correction that holds `follower` on the other deck's beat phase.
+fn update_sync(follower: &mut PlayState, master: &PlayState) {
+    follower.sync_bend = 0.0;
+    if !follower.sync_follow || !follower.playing || !master.playing || follower.search != 0.0 || master.search != 0.0 {
+        return;
+    }
+    let (Some(gf), Some(gm), Some(af), Some(am)) = (&follower.grid, &master.grid, &follower.audio, &master.audio) else { return };
+    if let Some(e) = phase_error(gf, follower.pos / af.sr as f64, gm, master.pos / am.sr as f64) {
+        follower.sync_bend = sync_correction(e);
+    }
+}
+
 /// The audio callback: both decks mixed into `out`.
 fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize, rate: u32) {
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    for st in states {
-        if let Some(mut s) = st.try_lock() {
-            render_deck(&mut s, out, channels, rate);
-        }
+    let mut a = states[0].try_lock();
+    let mut b = states[1].try_lock();
+    if let (Some(a), Some(b)) = (a.as_deref_mut(), b.as_deref_mut()) {
+        update_sync(a, b);
+        update_sync(b, a);
+    }
+    for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
+        render_deck(s, out, channels, rate);
     }
 }
 
@@ -422,6 +834,7 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     let searching = s.search != 0.0;
     if !s.playing && !searching {
         s.search_count = 0;
+        s.dsp.st.active = false;
         return;
     }
     let Some(audio) = s.audio.clone() else { return };
@@ -430,10 +843,23 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     let vol = if s.muted { 0.0 } else { s.volume * s.gain * if searching { 0.7 } else { 1.0 } };
     let click_len = (rate as f64 * 0.03) as usize;
     let stems = if s.stem_on.iter().all(|x| *x) { None } else { s.stems.clone() };
-    let stem_on = s.stem_on;
-    let stem_ratio = crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64;
+    let src = Src { audio: &audio, frames, stems: stems.as_deref(), stem_on: s.stem_on, stem_ratio: crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64 };
     let metro = if searching { None } else { s.metronome.clone() };
     let grain = search_grain(rate);
+    // Speed and pitch for this buffer. The pitch follows the speed unless Master Tempo holds
+    // it; the key shift is on top of either.
+    let speed = if searching { 1.0 } else { (s.tempo + s.bend + s.sync_bend).clamp(0.05, 4.0) };
+    let pitch = if searching { 1.0 } else { (if s.master_tempo { 1.0 } else { speed }) * 2f64.powf(s.key_shift as f64 / 12.0) };
+    let stretch = (pitch - speed).abs() > 1e-9;
+    let hop = ((rate as usize) / 50).clamp(64, 4096);
+    let fader_k = (1.0 / (0.005 * rate as f32)).min(1.0);
+    let eq_on = s.eq_on;
+    if eq_on {
+        s.dsp.eq.prepare(rate);
+    }
+    if !stretch {
+        s.dsp.st.active = false;
+    }
     for f in out.chunks_mut(channels) {
         if searching {
             // After each grain the position skips so that, overall, it moves at `search`
@@ -450,42 +876,22 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             }
         }
         let p = s.pos;
-        let i = p as usize;
-        if i + 1 >= frames {
+        if p as usize + 1 >= frames {
             s.playing = false;
             s.pos = frames.saturating_sub(1) as f64;
             break;
         }
-        let fr = (p - i as f64) as f32;
-        let (l, r) = match &stems {
-            // Some stems muted: sum the audible ones at the same position.
-            Some(st) if st.len > 1 => {
-                let sp = p * stem_ratio;
-                let si = (sp as usize).min(st.len - 2);
-                let sf = (sp - si as f64) as f32;
-                let (mut l, mut r) = (0.0f32, 0.0f32);
-                let n = st.len as isize;
-                for (src, on) in stem_on.iter().enumerate() {
-                    if *on {
-                        let lb = src * 2 * st.len;
-                        let rb = lb + st.len;
-                        let at = |base: usize, k: isize| st.data[base + k.clamp(0, n - 1) as usize];
-                        let k = si as isize;
-                        l += cubic(at(lb, k - 1), at(lb, k), at(lb, k + 1), at(lb, k + 2), sf);
-                        r += cubic(at(rb, k - 1), at(rb, k), at(rb, k + 1), at(rb, k + 2), sf);
-                    }
-                }
-                (l, r)
+        let (mut l, mut r) = if stretch { s.dsp.st.frame(&src, p, pitch * step, hop) } else { src.at(p) };
+        if eq_on {
+            let d = &mut s.dsp;
+            for k in 0..3 {
+                d.eq.g[k] += (s.eq_gain[k] - d.eq.g[k]) * fader_k;
             }
-            // 4-point cubic (Catmull-Rom) between frames: exact at whole positions, far less
-            // high-frequency loss than linear interpolation when the file's rate differs from
-            // the device's (e.g. 44.1 kHz files on a 48 kHz output).
-            _ => {
-                let at = |k: isize, c: usize| audio.samples[(k.clamp(0, frames as isize - 1) as usize) * 2 + c];
-                let ii = i as isize;
-                (cubic(at(ii - 1, 0), at(ii, 0), at(ii + 1, 0), at(ii + 2, 0), fr), cubic(at(ii - 1, 1), at(ii, 1), at(ii + 1, 1), at(ii + 2, 1), fr))
-            }
-        };
+            l = d.eq.run(0, l);
+            r = d.eq.run(1, r);
+        }
+        s.dsp.fader += (s.fader - s.dsp.fader) * fader_k;
+        let vol = vol * s.dsp.fader;
         let mut click = 0.0f32;
         if let Some(beats) = metro.as_ref() {
             // The beat list can be replaced by a shorter one (another track, a grid edit).
@@ -505,7 +911,7 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             }
             if s.click_phase < click_len {
                 let env = 1.0 - s.click_phase as f32 / click_len as f32;
-                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * crate::prefs_ext::click_hz() / rate as f32).sin() * env * s.metronome_vol * if s.muted { 0.0 } else { 1.0 };
+                click = (s.click_phase as f32 * 2.0 * std::f32::consts::PI * 1500.0 / rate as f32).sin() * env * s.metronome_vol * if s.muted { 0.0 } else { 1.0 };
                 s.click_phase += 1;
             }
         }
@@ -515,7 +921,8 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
         } else {
             f[0] += 0.5 * (l + r) * vol + click;
         }
-        s.pos += step;
+        s.pos += step * speed;
+        s.dsp.st.expect = s.pos;
     }
 }
 
@@ -683,5 +1090,276 @@ mod deck_mix_tests {
         };
         let (p1, p2, p3) = (peak(&mut s, 1), peak(&mut s, 2), peak(&mut s, 3));
         assert!(p1 > 0.05 && p2 > p1 * 1.5 && p3 > p2 * 1.5, "{p1} {p2} {p3}");
+    }
+}
+
+#[cfg(test)]
+mod dsp_tests {
+    use super::*;
+
+    fn tone(freq: f64, secs: f64, amp: impl Fn(f64) -> f32) -> Arc<Decoded> {
+        let sr = 44100u32;
+        let n = (secs * sr as f64) as usize;
+        let mut samples = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (2.0 * std::f64::consts::PI * freq * t).sin() as f32 * amp(t);
+            samples.push(v);
+            samples.push(v);
+        }
+        Arc::new(Decoded { sr, samples, raw_frames: n, damaged: 0, truncated: false })
+    }
+
+    fn deck(a: Arc<Decoded>) -> PlayState {
+        PlayState { audio: Some(a), playing: true, volume: 1.0, gain: 1.0, ..Default::default() }
+    }
+
+    /// Render `secs` of output in device-sized buffers; left channel.
+    fn run(s: &mut PlayState, secs: f64) -> Vec<f32> {
+        let mut all = vec![];
+        let mut buf = vec![0.0f32; 1024];
+        let total = (secs * 44100.0) as usize;
+        while all.len() < total {
+            buf.iter_mut().for_each(|v| *v = 0.0);
+            render_deck(s, &mut buf, 2, 44100);
+            all.extend(buf.chunks(2).map(|f| f[0]));
+        }
+        all.truncate(total);
+        all
+    }
+
+    /// Frequency of a steady tone from its upward zero crossings (first to last).
+    fn freq_of(x: &[f32]) -> f64 {
+        let mut first = None;
+        let mut last = 0.0f64;
+        let mut count = 0usize;
+        for i in 1..x.len() {
+            if x[i - 1] < 0.0 && x[i] >= 0.0 {
+                let t = (i - 1) as f64 + (-x[i - 1] / (x[i] - x[i - 1])) as f64;
+                if first.is_none() {
+                    first = Some(t);
+                } else {
+                    count += 1;
+                }
+                last = t;
+            }
+        }
+        count as f64 / ((last - first.unwrap_or(0.0)) / 44100.0)
+    }
+
+    fn cents(f: f64, reference: f64) -> f64 {
+        1200.0 * (f / reference).log2()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+    }
+
+    #[test]
+    fn tempo_without_master_tempo_changes_speed_and_pitch_together() {
+        let mut s = deck(tone(440.0, 12.0, |_| 0.5));
+        s.tempo = 1.1;
+        let out = run(&mut s, 4.0);
+        assert!((s.pos - 4.0 * 44100.0 * 1.1).abs() < 1.0, "{}", s.pos);
+        assert!(cents(freq_of(&out[4410..]), 484.0).abs() < 2.0, "{}", freq_of(&out[4410..]));
+    }
+
+    #[test]
+    fn master_tempo_keeps_the_pitch_within_a_few_cents_and_the_tempo_exact() {
+        for (tempo, f) in [(1.16, 440.0), (0.84, 440.0), (1.06, 110.0), (0.92, 2000.0), (1.03, 55.0)] {
+            let mut s = deck(tone(f, 14.0, |_| 0.5));
+            s.tempo = tempo;
+            s.master_tempo = true;
+            let out = run(&mut s, 5.0);
+            // The position moved at exactly the tempo…
+            assert!((s.pos - 5.0 * 44100.0 * tempo).abs() < 1.0, "tempo {tempo}: {}", s.pos);
+            // …the pitch stayed…
+            let c = cents(freq_of(&out[8820..]), f);
+            assert!(c.abs() < 3.0, "tempo {tempo}, {f} Hz: {c} cents");
+            // …and the level did too (no holes or doubling at the joins).
+            let lv = rms(&out[8820..]) / (0.5 * std::f32::consts::FRAC_1_SQRT_2);
+            assert!((lv - 1.0).abs() < 0.03, "tempo {tempo}, {f} Hz: level {lv}");
+        }
+    }
+
+    #[test]
+    fn master_tempo_output_follows_the_source_position() {
+        // The tone gets louder at 4.0 s of the track; at 125 % that is heard after 3.2 s.
+        let mut s = deck(tone(330.0, 12.0, |t| if t < 4.0 { 0.2 } else { 0.8 }));
+        s.tempo = 1.25;
+        s.master_tempo = true;
+        let out = run(&mut s, 5.0);
+        let at = |t: f64| rms(&out[(t * 44100.0) as usize..((t + 0.02) * 44100.0) as usize]);
+        assert!(at(3.15) < 0.2, "{}", at(3.15));
+        assert!(at(3.25) > 0.5, "{}", at(3.25));
+    }
+
+    #[test]
+    fn key_shift_moves_the_pitch_by_semitones_at_the_same_speed() {
+        for semis in [3.0f32, -2.0, 12.0, -5.0] {
+            let mut s = deck(tone(440.0, 10.0, |_| 0.5));
+            s.key_shift = semis;
+            let out = run(&mut s, 4.0);
+            assert!((s.pos - 4.0 * 44100.0).abs() < 1.0);
+            let want = 440.0 * 2f64.powf(semis as f64 / 12.0);
+            let c = cents(freq_of(&out[8820..]), want);
+            assert!(c.abs() < 3.0, "{semis} semitones: {c} cents");
+        }
+        // With a tempo change and Master Tempo off the shift is on top of the tempo's pitch.
+        let mut s = deck(tone(440.0, 10.0, |_| 0.5));
+        s.key_shift = 2.0;
+        s.tempo = 1.05;
+        let out = run(&mut s, 4.0);
+        let want = 440.0 * 1.05 * 2f64.powf(2.0 / 12.0);
+        assert!(cents(freq_of(&out[8820..]), want).abs() < 3.0);
+        assert!((s.pos - 4.0 * 44100.0 * 1.05).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_seek_while_stretching_lands_on_the_new_position() {
+        let mut s = deck(tone(440.0, 20.0, |t| if t < 10.0 { 0.2 } else { 0.8 }));
+        s.tempo = 0.9;
+        s.master_tempo = true;
+        run(&mut s, 1.0);
+        s.pos = 12.0 * 44100.0;
+        let out = run(&mut s, 0.5);
+        assert!(rms(&out[4410..]) > 0.5);
+        assert!((s.pos - (12.0 + 0.45) * 44100.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn pitch_bend_adds_to_the_tempo_while_it_is_held() {
+        let mut s = deck(tone(440.0, 10.0, |_| 0.5));
+        s.tempo = 1.02;
+        s.bend = 0.04;
+        run(&mut s, 1.0);
+        assert!((s.pos - 44100.0 * 1.06).abs() < 1.0);
+        s.bend = 0.0;
+        let from = s.pos;
+        run(&mut s, 1.0);
+        assert!((s.pos - from - 44100.0 * 1.02).abs() < 1.0);
+    }
+
+    #[test]
+    fn crossfader_law() {
+        // Middle: both decks at full level. Ends: one deck only.
+        assert_eq!(crossfader_gains(0.5), (1.0, 1.0));
+        let (a, b) = crossfader_gains(0.0);
+        assert!(a == 1.0 && b == 0.0);
+        let (a, b) = crossfader_gains(1.0);
+        assert!(a.abs() < 1e-6 && b == 1.0);
+        // Deck B fades in over the first half and deck A out over the second, without steps.
+        let mut prev = crossfader_gains(0.0);
+        for i in 1..=100 {
+            let g = crossfader_gains(i as f32 / 100.0);
+            assert!(g.0 <= prev.0 + 1e-6 && g.1 >= prev.1 - 1e-6);
+            assert!((g.0 - prev.0).abs() < 0.04 && (g.1 - prev.1).abs() < 0.04);
+            prev = g;
+        }
+        assert!((crossfader_gains(0.75).0 - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        // Symmetric.
+        assert!((crossfader_gains(0.3).1 - crossfader_gains(0.7).0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn crossfader_gain_reaches_the_output_smoothly() {
+        let dc = Arc::new(Decoded { sr: 44100, samples: vec![0.5; 44100 * 2], raw_frames: 44100, damaged: 0, truncated: false });
+        let mut s = deck(dc);
+        s.fader = 0.0;
+        let out = run(&mut s, 0.2);
+        // No step at the start, silent once the fade is through.
+        assert!(out.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01));
+        assert!(out[4410..].iter().all(|v| v.abs() < 1e-4));
+    }
+
+    #[test]
+    fn isolator_band_gains() {
+        let sine = |f: f64| -> Vec<f32> { (0..44100).map(|i| (2.0 * std::f64::consts::PI * f * i as f64 / 44100.0).sin() as f32).collect() };
+        let level = |g: [f32; 3], f: f64| -> f32 { rms(&Iso3::process(44100, g, &sine(f))[22050..]) / std::f32::consts::FRAC_1_SQRT_2 };
+        let db = |x: f32| 20.0 * x.max(1e-9).log10();
+        // All bands on: the level is unchanged everywhere, the crossovers included.
+        for f in [30.0, 60.0, 250.0, 700.0, 1000.0, 2500.0, 8000.0, 15000.0] {
+            assert!(db(level([1.0; 3], f)).abs() < 0.1, "{f} Hz: {} dB", db(level([1.0; 3], f)));
+        }
+        // LOW off: bass gone, mids and highs untouched; -6 dB at the crossover.
+        assert!(db(level([0.0, 1.0, 1.0], 60.0)) < -45.0);
+        assert!(db(level([0.0, 1.0, 1.0], 1000.0)).abs() < 0.2);
+        assert!(db(level([0.0, 1.0, 1.0], 8000.0)).abs() < 0.1);
+        assert!((db(level([0.0, 1.0, 1.0], 250.0)) + 6.0).abs() < 0.3);
+        // MID off: only the band between the crossovers goes.
+        assert!(db(level([1.0, 0.0, 1.0], 800.0)) < -18.0);
+        assert!(db(level([1.0, 0.0, 1.0], 40.0)).abs() < 0.2);
+        assert!(db(level([1.0, 0.0, 1.0], 12000.0)).abs() < 0.2);
+        // HIGH off.
+        assert!(db(level([1.0, 1.0, 0.0], 10000.0)) < -45.0);
+        assert!(db(level([1.0, 1.0, 0.0], 100.0)).abs() < 0.1);
+        // Everything off is silence.
+        assert!(db(level([0.0; 3], 1000.0)) < -100.0);
+    }
+
+    #[test]
+    fn isolator_in_the_deck_follows_the_kill_switches() {
+        let mut s = deck(tone(60.0, 10.0, |_| 0.5));
+        s.eq_on = true;
+        let on = rms(&run(&mut s, 1.0)[22050..]);
+        s.eq_gain = [0.0, 1.0, 1.0];
+        let off = rms(&run(&mut s, 1.0)[22050..]);
+        assert!((on - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01, "{on}");
+        assert!(off < 0.002, "{off}");
+    }
+
+    #[test]
+    fn sync_phase_maths() {
+        let grid = |first: f64, bpm: f64, n: usize| -> Vec<f64> { (0..n).map(|i| first + i as f64 * 60.0 / bpm).collect() };
+        let a = grid(0.5, 120.0, 400);
+        assert!((beat_phase(&a, 0.5).unwrap()).abs() < 1e-9);
+        assert!((beat_phase(&a, 0.75).unwrap() - 0.5).abs() < 1e-9);
+        // Before the first and after the last beat the grid is continued.
+        assert!((beat_phase(&a, 0.125).unwrap() - 0.25).abs() < 1e-9);
+        assert!((beat_phase(&a, 0.5 + 400.0 * 0.5 + 0.1).unwrap() - 0.2).abs() < 1e-6);
+        assert_eq!(beat_phase(&[1.0], 1.0), None);
+        // A 128 BPM track against it: on its beat while the master is a quarter beat in.
+        let b = grid(0.2, 128.0, 400);
+        let e = phase_error(&b, b[10], &a, a[7] + 0.125).unwrap();
+        assert!((e + 0.25).abs() < 1e-9, "{e}");
+        // Errors wrap to the nearest beat.
+        let e = phase_error(&b, b[10] + 0.9 * 60.0 / 128.0, &a, a[7]).unwrap();
+        assert!((e + 0.1).abs() < 1e-9, "{e}");
+        // Ahead: slow down; behind: speed up; tiny errors are left alone; bounded.
+        assert!(sync_correction(0.1) < 0.0 && sync_correction(-0.1) > 0.0);
+        assert_eq!(sync_correction(0.001), 0.0);
+        assert_eq!(sync_correction(0.5), -0.08);
+        // Tempo match, with the octave rule.
+        assert!((sync_rate(128.0, 120.0) - 128.0 / 120.0).abs() < 1e-12);
+        assert!((sync_rate(140.0, 70.0) - 1.0).abs() < 1e-12);
+        assert!((sync_rate(87.0, 174.0) - 1.0).abs() < 1e-12);
+        assert_eq!(sync_rate(0.0, 120.0), 1.0);
+    }
+
+    #[test]
+    fn beat_sync_pulls_the_follower_onto_the_masters_beats() {
+        // Master at 120 BPM, follower a 126 BPM track played at 120/126 and started 80 ms late.
+        let grid = |first: f64, bpm: f64| -> Arc<Vec<f64>> { Arc::new((0..600).map(|i| first + i as f64 * 60.0 / bpm).collect()) };
+        let silence = || Arc::new(Decoded { sr: 44100, samples: vec![0.0; 44100 * 2 * 60], raw_frames: 44100 * 60, damaged: 0, truncated: false });
+        let m = Arc::new(Mutex::new(PlayState { grid: Some(grid(0.0, 120.0)), ..deck(silence()) }));
+        let f = Arc::new(Mutex::new(PlayState { grid: Some(grid(0.3, 126.0)), tempo: 120.0 / 126.0, sync_follow: true, master_tempo: true, ..deck(silence()) }));
+        f.lock().pos = (0.3 + 0.08) * 44100.0;
+        let states = [m.clone(), f.clone()];
+        let mut buf = vec![0.0f32; 1024];
+        for _ in 0..(10 * 44100 / 512) {
+            render(&states, &mut buf, 2, 44100);
+        }
+        let (pm, pf) = (m.lock().pos / 44100.0, f.lock().pos / 44100.0);
+        let e = phase_error(f.lock().grid.as_ref().unwrap(), pf, m.lock().grid.as_ref().unwrap(), pm).unwrap();
+        assert!(e.abs() < 0.01, "phase error after 10 s: {e} beats");
+        // Without BEAT SYNC the offset stays.
+        f.lock().sync_follow = false;
+        f.lock().pos += 0.1 * 44100.0;
+        for _ in 0..(2 * 44100 / 512) {
+            render(&states, &mut buf, 2, 44100);
+        }
+        let (pm, pf) = (m.lock().pos / 44100.0, f.lock().pos / 44100.0);
+        let e = phase_error(f.lock().grid.as_ref().unwrap(), pf, m.lock().grid.as_ref().unwrap(), pm).unwrap();
+        assert!(e.abs() > 0.15, "{e}");
     }
 }

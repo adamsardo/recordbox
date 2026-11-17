@@ -171,6 +171,12 @@ pub fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 pub fn card_help(ui: &mut Ui, title: &str, tip: Option<&str>, add: impl FnOnce(&mut Ui)) {
+    card_x(ui, title, 25.0, tip, add)
+}
+
+/// A card whose heading starts `x` pt from its left edge (25 everywhere but Audio > Metronome,
+/// which the original sets 8 pt further left).
+pub fn card_x(ui: &mut Ui, title: &str, x: f32, tip: Option<&str>, add: impl FnOnce(&mut Ui)) {
     let w = ui.available_width().min(CARD_W);
     egui::Frame::default().fill(BG2).show(ui, |ui| {
         ui.set_width(w);
@@ -178,9 +184,9 @@ pub fn card_help(ui: &mut Ui, title: &str, tip: Option<&str>, add: impl FnOnce(&
         ui.add_space(20.0);
         set_flow(ui, Flow { prev: Kind::Title, indent: 52.0 });
         let (r, _) = ui.allocate_exact_size(vec2(w, 23.0), Sense::hover());
-        let tr = paint_text(ui, pos2(r.min.x + 25.0, r.center().y - 0.5), Align2::LEFT_CENTER, title, inter_bold(17.0), WHITE, 0.17);
+        let tr = paint_text(ui, pos2(r.min.x + x, r.center().y - 0.5), Align2::LEFT_CENTER, title, inter_bold(17.0), WHITE, 0.17);
         if let Some(tip) = tip {
-            help_in(ui, Rect::from_min_size(pos2(tr.max.x + 86.5, r.center().y - 7.0), vec2(14.0, 12.0)), tip);
+            help_in(ui, Rect::from_min_size(pos2(tr.max.x + HELP_GAP, r.center().y - 7.0), vec2(14.0, 12.0)), tip);
         }
         add(ui);
         ui.add_space(20.0);
@@ -206,9 +212,14 @@ pub fn sub_help(ui: &mut Ui, text: &str, tip: Option<&str>) {
 
 /// 1 pt line across the card; the controls after it are back at 52 pt.
 pub fn separator(ui: &mut Ui) {
+    separator_col(ui, SEP)
+}
+
+/// The same line in another colour (Audio > Metronome has a white one).
+pub fn separator_col(ui: &mut Ui, col: Color32) {
     gap(ui, Kind::Sep);
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x + 20.0, r.min.y), pos2((r.min.x + 608.0).min(r.max.x - 16.0), r.max.y)), 0.0, SEP);
+    ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x + 20.0, r.min.y), pos2((r.min.x + 608.0).min(r.max.x - 16.0), r.max.y)), 0.0, col);
     indent(ui, 52.0);
 }
 
@@ -300,6 +311,63 @@ pub fn toggle_off_raw(ui: &mut Ui, label: &str, why: &str) -> bool {
     resp.on_hover_text(why).clicked()
 }
 
+/// A switch that cannot be changed here: drawn in the state it really is in; hovering gives
+/// the reason and a click returns true so the caller can say it.
+pub fn toggle_locked(ui: &mut Ui, on: bool, label: &str, why: &str) -> bool {
+    row(ui, 16.0, |ui| {
+        let g = label_galley(ui, label, 14.0, WHITE, -0.21);
+        let (r, resp) = ui.allocate_exact_size(vec2(37.0 + g.size().x, g.size().y.max(16.0)), Sense::click());
+        paint_toggle(ui.painter(), Rect::from_min_size(pos2(r.min.x, r.center().y - 8.0), vec2(32.0, 16.0)), on, true);
+        ui.painter().galley(pos2(r.min.x + 37.0, r.center().y - g.size().y / 2.0), g, WHITE);
+        resp.on_hover_text(why).clicked()
+    })
+}
+
+/// A checkbox for something Recordbox does not have: greyed and not ticked, with the reason
+/// on hover. Inside a row.
+pub fn checkbox_off_raw(ui: &mut Ui, label: &str, why: &str) -> Response {
+    let g = label_galley(ui, label, 14.0, OFF, 0.1);
+    let (r, resp) = ui.allocate_exact_size(vec2(21.0 + g.size().x, g.size().y.max(16.5)), Sense::hover());
+    paint_checkbox(ui.painter(), Rect::from_min_size(pos2(r.min.x, r.center().y - 8.25), vec2(16.5, 16.5)), false, false);
+    ui.painter().galley(pos2(r.min.x + 21.0, r.center().y - g.size().y / 2.0), g, OFF);
+    resp.on_hover_text(why)
+}
+
+pub fn checkbox_off(ui: &mut Ui, label: &str, why: &str) {
+    row(ui, 16.0, |ui| {
+        checkbox_off_raw(ui, label, why);
+    });
+}
+
+/// A radio button that cannot be chosen: greyed, with the reason on hover.
+pub fn radio_off(ui: &mut Ui, on: bool, label: &str, why: &str) {
+    row(ui, 16.0, |ui| {
+        ui.add_enabled_ui(false, |ui| radio_raw(ui, on, label)).inner.on_disabled_hover_text(why);
+    });
+}
+
+/// Continuous slider (Audio page): 516 pt track 62 pt from the card's left, 5 x 20 pt handle.
+/// `t` is 0..=1. Returns true while it is being moved.
+pub fn slider(ui: &mut Ui, t: &mut f32) -> Response {
+    let handle_w = 5.0_f32;
+    row_at(ui, Kind::Ctl, 20.0, 62.0, |ui| {
+        let w = 516.0_f32.min(ui.available_width() - 20.0);
+        let (r, mut resp) = ui.allocate_exact_size(vec2(w, 20.0), Sense::click_and_drag());
+        if let Some(p) = resp.interact_pointer_pos() {
+            let n = ((p.x - r.min.x - handle_w / 2.0) / (w - handle_w)).clamp(0.0, 1.0);
+            if n != *t {
+                *t = n;
+                resp.mark_changed();
+            }
+        }
+        let en = ui.is_enabled();
+        ui.painter().rect_filled(Rect::from_min_max(pos2(r.min.x, r.center().y - 2.0), pos2(r.max.x, r.center().y + 2.0)), 0.0, hex(0x0F0F0F));
+        let x = r.min.x + t.clamp(0.0, 1.0) * (w - handle_w);
+        ui.painter().rect_filled(Rect::from_min_size(pos2(x, r.min.y), vec2(handle_w, 20.0)), 0.5, if en { hex(0xE6E6E6) } else { OFF });
+        resp
+    })
+}
+
 pub fn paint_radio(p: &egui::Painter, c: egui::Pos2, on: bool, enabled: bool) {
     p.circle_filled(c, 8.0, if !enabled { hex(0x3A3A3A) } else if on { PBLUE } else { hex(0x939393) });
     if on {
@@ -352,6 +420,9 @@ pub fn checkbox_raw(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
 pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     row(ui, 16.0, |ui| checkbox_raw(ui, on, label))
 }
+
+/// Distance from the end of a card heading to its "?" box.
+const HELP_GAP: f32 = 86.5;
 
 /// The "?" box (14 x 12 pt); its text is shown on hover.
 fn help_in(ui: &mut Ui, r: Rect, tip: &str) -> Response {

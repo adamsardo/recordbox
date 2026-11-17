@@ -1085,7 +1085,7 @@ pub fn shot_setup(app: &mut App, what: &str) {
         let mut tracks = HashMap::new();
         for id in &ids {
             if let Some(t) = app.track(*id).cloned() {
-                tracks.insert(*id, usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None });
+                tracks.insert(*id, usb::ExportTrack { cues: app.db.cues(*id).unwrap_or_default(), grid: app.db.grid(*id), wave: app.db.wave(*id), track: t, tags: vec![], rb_anlz: None, grid_same: false, vocal: None, phrases: None });
             }
         }
         let half = ids.len() / 2;

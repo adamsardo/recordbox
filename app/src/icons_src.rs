@@ -421,3 +421,107 @@ pub fn tile(p: &Painter, r: Rect, on: bool, hovered: bool, enabled: bool, panel:
         panel
     }
 }
+
+// ---------------------------------------------------------------- 7.2.19 browser glyphs
+/// An atom: three orbits 60 degrees apart around a dot, centred on `c` (`rx` x `ry` orbits).
+pub fn atom(p: &Painter, c: Pos2, rx: f32, ry: f32, w: f32, col: Color32) {
+    for k in 0..3 {
+        let rot = std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 3.0;
+        let pts: Vec<Pos2> = (0..=40)
+            .map(|i| {
+                let a = i as f32 / 40.0 * std::f32::consts::TAU;
+                let (x, y) = (rx * a.cos(), ry * a.sin());
+                c + vec2(x * rot.cos() - y * rot.sin(), x * rot.sin() + y * rot.cos())
+            })
+            .collect();
+        p.add(Shape::line(pts, Stroke::new(w, col)));
+    }
+    p.circle_filled(c, w * 1.1, col);
+}
+
+/// Track Suggestion source tile (skin brows_trackSuggestion_icon, 15 x 14): an atom.
+pub fn suggestion(p: &Painter, r: Rect, c: Color32, _bg: Color32) {
+    let k = r.width().min(r.height()) / 18.0;
+    atom(p, r.center(), 7.0 * k, 2.6 * k, 1.25 * k, c);
+}
+
+/// CUE Analysis Playlist (skin brows_treeicon_cuplaylist, 12 x 13): a sheet with two rows
+/// whose lower right corner gives way to a downward triangle.
+pub fn tree_cue_list(p: &Painter, c: Pos2, col: Color32) {
+    let g = G::at(c, 12.0, 13.0);
+    // Frame: top, left, and what is left of the bottom and right edges.
+    g.fill(p, 0.86, 1.36, 9.43, 3.07, col);
+    g.fill(p, 0.86, 1.36, 1.71, 11.64, col);
+    g.fill(p, 8.57, 1.36, 9.43, 5.89, col);
+    g.fill(p, 0.86, 9.93, 5.3, 11.64, col);
+    // Rows.
+    g.fill(p, 1.71, 4.36, 8.57, 5.64, col);
+    g.fill(p, 1.71, 6.93, 3.57, 8.64, col);
+    p.add(Shape::convex_polygon(vec![g.p(4.75, 6.91), g.p(11.17, 6.91), g.p(7.96, 12.48)], col, Stroke::NONE));
+}
+
+/// Skin brws_list_pathsystem_pulldown (10 x 16): an up and a down angle.
+pub fn path_pulldown(p: &Painter, r: Rect, c: Color32) {
+    let q = |x: f32, y: f32| r.min + vec2(x * r.width() / 10.0, y * r.height() / 16.0);
+    p.add(Shape::convex_polygon(vec![q(5.09, 0.0), q(10.0, 6.0), q(7.82, 6.0), q(5.09, 2.79)], c, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![q(5.09, 0.0), q(5.09, 2.79), q(2.37, 6.0), q(0.0, 6.0)], c, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![q(4.91, 16.0), q(0.0, 10.0), q(2.18, 10.0), q(4.91, 13.21)], c, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![q(4.91, 16.0), q(4.91, 13.21), q(7.63, 10.0), q(10.0, 10.0)], c, Stroke::NONE));
+}
+
+/// Skin brows_treeicon_add_btn (12 x 12): a disc with a plus cut out.
+pub fn plus_disc(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
+    p.circle_filled(c, 6.0, col);
+    p.rect_filled(Rect::from_center_size(c, vec2(8.0, 2.0)), 0.0, bg);
+    p.rect_filled(Rect::from_center_size(c, vec2(2.0, 8.0)), 0.0, bg);
+}
+
+/// Skin brws_setting (14 x 14): a gear with eight teeth and a round hole.
+pub fn gear(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
+    p.circle_filled(c, 5.2, col);
+    for k in 0..8 {
+        let a = k as f32 * std::f32::consts::FRAC_PI_4;
+        let (dx, dy) = (a.cos(), a.sin());
+        let (nx, ny) = (-dy, dx);
+        let tip = c + vec2(dx, dy) * 7.0;
+        let base = c + vec2(dx, dy) * 4.6;
+        p.add(Shape::convex_polygon(vec![base + vec2(nx, ny) * 1.75, tip + vec2(nx, ny) * 1.5, tip - vec2(nx, ny) * 1.5, base - vec2(nx, ny) * 1.75], col, Stroke::NONE));
+    }
+    p.circle_filled(c, 2.9, bg);
+}
+
+/// Skin subBrows_related_note_icon (14 x 14): an eighth note.
+pub fn sub_note(p: &Painter, r: Rect, col: Color32) {
+    let q = |x: f32, y: f32| r.min + vec2(x, y) * (r.width() / 14.0);
+    p.add(Shape::ellipse_filled(q(5.24, 10.45), vec2(2.16, 2.15) * (r.width() / 14.0), col));
+    p.rect_filled(Rect::from_min_max(q(5.95, 1.4), q(7.39, 10.38)), 0.0, col);
+    p.add(Shape::convex_polygon(vec![q(7.39, 1.4), q(10.85, 3.67), q(10.09, 4.83), q(6.67, 2.59)], col, Stroke::NONE));
+}
+
+/// Skin subBrows_related_sort_off_btn (12 x 13): an outlined sheet with three rows.
+pub fn sub_sort(p: &Painter, c: Pos2, col: Color32) {
+    let r = Rect::from_center_size(c, vec2(12.0, 13.0));
+    p.rect_stroke(r, 2.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
+    for y in [4.0, 6.0, 8.0] {
+        p.rect_filled(Rect::from_min_max(r.min + vec2(3.0, y), r.min + vec2(9.0, y + 1.0)), 0.0, col);
+    }
+}
+
+/// Skin brws_refresh (12 x 16): two curved arrows chasing each other.
+pub fn refresh(p: &Painter, c: Pos2, col: Color32) {
+    let arc = |from: f32, to: f32| -> Vec<Pos2> { (0..=14).map(|i| { let a = from + (to - from) * i as f32 / 14.0; c + vec2(4.9 * a.cos(), 4.9 * a.sin()) }).collect() };
+    use std::f32::consts::PI;
+    p.add(Shape::line(arc(-0.25 * PI, 0.55 * PI), Stroke::new(1.7, col)));
+    p.add(Shape::line(arc(0.75 * PI, 1.55 * PI), Stroke::new(1.7, col)));
+    // Arrow heads: lower one points left at the bottom, upper one points right at the top.
+    p.add(Shape::convex_polygon(vec![c + vec2(2.3, 2.0), c + vec2(2.3, 8.0), c + vec2(-2.2, 5.0)], col, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![c + vec2(-2.3, -2.0), c + vec2(-2.3, -8.0), c + vec2(2.2, -5.0)], col, Stroke::NONE));
+}
+
+/// Skin checkbox_on's tick, scaled to a `size` pt box centred on `c`.
+pub fn tick(p: &Painter, c: Pos2, size: f32, col: Color32) {
+    let k = size / 10.0;
+    let q = |x: f32, y: f32| c + vec2(x - 5.0, y - 5.0) * k;
+    p.add(Shape::convex_polygon(vec![q(2.0, 4.72), q(4.04, 6.5), q(4.04, 8.0), q(2.0, 6.05)], col, Stroke::NONE));
+    p.add(Shape::convex_polygon(vec![q(4.04, 6.5), q(8.0, 2.0), q(8.0, 3.57), q(4.04, 8.0)], col, Stroke::NONE));
+}

@@ -12,6 +12,14 @@
 //! - `audio_buffer`, `audio_rate`, `audio_channel`: the output stream (audio.rs).
 //! - `device_bg_color`, `delete_history_after_import`: the USB code.
 //! - `hot_cue_auto_load_on_import`: `App::poll_import`.
+//! - `palette_enabled`, `playlist_search_filter`, `all_tracks_in_playlists`,
+//!   `playlist_track_counts`: the browser (ui_browser.rs).
+//! - `metronome_sound`: the metronome click in audio.rs, through `click_hz`.
+//! - `preview_volume`: the preview player's volume (`App::tick_ext` in library_ext.rs).
+//! - `stem_reset_on_load`: `App::load_track`. `stem_solo`: `stem_part_click` here, which the
+//!   stem strip is to call. `stem_waveform`, `phrase_enlarged`, `phrase_types_always`,
+//!   `vocal_enlarged`: no reader yet (their controls say so; see the *_WIRED constants in
+//!   ui_prefs.rs).
 
 use crate::app::*;
 use crate::model::*;
@@ -20,8 +28,31 @@ pub fn default_color_names() -> [String; 8] {
     std::array::from_fn(|i| COLOR_NAMES[i + 1].to_string())
 }
 
-/// Tree View items of Preferences > View > Layout, in rekordbox's order.
+/// Every source tile of the browser's icon strip, in its order.
+#[allow(dead_code)]
 pub const TREE_ITEMS: [&str; 11] = ["Collection", "Playlists", "Related Tracks", "Matching", "Tag List", "Hot Cue Bank List", "iTunes", "rekordbox xml", "Explorer", "Devices", "Histories"];
+
+/// Preferences > View > Layout > Media Browser as rekordbox 7.2.19 lays it out: the left and
+/// the right column, top to bottom. Hot Cue Bank List (EXPORT mode only in rekordbox) takes
+/// the free place at the end of the right column.
+pub const MEDIA_BROWSER: [[&str; 7]; 2] = [
+    ["Related Tracks", "Apple Music", "SoundCloud", "Tidal", "Track Suggestion", "Explorer", "CloudDirectPlay Filter"],
+    ["iTunes", "Spotify", "Beatport", "Inflyte", "rekordbox xml", "SEARCH MOBILE button", "Hot Cue Bank List"],
+];
+
+/// Source tiles Recordbox has that rekordbox always shows (it has no checkbox for them).
+pub const TREE_ITEMS_OWN: [&str; 5] = ["Playlists", "Matching", "Tag List", "Devices", "Histories"];
+
+/// Why a Media Browser item of rekordbox cannot be ticked in Recordbox.
+pub fn media_absent_reason(name: &str) -> String {
+    match name {
+        "Apple Music" | "SoundCloud" | "Tidal" | "Spotify" | "Beatport" | "Inflyte" => format!("Recordbox has no streaming services, so there is no {name} source."),
+        "Track Suggestion" => "Recordbox has no Track Suggestion; Related Tracks finds matching tracks.".to_string(),
+        "CloudDirectPlay Filter" => "Recordbox has no cloud service, so there is nothing to filter.".to_string(),
+        "SEARCH MOBILE button" => "Recordbox has no mobile device search.".to_string(),
+        _ => format!("Recordbox has no {name} source yet."),
+    }
+}
 
 /// Tree View items Recordbox has a source for. The others are shown disabled in Preferences
 /// until their source exists (add the name here when it does).
@@ -401,6 +432,74 @@ pub static STREAM_OPTS: parking_lot::Mutex<(u32, u32, u16)> = parking_lot::Mutex
 
 pub fn set_stream_opts(p: &Prefs) {
     *STREAM_OPTS.lock() = (p.audio_rate, p.audio_buffer, p.audio_channel);
+    CLICK_SOUND.store(p.metronome_sound.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Preferences > Audio > Metronome: which of the three click sounds the metronome plays
+/// (the audio callback reads it for every click).
+pub static CLICK_SOUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Pitch of "Click Sound 01", "02" and "03".
+pub const CLICK_HZ: [f32; 3] = [1500.0, 1000.0, 2200.0];
+
+pub fn click_hz() -> f32 {
+    CLICK_HZ[(CLICK_SOUND.load(std::sync::atomic::Ordering::Relaxed) as usize).min(2)]
+}
+
+/// Buffer sizes the Audio page's slider offers (rekordbox's runs from 64 to 2048 samples,
+/// evenly spaced in samples).
+pub const SLIDER_BUFFERS: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
+
+/// Where a buffer size sits on the slider (0..=1), and the size nearest to a position.
+pub fn buffer_to_slider(b: u32) -> f32 {
+    ((b.clamp(64, 2048) - 64) as f32 / (2048 - 64) as f32).clamp(0.0, 1.0)
+}
+
+pub fn slider_to_buffer(t: f32, range: Option<(u32, u32)>) -> u32 {
+    let want = 64.0 + t.clamp(0.0, 1.0) * (2048 - 64) as f32;
+    let ok = |b: &u32| range.map(|(lo, hi)| *b >= lo && *b <= hi).unwrap_or(true);
+    let mut best = SLIDER_BUFFERS.iter().copied().filter(ok).collect::<Vec<_>>();
+    if best.is_empty() {
+        best = SLIDER_BUFFERS.to_vec();
+    }
+    best.into_iter().min_by(|a, b| (*a as f32 - want).abs().total_cmp(&(*b as f32 - want).abs())).unwrap_or(512)
+}
+
+// ------------------------------------------------------------------ stems
+
+/// What a click on a stem part button does to the four sources' on/off states
+/// (source index: 0 drums, 1 bass, 2 other, 3 vocals; `srcs` are the part's sources).
+/// MUTE mode: the part is switched off, or back on. SOLO mode: the part plays alone; a click
+/// on the part that already plays alone brings every part back.
+pub fn stem_click(on: [bool; 4], srcs: &[usize], solo: bool) -> [bool; 4] {
+    let mut next = on;
+    if solo {
+        let alone = (0..4).all(|i| on[i] == srcs.contains(&i));
+        for (i, n) in next.iter_mut().enumerate() {
+            *n = alone || srcs.contains(&i);
+        }
+    } else {
+        let target = !srcs.iter().all(|s| on[*s]);
+        for s in srcs {
+            next[*s] = target;
+        }
+    }
+    next
+}
+
+/// A click on a part button of the stem strip, in the mode chosen in Preferences > STEMS >
+/// ACTIVE STEM Setting (`Prefs::stem_solo`). The strip calls this with the part's sources.
+#[allow(dead_code)]
+pub fn stem_part_click(app: &mut App, srcs: &[usize]) {
+    let (have, on) = {
+        let s = app.player.state.lock();
+        (s.stems.is_some(), s.stem_on)
+    };
+    if !have {
+        app.separate_loaded();
+        return;
+    }
+    let next = stem_click(on, srcs, app.prefs.stem_solo);
+    app.player.state.lock().stem_on = next;
 }
 
 /// The stream configuration for a device: its default, with the chosen sample rate and
@@ -657,10 +756,71 @@ mod tests {
         assert_eq!(q.color_name(4), "Yellow", "a blank name falls back to the colour");
         assert_eq!(q.color_name(0), "No Color");
         // Preferences saved before these settings existed load with the defaults.
+        // The settings of the 7.2.19 pages.
+        let mut p = Prefs::default();
+        assert!(p.palette_enabled && p.playlist_search_filter && p.all_tracks_in_playlists && p.playlist_track_counts);
+        assert!(!p.show_phrase_bar && !p.phrase_enlarged && p.phrase_types_always && !p.vocal_enlarged && p.show_vocal);
+        assert!(!p.stem_solo && p.stem_reset_on_load && p.stem_waveform && p.metronome_sound == 0 && p.preview_volume == 0.5);
+        // The Media Browser ticks of the reference: everything Recordbox has but rekordbox xml.
+        assert!(p.tree_item("Related Tracks") && p.tree_item("iTunes") && p.tree_item("Explorer") && !p.tree_item("rekordbox xml"));
+        p.palette_enabled = false;
+        p.playlist_search_filter = false;
+        p.all_tracks_in_playlists = false;
+        p.playlist_track_counts = false;
+        p.phrase_enlarged = true;
+        p.phrase_types_always = false;
+        p.vocal_enlarged = true;
+        p.metronome_sound = 2;
+        p.preview_volume = 0.25;
+        p.stem_solo = true;
+        p.stem_reset_on_load = false;
+        p.stem_waveform = false;
+        let q: Prefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(format!("{p:?}"), format!("{q:?}"));
+        assert!(!q.palette_enabled && !q.playlist_search_filter && !q.all_tracks_in_playlists && !q.playlist_track_counts);
+        assert!(q.phrase_enlarged && !q.phrase_types_always && q.vocal_enlarged && q.metronome_sound == 2 && q.preview_volume == 0.25);
+        assert!(q.stem_solo && !q.stem_reset_on_load && !q.stem_waveform);
         let old: Prefs = serde_json::from_str(r#"{"key_alnum":true}"#).unwrap();
+        assert!(old.palette_enabled && old.all_tracks_in_playlists && old.stem_reset_on_load && old.preview_volume == 0.5);
         assert!(old.key_alnum && old.cue_markers_on_preview && old.hot_cue_auto_load_on_import);
         assert_eq!(old.color_names, default_color_names());
         assert_eq!(old.audio_buffer, 0);
+    }
+
+    #[test]
+    fn stem_buttons_in_mute_and_solo_mode() {
+        let all = [true; 4];
+        // MUTE: a click switches the part off, the next one back on; INST of three parts is two sources.
+        assert_eq!(stem_click(all, &[3], false), [true, true, true, false]);
+        assert_eq!(stem_click([true, true, true, false], &[3], false), all);
+        assert_eq!(stem_click(all, &[2, 1], false), [true, false, false, true]);
+        assert_eq!(stem_click([true, false, true, true], &[2, 1], false), all, "a half-muted part comes back whole");
+        // SOLO: the part alone; another part takes over; the same part again restores all.
+        assert_eq!(stem_click(all, &[3], true), [false, false, false, true]);
+        assert_eq!(stem_click([false, false, false, true], &[0], true), [true, false, false, false]);
+        assert_eq!(stem_click([true, false, false, false], &[0], true), all);
+        assert_eq!(stem_click(all, &[2, 1], true), [false, true, true, false]);
+        assert_eq!(stem_click([false, true, true, false], &[2, 1], true), all);
+    }
+
+    #[test]
+    fn buffer_slider_and_click_sounds() {
+        assert_eq!(buffer_to_slider(64), 0.0);
+        assert_eq!(buffer_to_slider(2048), 1.0);
+        assert!((buffer_to_slider(128) - 0.032).abs() < 0.001, "128 samples sits where the reference shows it");
+        for b in SLIDER_BUFFERS {
+            assert_eq!(slider_to_buffer(buffer_to_slider(b), None), b);
+        }
+        assert_eq!(slider_to_buffer(0.0, Some((128, 1024))), 128, "sizes the device refuses are skipped");
+        assert_eq!(slider_to_buffer(1.0, Some((128, 1024))), 1024);
+        let mut p = Prefs::default();
+        p.metronome_sound = 1;
+        set_stream_opts(&p);
+        assert_eq!(click_hz(), CLICK_HZ[1]);
+        p.metronome_sound = 0;
+        set_stream_opts(&p);
+        assert_eq!(click_hz(), CLICK_HZ[0]);
+        assert!(CLICK_HZ[0] != CLICK_HZ[1] && CLICK_HZ[1] != CLICK_HZ[2]);
     }
 
     #[test]

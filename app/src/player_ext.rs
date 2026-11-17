@@ -1,6 +1,8 @@
-//! Player logic beyond the basics in app.rs: the second deck (2 Players layout), loop
-//! adjust, cues and loops set from the waveform menu, "Export Loop As Wav", the Beat Count
-//! Display, search (scan), previous / next track and layouts.
+//! Player logic beyond the basics in app.rs: the second deck (2 Players and Dual Player
+//! layouts) with tempo, Master Tempo, pitch bend, BEAT SYNC / MASTER, KEY SYNC and key shift,
+//! the crossfader, A-GAIN and the isolator switches; PHRASE EDIT; loop adjust, cues and loops
+//! set from the waveform menu, "Export Loop As Wav", the Beat Count Display, search (scan),
+//! previous / next track and layouts.
 
 use crate::app::*;
 use crate::model::*;
@@ -21,6 +23,38 @@ pub struct DeckExt {
     /// The right mouse button is holding CUE on the waveform ("Click on the waveform for PLAY
     /// and CUE").
     pub wave_cue_held: bool,
+    /// Tempo set with TEMPO − / +, a typed BPM or RST, as the change from the track's own
+    /// speed (0.03 = +3 %). A BEAT SYNC follower plays at the master's tempo instead.
+    pub tempo_adj: f64,
+    /// MT (Master Tempo): the tempo changes without the pitch.
+    pub master_tempo: bool,
+    /// Key shift in semitones (-12..12), set with ‹ › or by KEY SYNC.
+    pub key_shift: i32,
+    pub key_sync: bool,
+    pub beat_sync: bool,
+    /// A pitch bend button is held: -1 slower, +1 faster.
+    pub bend: i32,
+    /// HIGH / MID / LOW switched off (index 0 = low, 1 = mid, 2 = high).
+    pub eq_kill: [bool; 3],
+    /// The tempo field is being typed in, and its text.
+    pub tempo_editing: bool,
+    pub tempo_text: String,
+    /// The deck's phrases carry PHRASE EDIT changes (kept per track; CLEAR removes them).
+    pub phrases_edited: bool,
+    /// The beats last handed to the audio thread for BEAT SYNC (count, first and last time).
+    pub grid_sig: (usize, u64, u64),
+    /// A-GAIN knob drag: pointer y and the gain (dB) when it began.
+    pub gain_drag: Option<(f32, f32)>,
+    /// Seconds the enlarged waveform was scrubbed or scrolled this frame (for the waveform link).
+    pub scrub: f64,
+}
+
+impl DeckExt {
+    /// What stays on a deck when another track is loaded or it is emptied: the switches of
+    /// the deck itself (MT, BEAT SYNC, KEY SYNC, isolator), not the settings made for a track.
+    pub fn carried(&self) -> DeckExt {
+        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, ..Default::default() }
+    }
 }
 
 /// Player state shared by the layouts (a field of `App`).
@@ -33,12 +67,97 @@ pub struct PlayerExt {
     pub active: u8,
     /// Master mute.
     pub muted: bool,
+    /// The deck BEAT SYNC and KEY SYNC follow (MASTER): 0 = A, 1 = B.
+    pub master: u8,
+    /// Crossfader position: 0.0 = deck A only, 0.5 = both, 1.0 = deck B only.
+    pub crossfader: f32,
+    /// Dual Player's dual control: beat jumps move both decks together.
+    pub dual_control: bool,
+    /// The waveform link: scrubbing or scrolling one enlarged waveform moves both decks.
+    pub wave_link: bool,
 }
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false }
+        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false }
     }
+}
+
+/// Tempo range of the TEMPO controls and typed BPM values (±16 %).
+pub const TEMPO_RANGE: f64 = 0.16;
+/// One click of TEMPO − / + (0.1 % of the track's tempo).
+pub const TEMPO_STEP: f64 = 0.001;
+/// Speed change while a pitch bend button is held (4 %).
+pub const BEND_AMOUNT: f64 = 0.04;
+/// Range of the A-GAIN knob in dB (its travel is ±135° around 0 dB).
+pub const GAIN_RANGE_DB: f32 = 20.0;
+
+/// The tempo of a grid at `t` seconds (the first beat's before it); 0.0 without beats.
+pub fn bpm_at(beats: &[Beat], t: f64) -> f64 {
+    let i = beats.partition_point(|b| b.time <= t);
+    if i > 0 {
+        beats[i - 1].bpm
+    } else {
+        beats.first().map(|b| b.bpm).unwrap_or(0.0)
+    }
+}
+
+/// A key (model index: 0..11 = 1A..12A, 12..23 = 1B..12B) moved by `semis` semitones. One
+/// semitone up is seven steps round the wheel.
+pub fn shift_key(k: i32, semis: i32) -> i32 {
+    if !(0..24).contains(&k) {
+        return k;
+    }
+    (k % 12 + 7 * semis).rem_euclid(12) + (k / 12) * 12
+}
+
+/// Two keys mix harmonically: the same key, its relative major / minor, or a neighbour on
+/// the wheel (a fifth up or down).
+pub fn keys_compatible(a: i32, b: i32) -> bool {
+    if !(0..24).contains(&a) || !(0..24).contains(&b) {
+        return false;
+    }
+    let (na, nb) = (a % 12, b % 12);
+    if a / 12 == b / 12 {
+        let d = (na - nb).rem_euclid(12);
+        d == 0 || d == 1 || d == 11
+    } else {
+        na == nb
+    }
+}
+
+/// KEY SYNC: the smallest key shift (-6..6 semitones) that makes `own` compatible with
+/// `master`; of two equally small shifts the one that lands on the master's own key, then
+/// the downward one. 0 when either key is unknown.
+pub fn key_sync_shift(own: i32, master: i32) -> i32 {
+    if !(0..24).contains(&own) || !(0..24).contains(&master) {
+        return 0;
+    }
+    let mut best: Option<(i32, bool, i32)> = None;
+    for d in -6..=6 {
+        let k = shift_key(own, d);
+        if keys_compatible(k, master) {
+            let cand = (d.abs(), k != master, d);
+            if best.map(|b| cand < b).unwrap_or(true) {
+                best = Some(cand);
+            }
+        }
+    }
+    best.map(|b| b.2).unwrap_or(0)
+}
+
+/// "±0", "+2", "-1": a key shift as the Dual Player shows it.
+pub fn shift_text(semis: i32) -> String {
+    match semis {
+        0 => "±0".into(),
+        n if n > 0 => format!("+{n}"),
+        n => format!("{n}"),
+    }
+}
+
+/// A-GAIN knob angle in degrees from straight up for a gain in dB.
+pub fn gain_angle(db: f32) -> f32 {
+    (db / GAIN_RANGE_DB).clamp(-1.0, 1.0) * 135.0
 }
 
 /// Auto beat loop lengths rekordbox offers, in beats ("1/64 Beat Loop" … "512 Beat Loop").
@@ -189,9 +308,14 @@ pub fn adjacent_row(list: &[i64], current: Option<i64>, dir: i32, ok: impl Fn(i6
 
 impl App {
     // ------------------------------------------------------------------ decks and layouts
-    /// The 2 Players layout is showing.
+    /// A layout with both decks is showing (2 Players or Dual Player).
     pub fn two_players(&self) -> bool {
-        !self.prefs.browser_only && self.prefs.player_layout == 1
+        !self.prefs.browser_only && matches!(self.prefs.player_layout, 1 | 3)
+    }
+
+    /// The Dual Player layout is showing.
+    pub fn dual_player(&self) -> bool {
+        !self.prefs.browser_only && self.prefs.player_layout == 3
     }
 
     fn swap_decks(&mut self) {
@@ -225,24 +349,37 @@ impl App {
         self.with_deck(d, |a| a.load_track_here(id));
     }
 
-    /// Layout: 0 = 1 Player, 1 = 2 Players, 2 = Simple Player, 3 = Full Browser.
+    /// Layout in the order of the View menu and the header's list: 0 = 1 Player,
+    /// 1 = 2 Players, 2 = Dual Player, 3 = Simple Player, 4 = Full Browser.
+    /// (`Prefs::player_layout` keeps its stored numbering: 0 = 1 Player, 1 = 2 Players,
+    /// 2 = Simple Player, 3 = Dual Player.)
     pub fn set_player_layout(&mut self, layout: u8) {
-        if layout >= 3 {
+        if layout >= 4 {
             self.prefs.browser_only = true;
         } else {
             self.prefs.browser_only = false;
-            self.prefs.player_layout = layout;
+            self.prefs.player_layout = [0, 1, 3, 2][layout as usize];
         }
         self.poll_decks();
         self.save_prefs();
     }
 
-    /// 0 = 1 Player, 1 = 2 Players, 2 = Simple Player, 3 = Full Browser.
+    /// 0 = 1 Player, 1 = 2 Players, 2 = Dual Player, 3 = Simple Player, 4 = Full Browser.
     pub fn player_layout(&self) -> u8 {
         if self.prefs.browser_only {
-            3
+            4
         } else {
-            self.prefs.player_layout.min(2)
+            [0, 1, 3, 2][self.prefs.player_layout.min(3) as usize]
+        }
+    }
+
+    /// Height of the player area for the layout showing (measured on rekordbox 7.2.19:
+    /// 1 Player 256 pt, 2 Players and Dual Player 375 pt, Simple Player 59 pt).
+    pub fn player_height(&self) -> f32 {
+        match self.prefs.player_layout {
+            1 | 3 => 375.0,
+            2 => crate::ui_player2::SIMPLE_HEIGHT,
+            _ => 256.0,
         }
     }
 
@@ -269,9 +406,367 @@ impl App {
             s.muted = self.px.muted;
             s.volume
         };
-        let mut o = self.player.other.lock();
-        o.volume = v;
-        o.muted = self.px.muted;
+        {
+            let mut o = self.player.other.lock();
+            o.volume = v;
+            o.muted = self.px.muted;
+        }
+        self.push_deck_controls();
+    }
+
+    /// Hand each deck's tempo, Master Tempo, key shift, crossfader gain, isolator switches,
+    /// BEAT SYNC state and beat grid to the audio thread. Outside the two-deck layouts the
+    /// deck plays plainly (those controls are not on screen there).
+    fn push_deck_controls(&mut self) {
+        let two = self.two_players();
+        let dual = self.dual_player();
+        let act = self.px.active;
+        let master = self.px.master.min(1);
+        let faders = crate::audio::crossfader_gains(self.px.crossfader);
+        // (deck index, position, own BPM at it, key, tempo set on the deck)
+        let info = |d: &Deck, st: &parking_lot::Mutex<crate::audio::PlayState>, tracks: &App| -> (f64, f64, i32) {
+            let pos = {
+                let s = st.lock();
+                s.audio.as_ref().map(|a| s.pos / a.sr as f64).unwrap_or(0.0)
+            };
+            let t = d.track.and_then(|id| tracks.track(id));
+            let bpm = if d.beats.is_empty() { t.map(|t| t.bpm).unwrap_or(0.0) } else { bpm_at(&d.beats, pos) };
+            (pos, bpm, t.map(|t| t.key).unwrap_or(-1))
+        };
+        let ia = info(&self.deck, &self.player.state, self);
+        let io = info(&self.px.other, &self.player.other, self);
+        // Indexed by deck: [A, B].
+        let (i_m, i_f) = if act == master { (ia, io) } else { (io, ia) };
+        let master_x = if act == master { &self.deck.x } else { &self.px.other.x };
+        let master_speed = 1.0 + master_x.tempo_adj;
+        let master_bpm = i_m.1 * master_speed;
+        let master_key = shift_key(i_m.2, master_x.key_shift);
+        let _ = i_f;
+        for n in 0..2u8 {
+            let is_act = n == act;
+            let (own_bpm, own_key) = if is_act { (ia.1, ia.2) } else { (io.1, io.2) };
+            let d = if is_act { &mut self.deck } else { &mut self.px.other };
+            let follower = two && n != master;
+            if follower && d.x.key_sync && d.track.is_some() {
+                d.x.key_shift = key_sync_shift(own_key, master_key);
+            }
+            let synced = follower && d.x.beat_sync && own_bpm > 0.0 && master_bpm > 0.0;
+            let tempo = if !two {
+                1.0
+            } else if synced {
+                crate::audio::sync_rate(master_bpm, own_bpm)
+            } else {
+                1.0 + d.x.tempo_adj
+            };
+            let sig = (d.beats.len(), d.beats.first().map(|b| b.time.to_bits()).unwrap_or(0), d.beats.last().map(|b| b.time.to_bits()).unwrap_or(0));
+            let grid = if sig != d.x.grid_sig {
+                d.x.grid_sig = sig;
+                Some(if d.beats.len() >= 2 { Some(std::sync::Arc::new(d.beats.iter().map(|b| b.time).collect::<Vec<f64>>())) } else { None })
+            } else {
+                None
+            };
+            let x = &d.x;
+            let st = if is_act { &self.player.state } else { &self.player.other };
+            let mut s = st.lock();
+            s.tempo = tempo;
+            s.bend = if two { x.bend as f64 * BEND_AMOUNT } else { 0.0 };
+            s.master_tempo = two && x.master_tempo;
+            s.key_shift = if dual { x.key_shift as f32 } else { 0.0 };
+            s.fader = if two { if n == 0 { faders.0 } else { faders.1 } } else { 1.0 };
+            s.eq_on = dual;
+            s.eq_gain = if dual { [!x.eq_kill[0] as u8 as f32, !x.eq_kill[1] as u8 as f32, !x.eq_kill[2] as u8 as f32] } else { [1.0; 3] };
+            s.sync_follow = synced;
+            if let Some(g) = grid {
+                s.grid = g;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ tempo, sync and key
+    /// The speed the active deck plays at (1.0 = the track's own tempo).
+    pub fn deck_speed(&self) -> f64 {
+        self.player.state.lock().tempo
+    }
+
+    /// The tempo heard on the active deck: the grid's BPM at the playhead times the speed.
+    pub fn effective_bpm(&self) -> f64 {
+        self.current_bpm() * self.deck_speed()
+    }
+
+    /// The active deck follows the master's tempo (BEAT SYNC on, and it is not the master).
+    pub fn sync_follower(&self) -> bool {
+        self.two_players() && self.deck.x.beat_sync && self.px.active != self.px.master
+    }
+
+    /// TEMPO − / +: one step slower or faster, inside the tempo range.
+    pub fn tempo_step(&mut self, dir: i32) {
+        if self.sync_follower() {
+            self.toast_err("Invalid operation. In Sync mode, Tempo Slider is only available for Master Deck.");
+            return;
+        }
+        let v = ((self.deck.x.tempo_adj + dir.signum() as f64 * TEMPO_STEP) * 1000.0).round() / 1000.0;
+        self.deck.x.tempo_adj = v.clamp(-TEMPO_RANGE, TEMPO_RANGE);
+        self.push_deck_controls();
+    }
+
+    /// RST: back to the track's own tempo.
+    pub fn tempo_reset(&mut self) {
+        if self.sync_follower() {
+            self.toast_err("Invalid operation. In Sync mode, Tempo Reset is only available for Master Deck.");
+            return;
+        }
+        self.deck.x.tempo_adj = 0.0;
+        self.push_deck_controls();
+    }
+
+    /// A BPM typed into the tempo field: the deck plays at it when it is inside the range.
+    pub fn tempo_enter_bpm(&mut self, text: &str) {
+        if self.sync_follower() {
+            self.toast_err("Invalid operation. In Sync mode, Tempo Slider is only available for Master Deck.");
+            return;
+        }
+        let own = self.current_bpm();
+        let Ok(v) = text.trim().replace(',', ".").parse::<f64>() else {
+            self.toast_err("Invalid Operation. Enter a BPM value within the Tempo Range.");
+            return;
+        };
+        if own <= 0.0 {
+            return;
+        }
+        let adj = v / own - 1.0;
+        if !(-TEMPO_RANGE - 1e-9..=TEMPO_RANGE + 1e-9).contains(&adj) {
+            self.toast_err("Invalid Operation. Enter a BPM value within the Tempo Range.");
+            return;
+        }
+        self.deck.x.tempo_adj = adj;
+        self.push_deck_controls();
+    }
+
+    pub fn toggle_master_tempo(&mut self) {
+        self.deck.x.master_tempo = !self.deck.x.master_tempo;
+        self.push_deck_controls();
+    }
+
+    /// Hold (-1 / +1) or release (0) a pitch bend button.
+    pub fn pitch_bend(&mut self, dir: i32) {
+        if self.deck.x.bend != dir {
+            self.deck.x.bend = dir;
+            self.push_deck_controls();
+        }
+    }
+
+    /// MASTER: the active deck becomes the one BEAT SYNC and KEY SYNC follow.
+    pub fn set_master(&mut self) {
+        self.px.master = self.px.active;
+        self.push_deck_controls();
+    }
+
+    /// BEAT SYNC on / off for the active deck. Switched on while both decks play, the deck
+    /// jumps onto the master's beat at once; from then on the audio thread holds it there.
+    pub fn toggle_beat_sync(&mut self) {
+        let on = !self.deck.x.beat_sync;
+        if on && self.px.active != self.px.master && self.deck.track.is_some() && self.deck.beats.len() < 2 {
+            self.toast_err("Beat Sync is unavailable. The track has no beat grid information.");
+        }
+        if !on && self.px.active != self.px.master {
+            // The tempo it was synced to stays, as on a player.
+            let sp = self.deck_speed();
+            if sp > 0.0 {
+                self.deck.x.tempo_adj = sp - 1.0;
+            }
+        }
+        self.deck.x.beat_sync = on;
+        self.push_deck_controls();
+        if on {
+            self.sync_align();
+        }
+    }
+
+    /// Move the active deck (a playing BEAT SYNC follower) by less than a beat so that its
+    /// beats fall on the master's.
+    pub fn sync_align(&mut self) {
+        if !self.sync_follower() {
+            return;
+        }
+        let (pf, pm, gf, gm, both) = {
+            let (f, m) = (self.player.state.lock(), self.player.other.lock());
+            let t = |s: &crate::audio::PlayState| s.audio.as_ref().map(|a| s.pos / a.sr as f64);
+            (t(&f), t(&m), f.grid.clone(), m.grid.clone(), f.playing && m.playing)
+        };
+        let (Some(pf), Some(pm), Some(gf), Some(gm), true) = (pf, pm, gf, gm, both) else { return };
+        if let Some(e) = crate::audio::phase_error(&gf, pf, &gm, pm) {
+            let len = self.beat_len();
+            self.seek(pf - e * len);
+        }
+    }
+
+    /// PLAY/PAUSE in the two-deck layouts: a BEAT SYNC follower starts on the master's beat.
+    pub fn play_pause_synced(&mut self) {
+        self.play_pause();
+        if self.playing() {
+            self.sync_align();
+        }
+    }
+
+    pub fn toggle_key_sync(&mut self) {
+        self.deck.x.key_sync = !self.deck.x.key_sync;
+        if !self.deck.x.key_sync {
+            // KEY SYNC off: back to the track's own key.
+            self.deck.x.key_shift = 0;
+        }
+        self.push_deck_controls();
+    }
+
+    /// Key shift ‹ ›: one semitone down or up (at most an octave). Takes the deck out of KEY SYNC.
+    pub fn key_shift_step(&mut self, dir: i32) {
+        if self.deck.track.is_none() {
+            return;
+        }
+        self.deck.x.key_sync = false;
+        self.deck.x.key_shift = (self.deck.x.key_shift + dir.signum()).clamp(-12, 12);
+        self.push_deck_controls();
+    }
+
+    pub fn key_reset(&mut self) {
+        self.deck.x.key_sync = false;
+        self.deck.x.key_shift = 0;
+        self.push_deck_controls();
+    }
+
+    /// The key the active deck sounds in (the track's key moved by the key shift), as shown.
+    pub fn result_key_label(&self) -> String {
+        let Some(t) = self.deck.track.and_then(|id| self.track(id)) else { return String::new() };
+        let shift = if self.dual_player() { self.deck.x.key_shift } else { 0 };
+        if shift == 0 {
+            t.key_label(self.prefs.key_alnum)
+        } else {
+            key_name(shift_key(t.key, shift), self.prefs.key_alnum)
+        }
+    }
+
+    // ------------------------------------------------------------------ mixer
+    pub fn set_crossfader(&mut self, x: f32) {
+        self.px.crossfader = x.clamp(0.0, 1.0);
+        self.push_deck_controls();
+    }
+
+    /// HIGH / MID / LOW (band 2 / 1 / 0): switch a band of the active deck off or back on.
+    pub fn toggle_eq_kill(&mut self, band: usize) {
+        if band < 3 {
+            self.deck.x.eq_kill[band] = !self.deck.x.eq_kill[band];
+            self.push_deck_controls();
+        }
+    }
+
+    /// The active deck's gain in dB (the loaded track's auto gain, or what A-GAIN set).
+    pub fn gain_db(&self) -> f32 {
+        let g = self.player.state.lock().gain;
+        if self.deck.track.is_none() || g <= 0.0 {
+            0.0
+        } else {
+            20.0 * g.log10()
+        }
+    }
+
+    /// A-GAIN: set the active deck's gain. With `store` the value becomes the track's auto
+    /// gain (kept in the library, as rekordbox keeps an adjusted Auto Gain value).
+    pub fn set_gain_db(&mut self, db: f32, store: bool) {
+        let Some(id) = self.deck.track else { return };
+        let db = (db.clamp(-GAIN_RANGE_DB, 12.0) * 10.0).round() / 10.0;
+        self.player.state.lock().gain = 10f32.powf(db / 20.0);
+        if store {
+            let changed = self.track(id).map(|t| !(t.gain_db - db).abs().lt(&0.05)).unwrap_or(false);
+            if changed {
+                if let Some(t) = self.track_mut(id) {
+                    t.gain_db = db;
+                }
+                self.save_track(id);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ phrase edit
+    fn phrase_key(id: i64) -> String {
+        format!("phrase_edit:{id}")
+    }
+
+    /// The phrases a track was given with PHRASE EDIT, if any.
+    pub fn stored_phrases(&self, id: i64) -> Option<crate::phrase::Structure> {
+        self.db.setting(&Self::phrase_key(id)).filter(|s| !s.is_empty()).and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Keep (or with None, forget) a track's edited phrases, and show them on any deck that
+    /// has the track. Forgetting brings the analysed phrases back.
+    pub fn store_phrases(&mut self, id: i64, st: Option<crate::phrase::Structure>) {
+        self.db.set_setting(&Self::phrase_key(id), &st.as_ref().and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default());
+        let edited = st.is_some();
+        for n in 0..2u8 {
+            let has = if n == self.px.active { self.deck.track } else { self.px.other.track } == Some(id);
+            if has {
+                let st = st.clone();
+                self.with_deck(n, |a| {
+                    a.deck.x.phrases_edited = edited;
+                    match st {
+                        Some(s) => a.deck.phrases = Some(s),
+                        None => a.reanalyse_deck_phrases(),
+                    }
+                });
+            }
+        }
+    }
+
+    /// 1-based number of the beat under the active deck's playhead.
+    fn playhead_beat(&self) -> u16 {
+        crate::phrase::beat_number(&self.deck.beats, self.pos())
+    }
+
+    /// The phrase under the playhead: (mood, kind).
+    pub fn current_phrase(&self) -> Option<(u16, u16)> {
+        let st = self.deck.phrases.as_ref()?;
+        if self.deck.beats.is_empty() {
+            return None;
+        }
+        crate::phrase::index_at(st, self.playhead_beat()).map(|i| (st.mood, st.phrases[i].kind))
+    }
+
+    fn phrase_change(&mut self, f: impl FnOnce(&mut crate::phrase::Structure, u16) -> bool) -> bool {
+        let (Some(id), Some(mut st)) = (self.deck.track, self.deck.phrases.clone()) else { return false };
+        if self.deck.beats.is_empty() {
+            return false;
+        }
+        let beat = self.playhead_beat();
+        if !f(&mut st, beat) {
+            return false;
+        }
+        self.record_phrases(id);
+        self.store_phrases(id, Some(st));
+        true
+    }
+
+    /// PHRASE EDIT > CUT: split the phrase at the playhead (on the beat it is in).
+    pub fn phrase_cut(&mut self) {
+        if self.deck.phrases.is_none() {
+            self.toast_err("This track has no phrases yet.");
+            return;
+        }
+        if !self.phrase_change(crate::phrase::cut) {
+            self.toast("A phrase already starts here.");
+        }
+    }
+
+    /// PHRASE EDIT's type list: change the type of the phrase under the playhead.
+    pub fn phrase_set_kind(&mut self, kind: u16) {
+        self.phrase_change(|s, b| crate::phrase::set_kind(s, b, kind));
+    }
+
+    /// PHRASE EDIT > CLEAR: drop the track's phrase edits (the analysed phrases come back).
+    pub fn phrase_clear(&mut self) {
+        let Some(id) = self.deck.track else { return };
+        if self.stored_phrases(id).is_none() {
+            return;
+        }
+        self.record_phrases(id);
+        self.store_phrases(id, None);
     }
 
     pub fn toggle_mute(&mut self) {
@@ -340,7 +835,8 @@ impl App {
             s.search = 0.0;
         }
         let (ctrl_tab, panel_tab, metronome) = (self.deck.ctrl_tab, self.deck.panel_tab, self.deck.metronome);
-        self.deck = Deck { ctrl_tab, panel_tab, metronome, ..Deck::default() };
+        let x = self.deck.x.carried();
+        self.deck = Deck { ctrl_tab, panel_tab, metronome, x, ..Deck::default() };
         self.deck_backup = None;
     }
 

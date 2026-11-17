@@ -334,6 +334,14 @@ pub struct LibExt {
     pub panel_sel: [Option<i64>; 2],
     /// New My Tag being typed in the My Tag window: (category, text).
     pub cv_scroll_end: bool,
+    /// The sub-browser is being drawn (its state is swapped into the app's browser fields).
+    pub in_sub: bool,
+    /// The sub-browser was clicked last: list keys go to it.
+    pub sub_focus: bool,
+    /// Preferences were saved while the sub-browser's state was swapped in.
+    pub sub_save_wanted: std::cell::Cell<bool>,
+    /// New My Tag being typed in the My Tag window.
+    pub panel_menu: Option<u8>,
 }
 
 impl Default for LibExt {
@@ -374,6 +382,10 @@ impl Default for LibExt {
             panel_cache: [None, None],
             panel_sel: [None, None],
             cv_scroll_end: false,
+            in_sub: false,
+            sub_focus: false,
+            sub_save_wanted: std::cell::Cell::new(false),
+            panel_menu: None,
         }
     }
 }
@@ -1762,6 +1774,49 @@ pub fn shot_view(app: &mut App, name: &str) {
             eprintln!("libcheck matching: {:?} / {:?}", app.matching_of(copied[0]) == vec![copied[1]], app.matching_of(copied[1]) == vec![copied[0]]);
             app.dialogs.rename = None;
             app.expanded.insert(folder);
+        }
+        // Browser states of the 7.2.19 references (combine with commas after "playlists").
+        "tree364" => app.prefs.bx.tree_w = 364.0,
+        "row2" => {
+            app.rebuild_list();
+            if let Some(id) = app.list.get(1).copied() {
+                app.selected = [id].into_iter().collect();
+                app.anchor_id = Some(id);
+            }
+        }
+        "relwin" => crate::ui_browser_ext::set_right_panel(app, 2),
+        "sugwin" => crate::ui_browser_ext::set_right_panel(app, 3),
+        "infowin" => crate::ui_browser_ext::set_right_panel(app, 4),
+        "subv" | "subh" => {
+            if name == "subv" {
+                crate::ui_browser_ext::set_right_panel(app, 5);
+            } else {
+                crate::ui_browser_ext::set_right_panel(app, 0);
+                app.prefs.bx.sub_horizontal = true;
+            }
+            if let View::Playlist(id) = app.view {
+                app.sub_view = View::Playlist(id);
+            }
+        }
+        "colview" => app.prefs.bx.column_view = true,
+        "suggest" => {
+            app.side = SideMode::Suggest;
+            app.view = View::Suggest(0);
+            app.list_dirty = true;
+        }
+        "browseronly" => app.prefs.browser_only = true,
+        "cuestart" => {
+            // End-to-end check of the CUE Analysis Playlist on the scratch library: register
+            // the tracks that have cues, press [Start], and report the tendency.
+            if let Some(pl) = app.cue_playlist() {
+                let ids: Vec<i64> = app.tracks.iter().filter(|t| t.analyzed == 1 && app.cue_counts.get(&t.id).map(|c| c.0 + c.1 > 0).unwrap_or(false)).take(40).map(|t| t.id).collect();
+                let _ = app.db.set_playlist_tracks(pl, &ids);
+                app.reload_playlists();
+                app.cue_analysis_start();
+                eprintln!("cue analysis: {} tracks registered, tendency {:?}", ids.len(), app.prefs.bx.cue_tendency);
+            } else {
+                eprintln!("cue analysis: no CUE Analysis Playlist");
+            }
         }
         "datecreated" => {
             if !app.prefs.columns.contains(&Col::DateCreated) {

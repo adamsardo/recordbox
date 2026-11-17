@@ -56,7 +56,7 @@ fn export_matches_collection_xml() {
             (Some(b), Some(g)) => crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| crate::app::grids_match(&r, g)).unwrap_or(false),
             _ => false,
         };
-        tracks.insert(id, ExportTrack { track: t, cues, grid: xt.grid.clone(), wave: r.map(|r| r.wave), tags: vec![], rb_anlz, grid_same, vocal: None });
+        tracks.insert(id, ExportTrack { track: t, cues, grid: xt.grid.clone(), wave: r.map(|r| r.wave), tags: vec![], rb_anlz, grid_same, vocal: None, phrases: None });
     }
     fn nodes(n: &[crate::importer::XmlNode], ids: &HashMap<String, i64>) -> Vec<ExportNode> {
         n.iter()
