@@ -526,8 +526,9 @@ impl Biquad {
 }
 
 /// Crossover frequencies of the isolator (Hz): LOW below the first, HIGH above the second.
-pub const ISO_LOW_HZ: f32 = 250.0;
-pub const ISO_HIGH_HZ: f32 = 2500.0;
+/// rekordbox's isolator crossovers (`Isolator::applyFilter`, 0x102ab9828 in 7.2.19).
+pub const ISO_LOW_HZ: f32 = 284.0;
+pub const ISO_HIGH_HZ: f32 = 4649.0;
 
 /// 3-band isolator: fourth-order Linkwitz-Riley crossovers, whose bands add back to the
 /// input's level at every frequency (the low band passes an all-pass matching the upper
@@ -1309,20 +1310,20 @@ mod dsp_tests {
         let level = |g: [f32; 3], f: f64| -> f32 { rms(&Iso3::process(44100, g, &sine(f))[22050..]) / std::f32::consts::FRAC_1_SQRT_2 };
         let db = |x: f32| 20.0 * x.max(1e-9).log10();
         // All bands on: the level is unchanged everywhere, the crossovers included.
-        for f in [30.0, 60.0, 250.0, 700.0, 1000.0, 2500.0, 8000.0, 15000.0] {
+        for f in [30.0, 60.0, 284.0, 700.0, 1000.0, 4649.0, 8000.0, 15000.0] {
             assert!(db(level([1.0; 3], f)).abs() < 0.1, "{f} Hz: {} dB", db(level([1.0; 3], f)));
         }
         // LOW off: bass gone, mids and highs untouched; -6 dB at the crossover.
         assert!(db(level([0.0, 1.0, 1.0], 60.0)) < -45.0);
         assert!(db(level([0.0, 1.0, 1.0], 1000.0)).abs() < 0.2);
         assert!(db(level([0.0, 1.0, 1.0], 8000.0)).abs() < 0.1);
-        assert!((db(level([0.0, 1.0, 1.0], 250.0)) + 6.0).abs() < 0.3);
+        assert!((db(level([0.0, 1.0, 1.0], ISO_LOW_HZ as f64)) + 6.0).abs() < 0.3);
         // MID off: only the band between the crossovers goes.
         assert!(db(level([1.0, 0.0, 1.0], 800.0)) < -18.0);
         assert!(db(level([1.0, 0.0, 1.0], 40.0)).abs() < 0.2);
         assert!(db(level([1.0, 0.0, 1.0], 12000.0)).abs() < 0.2);
         // HIGH off.
-        assert!(db(level([1.0, 1.0, 0.0], 10000.0)) < -45.0);
+        assert!(db(level([1.0, 1.0, 0.0], 18000.0)) < -40.0);
         assert!(db(level([1.0, 1.0, 0.0], 100.0)).abs() < 0.1);
         // Everything off is silence.
         assert!(db(level([0.0; 3], 1000.0)) < -100.0);
