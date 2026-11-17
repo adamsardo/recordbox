@@ -811,7 +811,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             ui.label(format!("Delete {} track(s) from the device?", ids.len()));
             ui.label(RichText::new("They are removed from the device's playlists and play histories, and their music, analysis and artwork files are deleted from the device. Your collection is not changed.").size(11.0).color(DIM));
             if usb::has_onelibrary(Path::new(&root)) {
-                ui.label(RichText::new("This drive also has a OneLibrary database that Recordbox can't read: the files are left in place, only the standard device library is changed.").size(11.0).color(CAUTION_TX));
+                ui.label(RichText::new("This drive also has a OneLibrary database that recordbox can't read: the files are left in place, only the standard device library is changed.").size(11.0).color(CAUTION_TX));
             }
             ui.horizontal(|ui| {
                 if ui.button("Delete").clicked() {
@@ -897,7 +897,7 @@ fn property_window(app: &mut App, ctx: &Context) {
             std::mem::swap(&mut app.prefs.usb_browse, &mut st.browse);
             std::mem::swap(&mut app.prefs.device_bg_color, &mut st.bg);
             if st.tab == 0 {
-                ui.label(RichText::new("Background Color is kept on the drive for Recordbox (it colours the device's row). The standard device library has no field for it; rekordbox stores it in the OneLibrary database, which Recordbox does not write.").size(10.5).color(DIM));
+                ui.label(RichText::new("Background Color is kept on the drive for recordbox (it colours the device's row). The standard device library has no field for it; rekordbox stores it in the OneLibrary database, which recordbox does not write.").size(10.5).color(DIM));
                 ui.add_space(8.0);
                 ui.label(RichText::new("Customize Color Comments").strong());
                 egui::Grid::new("device_color_names").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -995,7 +995,7 @@ fn sync_window(app: &mut App, ctx: &Context) {
             }
         });
         ui.checkbox(&mut st.cfg.cues, "including cue points").on_hover_text("Tracks that are already on the device get your collection's hot cues and memory cues again. Switched off, cues set on players stay as they are on the device.");
-        ui.checkbox(&mut st.cfg.auto, "Automatic synchronization").on_hover_text("The selected lists are synchronized automatically at each connection (Recordbox asks first).");
+        ui.checkbox(&mut st.cfg.auto, "Automatic synchronization").on_hover_text("The selected lists are synchronized automatically at each connection (recordbox asks first).");
         // What "Synchronize" will do.
         let (tree, keep) = sync_tree(app, &st.cfg);
         let lib = dev.1.clone().unwrap_or_default();

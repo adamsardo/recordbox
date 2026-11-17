@@ -46,11 +46,11 @@ pub const TREE_ITEMS_OWN: [&str; 5] = ["Playlists", "Matching", "Tag List", "Dev
 /// Why a Media Browser item of rekordbox cannot be ticked in Recordbox.
 pub fn media_absent_reason(name: &str) -> String {
     match name {
-        "Apple Music" | "SoundCloud" | "Tidal" | "Spotify" | "Beatport" | "Inflyte" => format!("Recordbox has no streaming services, so there is no {name} source."),
+        "Apple Music" | "SoundCloud" | "Tidal" | "Spotify" | "Beatport" | "Inflyte" => format!("recordbox has no streaming services, so there is no {name} source."),
         "Track Suggestion" => "Track Suggestion is not available.".to_string(),
-        "CloudDirectPlay Filter" => "Recordbox has no cloud service, so there is nothing to filter.".to_string(),
-        "SEARCH MOBILE button" => "Recordbox has no mobile device search.".to_string(),
-        _ => format!("Recordbox has no {name} source yet."),
+        "CloudDirectPlay Filter" => "recordbox has no cloud service, so there is nothing to filter.".to_string(),
+        "SEARCH MOBILE button" => "recordbox has no mobile device search.".to_string(),
+        _ => format!("recordbox has no {name} source yet."),
     }
 }
 

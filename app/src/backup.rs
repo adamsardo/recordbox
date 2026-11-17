@@ -165,7 +165,7 @@ fn write_backup_to(db_path: &Path, artwork_dir: &Path, tmp: &Path, with_music: b
             }
         }
     }
-    let m = Manifest { app: "Recordbox".into(), format: FORMAT, created: chrono::Local::now().to_rfc3339(), schema, tracks: tracks.len(), artwork_files, music: map, music_missing: missing };
+    let m = Manifest { app: "recordbox".into(), format: FORMAT, created: chrono::Local::now().to_rfc3339(), schema, tracks: tracks.len(), artwork_files, music: map, music_missing: missing };
     zw.start_file("manifest.json", stored())?;
     zw.write_all(&serde_json::to_vec_pretty(&m)?)?;
     let f = zw.finish()?;
@@ -188,15 +188,16 @@ pub struct Staged {
 }
 
 pub fn read_manifest(archive: &Path) -> Result<Manifest> {
-    let mut za = zip::ZipArchive::new(std::fs::File::open(archive)?).map_err(|_| anyhow!("This file is not a Recordbox library backup."))?;
+    let mut za = zip::ZipArchive::new(std::fs::File::open(archive)?).map_err(|_| anyhow!("This file is not a recordbox library backup."))?;
     let mut s = String::new();
-    za.by_name("manifest.json").map_err(|_| anyhow!("This file is not a Recordbox library backup."))?.read_to_string(&mut s)?;
+    za.by_name("manifest.json").map_err(|_| anyhow!("This file is not a recordbox library backup."))?.read_to_string(&mut s)?;
     let m: Manifest = serde_json::from_str(&s).map_err(|_| anyhow!("The backup's contents list cannot be read."))?;
-    if m.app != "Recordbox" {
-        bail!("This file is not a Recordbox library backup.");
+    // Archives written before the name was lowercased say "Recordbox".
+    if !m.app.eq_ignore_ascii_case("recordbox") {
+        bail!("This file is not a recordbox library backup.");
     }
     if m.format > FORMAT {
-        bail!("This backup was made by a newer version of Recordbox.");
+        bail!("This backup was made by a newer version of recordbox.");
     }
     if za.by_name("library.db").is_err() {
         bail!("The backup has no database file.");
@@ -255,7 +256,7 @@ pub fn stage_restore(archive: &Path, work_dir: &Path, artwork_dir: &Path, with_m
         }
         let has: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='tracks'", [], |r| r.get(0))?;
         if has == 0 {
-            bail!("The backup's database file is not a Recordbox library.");
+            bail!("The backup's database file is not a recordbox library.");
         }
     }
     {
@@ -568,7 +569,7 @@ mod tests {
             zw.start_file("library.db", stored()).unwrap();
             zw.write_all(&vec![0x55u8; 4096]).unwrap();
             zw.start_file("manifest.json", stored()).unwrap();
-            zw.write_all(&serde_json::to_vec(&Manifest { app: "Recordbox".into(), format: FORMAT, ..Default::default() }).unwrap()).unwrap();
+            zw.write_all(&serde_json::to_vec(&Manifest { app: "recordbox".into(), format: FORMAT, ..Default::default() }).unwrap()).unwrap();
             zw.finish().unwrap();
         }
         assert!(stage_restore(&bad, &d.join("w3"), &art, true, &|_, _, _| {}, &never).is_err());
@@ -577,7 +578,7 @@ mod tests {
             let mut zw = zip::ZipWriter::new(std::fs::File::create(&newer).unwrap());
             zw.start_file("library.db", stored()).unwrap();
             zw.start_file("manifest.json", stored()).unwrap();
-            zw.write_all(&serde_json::to_vec(&Manifest { app: "Recordbox".into(), format: FORMAT + 1, ..Default::default() }).unwrap()).unwrap();
+            zw.write_all(&serde_json::to_vec(&Manifest { app: "recordbox".into(), format: FORMAT + 1, ..Default::default() }).unwrap()).unwrap();
             zw.finish().unwrap();
         }
         assert!(read_manifest(&newer).unwrap_err().to_string().contains("newer"));

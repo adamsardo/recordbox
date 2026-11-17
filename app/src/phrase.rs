@@ -445,7 +445,7 @@ mod tests {
         let o = sum(&|x| x.1);
         let t = sum(&|x| x.2);
         eprintln!("{} tracks, {users} user cues", r.len());
-        eprintln!("Recordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * o.0 as f64 / users as f64, 100.0 * o.1 as f64 / o.2.max(1) as f64, o.2);
+        eprintln!("recordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * o.0 as f64 / users as f64, 100.0 * o.1 as f64 / o.2.max(1) as f64, o.2);
         eprintln!("rekordbox phrase starts: recall {:.1}%, precision {:.1}% ({} proposals)", 100.0 * t.0 as f64 / users as f64, 100.0 * t.1 as f64 / t.2.max(1) as f64, t.2);
     }
 

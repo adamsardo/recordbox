@@ -1685,7 +1685,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     progress(Progress::Report(report));
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
     if has_onelibrary(&root) {
-        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which Recordbox does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
+        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which recordbox does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
     }
     if !skipped.is_empty() {
         msg.push_str(&format!(". {} track(s) were not exported: {}", skipped.len(), short_list(&skipped, 5)));
@@ -2622,7 +2622,7 @@ mod tests {
                     }
                 }
                 let diff: Vec<usize> = (0..n).filter(|&k| x[k] != y[k]).collect();
-                assert!(diff.is_empty(), "table {t} row {i}: bytes {diff:?} differ (rekordbox {:?}, Recordbox {:?})", diff.iter().map(|&k| x[k]).collect::<Vec<_>>(), diff.iter().map(|&k| y[k]).collect::<Vec<_>>());
+                assert!(diff.is_empty(), "table {t} row {i}: bytes {diff:?} differ (rekordbox {:?}, recordbox {:?})", diff.iter().map(|&k| x[k]).collect::<Vec<_>>(), diff.iter().map(|&k| y[k]).collect::<Vec<_>>());
             }
         }
     }

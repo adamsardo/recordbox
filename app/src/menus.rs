@@ -33,7 +33,7 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("edit_copy", "Copy", false),
     ("edit_paste", "Paste", false),
     ("edit_select_all", "Select All", false),
-    ("about", "About Recordbox", false),
+    ("about", "About recordbox", false),
     ("prefs", "Preferences…", false),
     ("import_track", "Import Track", false),
     ("import_folder", "Import Folder", false),
@@ -93,7 +93,7 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("export_device", "Export to USB Device…", false),
     ("manual", "Online Manual", false),
     ("shortcuts", "Keyboard Shortcuts", false),
-    ("h_about", "About Recordbox", false),
+    ("h_about", "About recordbox", false),
 ];
 
 fn it<'a>(h: &'a Handles, id: &str) -> &'a dyn IsMenuItem {
@@ -146,7 +146,7 @@ pub fn build() -> Option<Menu> {
     let sep = PredefinedMenuItem::separator;
     let menu = Menu::new();
     {
-        let app_menu = Submenu::new("Recordbox", true);
+        let app_menu = Submenu::new("recordbox", true);
         app_menu
             .append_items(&[it(&h, "about"), &sep(), it(&h, "prefs"), &sep(), &PredefinedMenuItem::hide(None), &PredefinedMenuItem::hide_others(None), &PredefinedMenuItem::show_all(None), &sep(), &PredefinedMenuItem::quit(None)])
             .ok()?;
@@ -416,7 +416,7 @@ pub fn handle(app: &mut App, id: &str) {
         }
         "restore" => {
             if app.dialogs.ext.backup_job.is_none() {
-                if let Some(f) = rfd::FileDialog::new().set_title("Open backup file").add_filter("Recordbox library backup", &["zip"]).pick_file() {
+                if let Some(f) = rfd::FileDialog::new().set_title("Open backup file").add_filter("recordbox library backup", &["zip"]).pick_file() {
                     match crate::backup::read_manifest(&f) {
                         Ok(_) => app.dialogs.ext.restore_ask = Some(f),
                         Err(e) => app.dialogs.ext.backup_done = Some(("Library Restoration".into(), format!("Unable to restore the collection.\n{e}"))),

@@ -1226,7 +1226,7 @@ impl App {
             let files = crate::demo::ensure_demo_files();
             for f in files {
                 let mut t = crate::importer::read_track(&f);
-                t.artist = "Recordbox".into();
+                t.artist = "recordbox".into();
                 t.album = "Demo Tracks".into();
                 t.genre = "Demo".into();
                 let _ = app.db.insert_track(&t);
@@ -2127,7 +2127,7 @@ impl App {
         let (last, told) = self.audio_retry.unwrap_or((Instant::now() - std::time::Duration::from_secs(10), false));
         if !told {
             self.player.state.lock().playing = false;
-            self.toast_err("The audio output stopped working (device disconnected?). Recordbox will reconnect when it is available.");
+            self.toast_err("The audio output stopped working (device disconnected?). recordbox will reconnect when it is available.");
         }
         if last.elapsed() >= std::time::Duration::from_secs(2) {
             // The system's default output: opening it needs no device search (which can block),
@@ -2739,7 +2739,7 @@ impl App {
             msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
         }
         if first && lib.smart_lists > 0 {
-            msg.push_str(&format!(" {} intelligent playlist(s) use a condition Recordbox doesn't have and were not copied.", lib.smart_lists));
+            msg.push_str(&format!(" {} intelligent playlist(s) use a condition recordbox doesn't have and were not copied.", lib.smart_lists));
         }
         if !msg.is_empty() {
             self.toast(msg);

@@ -191,7 +191,7 @@ fn menus(app: &mut App, ui: &mut Ui) {
         }
         if ui.button("Backup Library…").clicked() {
             ui.close_menu();
-            if let Some(f) = rfd::FileDialog::new().set_file_name("Recordbox-library-backup.db").save_file() {
+            if let Some(f) = rfd::FileDialog::new().set_file_name("recordbox-library-backup.db").save_file() {
                 let _ = app.db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                 match std::fs::copy(crate::db::data_dir().join("library.db"), &f) {
                     Ok(_) => app.toast("Library backed up."),
@@ -249,7 +249,7 @@ fn menus(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.menu_button(small("Help"), |ui| {
-        if ui.button("About Recordbox").clicked() {
+        if ui.button("About recordbox").clicked() {
             app.dialogs.about = true;
             ui.close_menu();
         }
@@ -1181,7 +1181,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
                     Some((name, _)) if crate::export::usb::has_onelibrary(std::path::Path::new(&r2)) => {
-                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which Recordbox can't read yet, so it can't tell which files are unused."));
+                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which recordbox can't read yet, so it can't tell which files are unused."));
                     }
                     Some((name, Some(lib))) => {
                         let files = crate::export::usb::unused_files(std::path::Path::new(&r2), &lib);
@@ -1195,7 +1195,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 }
                 ui.close_menu();
             }
-            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from Recordbox.").clicked() {
+            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from recordbox.").clicked() {
                 app.check_player_cue_edits(&r2, true);
                 ui.close_menu();
             }
@@ -1230,7 +1230,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new(e).size(10.5).color(CAUTION_TX));
         }
         if fs != "folder" && crate::export::usb::has_onelibrary(std::path::Path::new(&root)) {
-            ui.label(RichText::new("Has a OneLibrary database that Recordbox does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by Recordbox.");
+            ui.label(RichText::new("Has a OneLibrary database that recordbox does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by recordbox.");
         }
         if let Some(nodes) = nodes {
             fn rows(app: &mut App, ui: &mut Ui, root: &str, nodes: &[crate::export::usb::DevNode], parent: u32, depth: usize) {

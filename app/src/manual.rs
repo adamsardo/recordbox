@@ -11,10 +11,10 @@ fn esc(s: &str) -> String {
 /// (anchor, title, body as HTML).
 const CHAPTERS: [(&str, &str, &str); 14] = [
     ("start", "Getting started", r#"
-<p>Recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
+<p>recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
 <ul>
-<li><b>Your music files are only read.</b> Tags, cues, grids and everything else you edit are kept in Recordbox's own library, never written into the audio files.</li>
-<li><b>rekordbox is never changed.</b> If rekordbox is installed, Recordbox copies its library and reads the copy (Preferences &gt; Advanced &gt; Others).</li>
+<li><b>Your music files are only read.</b> Tags, cues, grids and everything else you edit are kept in recordbox's own library, never written into the audio files.</li>
+<li><b>rekordbox is never changed.</b> If rekordbox is installed, recordbox copies its library and reads the copy (Preferences &gt; Advanced &gt; Others).</li>
 <li>The library lives in one folder: <i>File &gt; Show Library Folder in Finder</i>.</li>
 </ul>
 <h3>The window</h3>
@@ -45,7 +45,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <ul>
 <li>Click a column header to sort; right-click it to choose columns; drag the edges to resize. Playlists and the Collection keep separate column sets.</li>
 <li>The search field filters the list (the magnifier menu chooses which field is searched). <i>View &gt; Filter</i> opens the Track Filter: BPM range, key, rating, colour and My Tags.</li>
-<li>The <b>column browser</b> (Genre / Artist / Album) and the <b>Sub-Browser Window</b> (a second list under the main one) are switched in <i>View</i> and Preferences &gt; View &gt; Recordbox.</li>
+<li>The <b>column browser</b> (Genre / Artist / Album) and the <b>Sub-Browser Window</b> (a second list under the main one) are switched in <i>View</i> and Preferences &gt; View &gt; recordbox.</li>
 <li>Right-click a track for its menu: load, analyse, add to playlist, colour, rating, My Tag, Property, Show in Finder, Remove from Collection.</li>
 <li><i>Track &gt; Property</i> edits a track's information. <i>Track &gt; Reload Tag</i> reads the tags from the file again.</li>
 <li>Removed tracks can be brought back for 30 days: <i>Track &gt; Restore Removed Tracks…</i></li>
@@ -75,7 +75,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li><b>Overview</b> (whole track) and <b>enlarged waveform</b>: click or drag to move; Zoom In / Zoom Out / Reset Zoom change the enlarged waveform's scale. Waveform colour (BLUE, RGB, 3Band) is in Preferences &gt; View &gt; Color, Full / Half Waveform in Preferences &gt; View &gt; Display Type.</li>
 <li><b>Play/Pause</b> and <b>Cue</b>: Cue while paused sets the cue point; holding it previews from the cue point.</li>
 <li><b>Search</b> buttons scan through the track while held; <b>Previous / Next Track</b> load the neighbouring row of the list.</li>
-<li><b>Quantize</b> snaps cues and loops to the beat grid (resolution in Preferences &gt; View &gt; Recordbox).</li>
+<li><b>Quantize</b> snaps cues and loops to the beat grid (resolution in Preferences &gt; View &gt; recordbox).</li>
 <li><b>Beat Jump</b> moves by the chosen number of beats; with Shift, by one beat.</li>
 <li>The time display switches between elapsed and remaining.</li>
 <li><b>2 Players</b> shows two decks side by side; <b>Simple Player</b> is a compact strip.</li>
@@ -101,7 +101,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 "#),
     ("stems", "Stems", r#"
-<p>Recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Advanced &gt; STEMS). Separated stems are kept so each track is only split once. The stem pads mute and unmute parts; Preferences &gt; Advanced &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
+<p>recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Advanced &gt; STEMS). Separated stems are kept so each track is only split once. The stem pads mute and unmute parts; Preferences &gt; Advanced &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
 "#),
     ("export", "Exporting to USB", r#"
 <ol>
@@ -114,7 +114,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <ul>
 <li>Under Devices you can browse a drive's playlists and tracks, delete playlists from it, update its playlists from the library, and clean up files nothing refers to.</li>
 <li><b>Histories</b>: play histories the players saved are imported as playlists (Preferences &gt; DJ System &gt; Device).</li>
-<li>If cues were changed on the players, Recordbox offers to take the changes back into the library the next time the drive is connected.</li>
+<li>If cues were changed on the players, recordbox offers to take the changes back into the library the next time the drive is connected.</li>
 </ul>
 <h3>What the players show</h3>
 <p>Preferences &gt; DJ System decides the waveform colour, current position and divisions (General), the browse categories and sort options (Category, Sort), and your player settings such as Quantize, Auto Cue, Time Mode, Jog Mode and brightness (My Settings). They are written to every drive you export.</p>
@@ -129,9 +129,9 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <p><i>File &gt; Library &gt; Restore Library</i> opens a backup file, checks it, and asks before replacing the present library. Before anything is replaced, the present library is copied into the <code>backups</code> folder of the library folder, so a restore can itself be undone. The app keeps running: the restored library is shown as soon as it is in place. Music files in the backup are put back only where the file is missing; a file that exists is never written over.</p>
 "#),
     ("prefs", "Preferences", r#"
-<p>Open with ⌘, (or Recordbox &gt; Preferences…). The field above the categories searches all settings by name. <b>Reset to defaults</b> asks first, and keeps your keyboard shortcuts and column layout.</p>
+<p>Open with ⌘, (or recordbox &gt; Preferences…). The field above the categories searches all settings by name. <b>Reset to defaults</b> asks first, and keeps your keyboard shortcuts and column layout.</p>
 <ul>
-<li><b>View</b> — <i>Display Type</i>: tooltips, list font size and line space, key format (Classic / Alphanumeric). Full / Half Waveform, Beat Count Display. <i>Layout</i>: which sources the Media Browser shows, the playlist palette, cue markers on previews, the playlist search filter, All Tracks and track counts in the playlist tree, phrases and vocal positions on the full waveform. <i>Color</i>: waveform colour. <i>Recordbox</i>: time mode, quantize resolution, the other source tiles, My Tag window, column browser, sub-browser.</li>
+<li><b>View</b> — <i>Display Type</i>: tooltips, list font size and line space, key format (Classic / Alphanumeric). Full / Half Waveform, Beat Count Display. <i>Layout</i>: which sources the Media Browser shows, the playlist palette, cue markers on previews, the playlist search filter, All Tracks and track counts in the playlist tree, phrases and vocal positions on the full waveform. <i>Color</i>: waveform colour. <i>recordbox</i>: time mode, quantize resolution, the other source tiles, My Tag window, column browser, sub-browser.</li>
 <li><b>Audio</b> — <i>Configuration</i>: output device, sample rate, buffer size, metronome click sound and volume, preview volume. <i>Input/Output</i>: output channels.</li>
 <li><b>Analysis</b> — <i>Track Analysis</i>: high precision BeatGrid analysis, Analysis Mode, BPM Range, what is analysed, Auto Analysis, Auto Gain. <i>CUE Analysis</i>: cues set automatically on first analysis.</li>
 <li><b>DJ System</b> — everything written to USB drives: General, Category, Sort, Column, My Settings, Device, Others.</li>
@@ -153,14 +153,14 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 /// The whole manual as one HTML page.
 pub fn html(prefs: &Prefs) -> String {
     let mut s = String::with_capacity(64_000);
-    s.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Recordbox Manual</title><style>");
+    s.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>recordbox Manual</title><style>");
     s.push_str(":root{--bg:#141414;--fg:#e6e6e6;--dim:#a0a0a0;--card:#1e1e1e;--line:#333;--blue:#3d7be6}@media(prefers-color-scheme:light){:root{--bg:#fafafa;--fg:#1a1a1a;--dim:#555;--card:#fff;--line:#ddd;--blue:#1f5fd0}}");
     s.push_str("body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif}main{max-width:820px;margin:0 auto;padding:24px 16px 80px}h1{font-size:28px;margin:8px 0 4px}h2{font-size:21px;margin:40px 0 8px;padding-top:12px;border-top:1px solid var(--line)}h3{font-size:16px;margin:20px 0 4px}a{color:var(--blue)}nav{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 18px;columns:2}nav a{display:block;text-decoration:none;padding:2px 0}code,kbd{font:13px ui-monospace,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:4px;padding:1px 5px}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:600}.dim{color:var(--dim)}li{margin:3px 0}@media(max-width:600px){nav{columns:1}}");
     // The logo heads the page (it follows the text colour, light or dark), with the mark as the
     // page icon.
     s.push_str(&format!("</style><link rel=\"icon\" href=\"data:image/svg+xml;utf8,{}\"></head><body><main>", crate::brand::MARK_SVG.replace('"', "'").replace('#', "%23").replace('\n', "")));
     s.push_str(&format!("<h1 class=\"logo\" aria-label=\"recordbox Manual\"><span style=\"display:block;width:280px;max-width:70vw\">{}</span><span style=\"font-size:21px;font-weight:600\">Manual</span></h1>", crate::brand::LOGO_SVG.replace("<svg ", "<svg style=\"width:100%;height:auto;color:var(--fg)\" ")));
-    s.push_str(&format!("<p class=\"dim\">Version {}. This page was written by Recordbox on this computer; the keyboard shortcuts below are your current ones.</p><nav>", env!("CARGO_PKG_VERSION")));
+    s.push_str(&format!("<p class=\"dim\">Version {}. This page was written by recordbox on this computer; the keyboard shortcuts below are your current ones.</p><nav>", env!("CARGO_PKG_VERSION")));
     for (a, t, _) in CHAPTERS {
         s.push_str(&format!("<a href=\"#{a}\">{}</a>", esc(t)));
     }

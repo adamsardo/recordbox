@@ -33,12 +33,12 @@ const STEM_WAVEFORM_WIRED: bool = true;
 
 /// Categories the original has and Recordbox does not (no subscription, no cloud): shown
 /// dimmed at their places so the list reads the same.
-const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "Recordbox has no subscription plans."), (101, "CLOUD", "Recordbox has no cloud service.")];
+const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "recordbox has no subscription plans."), (101, "CLOUD", "recordbox has no cloud service.")];
 const PAGES: [(u8, &str); 6] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced")];
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
     match page {
-        0 => &["Display Type", "Layout", "Color", "Recordbox"],
+        0 => &["Display Type", "Layout", "Color", "recordbox"],
         1 => &["Track Analysis", "CUE Analysis"],
         2 => &["General", "Category", "Sort", "Column", "My Settings", "Device", "Others"],
         3 => &ACTION_CATEGORIES,
@@ -523,7 +523,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                 ui.add_space(0.5);
                 separator(ui);
                 // LINK EXPORT is not part of Recordbox: the section is shown switched off.
-                let why = "Recordbox has no LINK EXPORT, so no tracks are coloured as played.";
+                let why = "recordbox has no LINK EXPORT, so no tracks are coloured as played.";
                 sub(ui, "Coloring of played tracks  (LINK EXPORT)");
                 let mut refused = kit::toggle_off(ui, "Reset color when exiting rekordbox", why);
                 ui.add_space(6.0);
@@ -564,7 +564,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
         2 => {
             card(ui, "Appearance", |ui| {
                 radio(ui, true, "Dark");
-                kit::radio_off(ui, false, "Light", "Recordbox has the dark appearance only.");
+                kit::radio_off(ui, false, "Light", "recordbox has the dark appearance only.");
             });
             card(ui, "Waveform color", |ui| {
                 for (i, n) in ["BLUE", "RGB", "3Band"].iter().enumerate() {
@@ -576,7 +576,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "HOT CUE color", |ui| {
                 // Recordbox gives new hot cues rekordbox's COLORFUL colours; the other three
                 // colour sets are listed as rekordbox lists them, and cannot be chosen.
-                let why = "Recordbox colours hot cues as rekordbox's COLORFUL setting does; it has no other colour set yet.";
+                let why = "recordbox colours hot cues as rekordbox's COLORFUL setting does; it has no other colour set yet.";
                 kit::combo_row(ui, 22.0, |ui| {
                     kit::combo("hotcue_color", 520.0, "COLORFUL", 14.0).show_ui(ui, |ui| {
                         for n in ["CDJ", "COLD1", "COLD2"] {
@@ -588,8 +588,8 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
             });
         }
         _ => {
-            card(ui, "Recordbox", |ui| {
-                kit::line(ui, "Settings of Recordbox that rekordbox keeps elsewhere or does not have.");
+            card(ui, "recordbox", |ui| {
+                kit::line(ui, "Settings of recordbox that rekordbox keeps elsewhere or does not have.");
             });
             card(ui, "Time Mode", |ui| {
                 if radio(ui, !app.prefs.time_remain, "Elapsed") {
@@ -673,7 +673,7 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
         ui.add_space(3.0);
         separator(ui);
         sub(ui, "Deck");
-        kit::checkbox_off(ui, "Display SYNC RATE", "Recordbox does not show a sync rate next to BEAT SYNC yet.");
+        kit::checkbox_off(ui, "Display SYNC RATE", "recordbox does not show a sync rate next to BEAT SYNC yet.");
         ui.add_space(3.0);
         separator(ui);
         sub(ui, "Phrases");
@@ -681,11 +681,11 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
         if PHRASE_ENLARGED_WIRED {
             kit::checkbox(ui, &mut app.prefs.phrase_enlarged, "Phrase (Enlarged Waveform)");
         } else {
-            kit::checkbox_off(ui, "Phrase (Enlarged Waveform)", "Recordbox shows phrases under the full waveform only, so far.");
+            kit::checkbox_off(ui, "Phrase (Enlarged Waveform)", "recordbox shows phrases under the full waveform only, so far.");
         }
         kit::checkbox(ui, &mut app.prefs.show_phrase_bar, "Phrase (Full Waveform)");
         ui.add_space(3.0);
-        toggle_if(app, ui, PHRASE_TYPES_WIRED, |p| &mut p.phrase_types_always, "Always show types of phrases", "Recordbox shows phrases as coloured blocks without their type names, so far.");
+        toggle_if(app, ui, PHRASE_TYPES_WIRED, |p| &mut p.phrase_types_always, "Always show types of phrases", "recordbox shows phrases as coloured blocks without their type names, so far.");
         ui.add_space(3.0);
         separator(ui);
         sub(ui, "Vocal");
@@ -693,7 +693,7 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
         if VOCAL_ENLARGED_WIRED {
             kit::checkbox(ui, &mut app.prefs.vocal_enlarged, "Vocal (Enlarged Waveform)");
         } else {
-            kit::checkbox_off(ui, "Vocal (Enlarged Waveform)", "Recordbox shows vocal positions above the full waveform only, so far.");
+            kit::checkbox_off(ui, "Vocal (Enlarged Waveform)", "recordbox shows vocal positions above the full waveform only, so far.");
         }
         kit::checkbox(ui, &mut app.prefs.show_vocal, "Vocal (Full Waveform)");
     });
@@ -970,9 +970,9 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         });
         return;
     }
-    let no_cloud = "Recordbox has no cloud service: nothing is collected or uploaded.";
+    let no_cloud = "recordbox has no cloud service: nothing is collected or uploaded.";
     card(ui, "Track Analysis", |ui| {
-        let why = "Recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
+        let why = "recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
         let mut refused = false;
         kit::row(ui, 16.0, |ui| {
             if HIGH_PRECISION_WIRED {
@@ -1036,12 +1036,12 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         }
     });
     card(ui, "Key Analysis", |ui| {
-        let why = "Recordbox never changes your audio files; the key is kept in its own library.";
+        let why = "recordbox never changes your audio files; the key is kept in its own library.";
         if kit::toggle_off(ui, "Write the value to the ID3 tag", why) {
             app.toast(why);
         }
     });
-    card(ui, "Auto Gain (Recordbox)", |ui| {
+    card(ui, "Auto Gain (recordbox)", |ui| {
         kit::block(ui, |ui| {
             ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));
         });
@@ -1208,7 +1208,7 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "Display username on-screen", |ui| {
                 sub(ui, "Display the AlphaTheta account nickname on CDJ/XDJ");
                 kit::indent(ui, 88.0);
-                let why = "Recordbox has no AlphaTheta account, so there is no nickname to show.";
+                let why = "recordbox has no AlphaTheta account, so there is no nickname to show.";
                 if kit::toggle_off(ui, "OFF", why) {
                     app.toast(why);
                 }
@@ -1280,7 +1280,7 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "Column", |ui| {
                 sub(ui, "Select item which is shown next to track name on CDJ/XDJ");
                 kit::indent(ui, 88.0);
-                let why = "Where the players store this choice has not been confirmed, so Recordbox does not write it; the players show their own default.";
+                let why = "Where the players store this choice has not been confirmed, so recordbox does not write it; the players show their own default.";
                 kit::combo_row(ui, 19.0, |ui| {
                     ui.add_enabled_ui(false, |ui| {
                         kit::combo("rightcol", 500.0, "Not Specified", 12.0).show_ui(ui, |_| {});
@@ -1315,7 +1315,7 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             });
             card(ui, "History", |ui| {
                 toggle(ui, &mut app.prefs.import_device_history, "Import the play history automatically");
-                toggle_if(app, ui, HISTORY_DELETE_WIRED, |p| &mut p.delete_history_after_import, "Delete from the device after importing the play history", "Recordbox does not remove histories from a device yet; imported histories are left on it.");
+                toggle_if(app, ui, HISTORY_DELETE_WIRED, |p| &mut p.delete_history_after_import, "Delete from the device after importing the play history", "recordbox does not remove histories from a device yet; imported histories are left on it.");
             });
         }
         _ => {
@@ -1404,7 +1404,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                 if let Some(f) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                     match std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&b).ok()) {
                         Some(m) => app.prefs.keymap = m.into_iter().filter(|(k, v)| ACTIONS.iter().any(|a| a.0 == k) && (v.is_empty() || Shortcut::parse(v).is_some())).collect(),
-                        None => app.toast_err("That file is not a Recordbox shortcut profile."),
+                        None => app.toast_err("That file is not a recordbox shortcut profile."),
                     }
                 }
             }
@@ -1550,8 +1550,8 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         3 => page_stems(app, ui),
         _ => {
             card(ui, "rekordbox Library", |ui| {
-                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when Recordbox starts");
-                note(ui, "Recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.");
+                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when recordbox starts");
+                note(ui, "recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.");
                 kit::block(ui, |ui| {
                     if ui.add_enabled(app.rb_job.is_none(), btn("Sync now")).clicked() {
                         crate::menus::handle(app, "sync_rekordbox");
@@ -1604,7 +1604,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
     card(ui, "Layout", |ui| {
         sub(ui, "ACTIVE STEM/STEM ISO/STEM FX Layout");
         kit::indent(ui, 88.0);
-        let why = "Recordbox has one layout for the part buttons, in the player's STEMS strip.";
+        let why = "recordbox has one layout for the part buttons, in the player's STEMS strip.";
         radio(ui, true, "Auto");
         kit::radio_off(ui, false, "Customize", why);
         kit::combo_row(ui, 22.0, |ui| {
@@ -1616,7 +1616,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         kit::radio_off(ui, false, "Do not display", "Switch \"Enable the STEMS Function\" off to hide the part buttons.");
     });
     kit::card_help(ui, "STEM Waveform Display", Some("When enabled, the waveform shows the parts that sound. When disabled, the original waveform is always shown."), |ui| {
-        toggle_if(app, ui, STEM_WAVEFORM_WIRED, |p| &mut p.stem_waveform, "Enable", "Recordbox always shows the original waveform, so far.");
+        toggle_if(app, ui, STEM_WAVEFORM_WIRED, |p| &mut p.stem_waveform, "Enable", "recordbox always shows the original waveform, so far.");
     });
     card(ui, "ACTIVE STEM Setting", |ui| {
         if radio(ui, !app.prefs.stem_solo, "MUTE") {
@@ -1631,7 +1631,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         }
         toggle(ui, &mut app.prefs.stem_reset_on_load, "Reset the MUTE/SOLO state while loading");
     });
-    card(ui, "Stem separation model (Recordbox)", |ui| {
+    card(ui, "Stem separation model (recordbox)", |ui| {
         if let Some(hw) = &app.stem.hw {
             kit::line(
                 ui,
@@ -1740,8 +1740,8 @@ fn backup_windows(app: &mut App, ctx: &Context) {
         if let Some(c) = choice {
             app.dialogs.ext.backup_ask = false;
             if let Some(music) = c {
-                let name = format!("Recordbox-backup-{}.zip", chrono::Local::now().format("%Y%m%d"));
-                if let Some(f) = rfd::FileDialog::new().set_title("Backup file").set_file_name(name).add_filter("Recordbox library backup", &["zip"]).save_file() {
+                let name = format!("recordbox-backup-{}.zip", chrono::Local::now().format("%Y%m%d"));
+                if let Some(f) = rfd::FileDialog::new().set_title("Backup file").set_file_name(name).add_filter("recordbox library backup", &["zip"]).save_file() {
                     app.save_prefs();
                     let _ = app.db.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
                     app.dialogs.ext.backup_job = Some(crate::backup::start_backup(ctx.clone(), f, music));

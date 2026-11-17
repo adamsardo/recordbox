@@ -125,7 +125,7 @@ pub fn track_line_id(t: &Track, extra: &crate::importer::XmlExtra, id: &str) -> 
 pub fn build(app: &App) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DJ_PLAYLISTS Version=\"1.0.0\">\n");
-    x.push_str("  <PRODUCT Name=\"Recordbox\" Version=\"1.0\" Company=\"\"/>\n");
+    x.push_str("  <PRODUCT Name=\"recordbox\" Version=\"1.0\" Company=\"\"/>\n");
     x.push_str(&format!("  <COLLECTION Entries=\"{}\">\n", app.tracks.len()));
     let extras: std::collections::HashMap<i64, crate::importer::XmlExtra> = app.tracks.iter().map(|t| (t.id, app.db.xml_extra(t.id))).collect();
     let ids = export_ids(&app.tracks.iter().map(|t| (t.id, extras[&t.id].xml_id.clone())).collect::<Vec<_>>());

@@ -1063,9 +1063,9 @@ impl App {
         let (_, only) = self.ext.reloc_rx.take().unwrap();
         let (moved, ambiguous, not_found) = self.apply_relocation(&by_name, only.as_deref());
         let msg = match moved {
-            0 => "rekordbox was not able to locate any files.".replace("rekordbox", "Recordbox"),
-            1 => "Recordbox found one file.".to_string(),
-            n => format!("Recordbox found {n} files."),
+            0 => "rekordbox was not able to locate any files.".replace("rekordbox", "recordbox"),
+            1 => "recordbox found one file.".to_string(),
+            n => format!("recordbox found {n} files."),
         };
         let mut msg = msg;
         if ambiguous > 0 {

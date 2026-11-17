@@ -50,7 +50,7 @@ impl Db {
             let has_tables: bool = probe.query_row("SELECT count(*) FROM sqlite_master WHERE name='tracks'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
             drop(probe);
             if v > SCHEMA_VERSION {
-                anyhow::bail!("This library was written by a newer version of Recordbox (schema {v}); update Recordbox to open it. It was not changed.");
+                anyhow::bail!("This library was written by a newer version of recordbox (schema {v}); update recordbox to open it. It was not changed.");
             }
             if v < SCHEMA_VERSION && has_tables {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");

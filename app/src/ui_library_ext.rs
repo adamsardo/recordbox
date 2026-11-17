@@ -1936,7 +1936,7 @@ pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     }
                 });
                 ui.add_space(4.0);
-                ui.label(RichText::new("Artwork is kept in the Recordbox library; the music files are not changed.").size(10.5).color(DIM));
+                ui.label(RichText::new("Artwork is kept in the recordbox library; the music files are not changed.").size(10.5).color(DIM));
             }
         }
     });
@@ -1981,7 +1981,7 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
             kit::apply_style(ui);
             ui.set_width(420.0);
             // The original's sentence, with this application's name.
-            kit::message(ui, "Would you like Recordbox to find other missing file using the location of this track ?");
+            kit::message(ui, "Would you like recordbox to find other missing file using the location of this track ?");
             kit::message_note(ui, &dir.to_string_lossy());
             match kit::dialog_buttons(ui, &["Yes", "No"]) {
                 Some(0) => answer = Some(true),

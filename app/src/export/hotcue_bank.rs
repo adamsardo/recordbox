@@ -117,7 +117,7 @@ impl Banks {
 }
 
 /// Why a bank list cannot be written to a device yet (shown by "Export Hot Cue Bank List").
-pub const EXPORT_NOT_KNOWN: &str = "Hot Cue Bank Lists can't be exported to a device yet. rekordbox keeps them in the device's OneLibrary database, which Recordbox does not write, and how the standard device library stores them is not known: none of the rekordbox-made drives examined contains one. Bank lists already on a device are left exactly as they are.";
+pub const EXPORT_NOT_KNOWN: &str = "Hot Cue Bank Lists can't be exported to a device yet. rekordbox keeps them in the device's OneLibrary database, which recordbox does not write, and how the standard device library stores them is not known: none of the rekordbox-made drives examined contains one. Bank lists already on a device are left exactly as they are.";
 
 /// Window state (kept in `DeviceUi`).
 #[derive(Default)]

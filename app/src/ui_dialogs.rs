@@ -345,7 +345,7 @@ fn export_window(app: &mut App, ctx: &Context) {
                 ui.label(RichText::new("This drive is formatted as APFS, which DJ players cannot read. Use FAT32 or exFAT.").color(CAUTION_TX));
             }
             if crate::export::usb::has_onelibrary(std::path::Path::new(&d.root)) {
-                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). Recordbox updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
+                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). recordbox updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
             }
             if let Some(l) = &d.lib {
                 ui.label(RichText::new(format!("Already on the device: {} tracks, {} playlists. New items are added; existing ones are updated.", l.tracks.len(), l.nodes.iter().filter(|n| !n.folder).count())).size(11.0).color(DIM));
@@ -610,8 +610,8 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
         let pe = app.dialogs.player_edits.as_mut().unwrap();
         kit::dialog(ctx, "Cue changes made on players").resizable(false).show(ctx, |ui| {
             kit::apply_style(ui);
-            ui.label(format!("{} track(s) on {} have cues that were changed after the last export from Recordbox.", pe.items.len(), pe.device));
-            ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in Recordbox with the ones on the device. The device is not changed.").size(11.0).color(DIM));
+            ui.label(format!("{} track(s) on {} have cues that were changed after the last export from recordbox.", pe.items.len(), pe.device));
+            ui.label(RichText::new("Importing replaces the track's hot cues and memory cues in recordbox with the ones on the device. The device is not changed.").size(11.0).color(DIM));
             ui.add_space(4.0);
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 for it in pe.items.iter_mut() {
@@ -622,7 +622,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                         ui.label(format!("{} – {}", it.edit.title, it.edit.artist));
                         ui.label(RichText::new(format!("{hot} hot, {mem} memory")).size(11.0).color(DIM));
                         if it.conflict {
-                            ui.label(RichText::new("also changed in Recordbox").size(11.0).color(CAUTION_TX)).on_hover_text("The cues were edited in Recordbox too since the export. Importing replaces those edits.");
+                            ui.label(RichText::new("also changed in recordbox").size(11.0).color(CAUTION_TX)).on_hover_text("The cues were edited in recordbox too since the export. Importing replaces those edits.");
                         }
                     });
                 }
@@ -649,7 +649,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     }
     if app.dialogs.about {
         let mut open = true;
-        kit::dialog(ctx, "About Recordbox").open(&mut open).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
+        kit::dialog(ctx, "About recordbox").open(&mut open).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
             kit::apply_style(ui);
             ui.set_width(380.0);
             // The logo (mark and wordmark) instead of the name in text.

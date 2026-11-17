@@ -122,7 +122,7 @@ pub fn strip_menu_extra(app: &mut App, ui: &mut Ui) {
         app.toggle_mute();
     }
     ui.separator();
-    ui.label(egui::RichText::new("Recordbox extras").size(10.5).color(DIM));
+    ui.label(egui::RichText::new("recordbox extras").size(10.5).color(DIM));
     let mut changed = ui.checkbox(&mut app.prefs.show_stems, "STEMS button").clicked();
     changed |= ui.checkbox(&mut app.prefs.show_phrase_bar, "Phrase bar").clicked();
     changed |= ui.checkbox(&mut app.prefs.show_vocal, "Vocal positions").clicked();
