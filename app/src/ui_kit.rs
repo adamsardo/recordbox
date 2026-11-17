@@ -659,3 +659,33 @@ impl egui::Widget for Check<'_> {
         resp
     }
 }
+
+/// Many solid axis-aligned bars as one mesh. Waveforms are thousands of one-point columns;
+/// as separate line or rectangle shapes each is tessellated on its own every frame (about a
+/// third of a frame's CPU time while a track plays), as one mesh they are copied as they are.
+pub struct Bars {
+    mesh: egui::Mesh,
+}
+
+impl Bars {
+    pub fn new() -> Self {
+        Bars { mesh: egui::Mesh::default() }
+    }
+    pub fn rect(&mut self, r: egui::Rect, c: egui::Color32) {
+        if c.a() > 0 && r.width() > 0.0 && r.height() > 0.0 {
+            self.mesh.add_colored_rect(r, c);
+        }
+    }
+    /// A one-point-wide column centred on `x` between two heights (in either order).
+    pub fn column(&mut self, x: f32, y0: f32, y1: f32, c: egui::Color32) {
+        self.rect(egui::Rect::from_min_max(egui::pos2(x - 0.5, y0.min(y1)), egui::pos2(x + 0.5, y0.max(y1))), c);
+    }
+    pub fn into_mesh(self) -> egui::Mesh {
+        self.mesh
+    }
+    pub fn paint(self, p: &egui::Painter) {
+        if !self.mesh.is_empty() {
+            p.add(egui::Shape::mesh(self.mesh));
+        }
+    }
+}

@@ -111,3 +111,27 @@ pub fn spawn_export(req: crate::export::usb::ExportRequest, ctx: egui::Context) 
     });
     ExportJob { rx, cancel, last: (0, 0, String::new()) }
 }
+
+#[cfg(test)]
+mod throughput_probe {
+    /// Opt-in: PREPDECK_PATHS=<file with one audio path per line> PREPDECK_N=<workers>.
+    /// Prints how long analysing those files takes with that many workers.
+    #[test]
+    #[ignore]
+    fn analysis_workers() {
+        let paths: Vec<String> = std::fs::read_to_string(std::env::var("PREPDECK_PATHS").unwrap()).unwrap().lines().map(|s| s.to_string()).collect();
+        let n: usize = std::env::var("PREPDECK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let t = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = paths.get(i) else { break };
+                    let _ = crate::analysis::analyze_file(p, &Default::default());
+                });
+            }
+        });
+        eprintln!("{} files, {} workers: {:.1} s", paths.len(), n, t.elapsed().as_secs_f32());
+    }
+}

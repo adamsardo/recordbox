@@ -808,13 +808,44 @@ fn update_sync(follower: &mut PlayState, master: &PlayState) {
     }
 }
 
+/// How often the audio callback found a deck's state held by the interface, and how often it
+/// had to give the buffer up (silence) because the state stayed held.
+pub static AUDIO_CONTENDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static AUDIO_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A deck's state for the audio callback. The interface holds it for well under a microsecond
+/// at a time (to read the position or set a control), but it does so many times per frame, so
+/// a single `try_lock` loses now and then, and losing means a whole buffer of silence: an
+/// audible click. Waiting out such a hold costs far less than a buffer, so the callback spins
+/// for it, and gives up only after a quarter of a millisecond (something is then really wrong).
+fn lock_for_audio(m: &Mutex<PlayState>) -> Option<parking_lot::MutexGuard<'_, PlayState>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(g) = m.try_lock() {
+        return Some(g);
+    }
+    AUDIO_CONTENDED.fetch_add(1, Relaxed);
+    let t = std::time::Instant::now();
+    loop {
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+        if let Some(g) = m.try_lock() {
+            return Some(g);
+        }
+        if t.elapsed() > std::time::Duration::from_micros(250) {
+            AUDIO_DROPPED.fetch_add(1, Relaxed);
+            return None;
+        }
+    }
+}
+
 /// The audio callback: both decks mixed into `out`.
 fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize, rate: u32) {
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    let mut a = states[0].try_lock();
-    let mut b = states[1].try_lock();
+    let mut a = lock_for_audio(&states[0]);
+    let mut b = lock_for_audio(&states[1]);
     if let (Some(a), Some(b)) = (a.as_deref_mut(), b.as_deref_mut()) {
         update_sync(a, b);
         update_sync(b, a);

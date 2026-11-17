@@ -2232,6 +2232,12 @@ pub fn list_font(app: &App) -> FontId {
     }
 }
 
+thread_local! {
+    /// Preview-cell bars by (track, columns, height, colour mode), each with a hash of the
+    /// preview data it was built from.
+    static PREVIEW_MESHES: std::cell::RefCell<HashMap<(i64, usize, u32, u8), (u64, egui::Mesh)>> = std::cell::RefCell::new(HashMap::new());
+}
+
 fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize) {
     let p = ui.painter().with_clip_rect(r.shrink2(vec2(3.0, 0.0)));
     let text_pos = |right: bool| if right { pos2(r.max.x - 4.5, r.center().y) } else { pos2(r.min.x + 5.0, r.center().y) };
@@ -2260,49 +2266,75 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
             }
             if let Some(pv) = app.previews.get(&t.id) {
                 let n = (x1 - x0).max(1.0) as usize;
-                // Stored preview: 400 display-level columns of 4 bytes; resample to the cell width.
-                let src: Vec<[u8; 4]> = pv.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
-                let len = src.len().max(1);
-                let cols: Vec<[u8; 4]> = (0..n)
-                    .map(|i| {
-                        let a = i * len / n;
-                        let b = ((i + 1) * len / n).max(a + 1).min(len);
-                        // Mostly the mean of the columns under each pixel, which keeps the
-                        // track's shape (the maximum alone flattens loud music into a solid
-                        // block), with some of the maximum so single hits still stand out.
-                        let part = src.get(a..b).unwrap_or(&[]);
-                        let mut m = [0u8; 4];
-                        for k in 0..4 {
-                            let mean = part.iter().map(|f| f[k] as f32).sum::<f32>() / part.len().max(1) as f32;
-                            let peak = part.iter().map(|f| f[k]).max().unwrap_or(0) as f32;
-                            m[k] = (0.6 * mean + 0.4 * peak) as u8;
-                        }
-                        m
-                    })
-                    .collect();
-                let base = r.max.y - 2.5;
+                // The bars of one cell depend only on the stored preview, the cell's size and the
+                // colour mode, so they are built once (as a mesh at the origin) and moved into
+                // place each frame: rebuilding them for every visible row was most of the cost
+                // of drawing the track list.
                 let hh = (r.height() - 6.0).max(4.0);
-                for (k, v) in cols.iter().enumerate() {
-                    let x = x0 + k as f32 + 0.5;
-                    if app.prefs.wave_color == 2 {
-                        // 3Band, as rekordbox's preview stacks it (reference 02): the low band
-                        // stands on the base in blue, the mid band sits on top of it in orange
-                        // and the highs on top of that in white. Display levels carry the
-                        // gains 1 / 1.5 / 2.6, taken out again here.
-                        let f = |b: u8, g: f32| b as f32 / 255.0 / g;
-                        let mut y = base;
-                        for (h, cc) in [(f(v[1], 1.0) * 0.46, WAVE_LOW), (f(v[2], 1.5) * 0.40, WAVE_MID), (f(v[3], 2.6) * 0.75, WAVE_HIGH)] {
-                            let top = y - h * hh;
-                            if h > 0.0 {
-                                p.rect_filled(Rect::from_min_max(pos2(x - 0.5, top), pos2(x + 0.5, y)), 0.0, cc);
-                            }
-                            y = top;
-                        }
-                    } else {
-                        for (h, cc) in crate::ui_player::wave_bars(app.prefs.wave_color, *v) {
-                            p.line_segment([pos2(x, base), pos2(x, base - h * hh)], Stroke::new(1.0, cc));
+                let wave_color = app.prefs.wave_color;
+                let stamp = pv.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+                let key = (t.id, n, hh.to_bits(), wave_color);
+                let mut mesh = PREVIEW_MESHES.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if let Some((st, m)) = c.get(&key) {
+                        if *st == stamp {
+                            return m.clone();
                         }
                     }
+                    // Stored preview: 400 display-level columns of 4 bytes; resample to the cell width.
+                    let src: Vec<[u8; 4]> = pv.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+                    let len = src.len().max(1);
+                    let cols: Vec<[u8; 4]> = (0..n)
+                        .map(|i| {
+                            let a = i * len / n;
+                            let b = ((i + 1) * len / n).max(a + 1).min(len);
+                            // Mostly the mean of the columns under each pixel, which keeps the
+                            // track's shape (the maximum alone flattens loud music into a solid
+                            // block), with some of the maximum so single hits still stand out.
+                            let part = src.get(a..b).unwrap_or(&[]);
+                            let mut m = [0u8; 4];
+                            for k in 0..4 {
+                                let mean = part.iter().map(|f| f[k] as f32).sum::<f32>() / part.len().max(1) as f32;
+                                let peak = part.iter().map(|f| f[k]).max().unwrap_or(0) as f32;
+                                m[k] = (0.6 * mean + 0.4 * peak) as u8;
+                            }
+                            m
+                        })
+                        .collect();
+                    let base = 0.0_f32;
+                    let mut bars = crate::ui_kit::Bars::new();
+                    for (k, v) in cols.iter().enumerate() {
+                        let x = k as f32 + 0.5;
+                        if wave_color == 2 {
+                            // 3Band, as rekordbox's preview stacks it (reference 02): the low band
+                            // stands on the base in blue, the mid band sits on top of it in orange
+                            // and the highs on top of that in white. Display levels carry the
+                            // gains 1 / 1.5 / 2.6, taken out again here.
+                            let f = |b: u8, g: f32| b as f32 / 255.0 / g;
+                            let mut y = base;
+                            for (h, cc) in [(f(v[1], 1.0) * 0.46, WAVE_LOW), (f(v[2], 1.5) * 0.40, WAVE_MID), (f(v[3], 2.6) * 0.75, WAVE_HIGH)] {
+                                let top = y - h * hh;
+                                if h > 0.0 {
+                                    bars.column(x, top, y, cc);
+                                }
+                                y = top;
+                            }
+                        } else {
+                            for (h, cc) in crate::ui_player::wave_bars(wave_color, *v) {
+                                bars.column(x, base, base - h * hh, cc);
+                            }
+                        }
+                    }
+                    let m = bars.into_mesh();
+                    if c.len() > 4096 {
+                        c.clear();
+                    }
+                    c.insert(key, (stamp, m.clone()));
+                    m
+                });
+                if !mesh.is_empty() {
+                    mesh.translate(vec2(x0, r.max.y - 2.5));
+                    p.add(egui::Shape::mesh(mesh));
                 }
                 // Hot cue letters at their positions (as the original's preview shows them).
                 if let Some(hc) = app.hot_positions.get(&t.id).filter(|_| app.prefs.cue_markers_on_preview) {

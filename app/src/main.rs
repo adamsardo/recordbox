@@ -119,22 +119,33 @@ impl eframe::App for Gui {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let bench_t0 = std::time::Instant::now();
         let app = &mut self.app;
-        app.poll_import();
-        app.poll_analysis();
-        app.poll_load();
-        app.poll_decks();
-        app.poll_export();
-        app.poll_rekordbox_sync();
-        app.poll_stems();
-        app.poll_phrases();
-        app.poll_vocal();
-        app.poll_key_job();
-        app.poll_audio_device();
-        app.poll_relocate();
-        backup::poll(app);
-        menus::poll(app);
-        menus::sync(app);
+        // PREPDECK_BENCH: name any step that holds a frame up for more than 4 ms.
+        macro_rules! step {
+            ($e:expr) => {{
+                let t = std::time::Instant::now();
+                $e;
+                if bench_on() && t.elapsed().as_millis() >= 4 {
+                    eprintln!("bench: slow step {} {:.1} ms", stringify!($e), t.elapsed().as_secs_f32() * 1000.0);
+                }
+            }};
+        }
+        step!(app.poll_import());
+        step!(app.poll_analysis());
+        step!(app.poll_load());
+        step!(app.poll_decks());
+        step!(app.poll_export());
+        step!(app.poll_rekordbox_sync());
+        step!(app.poll_stems());
+        step!(app.poll_phrases());
+        step!(app.poll_vocal());
+        step!(app.poll_key_job());
+        step!(app.poll_audio_device());
+        step!(app.poll_relocate());
+        step!(backup::poll(app));
+        step!(menus::poll(app));
+        step!(menus::sync(app));
         shortcuts(app, ctx);
         // Full screen (View menu, keyboard): the window follows; the menu tick follows the window.
         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -144,7 +155,7 @@ impl eframe::App for Gui {
         app.dialogs.ext.fullscreen = fs;
 
         egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
-            ui_browser::header_bar(app, ui);
+            step!(ui_browser::header_bar(app, ui));
         });
         egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
@@ -155,20 +166,48 @@ impl eframe::App for Gui {
             // Player is one 58 pt row.
             let h = app.player_height();
             egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(3)))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
-                1 | 3 => ui_player2::two_players(app, ui),
-                2 => ui_player2::simple_player(app, ui),
-                _ => ui_player::player_panel(app, ui),
+                1 | 3 => step!(ui_player2::two_players(app, ui)),
+                2 => step!(ui_player2::simple_player(app, ui)),
+                _ => step!(ui_player::player_panel(app, ui)),
             });
         }
         egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
-            ui_browser::browser(app, ui);
+            step!(ui_browser::browser(app, ui));
         });
-        ui_dialogs::dialogs(app, ctx);
+        step!(ui_dialogs::dialogs(app, ctx));
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
+        // PREPDECK_BENCH=<frames> (with --screenshot): play the loaded track muted for that many
+        // frames before the picture and print how long building each frame took.
+        let bench: u32 = std::env::var("PREPDECK_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if bench > 0 {
+            if let Some((_, frames)) = app.screenshot.clone() {
+                static TIMES: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+                if frames == 60 {
+                    if !app.px.muted {
+                        app.toggle_mute();
+                    }
+                    if !app.playing() {
+                        app.play_pause();
+                    }
+                }
+                let mut t = TIMES.lock().unwrap();
+                if frames > 90 {
+                    t.push(bench_t0.elapsed().as_secs_f32() * 1000.0);
+                }
+                if frames == 119 + bench && !t.is_empty() {
+                    let mut v = t.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let avg = v.iter().sum::<f32>() / v.len() as f32;
+                    eprintln!("bench: {} frames, update avg {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}", v.len(), avg, v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1]);
+                    use std::sync::atomic::Ordering::Relaxed;
+                    eprintln!("bench: audio callback found a deck held {} times, gave a buffer up {} times", audio::AUDIO_CONTENDED.load(Relaxed), audio::AUDIO_DROPPED.load(Relaxed));
+                }
+            }
+        }
         // --screenshot: draw ~120 frames, then save the window picture and quit.
         if let Some((path, frames)) = app.screenshot.clone() {
             let shot = ctx.input(|i| {
@@ -190,10 +229,10 @@ impl eframe::App for Gui {
             // Taken once the launch-time rekordbox sync has finished, so the picture shows the
             // synced library (up to ~20 s).
             static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if frames >= 120 && (app.rb_job.is_none() || frames >= 1200) && !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if frames >= 120 + bench && (app.rb_job.is_none() || frames >= 1200 + bench) && !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
-            if frames > 1500 {
+            if frames > 1500 + bench {
                 std::process::exit(1);
             }
             app.screenshot = Some((path, frames + 1));
@@ -205,6 +244,11 @@ impl eframe::App for Gui {
         self.app.save_prefs();
         let _ = self.app.db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
+}
+
+fn bench_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PREPDECK_BENCH").is_ok())
 }
 
 fn recordbox_actions() -> Vec<&'static str> {
@@ -396,5 +440,12 @@ fn main() -> eframe::Result<()> {
         }));
         options.run_and_return = false;
     }
-    eframe::run_native("recordbox", options, Box::new(move |cc| Ok(Box::new(Gui { app: App::new(cc, screenshot) }))))
+    let t0 = std::time::Instant::now();
+    eframe::run_native("recordbox", options, Box::new(move |cc| {
+        let app = App::new(cc, screenshot);
+        if bench_on() {
+            eprintln!("bench: App::new {:.0} ms ({:.0} ms since main)", 0.0, t0.elapsed().as_secs_f32() * 1000.0);
+        }
+        Ok(Box::new(Gui { app }))
+    }))
 }

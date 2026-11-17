@@ -338,6 +338,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         // the overview fills its height at the track's loudest column
         let top = cols.iter().map(|c| { let d = Waveform::disp(c); d[0].max(d[1]) }).max().unwrap_or(255).max(1) as f32;
         let norm = (255.0 / top).min(4.0);
+        let mut bars = crate::ui_kit::Bars::new();
         for (i, c) in cols.iter().enumerate() {
             let x = r.min.x + i as f32 + 0.5;
             let played = (i as f64 / n as f64) * dur < pos;
@@ -362,9 +363,10 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             };
             for (h, col) in layers {
                 let col = if played { col.gamma_multiply(0.45) } else { col };
-                p.line_segment([pos2(x, base), pos2(x, base - h.min(1.0) * full_h)], Stroke::new(1.0_f32, col));
+                bars.column(x, base, base - h.min(1.0) * full_h, col);
             }
         }
+        bars.paint(&p);
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
     }
@@ -373,6 +375,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     if let (true, Some(v)) = (app.prefs.show_vocal, &app.deck.vocal) {
         let (step, levels) = (v.0, &v.1);
         let w = r.width().max(1.0) as usize;
+        let mut bars = crate::ui_kit::Bars::new();
         for i in 0..w {
             let t0 = i as f64 / w as f64 * dur;
             let t1 = (i + 1) as f64 / w as f64 * dur;
@@ -381,9 +384,10 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             if lvl > 0 {
                 let x = r.min.x + i as f32 + 0.5;
                 let col = hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0));
-                p.line_segment([pos2(x, r.min.y + 1.0), pos2(x, r.min.y + 3.5)], Stroke::new(1.0_f32, col));
+                bars.column(x, r.min.y + 1.0, r.min.y + 3.5, col);
             }
         }
+        bars.paint(&p);
     }
     // Phrase bar (as rekordbox shows phrase analysis): one coloured block per phrase.
     if let (Some(st), false, true) = (&app.deck.phrases, app.deck.beats.is_empty(), app.prefs.show_phrase_bar) {
@@ -537,6 +541,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         let fps = WAVE_FPS;
         let n = w.frames.len();
         let mut x = r.min.x;
+        let mut cols = crate::ui_kit::Bars::new();
         while x < r.max.x {
             let t0 = t_of(x);
             let t1 = t_of(x + 1.0);
@@ -580,20 +585,21 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                         if half_mode {
                             // Half of the waveform, from this deck's edge of the shared area.
                             let hh = h * r.height();
-                            p.line_segment([pos2(x + 0.5, fy(r.max.y)), pos2(x + 0.5, fy(r.max.y - hh))], Stroke::new(1.0_f32, col));
+                            cols.column(x + 0.5, fy(r.max.y), fy(r.max.y - hh), col);
                             continue;
                         }
                         // Preferences > View > Color: Half Waveform draws the upper half only.
                         if app.prefs.wave_half {
-                            p.line_segment([pos2(x + 0.5, mid + half - 2.0 * hh), pos2(x + 0.5, mid + half)], Stroke::new(1.0_f32, col));
+                            cols.column(x + 0.5, mid + half - 2.0 * hh, mid + half, col);
                             continue;
                         }
-                        p.line_segment([pos2(x + 0.5, mid - hh), pos2(x + 0.5, mid + hh)], Stroke::new(1.0_f32, col));
+                        cols.column(x + 0.5, mid - hh, mid + hh, col);
                     }
                 }
             }
             x += 1.0;
         }
+        cols.paint(&p);
     } else if app.deck.track.is_some() {
         p.text(r.center() + vec2(60.0, 0.0), Align2::LEFT_CENTER, if app.deck.loading.is_some() { "Loading…" } else { "Analyzing…" }, FontId::proportional(12.0), DIM);
     }
@@ -604,6 +610,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         let (step, levels) = (v.0, &v.1);
         let (y0, y1) = (fy(r.min.y + 5.0), fy(r.min.y + 7.0));
         let mut x = r.min.x;
+        let mut band = crate::ui_kit::Bars::new();
         while x < r.max.x {
             let t0 = t_of(x);
             if t0 >= 0.0 && t0 <= dur {
@@ -611,11 +618,12 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                 let b = ((t_of(x + 1.0) / step) as usize).max(a + 1);
                 let lvl = levels.get(a.min(levels.len())..b.min(levels.len())).and_then(|s| s.iter().max().copied()).unwrap_or(0);
                 if lvl > 0 {
-                    p.rect_filled(Rect::from_two_pos(pos2(x, y0), pos2(x + 1.0, y1)), 0.0, hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0)));
+                    band.rect(Rect::from_two_pos(pos2(x, y0), pos2(x + 1.0, y1)), hex(0x4FC3D9).gamma_multiply(0.35 + 0.65 * (lvl.min(4) as f32 / 4.0)));
                 }
             }
             x += 1.0;
         }
+        band.paint(&p);
     }
     if let (true, Some(st), false) = (app.prefs.phrase_enlarged, &app.deck.phrases, app.deck.beats.is_empty()) {
         let beat_t = |b: u16| app.deck.beats.get((b.max(1) - 1) as usize).map(|x| x.time).unwrap_or(dur);

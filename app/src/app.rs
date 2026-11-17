@@ -1845,6 +1845,13 @@ impl App {
         let order: HashMap<i64, usize> = base.iter().enumerate().map(|(i, t)| (*t, i)).collect();
         let q = crate::smart::fold(self.search.trim());
         let words: Vec<&str> = q.split_whitespace().collect();
+        // My Tag names once for the whole pass (not once per track looked at).
+        let tag_names: HashMap<i64, &str> = self.mytags.iter().map(|t| (t.id, t.name.as_str())).collect();
+        let tag_text = |id: i64| -> String {
+            let mut v: Vec<&str> = self.track_tags.get(&id).map(|s| s.iter().filter_map(|x| tag_names.get(x).copied()).collect()).unwrap_or_default();
+            v.sort();
+            v.join(", ")
+        };
         let mut v: Vec<i64> = base
             .into_iter()
             .filter(|id| {
@@ -1857,7 +1864,7 @@ impl App {
                         4 => crate::smart::fold(&t.genre),
                         5 => crate::smart::fold(&t.label),
                         6 => crate::smart::fold(&t.comment),
-                        7 => crate::smart::fold(&self.tag_text(t.id)),
+                        7 => crate::smart::fold(&tag_text(t.id)),
                         _ => crate::smart::fold(&format!(
                         "{} {} {} {} {} {} {} {} {} {} {}",
                         t.display_title(),
@@ -1870,7 +1877,7 @@ impl App {
                         t.composer,
                         t.mix_name,
                         format!("{} {}", t.key_label(self.prefs.key_alnum), key_name(t.key, self.prefs.key_alnum)),
-                        self.tag_text(t.id)
+                        tag_text(t.id)
                     )),
                     };
                     if !words.iter().all(|w| hay.contains(w)) {
@@ -1928,8 +1935,40 @@ impl App {
         let col = self.prefs.sort_col;
         let asc = self.prefs.sort_asc;
         let alnum = self.prefs.key_alnum;
-        let tagtexts: HashMap<i64, String> = if col == Col::MyTag { v.iter().map(|id| (*id, self.tag_text(*id))).collect() } else { HashMap::new() };
+        let tagtexts: HashMap<i64, String> = if col == Col::MyTag { v.iter().map(|id| (*id, tag_text(*id))).collect() } else { HashMap::new() };
+        // Text columns compare case- and accent-folded text: fold each row's text once, not
+        // twice per comparison.
+        let folded: HashMap<i64, String> = v
+            .iter()
+            .filter_map(|id| {
+                let t = self.track(*id)?;
+                let text = match col {
+                    Col::Title => t.display_title(),
+                    Col::Artist => t.artist.clone(),
+                    Col::Album => t.album.clone(),
+                    Col::Genre => t.genre.clone(),
+                    Col::Comments => t.comment.clone(),
+                    Col::Label => t.label.clone(),
+                    Col::Remixer => t.remixer.clone(),
+                    Col::OriginalArtist => t.original_artist.clone(),
+                    Col::Composer => t.composer.clone(),
+                    Col::FileName => t.file_name(),
+                    Col::MixName => t.mix_name.clone(),
+                    Col::AlbumArtist => t.album_artist.clone(),
+                    Col::Grouping => t.grouping.clone(),
+                    Col::Lyricist => t.lyricist.clone(),
+                    Col::Message => t.message.clone(),
+                    _ => return None,
+                };
+                Some((*id, crate::smart::fold(&text)))
+            })
+            .collect();
         v.sort_by(|a, b| {
+            if let (Some(x), Some(y)) = (folded.get(a), folded.get(b)) {
+                let o = x.cmp(y);
+                let o = if asc { o } else { o.reverse() };
+                return o.then(order[a].cmp(&order[b]));
+            }
             let ta = self.track(*a).unwrap();
             let tb = self.track(*b).unwrap();
             use std::cmp::Ordering;
