@@ -41,6 +41,9 @@ pub fn icon_button(ui: &mut Ui, rect: Rect, id: &str, fill: Option<Color32>, dra
     r
 }
 
+/// Share of half the enlarged waveform's height a full-scale value reaches (see `draw_detail`).
+pub const DETAIL_FULL_SCALE: f32 = 0.68;
+
 /// True once per press of a pad-like control: on the frame the button goes down on it, or,
 /// when press and release arrive within one frame (a quick tap), on the click itself.
 pub fn press_fired(ui: &Ui, resp: &Response) -> bool {
@@ -559,16 +562,24 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                             }
                             _ => crate::export::anlz::three_band_detail(&m),
                         };
-                        let s = |v: u8| (v as f32 / 95.0).min(1.0);
+                        // Measured against rekordbox 7.2.19 (its own PWV7 values for a track vs
+                        // its enlarged waveform, export/01 of the reference set): 0.39 pt of
+                        // half-height per unit in a 147 pt tall waveform, so full scale (127)
+                        // reaches 0.68 of half the area.
+                        let s = |v: u8| (v as f32 / 127.0).min(1.0) * DETAIL_FULL_SCALE;
                         vec![(s(lo), WAVE_LOW), (s(mi), WAVE_MID), (s(hi), WAVE_HIGH)]
                     } else {
-                        wave_bars(app.prefs.wave_color, Waveform::disp(&m))
+                        // BLUE and RGB use the same share of the area as 3Band.
+                        wave_bars(app.prefs.wave_color, Waveform::disp(&m)).into_iter().map(|(h, c)| (h * DETAIL_FULL_SCALE, c)).collect()
                     };
+                    // Heights are a share of half the waveform area (not of the area less
+                    // its margins), as measured.
+                    let half = r.height() / 2.0;
                     for (h, col) in bars {
                         let hh = h * half;
                         if half_mode {
                             // Half of the waveform, from this deck's edge of the shared area.
-                            let hh = h * (r.height() - 10.0);
+                            let hh = h * r.height();
                             p.line_segment([pos2(x + 0.5, fy(r.max.y)), pos2(x + 0.5, fy(r.max.y - hh))], Stroke::new(1.0_f32, col));
                             continue;
                         }
