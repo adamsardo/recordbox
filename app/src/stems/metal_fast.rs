@@ -252,6 +252,22 @@ pub fn release_buffers() {
     }
 }
 
+/// The values of a contiguous f32 tensor, copied straight out of its (shared-memory) buffer
+/// once the GPU has finished. `Tensor::to_vec1` copies the whole underlying buffer first,
+/// which for one source of four is four times too much.
+pub fn read(t: &Tensor) -> Result<Vec<f32>> {
+    t.device().synchronize()?;
+    let (storage, layout) = t.storage_and_layout();
+    let Storage::Metal(s) = &*storage else { candle_core::bail!("read: tensor is not on Metal") };
+    let count = layout.shape().elem_count();
+    if !layout.is_contiguous() || s.dtype() != DType::F32 || (layout.start_offset() + count) * 4 > s.buffer().length() {
+        candle_core::bail!("read: tensor must be contiguous f32")
+    }
+    // SAFETY: the buffer is CPU-visible shared memory of at least `start + count` f32s (checked
+    // above), it stays alive through `storage`, and every command writing it has completed.
+    Ok(unsafe { std::slice::from_raw_parts((s.buffer().contents() as *const f32).add(layout.start_offset()), count) }.to_vec())
+}
+
 /// Candle's matrix multiply kernel, writing into a pooled buffer. Operands (.., m, k) and
 /// (.., k, n) with the same leading dimensions; either may be a transposed view.
 struct Gemm;

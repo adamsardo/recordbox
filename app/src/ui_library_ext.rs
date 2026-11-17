@@ -146,11 +146,18 @@ pub fn status_cell(app: &mut App, ui: &mut Ui, t: &Track, r: Rect) {
             p.circle_filled(ic, 1.2, hex(0x787878));
             tips.push("Track is not analyzed");
         }
-        _ => star(&p, ic, 4.8, WHITE, true),
+        _ => {}
     }
+    // Reference 01/04: the skin's 21 x 9 pt "CUE" mark (#969696) starts 12 pt into the half and
+    // runs under the column line; the analysed star (12 x 11 pt, white) sits over its first
+    // letter, or in the middle of the half when there is no cue.
     if cued && t.analyzed != 3 {
-        icon_cue(&p, pos2(b.min.x + 13.0, cy), if t.analyzed == 1 { hex(0xC8C8C8) } else { DIM });
+        p.with_clip_rect(Rect::from_min_max(b.min, pos2(b.max.x - 1.0, b.max.y))).text(pos2(b.min.x + 12.2, cy + 0.6), Align2::LEFT_CENTER, "CUE", rb(10.2), if t.analyzed == 1 { DIM } else { OFF });
         tips.push("Track has Hot Cue/Memory Cue");
+    }
+    if t.analyzed == 1 {
+        let sc = pos2(b.min.x + if cued { 7.5 } else { 14.5 }, cy - 0.5);
+        crate::icons_src::star(&p, sc + vec2(0.0, 0.0), true, WHITE);
     }
     if !tips.is_empty() && app.prefs.tooltips && ui.rect_contains_pointer(r) {
         let resp = ui.interact(r, ui.id().with(("attr_tip", t.id, r.min.y as i32)), Sense::hover());
@@ -304,7 +311,7 @@ pub fn color_picker(app: &mut App, ctx: &egui::Context) {
             for i in (1..=8u8).chain([0u8]) {
                 let (rr, resp) = ui.allocate_exact_size(vec2(118.0, 17.0), Sense::click());
                 if resp.hovered() || cur == i {
-                    ui.painter().rect_filled(rr, 2.0, if resp.hovered() { SELECT } else { BTN });
+                    ui.painter().rect_filled(rr, 2.0, if resp.hovered() { ROW_SEL } else { BTN });
                 }
                 let chip = Rect::from_center_size(pos2(rr.min.x + 12.0, rr.center().y), vec2(14.0, 9.0));
                 if i == 0 {
@@ -902,7 +909,7 @@ pub fn tree_top_rows(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
     {
         // The tag-list glyph over the note placeholder.
         let ir = Rect::from_min_size(pos2(r.rect.min.x + 4.0 + 15.0 - 1.0, r.rect.min.y), vec2(14.0, 15.0));
-        ui.painter().rect_filled(ir, 0.0, if app.view == View::TagList { SELECT } else if r.hovered() { hex(0x262626) } else { BG2 });
+        ui.painter().rect_filled(ir, 0.0, if app.view == View::TagList { ROW_SEL } else if r.hovered() { hex(0x262626) } else { BG2 });
         icon_tag_list(ui.painter(), ir.center() + vec2(0.0, 0.5), DIM2);
     }
     drop.push((r.rect, -1));
@@ -967,7 +974,7 @@ pub fn palette_bar(app: &mut App, ui: &mut Ui, r: Rect, drop: &mut Vec<(Rect, i6
         let node = app.node(pl).cloned();
         let resp = ui.interact(sr, ui.id().with(("palette", slot)), Sense::click());
         let showing = node.as_ref().map(|n| app.view == View::Playlist(n.id)).unwrap_or(false);
-        p.rect_filled(sr, 2.0, if showing { SELECT } else if resp.hovered() { hex(0x3A3A3A) } else { BTN });
+        p.rect_filled(sr, 2.0, if showing { ROW_SEL } else if resp.hovered() { hex(0x3A3A3A) } else { BTN });
         p.text(pos2(sr.min.x + 7.0, sr.center().y), Align2::LEFT_CENTER, (slot + 1).to_string(), bold(10.0), DIM2);
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(sr.min.x + 20.0, sr.min.y), pos2(sr.max.x - 30.0, sr.max.y)));
         match &node {
@@ -1383,7 +1390,7 @@ pub fn source_tree(app: &mut App, ui: &mut Ui, kind: u8) {
                 }
             }
         }
-        rows(app, ui, kind, &lib.nodes, "", 3);
+        rows(app, ui, kind, &lib.nodes, "", 1);
     });
 }
 
@@ -1450,7 +1457,7 @@ pub fn source_list(app: &mut App, ui: &mut Ui, kind: u8, node: &str) {
             let t = &lib.tracks[ti];
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let sel = app.ext.sources[k].sel.contains(&ti);
-            ui.painter().rect_filled(rr, 0.0, if sel { SELECT } else if ri % 2 == 0 { BG1 } else { BG2 });
+            ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
             let have = present[ri];
             if have {
                 // "Track imported to the Collection": a tick.

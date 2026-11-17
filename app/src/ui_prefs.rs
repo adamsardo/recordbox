@@ -8,7 +8,8 @@ use crate::export::settings::{SettingFile, DEV_OVERVIEW_TYPE, DEV_WAVEFORM_COLOR
 use crate::prefs_ext::{ACTIONS, ACTION_CATEGORIES};
 use crate::theme::*;
 use eframe::egui;
-use egui::{vec2, Context, RichText, Ui};
+use crate::ui_kit::{self as kit, btn, card, inter, inter_bold, note, radio, separator, sub, toggle, PBLUE};
+use egui::{pos2, vec2, Color32, Context, Rect, RichText, Ui};
 
 // Settings another part of the app has to act on. While one is false its control is shown
 // switched off with the reason, so nothing in the window pretends to work.
@@ -19,6 +20,9 @@ const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.
 const BG_COLOR_WRITTEN: bool = false;
 
+/// Categories the original has and Recordbox does not (no subscription, no cloud): shown
+/// dimmed at their places so the list reads the same.
+const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "Recordbox has no subscription plans."), (101, "CLOUD", "Recordbox has no cloud service.")];
 const PAGES: [(u8, &str); 6] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced")];
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
@@ -125,58 +129,12 @@ pub fn search_settings(q: &str) -> Vec<(u8, usize, String)> {
 
 // ------------------------------------------------------------------ widgets
 
-/// Card with a 17 pt bold heading on #1E1E1E, as in the original's Preferences.
-fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
-    egui::Frame::default().fill(BG2).inner_margin(egui::Margin { left: 25, right: 18, top: 18, bottom: 18 }).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(RichText::new(title).font(bold(17.0)).color(WHITE));
-        ui.add_space(8.0);
-        ui.indent(title, |ui| add(ui));
-    });
-    ui.add_space(4.0);
-}
-
-fn sub(ui: &mut Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).font(bold(15.0)).color(WHITE));
-    ui.add_space(4.0);
-}
-
-fn note(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(DIM));
-}
-
-/// Blue pill switch with a white knob (off: grey).
-fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        let (r, resp) = ui.allocate_exact_size(vec2(32.0, 17.0), egui::Sense::click());
-        if resp.clicked() {
-            *on = !*on;
-            changed = true;
-        }
-        let en = ui.is_enabled();
-        let p = ui.painter();
-        p.rect_filled(r, 8.5, if !en { hex(0x3A3A3A) } else if *on { BLUE } else { DIM });
-        let kx = if *on { r.max.x - 8.5 } else { r.min.x + 8.5 };
-        p.circle_filled(egui::pos2(kx, r.center().y), 6.5, if en { WHITE } else { OFF });
-        ui.add_space(4.0);
-        if ui.add(egui::Label::new(RichText::new(label).size(14.0).color(if en { WHITE } else { OFF })).sense(egui::Sense::click())).clicked() {
-            *on = !*on;
-            changed = true;
-        }
-    });
-    changed
-}
-
 /// A switch that only works once `wired`; until then it is shown off, with the reason.
-fn toggle_if(ui: &mut Ui, wired: bool, on: &mut bool, label: &str, why: &str) {
+fn toggle_if(app: &mut App, ui: &mut Ui, wired: bool, pick: fn(&mut Prefs) -> &mut bool, label: &str, why: &str) {
     if wired {
-        toggle(ui, on, label);
-    } else {
-        let mut off = false;
-        ui.add_enabled_ui(false, |ui| toggle(ui, &mut off, label)).response.on_disabled_hover_text(why);
-        note(ui, why);
+        toggle(ui, pick(&mut app.prefs), label);
+    } else if kit::toggle_off(ui, label, why) {
+        app.toast(why);
     }
 }
 
@@ -186,19 +144,91 @@ fn key_text(sc: &Shortcut) -> String {
     sc.label().replace('⌃', "Ctrl ").replace('⌥', "Opt ").replace('⇧', "Shift ")
 }
 
-fn radio(ui: &mut Ui, on: bool, label: &str) -> bool {
-    ui.radio(on, RichText::new(label).size(14.0)).clicked()
-}
-
 fn path_row(ui: &mut Ui, value: &Option<String>, empty: &str) {
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(520.0), 24.0), egui::Sense::hover());
-    ui.painter().rect_filled(r, 0.0, BG);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(500.0), 22.0), egui::Sense::hover());
+    ui.painter().rect_filled(r, 3.0, BG);
     let text = value.clone().unwrap_or_else(|| empty.to_string());
     let col = if value.is_some() { WHITE } else { DIM };
-    ui.painter().with_clip_rect(r).text(egui::pos2(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(12.5), col);
+    ui.painter().with_clip_rect(r).text(pos2(r.min.x + 6.5, r.center().y), egui::Align2::LEFT_CENTER, text, inter(12.5), col);
+}
+
+/// The category icons of the sidebar, in a 30 pt box at `o` (shapes as the original's).
+fn side_icon(p: &egui::Painter, o: egui::Pos2, page: u8, c: Color32, bg: Color32) {
+    let at = |x: f32, y: f32| pos2(o.x + x, o.y + y);
+    let bar = |x: f32, y: f32, w: f32, h: f32, col: Color32| p.rect_filled(Rect::from_min_size(at(x, y), vec2(w, h)), 0.0, col);
+    match page {
+        // View: an eye.
+        0 => {
+            let n = 28;
+            let half = |sign: f32| (0..=n).map(move |i| {
+                let u = -1.0 + 2.0 * i as f32 / n as f32;
+                (15.005 + u * 8.27 * sign, 15.005 - sign * 5.79 * (u * std::f32::consts::FRAC_PI_2).cos().powf(0.92))
+            });
+            let pts: Vec<egui::Pos2> = half(1.0).chain(half(-1.0)).map(|(x, y)| at(x, y)).collect();
+            p.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.29, c)));
+            p.circle_filled(at(15.005, 15.005), 3.86, c);
+        }
+        // Audio: a speaker.
+        5 => {
+            p.add(egui::Shape::convex_polygon(vec![at(8.45, 8.68), at(16.17, 12.54), at(16.17, 17.69), at(8.45, 21.55)], c, egui::Stroke::NONE));
+            bar(17.45, 12.54, 3.86, 5.15, c);
+        }
+        // Analysis: seven bars, the middle one tall.
+        1 => {
+            bar(14.36, 7.29, 1.29, 15.44, c);
+            for x in [6.64, 9.22, 11.79, 16.93, 19.51, 22.08] {
+                bar(x, 11.15, 1.29, 7.72, c);
+            }
+        }
+        // DJ System: a player seen from above.
+        2 => {
+            bar(6.0, 8.57, 18.01, 12.87, c);
+            p.circle_filled(at(11.147, 15.005), 3.86, bg);
+            p.circle_filled(at(11.146, 15.005), 1.29, c);
+            for y in [10.50, 13.08, 15.65, 18.22] {
+                bar(16.29, y, 2.57, 1.29, bg);
+                bar(20.15, y, 2.57, 1.29, bg);
+            }
+        }
+        // Keyboard: a key cap with an A.
+        3 => {
+            p.rect_filled(Rect::from_min_max(at(7.66, 7.40), at(23.10, 22.83)), 1.29, c);
+            p.text(at(15.38, 15.3), egui::Align2::CENTER_CENTER, "A", inter_bold(10.6), bg);
+        }
+        // PLAN: a disc with two quarter arcs cut out.
+        100 => {
+            p.circle_filled(at(15.007, 15.005), 7.72, c);
+            let arc = |a0: f32| (0..=10).map(|i| { let a = a0 + i as f32 / 10.0 * std::f32::consts::FRAC_PI_2; at(15.007 + 5.145 * a.cos(), 15.005 + 5.145 * a.sin()) }).collect::<Vec<_>>();
+            p.add(egui::Shape::line(arc(std::f32::consts::PI), egui::Stroke::new(2.57, bg)));
+            p.add(egui::Shape::line(arc(0.0), egui::Stroke::new(2.57, bg)));
+            p.circle_filled(at(15.007, 15.005), 2.57, bg);
+        }
+        // CLOUD: a cloud with the two sync arrows.
+        101 => {
+            p.circle_filled(at(14.36, 14.2), 5.63, c);
+            p.circle_filled(at(9.86, 17.58), 3.86, c);
+            p.circle_filled(at(20.0, 16.6), 4.2, c);
+            p.rect_filled(Rect::from_min_max(at(9.86, 16.5), at(20.15, 21.44)), 1.0, c);
+            let arc = |a0: f32| (0..=8).map(|i| { let a = a0 + i as f32 / 8.0 * 2.4; at(15.004 + 3.43 * a.cos(), 15.97 + 3.43 * a.sin()) }).collect::<Vec<_>>();
+            p.add(egui::Shape::line(arc(std::f32::consts::PI), egui::Stroke::new(0.86, bg)));
+            p.add(egui::Shape::line(arc(0.0), egui::Stroke::new(0.86, bg)));
+            p.add(egui::Shape::line(vec![at(18.43, 12.11), at(18.43, 14.68), at(15.86, 14.68)], egui::Stroke::new(0.86, bg)));
+            p.add(egui::Shape::line(vec![at(11.57, 19.83), at(11.57, 17.26), at(14.15, 17.26)], egui::Stroke::new(0.86, bg)));
+        }
+        // Advanced: three lines.
+        _ => {
+            for y in [10.61, 14.47, 18.33] {
+                bar(8.82, y, 12.86, 1.29, c);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ window
+
+/// Width and height of the window's content (the original's 800 x 828 window less its
+/// 28 pt title bar).
+const WIN: egui::Vec2 = vec2(800.0, 800.0);
 
 pub fn prefs_window(app: &mut App, ctx: &Context) {
     if !app.dialogs.prefs_open {
@@ -211,7 +241,7 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
         return;
     }
     let vid = egui::ViewportId::from_hash_of("recordbox_preferences");
-    let builder = egui::ViewportBuilder::default().with_title("Preferences").with_inner_size([800.0, 828.0]).with_min_inner_size([760.0, 520.0]);
+    let builder = egui::ViewportBuilder::default().with_title("Preferences").with_inner_size([WIN.x, WIN.y]).with_min_inner_size([WIN.x, 520.0]).with_max_inner_size([WIN.x, 4000.0]);
     ctx.show_viewport_immediate(vid, builder, |vctx, class| {
         if class == egui::ViewportClass::Embedded {
             prefs_embedded(app, vctx);
@@ -228,149 +258,168 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
 }
 
 fn prefs_embedded(app: &mut App, ctx: &Context) {
+    // Screenshots: the window's content alone at the top left of the picture, at the
+    // original's size, so it can be laid over the reference.
+    if app.screenshot.is_some() {
+        egui::Area::new(egui::Id::new("prefs_flat")).fixed_pos(pos2(0.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            let r = Rect::from_min_size(pos2(0.0, 0.0), WIN);
+            ui.set_min_size(WIN);
+            ui.painter().rect_filled(r, 0.0, BG);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| prefs_body(app, ui, WIN.y));
+        });
+        return;
+    }
     let mut open = true;
     let frame = egui::Frame::window(&ctx.style()).fill(BG).inner_margin(0.0);
-    let h = (ctx.screen_rect().height() - 90.0).clamp(480.0, 800.0);
-    egui::Window::new("Preferences").open(&mut open).default_size(vec2(800.0, h)).collapsible(false).resizable(false).frame(frame).show(ctx, |ui| prefs_body(app, ui, h));
+    let h = (ctx.screen_rect().height() - 90.0).clamp(480.0, WIN.y);
+    egui::Window::new("Preferences").open(&mut open).default_size(vec2(WIN.x, h)).collapsible(false).resizable(false).frame(frame).show(ctx, |ui| prefs_body(app, ui, h));
     app.dialogs.prefs_open = open;
 }
 
 fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
-    ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
-    ui.horizontal_top(|ui| {
-        // Sidebar 160 pt, #1E1E1E: search field, then categories with icons.
-        egui::Frame::default().fill(BG2).inner_margin(8.0).show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, 3.0);
-                ui.set_width(144.0);
-                ui.set_min_height(height - 16.0);
-                let (sr, _) = ui.allocate_exact_size(vec2(144.0, 24.0), egui::Sense::hover());
-                ui.painter().rect_filled(sr, 0.0, BG);
-                crate::icons::magnifier(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.min.x + 12.0, sr.center().y), vec2(16.0, 16.0)), DIM2, 0);
-                let field = egui::Rect::from_min_max(egui::pos2(sr.min.x + 24.0, sr.min.y + 2.0), sr.max);
-                ui.put(field, egui::TextEdit::singleline(&mut app.dialogs.ext.prefs_search).frame(false).font(egui::FontId::proportional(13.0)).text_color(WHITE).hint_text("Search"));
-                ui.add_space(14.0);
-                type Ic = fn(&egui::Painter, egui::Rect, egui::Color32);
-                let icons: [Ic; 6] = [crate::icons::info, crate::icons::speech, crate::icons::view_columns, crate::icons::usb, crate::icons::list, crate::icons::hamburger];
-                for ((i, n), ic) in PAGES.iter().zip(icons.iter()) {
-                    let sel = app.dialogs.prefs_tab == *i && app.dialogs.ext.prefs_search.trim().is_empty();
-                    let (r, resp) = ui.allocate_exact_size(vec2(144.0, 30.0), egui::Sense::click());
-                    if sel {
-                        ui.painter().rect_filled(r, 0.0, BLUE);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(r, 0.0, hex(0x2A2A2A));
-                    }
-                    ic(ui.painter(), egui::Rect::from_center_size(egui::pos2(r.min.x + 15.0, r.center().y), vec2(18.0, 18.0)), if sel { WHITE } else { DIM });
-                    ui.painter().text(egui::pos2(r.min.x + 40.0, r.center().y), egui::Align2::LEFT_CENTER, *n, egui::FontId::proportional(14.0), if sel { WHITE } else { DIM2 });
-                    if resp.clicked() {
-                        app.dialogs.prefs_tab = *i;
-                        app.dialogs.ext.prefs_search.clear();
-                    }
-                }
-            })
-        });
-        ui.vertical(|ui| {
-            ui.set_width(620.0);
-            let page = app.dialogs.prefs_tab;
-            let tabs = tabs_of(page);
-            let key = format!("prefs_subtab_{page}");
-            let mut sub_tab: usize = ui.ctx().data_mut(|d| *d.get_temp_mut_or(egui::Id::new(&key), 0usize)).min(tabs.len() - 1);
-            let searching = !app.dialogs.ext.prefs_search.trim().is_empty();
-            ui.add_space(4.0);
-            // Tab strip (black): active tab blue, inactive #1E1E1E with #AAAAAA text.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.add_space(4.0);
-                if searching {
-                    let b = egui::Button::new(RichText::new("Search results").size(14.0).color(WHITE)).fill(BLUE).corner_radius(0.0).min_size(vec2(0.0, 30.0));
-                    let _ = ui.add(b);
-                } else {
-                    for (i, t) in tabs.iter().enumerate() {
-                        let sel = sub_tab == i;
-                        let b = egui::Button::new(RichText::new(*t).size(14.0).color(if sel { WHITE } else { DIM2 })).fill(if sel { BLUE } else { BG2 }).corner_radius(0.0).min_size(vec2(0.0, 30.0));
-                        if ui.add(b).clicked() {
-                            sub_tab = i;
-                        }
-                    }
-                }
-            });
-            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(&key), sub_tab));
-            ui.add_space(4.0);
-            let before = format!("{:?}", app.prefs);
-            egui::ScrollArea::vertical().id_salt(("prefs_scroll", page, sub_tab, searching)).max_height(height - 92.0).min_scrolled_height(height - 92.0).auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-                if searching {
-                    search_results(app, ui);
-                } else {
-                    match page {
-                        0 => page_view(app, ui, sub_tab),
-                        1 => page_analysis(app, ui, sub_tab),
-                        2 => page_dj_system(app, ui, sub_tab),
-                        3 => page_keyboard(app, ui, sub_tab),
-                        5 => page_audio(app, ui),
-                        _ => page_advanced(app, ui, sub_tab),
-                    }
-                }
-            });
-            if format!("{:?}", app.prefs) != before {
-                app.save_prefs();
+    kit::apply_style(ui);
+    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+    let o = ui.cursor().min;
+    let (full, _) = ui.allocate_exact_size(vec2(WIN.x, height), egui::Sense::hover());
+    let at = |x: f32, y: f32| pos2(o.x + x, o.y + y);
+    ui.painter().rect_filled(full, 0.0, BG);
+    // Sidebar 160 pt, #1E1E1E: search field, then the categories 33 pt apart.
+    ui.painter().rect_filled(Rect::from_min_max(o, at(160.0, height)), 0.0, BG2);
+    let sr = Rect::from_min_max(at(8.0, 16.0), at(152.0, 40.0));
+    ui.painter().rect_filled(sr, 0.0, BG);
+    let lens = egui::Stroke::new(1.0, hex(0x555555));
+    ui.painter().circle_stroke(at(12.0 + 6.857, 20.0 + 6.857), 5.214, lens);
+    ui.painter().line_segment([at(12.0 + 10.64, 20.0 + 11.075), at(12.0 + 14.07, 20.0 + 14.5)], lens);
+    let field = Rect::from_min_max(pos2(sr.min.x + 24.0, sr.min.y + 3.0), pos2(sr.max.x - 2.0, sr.max.y));
+    ui.put(field, egui::TextEdit::singleline(&mut app.dialogs.ext.prefs_search).frame(false).font(inter(13.0)).text_color(WHITE));
+    for (n, (i, name, why)) in ABSENT.iter().enumerate() {
+        let r = Rect::from_min_size(at(8.0, 56.0 + n as f32 * 33.0), vec2(144.0, 30.0));
+        side_icon(ui.painter(), r.min, *i, OFF, BG2);
+        ui.painter().text(pos2(r.min.x + 40.0, r.center().y), egui::Align2::LEFT_CENTER, *name, inter(13.0), OFF);
+        ui.interact(r, ui.id().with(("prefs_absent", *i)), egui::Sense::hover()).on_hover_text(*why);
+    }
+    for (n, (i, name)) in PAGES.iter().enumerate() {
+        let sel = app.dialogs.prefs_tab == *i && app.dialogs.ext.prefs_search.trim().is_empty();
+        let r = Rect::from_min_size(at(8.0, 56.0 + (n + ABSENT.len()) as f32 * 33.0), vec2(144.0, 30.0));
+        let resp = ui.interact(r, ui.id().with(("prefs_page", *i)), egui::Sense::click());
+        let bg = if sel { PBLUE } else if resp.hovered() { hex(0x2A2A2A) } else { BG2 };
+        if bg != BG2 {
+            ui.painter().rect_filled(r, 0.0, bg);
+        }
+        let c = if sel { WHITE } else { DIM2 };
+        side_icon(ui.painter(), r.min, *i, c, bg);
+        kit::paint_text(ui, pos2(r.min.x + 40.0, r.center().y), egui::Align2::LEFT_CENTER, name, inter(13.0), c, 0.13);
+        if resp.clicked() {
+            app.dialogs.prefs_tab = *i;
+            app.dialogs.ext.prefs_search.clear();
+        }
+    }
+    let page = app.dialogs.prefs_tab;
+    let tabs = tabs_of(page);
+    let key = format!("prefs_subtab_{page}");
+    let mut sub_tab: usize = ui.ctx().data_mut(|d| *d.get_temp_mut_or(egui::Id::new(&key), 0usize)).min(tabs.len() - 1);
+    let searching = !app.dialogs.ext.prefs_search.trim().is_empty();
+    // Tab strip on black, 30 pt tall: the active tab blue, the others #1E1E1E with #AAAAAA text.
+    let mut x = 164.0;
+    let names: Vec<&str> = if searching { vec!["Search results"] } else { tabs.to_vec() };
+    for (i, t) in names.iter().enumerate() {
+        let sel = searching || sub_tab == i;
+        let g = kit::galley(ui, t, inter(12.0), if sel { WHITE } else { DIM2 }, 0.0);
+        let w = (g.size().x + 4.45).round();
+        if x + w > WIN.x - 2.0 {
+            break;
+        }
+        let r = Rect::from_min_size(at(x, 4.0), vec2(w, 30.0));
+        let resp = ui.interact(r, ui.id().with(("prefs_tab", page, i)), egui::Sense::click());
+        ui.painter().rect_filled(r, 0.0, if sel { PBLUE } else if resp.hovered() { hex(0x2A2A2A) } else { BG2 });
+        ui.painter().galley(pos2(r.center().x - g.size().x / 2.0, r.center().y - g.size().y / 2.0), g, WHITE);
+        if resp.clicked() && !searching {
+            sub_tab = i;
+        }
+        x += w + 4.0;
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(&key), sub_tab));
+    let before = format!("{:?}", app.prefs);
+    // The cards, from 38 pt down to 40 pt above the bottom edge. DJ System > General has no
+    // "Reset to defaults" in the original: its cards run to 4 pt above the bottom edge.
+    let no_reset = page == 2 && sub_tab == 0 && !searching;
+    let area = Rect::from_min_max(at(164.0, 38.0), at(WIN.x, height - if no_reset { 4.0 } else { 40.0 }));
+    let mut content = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Min)));
+    egui::ScrollArea::vertical().id_salt(("prefs_scroll", page, sub_tab, searching)).max_height(area.height()).auto_shrink([false, false]).show(&mut content, |ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        if searching {
+            search_results(app, ui);
+        } else {
+            match page {
+                0 => page_view(app, ui, sub_tab),
+                1 => page_analysis(app, ui, sub_tab),
+                2 => page_dj_system(app, ui, sub_tab),
+                3 => page_keyboard(app, ui, sub_tab),
+                5 => page_audio(app, ui),
+                _ => page_advanced(app, ui, sub_tab),
             }
-            ui.add_space(6.0);
-            reset_row(app, ui);
-        });
+        }
     });
+    if format!("{:?}", app.prefs) != before {
+        app.save_prefs();
+    }
+    let foot = Rect::from_min_max(at(164.5, height - 35.75), at(WIN.x - 8.0, height - 4.75));
+    if !no_reset || app.dialogs.ext.reset_ask.is_some() {
+        let mut foot_ui = ui.new_child(egui::UiBuilder::new().max_rect(foot).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        reset_row(app, &mut foot_ui);
+    }
 }
 
 fn search_results(app: &mut App, ui: &mut Ui) {
     let hits = search_settings(&app.dialogs.ext.prefs_search);
     card(ui, "Search results", |ui| {
         if hits.is_empty() {
-            ui.label(RichText::new("No setting has that in its name.").size(13.0).color(DIM2));
+            kit::line(ui, "No setting has that in its name.");
         }
-        for (page, tab, name) in hits {
-            let place = format!("{} > {}", PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or(""), tabs_of(page).get(tab).copied().unwrap_or(""));
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new(&name).size(14.0).color(WHITE)).fill(BG).min_size(vec2(300.0, 24.0))).clicked() {
-                    app.dialogs.prefs_tab = page;
-                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(format!("prefs_subtab_{page}")), tab));
-                    app.dialogs.ext.prefs_search.clear();
-                }
-                ui.label(RichText::new(place).size(12.0).color(DIM));
-            });
-        }
+        kit::block(ui, |ui| {
+            for (page, tab, name) in hits {
+                let place = format!("{} > {}", PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or(""), tabs_of(page).get(tab).copied().unwrap_or(""));
+                ui.horizontal(|ui| {
+                    if ui.add(btn(name.as_str()).min_size(vec2(300.0, 22.0))).clicked() {
+                        app.dialogs.prefs_tab = page;
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(format!("prefs_subtab_{page}")), tab));
+                        app.dialogs.ext.prefs_search.clear();
+                    }
+                    ui.label(kit::text(place, 12.0).color(DIM));
+                });
+            }
+        });
     });
 }
 
-/// "Reset to defaults": asks first; keyboard shortcuts, columns and this computer's devices
-/// and folders are kept.
+/// "Reset to defaults": asks first, in the original's words; keyboard shortcuts, columns and
+/// this computer's devices and folders are kept.
 fn reset_row(app: &mut App, ui: &mut Ui) {
+    ui.spacing_mut().item_spacing.x = 8.0;
     match app.dialogs.ext.reset_ask {
         None => {
-            if ui.add(egui::Button::new(RichText::new("Reset to defaults").size(14.0)).fill(hex(0x1E1E20)).min_size(vec2(250.0, 30.0))).clicked() {
+            if ui.add(btn("Reset to defaults").exact(vec2(249.0, 31.0))).clicked() {
                 app.dialogs.ext.reset_ask = Some(None);
             }
         }
         Some(scope) => {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let text = if scope == Some(3) { "Reset every keyboard shortcut to its default?" } else { "Reset all settings to their defaults? Keyboard shortcuts and columns are kept." };
-                ui.label(RichText::new(text).size(13.0).color(WHITE));
-                if ui.add(egui::Button::new(RichText::new("Reset").size(14.0)).fill(BLUE).min_size(vec2(80.0, 30.0))).clicked() {
-                    if scope == Some(3) {
-                        app.prefs.keymap.clear();
-                    } else {
-                        app.prefs = reset_prefs(&app.prefs);
-                        crate::prefs_ext::set_stream_opts(&app.prefs);
-                        let _ = app.player.switch_device(app.prefs.audio_device.as_deref());
-                        app.list_dirty = true;
-                    }
-                    app.save_prefs();
-                    app.dialogs.ext.reset_ask = None;
+            let text = if scope == Some(3) { "Are you sure you want to reset all the key-mappings to their default state?" } else { "Do you want to reset the settings to defaults ?" };
+            ui.label(kit::text(text, 13.0).color(WHITE)).on_hover_text("Keyboard shortcuts, columns and this computer's devices and folders are kept.");
+            if ui.add(btn("OK").exact(vec2(80.0, 29.0))).clicked() {
+                if scope == Some(3) {
+                    app.prefs.keymap.clear();
+                } else {
+                    app.prefs = reset_prefs(&app.prefs);
+                    crate::prefs_ext::set_stream_opts(&app.prefs);
+                    let _ = app.player.switch_device(app.prefs.audio_device.as_deref());
+                    app.list_dirty = true;
                 }
-                if ui.add(egui::Button::new(RichText::new("Cancel").size(14.0)).fill(hex(0x1E1E20)).min_size(vec2(80.0, 30.0))).clicked() {
-                    app.dialogs.ext.reset_ask = None;
-                }
-            });
+                app.save_prefs();
+                app.dialogs.ext.reset_ask = None;
+            }
+            if ui.add(btn("Cancel").exact(vec2(80.0, 29.0))).clicked() {
+                app.dialogs.ext.reset_ask = None;
+            }
         }
     }
 }
@@ -404,8 +453,10 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
             card(ui, "Language", |ui| {
-                egui::ComboBox::from_id_salt("lang").width(330.0).selected_text(RichText::new("English").font(bold(14.0))).show_ui(ui, |ui| {
-                    let _ = ui.selectable_label(true, "English");
+                kit::combo_row(ui, 22.0, |ui| {
+                    kit::combo("lang", 520.0, "English", 14.0).show_ui(ui, |ui| {
+                        let _ = ui.selectable_label(true, "English");
+                    });
                 });
             });
             card(ui, "Tooltips", |ui| {
@@ -414,26 +465,32 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "Browse", |ui| {
                 sub(ui, "Font Size");
                 let mut f = app.prefs.browse_font as u32;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Small").size(12.0).color(DIM2));
-                    if ui.add(egui::Slider::new(&mut f, 0..=4).show_value(false)).changed() {
-                        app.prefs.browse_font = f as u8;
-                    }
-                    ui.label(RichText::new("Large").size(12.0).color(DIM2));
-                });
+                if kit::step_slider(ui, &mut f, 4, "Small", "Large") {
+                    app.prefs.browse_font = f as u8;
+                }
+                kit::indent(ui, 84.0);
+                ui.add_space(-0.5);
                 toggle(ui, &mut app.prefs.browse_bold, "Bold");
-                ui.separator();
+                separator(ui);
                 sub(ui, "Line Space");
                 let mut l = app.prefs.browse_line as u32;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Small").size(12.0).color(DIM2));
-                    if ui.add(egui::Slider::new(&mut l, 0..=4).show_value(false)).changed() {
-                        app.prefs.browse_line = l as u8;
-                    }
-                    ui.label(RichText::new("Large").size(12.0).color(DIM2));
-                });
-                ui.separator();
+                if kit::step_slider(ui, &mut l, 4, "Small", "Large") {
+                    app.prefs.browse_line = l as u8;
+                }
+                separator(ui);
+                ui.add_space(-1.0);
                 toggle(ui, &mut app.prefs.center_selected, "Show the selected track to the center");
+                ui.add_space(0.5);
+                separator(ui);
+                // LINK EXPORT is not part of Recordbox: the section is shown switched off.
+                let why = "Recordbox has no LINK EXPORT, so no tracks are coloured as played.";
+                sub(ui, "Coloring of played tracks  (LINK EXPORT)");
+                let mut refused = kit::toggle_off(ui, "Reset color when exiting rekordbox", why);
+                ui.add_space(6.0);
+                refused |= kit::row(ui, 22.0, |ui| ui.add(btn("RESET").exact(vec2(264.0, 22.0)).font_size(12.0)).on_hover_text(why).clicked());
+                if refused {
+                    app.toast(why);
+                }
             });
             card(ui, "Key display format", |ui| {
                 if radio(ui, !app.prefs.key_alnum, "Classic") {
@@ -452,7 +509,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                     let avail = crate::prefs_ext::tree_item_available(name);
                     let fixed = name == "Collection";
                     let mut on = avail && app.prefs.tree_item(name);
-                    let r = ui.add_enabled(avail && !fixed, egui::Checkbox::new(&mut on, RichText::new(name).size(14.0)));
+                    let r = kit::row(ui, 16.0, |ui| ui.add_enabled_ui(avail && !fixed, |ui| kit::checkbox_raw(ui, &mut on, name)).inner);
                     if r.changed() {
                         app.prefs.tree_items.insert(name.to_string(), on);
                     }
@@ -502,21 +559,26 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "Color comments", |ui| {
                 sub(ui, "Customize Color Comments");
                 note(ui, "Your own names for the eight track colours. They are shown wherever a colour is chosen.");
-                egui::Grid::new("color_comments").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                    for i in 0..8usize {
-                        let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
-                        ui.painter().rect_filled(r.shrink(2.0), 2.0, label_color(i as u8 + 1));
-                        ui.add(egui::TextEdit::singleline(&mut app.prefs.color_names[i]).desired_width(300.0).hint_text(crate::model::COLOR_NAMES[i + 1]));
-                        ui.end_row();
+                kit::block(ui, |ui| {
+                    egui::Grid::new("color_comments").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                        for i in 0..8usize {
+                            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::hover());
+                            ui.painter().rect_filled(r.shrink(2.0), 2.0, label_color(i as u8 + 1));
+                            ui.add(egui::TextEdit::singleline(&mut app.prefs.color_names[i]).desired_width(300.0).hint_text(crate::model::COLOR_NAMES[i + 1]));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if ui.add(btn("RESET").min_size(vec2(120.0, 22.0)).font_size(12.0)).clicked() {
+                        app.prefs.color_names = crate::prefs_ext::default_color_names();
                     }
                 });
-                if ui.button("Reset").clicked() {
-                    app.prefs.color_names = crate::prefs_ext::default_color_names();
-                }
             });
         }
         _ => {
-            ui.label(RichText::new("  Settings of Recordbox that rekordbox keeps elsewhere or does not have.").size(12.0).color(DIM2));
+            card(ui, "Recordbox", |ui| {
+                kit::line(ui, "Settings of Recordbox that rekordbox keeps elsewhere or does not have.");
+            });
             card(ui, "Time Mode", |ui| {
                 if radio(ui, !app.prefs.time_remain, "Elapsed") {
                     app.prefs.time_remain = false;
@@ -527,10 +589,11 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
             });
             card(ui, "Quantize", |ui| {
                 toggle(ui, &mut app.prefs.quantize, "Cues and loops snap to the beat grid");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Resolution").size(13.0));
+                kit::row(ui, 16.0, |ui| {
+                    ui.label(kit::text("Resolution", 14.0).color(WHITE));
                     for (d, n) in [(1u8, "1 beat"), (2, "1/2"), (4, "1/4"), (8, "1/8")] {
-                        if ui.radio(app.prefs.quantize_div.max(1) == d, n).clicked() {
+                        ui.add_space(16.0);
+                        if kit::radio_raw(ui, app.prefs.quantize_div.max(1) == d, n).clicked() {
                             app.prefs.quantize_div = d;
                         }
                     }
@@ -613,11 +676,10 @@ fn page_audio(app: &mut App, ui: &mut Ui) {
         };
         let caps = cap_slot.lock().clone().flatten();
 
-        egui::Grid::new("audio_grid").num_columns(2).spacing(vec2(40.0, 12.0)).show(ui, |ui| {
-            ui.label(RichText::new("Audio").size(14.0));
-            let shown = current.clone().unwrap_or_else(|| "System default".to_string());
-            let mut pick: Option<Option<String>> = None;
-            egui::ComboBox::from_id_salt("audio_dev").width(330.0).selected_text(RichText::new(shown).font(bold(14.0))).show_ui(ui, |ui| {
+        let shown = current.clone().unwrap_or_else(|| "System default".to_string());
+        let mut pick: Option<Option<String>> = None;
+        kit::labeled(ui, "Audio", |ui| {
+            kit::combo("audio_dev", 400.0, shown, 14.0).show_ui(ui, |ui| {
                 if ui.selectable_label(current.is_none(), "System default").clicked() {
                     pick = Some(None);
                 }
@@ -630,30 +692,30 @@ fn page_audio(app: &mut App, ui: &mut Ui) {
                     ui.label(RichText::new("No audio device").color(DIM));
                 }
             });
-            if let Some(p) = pick {
-                // Another device has its own rates, buffers and channels: start from its defaults.
-                let keep = (app.prefs.audio_rate, app.prefs.audio_buffer, app.prefs.audio_channel);
-                app.prefs.audio_rate = 0;
-                app.prefs.audio_buffer = 0;
-                app.prefs.audio_channel = 0;
-                crate::prefs_ext::set_stream_opts(&app.prefs);
-                match app.player.switch_device(p.as_deref()) {
-                    Ok(()) => app.prefs.audio_device = p,
-                    Err(e) => {
-                        (app.prefs.audio_rate, app.prefs.audio_buffer, app.prefs.audio_channel) = keep;
-                        crate::prefs_ext::set_stream_opts(&app.prefs);
-                        app.toast_err(format!("Could not open that audio device: {e}"));
-                    }
+        });
+        if let Some(p) = pick {
+            // Another device has its own rates, buffers and channels: start from its defaults.
+            let keep = (app.prefs.audio_rate, app.prefs.audio_buffer, app.prefs.audio_channel);
+            app.prefs.audio_rate = 0;
+            app.prefs.audio_buffer = 0;
+            app.prefs.audio_channel = 0;
+            crate::prefs_ext::set_stream_opts(&app.prefs);
+            match app.player.switch_device(p.as_deref()) {
+                Ok(()) => app.prefs.audio_device = p,
+                Err(e) => {
+                    (app.prefs.audio_rate, app.prefs.audio_buffer, app.prefs.audio_channel) = keep;
+                    crate::prefs_ext::set_stream_opts(&app.prefs);
+                    app.toast_err(format!("Could not open that audio device: {e}"));
                 }
             }
-            ui.end_row();
+        }
 
-            ui.label(RichText::new("Sample Rate").size(14.0));
-            let rate_text = |r: u32| format!("{} Hz", r);
-            let sel = if app.prefs.audio_rate == 0 { format!("{} (device setting)", rate_text(app.player.device_rate)) } else { rate_text(app.prefs.audio_rate) };
-            let mut new_rate = None;
+        let rate_text = |r: u32| format!("{} Hz", r);
+        let sel = if app.prefs.audio_rate == 0 { format!("{} (device setting)", rate_text(app.player.device_rate)) } else { rate_text(app.prefs.audio_rate) };
+        let mut new_rate = None;
+        kit::labeled(ui, "Sample Rate", |ui| {
             ui.add_enabled_ui(caps.is_some(), |ui| {
-                egui::ComboBox::from_id_salt("audio_rate").width(330.0).selected_text(RichText::new(sel).font(bold(14.0))).show_ui(ui, |ui| {
+                kit::combo("audio_rate", 400.0, sel, 14.0).show_ui(ui, |ui| {
                     if ui.selectable_label(app.prefs.audio_rate == 0, "Device setting").clicked() {
                         new_rate = Some(0);
                     }
@@ -664,18 +726,18 @@ fn page_audio(app: &mut App, ui: &mut Ui) {
                     }
                 });
             });
-            if let Some(r) = new_rate.filter(|r| *r != app.prefs.audio_rate) {
-                app.prefs.audio_rate = r;
-                apply_audio(app);
-            }
-            ui.end_row();
+        });
+        if let Some(r) = new_rate.filter(|r| *r != app.prefs.audio_rate) {
+            app.prefs.audio_rate = r;
+            apply_audio(app);
+        }
 
-            ui.label(RichText::new("Buffer size").size(14.0));
-            let sel = if app.prefs.audio_buffer == 0 { "Device setting".to_string() } else { format!("{} samples", app.prefs.audio_buffer) };
-            let range = caps.as_ref().and_then(|c| c.buffer);
-            let mut new_buf = None;
+        let sel = if app.prefs.audio_buffer == 0 { "Device setting".to_string() } else { format!("{} samples", app.prefs.audio_buffer) };
+        let range = caps.as_ref().and_then(|c| c.buffer);
+        let mut new_buf = None;
+        kit::labeled(ui, "Buffer size", |ui| {
             ui.add_enabled_ui(caps.is_some(), |ui| {
-                egui::ComboBox::from_id_salt("audio_buf").width(330.0).selected_text(RichText::new(sel).font(bold(14.0))).show_ui(ui, |ui| {
+                kit::combo("audio_buf", 400.0, sel, 14.0).show_ui(ui, |ui| {
                     if ui.selectable_label(app.prefs.audio_buffer == 0, "Device setting").clicked() {
                         new_buf = Some(0);
                     }
@@ -690,19 +752,19 @@ fn page_audio(app: &mut App, ui: &mut Ui) {
                     }
                 });
             });
-            if let Some(b) = new_buf.filter(|b| *b != app.prefs.audio_buffer) {
-                app.prefs.audio_buffer = b;
-                apply_audio(app);
-            }
-            ui.end_row();
+        });
+        if let Some(b) = new_buf.filter(|b| *b != app.prefs.audio_buffer) {
+            app.prefs.audio_buffer = b;
+            apply_audio(app);
+        }
 
-            ui.label(RichText::new("Output channels").size(14.0));
-            let chans = caps.as_ref().map(|c| c.channels).unwrap_or(2);
-            let pair = |first: u16| format!("{} / {}", first + 1, first + 2);
-            let cur = if app.prefs.audio_channel + 1 < chans { app.prefs.audio_channel } else { 0 };
-            let mut new_ch = None;
+        let chans = caps.as_ref().map(|c| c.channels).unwrap_or(2);
+        let pair = |first: u16| format!("{} / {}", first + 1, first + 2);
+        let cur = if app.prefs.audio_channel + 1 < chans { app.prefs.audio_channel } else { 0 };
+        let mut new_ch = None;
+        kit::labeled(ui, "Output channels", |ui| {
             ui.add_enabled_ui(chans > 2, |ui| {
-                egui::ComboBox::from_id_salt("audio_ch").width(330.0).selected_text(RichText::new(if chans >= 2 { pair(cur) } else { "1".into() }).font(bold(14.0))).show_ui(ui, |ui| {
+                kit::combo("audio_ch", 400.0, if chans >= 2 { pair(cur) } else { "1".into() }, 14.0).show_ui(ui, |ui| {
                     let mut first = 0;
                     while first + 1 < chans {
                         if ui.selectable_label(cur == first, pair(first)).clicked() {
@@ -714,29 +776,30 @@ fn page_audio(app: &mut App, ui: &mut Ui) {
             })
             .response
             .on_disabled_hover_text("This device has one stereo output.");
-            if let Some(c) = new_ch.filter(|c| *c != app.prefs.audio_channel) {
-                app.prefs.audio_channel = c;
-                apply_audio(app);
-            }
-            ui.end_row();
         });
+        if let Some(c) = new_ch.filter(|c| *c != app.prefs.audio_channel) {
+            app.prefs.audio_channel = c;
+            apply_audio(app);
+        }
 
         match &state {
             None => note(ui, "Looking for audio devices…"),
-            Some(None) => {
-                ui.label(RichText::new("macOS did not answer with the list of audio devices. The system's default output is used; try Refresh.").size(11.0).color(CAUTION_TX));
-            }
+            Some(None) => kit::block(ui, |ui| {
+                ui.label(kit::text("macOS did not answer with the list of audio devices. The system's default output is used; try Refresh.", 11.0).color(CAUTION_TX));
+            }),
             _ => {}
         }
         if let (Some(d), Some(Some(_))) = (&current, &state) {
             if !devices.contains(d) {
-                ui.label(RichText::new(format!("\"{d}\" is not connected; the system's default output is used.")).size(11.0).color(CAUTION_TX));
+                kit::block(ui, |ui| {
+                    ui.label(kit::text(format!("\"{d}\" is not connected; the system's default output is used."), 11.0).color(CAUTION_TX));
+                });
             }
         }
-        ui.horizontal(|ui| {
-            let dev = caps.as_ref().map(|c| c.name.clone()).unwrap_or_default();
-            note(ui, &format!("Running at {} Hz{}.", app.player.device_rate, if dev.is_empty() { String::new() } else { format!(" on {dev}") }));
-            if ui.small_button("Refresh").clicked() {
+        let dev = caps.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+        note(ui, &format!("Running at {} Hz{}.", app.player.device_rate, if dev.is_empty() { String::new() } else { format!(" on {dev}") }));
+        kit::block(ui, |ui| {
+            if ui.add(btn("Refresh").small()).clicked() {
                 ui.ctx().data_mut(|m| {
                     m.remove::<Slot>(list_id);
                     m.remove::<CapSlot>(caps_id);
@@ -753,68 +816,115 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         card(ui, "CUE Analysis", |ui| {
             toggle(ui, &mut app.prefs.memory_cue_first_beat, "Set Memory Cue at the first beat of track when analyzing");
             note(ui, "For tracks that have no memory cue yet.");
-            ui.separator();
+            separator(ui);
             toggle(ui, &mut app.prefs.auto_first_downbeat_cue, "Set Hot Cue A on the first downbeat (\"1.1Bars\") when analyzing");
             note(ui, "As rekordbox does on first analysis. Only for tracks that have no cues yet; tracks from your rekordbox library keep their own cues.");
         });
         return;
     }
+    let no_cloud = "Recordbox has no cloud service: nothing is collected or uploaded.";
     card(ui, "Track Analysis", |ui| {
-        toggle_if(ui, HIGH_PRECISION_WIRED, &mut app.prefs.high_precision_grid, "Use high precision BeatGrid analysis", "Recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.");
-        ui.separator();
-        sub(ui, "Track Analysis Mode");
-        egui::Grid::new("tam").num_columns(2).spacing(vec2(40.0, 10.0)).show(ui, |ui| {
-            ui.label(RichText::new("Analysis Mode").size(14.0));
+        let why = "Recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
+        let mut refused = false;
+        kit::row(ui, 16.0, |ui| {
+            if HIGH_PRECISION_WIRED {
+                kit::toggle_raw(ui, &mut app.prefs.high_precision_grid, "Use high precision BeatGrid analysis");
+            } else {
+                refused = kit::toggle_off_raw(ui, "Use high precision BeatGrid analysis", why);
+            }
+            kit::help(ui, 37.5, if HIGH_PRECISION_WIRED { "A more precise beat grid, at the cost of a longer analysis." } else { why });
+        });
+        if refused {
+            app.toast(why);
+        }
+        separator(ui);
+        kit::sub_help(ui, "Track Analysis Mode", Some("Normal: optimized for tracks which have a constant BPM.\nDynamic: for tracks whose tempo changes, the beat grid follows the tempo."));
+        kit::labeled(ui, "Analysis Mode", |ui| {
             let modes = [("Normal", "Optimized for tracks which have a constant BPM"), ("Dynamic", "For tracks whose tempo changes: the beat grid follows the tempo")];
             let cur = (app.prefs.analysis_mode as usize).min(1);
-            egui::ComboBox::from_id_salt("amode").width(330.0).selected_text(RichText::new(modes[cur].0).font(bold(14.0))).show_ui(ui, |ui| {
+            kit::combo("amode", 400.0, modes[cur].0, 14.0).show_ui(ui, |ui| {
                 for (i, (n, tip)) in modes.iter().enumerate() {
                     if ui.selectable_label(cur == i, *n).on_hover_text(*tip).clicked() {
                         app.prefs.analysis_mode = i as u8;
                     }
                 }
             });
-            ui.end_row();
-            ui.label(RichText::new("BPM Range").size(14.0));
+        });
+        kit::labeled(ui, "BPM Range", |ui| {
             let (lo, hi) = BPM_RANGES[app.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-            egui::ComboBox::from_id_salt("bpmrange").width(330.0).selected_text(RichText::new(format!("{lo:.0}-{hi:.0}")).font(bold(14.0))).show_ui(ui, |ui| {
+            kit::combo("bpmrange", 400.0, format!("{lo:.0}-{hi:.0}"), 14.0).show_ui(ui, |ui| {
                 for (i, (a, b)) in BPM_RANGES.iter().enumerate() {
                     ui.selectable_value(&mut app.prefs.bpm_range, i, format!("{a:.0}-{b:.0}"));
                 }
             });
-            ui.end_row();
         });
-        ui.separator();
+        separator(ui);
         sub(ui, "Track Analysis Setting");
-        ui.indent("tas", |ui| {
-            ui.checkbox(&mut app.prefs.analyze_grid, RichText::new("BPM / Grid").size(14.0));
-            ui.checkbox(&mut app.prefs.analyze_key, RichText::new("KEY").size(14.0));
-            ui.checkbox(&mut app.prefs.phrase_analysis, RichText::new("Phrase").size(14.0)).on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
-            ui.checkbox(&mut app.prefs.vocal_analysis, RichText::new("Vocal").size(14.0)).on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
+        kit::indent(ui, 110.0);
+        kit::row(ui, 16.0, |ui| {
+            kit::checkbox_raw(ui, &mut app.prefs.analyze_grid, "BPM / Grid");
+            kit::help(ui, 54.0, "If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.");
         });
-        note(ui, "If tracks are not analyzed, BPM/Grid analysis starts when importing, loading, or exporting the tracks whether you tick this checkbox or not.");
-        ui.separator();
+        kit::checkbox(ui, &mut app.prefs.analyze_key, "KEY");
+        kit::checkbox(ui, &mut app.prefs.phrase_analysis, "Phrase").on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
+        kit::checkbox(ui, &mut app.prefs.vocal_analysis, "Vocal").on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
+        separator(ui);
         sub(ui, "Auto Analysis");
-        ui.indent("aa", |ui| {
-            toggle(ui, &mut app.prefs.auto_analysis, "Enable");
-        });
+        toggle(ui, &mut app.prefs.auto_analysis, "Enable");
+        separator(ui);
+        // The cloud services are not part of Recordbox: shown switched off.
+        ui.add_space(-3.5);
+        kit::sub_help(ui, "Cloud Analysis", Some(no_cloud));
+        ui.add_space(1.5);
+        let mut refused = kit::toggle_off(ui, "Participate in rekordbox data collection\nand upload analysis data", no_cloud);
+        ui.add_space(5.0);
+        separator(ui);
+        ui.add_space(-3.5);
+        kit::sub_help(ui, "Radar Analysis", Some(no_cloud));
+        ui.add_space(1.5);
+        refused |= kit::toggle_off(ui, "Enable", no_cloud);
+        if refused {
+            app.toast(no_cloud);
+        }
     });
-    card(ui, "Key (Recordbox)", |ui| {
-        toggle(ui, &mut app.prefs.keep_tag_key, "Keep the key written in a file's tag (for example by Mixed In Key) instead of analysing it");
-        note(ui, "Track > Analyze Key always analyses and replaces the key.");
+    card(ui, "Key Analysis", |ui| {
+        let why = "Recordbox never changes your audio files; the key is kept in its own library.";
+        if kit::toggle_off(ui, "Write the value to the ID3 tag", why) {
+            app.toast(why);
+        }
     });
     card(ui, "Auto Gain (Recordbox)", |ui| {
-        ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));
+        kit::block(ui, |ui| {
+            ui.add(egui::Slider::new(&mut app.prefs.target_lufs, -20.0..=-5.0).suffix(" LUFS").text("Reference loudness"));
+        });
         toggle(ui, &mut app.prefs.auto_gain_peak_cap, "Limit gain so the loudest peak stays below full scale");
         note(ui, "Used for the preview player's gain and stored per track when analysing.");
-        if ui.button("Re-analyze all tracks now").clicked() {
-            let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
-            app.reanalyze(&ids);
-        }
+        kit::block(ui, |ui| {
+            if ui.add(btn("Re-analyze all tracks now")).clicked() {
+                let ids: Vec<i64> = app.tracks.iter().map(|t| t.id).collect();
+                app.reanalyze(&ids);
+            }
+        });
     });
 }
 
 // ------------------------------------------------------------------ DJ System
+
+/// A widget at an exact place inside a card that is laid out by coordinates.
+fn place(ui: &mut Ui, r: Rect, enabled: bool, w: impl egui::Widget) -> egui::Response {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    child.add_enabled(enabled, w)
+}
+
+/// The grey 20 pt square with a white arrow head under the Active list.
+fn order_button(ui: &mut Ui, r: Rect, up: bool, enabled: bool, tip: &str) -> bool {
+    let resp = ui.interact(r, ui.id().with(("order", up, r.min.x as i32)), if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    ui.painter().rect_filled(r, 2.0, if !enabled { hex(0x3A3A3A) } else if resp.hovered() { hex(0x666666) } else { hex(0x555555) });
+    let (a, b) = if up { (r.min.y + 12.0, r.min.y + 8.0) } else { (r.min.y + 8.0, r.min.y + 12.0) };
+    let pts = vec![pos2(r.min.x + 6.0, a), pos2(r.min.x + 10.0, b), pos2(r.min.x + 14.0, a)];
+    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.0, if enabled { WHITE } else { OFF })));
+    resp.on_hover_text(tip).clicked()
+}
 
 /// rekordbox's two lists: pick a name, then move it with the arrows.
 fn dual_list(app: &mut App, ui: &mut Ui, is_cat: bool) {
@@ -831,99 +941,75 @@ fn dual_list(app: &mut App, ui: &mut Ui, is_cat: bool) {
     let row = |ui: &mut Ui, name: &str, selected: bool, greyed: bool| -> bool {
         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), egui::Sense::click());
         if selected {
-            ui.painter().rect_filled(r, 0.0, BLUE);
+            ui.painter().rect_filled(r, 0.0, PBLUE);
         }
-        ui.painter().text(egui::pos2(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, name.to_uppercase(), egui::FontId::proportional(13.0), if greyed { OFF } else { WHITE });
+        ui.painter().text(pos2(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, name.to_uppercase(), inter(13.0), if greyed { OFF } else { WHITE });
         resp.clicked()
     };
-    let list_h = 380.0;
-    egui::Frame::default().fill(BG2).inner_margin(egui::Margin { left: 20, right: 20, top: 18, bottom: 18 }).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_top(|ui| {
+    // The card and everything in it at the original's coordinates (628 x 484 pt).
+    let w = ui.available_width().min(kit::CARD_W);
+    let (card, _) = ui.allocate_exact_size(vec2(w, 484.0), egui::Sense::hover());
+    ui.painter().rect_filled(card, 0.0, BG2);
+    let at = |x: f32, y: f32| pos2(card.min.x + x, card.min.y + y);
+    let left = Rect::from_min_max(at(20.0, 54.0), at(284.0, 464.0));
+    let right = Rect::from_min_max(at(344.0, 54.0), at(608.0, 441.0));
+    ui.painter().text(pos2(left.center().x, card.min.y + 29.5), egui::Align2::CENTER_CENTER, if is_cat { "Inactive Categories" } else { "Inactive Sort Options" }, inter_bold(14.0), WHITE);
+    ui.painter().text(pos2(right.center().x, card.min.y + 30.75), egui::Align2::CENTER_CENTER, if is_cat { "Active Categories" } else { "Active Sort Options" }, inter_bold(15.75), WHITE);
+    ui.painter().rect_filled(left, 0.0, BG);
+    ui.painter().rect_filled(right, 0.0, BG);
+    let list = |ui: &mut Ui, r: Rect, salt: &str, add: &mut dyn FnMut(&mut Ui)| {
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)));
+        egui::ScrollArea::vertical().id_salt((salt, is_cat)).max_height(r.height()).auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            ui.vertical(|ui| {
-                ui.set_width(250.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new(if is_cat { "Inactive Categories" } else { "Inactive Sort Options" }).font(bold(14.0)).color(WHITE)));
-                ui.add_space(10.0);
-                egui::Frame::default().fill(BG).show(ui, |ui| {
-                    ui.set_width(250.0);
-                    ui.set_min_height(list_h);
-                    egui::ScrollArea::vertical().id_salt(("dl_in", is_cat)).max_height(list_h).show(ui, |ui| {
-                        for (id, name) in &inactive {
-                            if row(ui, name, sel.0 == Some(*id), false) {
-                                sel = (Some(*id), None);
-                            }
-                        }
-                    });
-                });
-            });
-            ui.vertical(|ui| {
-                ui.set_width(56.0);
-                ui.add_space(list_h / 2.0 - 6.0);
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    let can_add = sel.0.is_some();
-                    if ui.add_enabled(can_add, egui::Button::new(">").min_size(vec2(22.0, 22.0))).on_hover_text("Make active").clicked() {
-                        if let Some(id) = sel.0.take() {
-                            next.push(id);
-                            sel.1 = Some(id);
-                        }
-                    }
-                    let can_remove = sel.1.map(|id| !fixed.contains(&id)).unwrap_or(false);
-                    if ui.add_enabled(can_remove, egui::Button::new("<").min_size(vec2(22.0, 22.0))).on_hover_text("Make inactive").on_disabled_hover_text("Greyed items are always shown on the players.").clicked() {
-                        if let Some(id) = sel.1.take() {
-                            next.retain(|x| *x != id);
-                            sel.0 = Some(id);
-                        }
-                    }
-                });
-            });
-            ui.vertical(|ui| {
-                ui.set_width(250.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new(if is_cat { "Active Categories" } else { "Active Sort Options" }).font(bold(14.0)).color(WHITE)));
-                ui.add_space(10.0);
-                egui::Frame::default().fill(BG).show(ui, |ui| {
-                    ui.set_width(250.0);
-                    ui.set_min_height(list_h - 34.0);
-                    egui::ScrollArea::vertical().id_salt(("dl_ac", is_cat)).max_height(list_h - 34.0).show(ui, |ui| {
-                        for id in &active {
-                            let name = column_name(*id).unwrap_or("?");
-                            if row(ui, name, sel.1 == Some(*id), fixed.contains(id)) {
-                                sel = (None, Some(*id));
-                            }
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                // Order: categories move freely; fixed sort options stay where the players put them.
-                let pos = sel.1.and_then(|id| active.iter().position(|x| *x == id));
-                let movable = |i: usize| is_cat || !fixed.contains(&active[i]);
-                let can_down = pos.map(|i| i + 1 < active.len() && movable(i) && movable(i + 1)).unwrap_or(false);
-                let can_up = pos.map(|i| i > 0 && movable(i) && movable(i - 1)).unwrap_or(false);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add_space(250.0 / 2.0 - 25.0);
-                    let down = ui.add_enabled(can_down, egui::Button::new(" ").min_size(vec2(22.0, 22.0))).on_hover_text("Down");
-                    crate::icons::chevron_down(ui.painter(), down.rect.shrink(5.0), if can_down { WHITE } else { OFF });
-                    if down.clicked() {
-                        if let Some(i) = pos {
-                            next.swap(i, i + 1);
-                        }
-                    }
-                    let up = ui.add_enabled(can_up, egui::Button::new(" ").min_size(vec2(22.0, 22.0))).on_hover_text("Up");
-                    let r = up.rect.shrink(5.0);
-                    let c = if can_up { WHITE } else { OFF };
-                    ui.painter().line_segment([egui::pos2(r.min.x, r.max.y - 2.0), egui::pos2(r.center().x, r.min.y + 2.0)], egui::Stroke::new(1.5_f32, c));
-                    ui.painter().line_segment([egui::pos2(r.center().x, r.min.y + 2.0), egui::pos2(r.max.x, r.max.y - 2.0)], egui::Stroke::new(1.5_f32, c));
-                    if up.clicked() {
-                        if let Some(i) = pos {
-                            next.swap(i, i - 1);
-                        }
-                    }
-                });
-            });
+            ui.add_space(1.0);
+            add(ui);
         });
+    };
+    list(ui, left, "dl_in", &mut |ui| {
+        for (id, name) in &inactive {
+            if row(ui, name, sel.0 == Some(*id), false) {
+                sel = (Some(*id), None);
+            }
+        }
     });
+    list(ui, right, "dl_ac", &mut |ui| {
+        for id in &active {
+            let name = column_name(*id).unwrap_or("?");
+            if row(ui, name, sel.1 == Some(*id), fixed.contains(id)) {
+                sel = (None, Some(*id));
+            }
+        }
+    });
+    let can_add = sel.0.is_some();
+    if place(ui, Rect::from_min_size(at(304.0, 221.0), vec2(20.0, 20.0)), can_add, btn(">").exact(vec2(20.0, 20.0)).font_size(12.0)).on_hover_text("Make active").clicked() {
+        if let Some(id) = sel.0.take() {
+            next.push(id);
+            sel.1 = Some(id);
+        }
+    }
+    let can_remove = sel.1.map(|id| !fixed.contains(&id)).unwrap_or(false);
+    if place(ui, Rect::from_min_size(at(304.0, 251.0), vec2(20.0, 20.0)), can_remove, btn("<").exact(vec2(20.0, 20.0)).font_size(12.0)).on_hover_text("Make inactive").on_disabled_hover_text("Greyed items are always shown on the players.").clicked() {
+        if let Some(id) = sel.1.take() {
+            next.retain(|x| *x != id);
+            sel.0 = Some(id);
+        }
+    }
+    // Order: categories move freely; fixed sort options stay where the players put them.
+    let pos = sel.1.and_then(|id| active.iter().position(|x| *x == id));
+    let movable = |i: usize| is_cat || !fixed.contains(&active[i]);
+    let can_down = pos.map(|i| i + 1 < active.len() && movable(i) && movable(i + 1)).unwrap_or(false);
+    let can_up = pos.map(|i| i > 0 && movable(i) && movable(i - 1)).unwrap_or(false);
+    if order_button(ui, Rect::from_min_size(at(452.0, 446.0), vec2(20.0, 20.0)), false, can_down, "Down") {
+        if let Some(i) = pos {
+            next.swap(i, i + 1);
+        }
+    }
+    if order_button(ui, Rect::from_min_size(at(478.0, 446.0), vec2(20.0, 20.0)), true, can_up, "Up") {
+        if let Some(i) = pos {
+            next.swap(i, i - 1);
+        }
+    }
+    ui.add_space(4.0);
     ui.ctx().data_mut(|d| d.insert_temp(sel_id, sel));
     if next != active {
         if is_cat {
@@ -936,54 +1022,72 @@ fn dual_list(app: &mut App, ui: &mut Ui, is_cat: bool) {
 }
 
 fn setting_rows(app: &mut App, ui: &mut Ui, id: &str, fields: &[crate::export::settings::Field]) {
-    egui::Grid::new(id).num_columns(2).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
-        for f in fields {
-            // Waveform Divisions is on the General tab, as in rekordbox.
-            if f.file == SettingFile::My2 && f.offset == 4 {
-                continue;
-            }
-            ui.label(RichText::new(f.name.to_uppercase()).size(13.0));
-            let cur = app.prefs.usb_settings.get(f.file, f.offset);
-            let shown = f.options.iter().find(|o| o.1 == cur).map(|o| o.0).unwrap_or("—");
-            let file_tag = match f.file {
-                SettingFile::My => 0u8,
-                SettingFile::My2 => 1,
-                SettingFile::Dev => 2,
-                SettingFile::Djm => 3,
-            };
-            egui::ComboBox::from_id_salt(("myset", f.offset, file_tag)).selected_text(RichText::new(shown).font(bold(13.0))).width(220.0).show_ui(ui, |ui| {
-                for (label, v) in f.options {
-                    if ui.selectable_label(cur == *v, *label).clicked() {
-                        app.prefs.usb_settings.set(f.file, f.offset, *v);
-                    }
+    kit::block(ui, |ui| {
+        ui.spacing_mut().interact_size.y = 19.0;
+        ui.spacing_mut().button_padding.y = 0.0;
+        egui::Grid::new(id).num_columns(2).spacing(vec2(24.0, 7.0)).show(ui, |ui| {
+            for f in fields {
+                // Waveform Divisions is on the General tab, as in rekordbox.
+                if f.file == SettingFile::My2 && f.offset == 4 {
+                    continue;
                 }
-            });
-            ui.end_row();
-        }
+                ui.label(kit::text(f.name.to_uppercase(), 13.0).color(WHITE));
+                let cur = app.prefs.usb_settings.get(f.file, f.offset);
+                let shown = f.options.iter().find(|o| o.1 == cur).map(|o| o.0).unwrap_or("—");
+                let file_tag = match f.file {
+                    SettingFile::My => 0u8,
+                    SettingFile::My2 => 1,
+                    SettingFile::Dev => 2,
+                    SettingFile::Djm => 3,
+                };
+                kit::combo(("myset", f.offset, file_tag), 240.0, shown, 12.0).show_ui(ui, |ui| {
+                    for (label, v) in f.options {
+                        if ui.selectable_label(cur == *v, *label).clicked() {
+                            app.prefs.usb_settings.set(f.file, f.offset, *v);
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+        });
     });
 }
 
 pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
+            // No AlphaTheta account in Recordbox: the section is shown switched off.
+            card(ui, "Display username on-screen", |ui| {
+                sub(ui, "Display the AlphaTheta account nickname on CDJ/XDJ");
+                kit::indent(ui, 88.0);
+                let why = "Recordbox has no AlphaTheta account, so there is no nickname to show.";
+                if kit::toggle_off(ui, "OFF", why) {
+                    app.toast(why);
+                }
+            });
             card(ui, "Background Color", |ui| {
                 sub(ui, "Color of device displayed on CDJ/XDJ");
+                kit::indent(ui, 88.0);
                 let names = ["Default Color", "Pink", "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple"];
                 let cur = (app.prefs.device_bg_color as usize).min(8);
-                egui::ComboBox::from_id_salt("bgcolor").width(330.0).selected_text(RichText::new(names[cur]).font(bold(14.0))).show_ui(ui, |ui| {
-                    for (i, n) in names.iter().enumerate() {
-                        let text = RichText::new(format!("■ {n}")).color(if i == 0 { DIM2 } else { label_color(i as u8) });
-                        if ui.selectable_label(cur == i, text).clicked() {
-                            app.prefs.device_bg_color = i as u8;
+                kit::combo_row(ui, 19.0, |ui| {
+                    let r = kit::combo("bgcolor", 500.0, names[cur], 12.0).show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            let text = RichText::new(format!("■ {n}")).color(if i == 0 { DIM2 } else { label_color(i as u8) });
+                            if ui.selectable_label(cur == i, text).clicked() {
+                                app.prefs.device_bg_color = i as u8;
+                            }
                         }
+                    });
+                    if !BG_COLOR_WRITTEN {
+                        r.response.on_hover_text("Not written to the device yet: where the players keep this colour has not been confirmed. Your choice is kept for when it is.");
                     }
                 });
-                if !BG_COLOR_WRITTEN {
-                    note(ui, "Not written to the device yet: where the players keep this colour has not been confirmed. Your choice is kept for when it is.");
-                }
+                ui.add_space(-3.0);
             });
             card(ui, "Waveform color", |ui| {
                 sub(ui, "Waveform color displayed on CDJ/XDJ");
+                kit::indent(ui, 88.0);
                 let cur = app.prefs.usb_settings.get(SettingFile::Dev, DEV_WAVEFORM_COLOR);
                 for (label, v) in [("BLUE", 1u8), ("RGB", 3), ("3Band", 4)] {
                     if radio(ui, cur == v, label) {
@@ -993,6 +1097,7 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             });
             card(ui, "Waveform Current Position", |ui| {
                 sub(ui, "Waveform Current Position displayed on CDJ/XDJ");
+                kit::indent(ui, 88.0);
                 let cur = app.prefs.usb_settings.get(SettingFile::Dev, DEV_WAVEFORM_POSITION);
                 for (label, v) in [("LEFT", 2u8), ("CENTER", 1)] {
                     if radio(ui, cur == v, label) {
@@ -1000,8 +1105,9 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
                     }
                 }
             });
-            card(ui, "Waveform Divisions", |ui| {
+            kit::card_help(ui, "Waveform Divisions", Some("Time Scale: bar lines under the waveform.\nPhrase: the track's phrases (Intro, Up, Down, Chorus, Outro) under the waveform, on players that show them."), |ui| {
                 sub(ui, "Waveform division displayed under the CDJ/XDJ waveform");
+                kit::indent(ui, 88.0);
                 let cur = app.prefs.usb_settings.get(SettingFile::My2, 4);
                 for (label, v) in [("Time Scale", 0x80u8), ("Phrase", 0x81)] {
                     if radio(ui, cur == v, label) {
@@ -1011,6 +1117,7 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             });
             card(ui, "Type of the Overview Waveform", |ui| {
                 sub(ui, "Type of the Overview Waveform displayed on CDJ/XDJ");
+                kit::indent(ui, 88.0);
                 let cur = app.prefs.usb_settings.get(SettingFile::Dev, DEV_OVERVIEW_TYPE);
                 for (label, v) in [("Half Waveform", 1u8), ("Full Waveform", 2)] {
                     if radio(ui, cur == v, label) {
@@ -1024,38 +1131,43 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
         3 => {
             card(ui, "Column", |ui| {
                 sub(ui, "Select item which is shown next to track name on CDJ/XDJ");
-                ui.add_enabled_ui(false, |ui| {
-                    egui::ComboBox::from_id_salt("rightcol").width(330.0).selected_text(RichText::new("Not Specified").font(bold(14.0))).show_ui(ui, |_| {});
-                })
-                .response
-                .on_disabled_hover_text("Where the players store this choice has not been confirmed, so Recordbox does not write it; the players show their own default.");
+                kit::indent(ui, 88.0);
+                let why = "Where the players store this choice has not been confirmed, so Recordbox does not write it; the players show their own default.";
+                kit::combo_row(ui, 19.0, |ui| {
+                    ui.add_enabled_ui(false, |ui| {
+                        kit::combo("rightcol", 500.0, "Not Specified", 12.0).show_ui(ui, |_| {});
+                    })
+                    .response
+                    .on_disabled_hover_text(why);
+                });
                 note(ui, "Not written yet: where the players store this choice has not been confirmed, so they show their own default.");
             });
         }
         4 => {
             card(ui, "My Settings", |ui| {
-                ui.label(RichText::new("Player settings written to every USB you export. CDJ/XDJ players apply them when the USB is loaded.").size(12.0).color(DIM2));
+                kit::line(ui, "Player settings written to every USB you export. CDJ/XDJ players apply them when the USB is loaded.");
                 sub(ui, "CDJ / XDJ");
                 setting_rows(app, ui, "my_settings_grid", crate::export::settings_fields::MY_SETTINGS);
-                ui.separator();
+                separator(ui);
                 sub(ui, "DJM");
                 setting_rows(app, ui, "djm_settings_grid", crate::export::settings_fields::DJM_SETTINGS);
-                ui.add_space(6.0);
-                if ui.button("Reset to rekordbox defaults").clicked() {
-                    // The General tab's choices (DEVSETTING and Waveform Divisions) stay.
-                    let keep = (app.prefs.usb_settings.dev.clone(), app.prefs.usb_settings.get(SettingFile::My2, 4));
-                    app.prefs.usb_settings = crate::export::settings::UsbSettings { dev: keep.0, ..Default::default() };
-                    app.prefs.usb_settings.set(SettingFile::My2, 4, keep.1);
-                }
+                kit::block(ui, |ui| {
+                    if ui.add(btn("Reset to rekordbox defaults")).clicked() {
+                        // The General tab's choices (DEVSETTING and Waveform Divisions) stay.
+                        let keep = (app.prefs.usb_settings.dev.clone(), app.prefs.usb_settings.get(SettingFile::My2, 4));
+                        app.prefs.usb_settings = crate::export::settings::UsbSettings { dev: keep.0, ..Default::default() };
+                        app.prefs.usb_settings.set(SettingFile::My2, 4, keep.1);
+                    }
+                });
             });
         }
         5 => {
             card(ui, "Delete Tracks", |ui| {
-                toggle(ui, &mut app.prefs.delete_device_tracks, "Delete playlist tracks from device if playlist is deleted");
+                toggle(ui, &mut app.prefs.delete_device_tracks, "Delete playlist tracks from device\nif playlist is deleted");
             });
             card(ui, "History", |ui| {
                 toggle(ui, &mut app.prefs.import_device_history, "Import the play history automatically");
-                toggle_if(ui, HISTORY_DELETE_WIRED, &mut app.prefs.delete_history_after_import, "Delete from the device after importing the play history", "Recordbox does not remove histories from a device yet; imported histories are left on it.");
+                toggle_if(app, ui, HISTORY_DELETE_WIRED, |p| &mut p.delete_history_after_import, "Delete from the device after importing the play history", "Recordbox does not remove histories from a device yet; imported histories are left on it.");
             });
         }
         _ => {
@@ -1064,12 +1176,12 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
                 note(ui, "Tracks get Hot Cue Auto Load switched on as they are imported, so players set to \"rekordbox SETTING\" load their hot cues.");
             });
             card(ui, "Waveform data written to the device", |ui| {
-                ui.label(RichText::new("Exports always include the blue, RGB and 3-band waveforms; DJ System > General chooses which one the players show.").size(12.0).color(DIM2));
+                kit::line(ui, "Exports always include the blue, RGB and 3-band waveforms; DJ System > General chooses which one the players show.");
             });
             card(ui, "Supported devices", |ui| {
-                ui.label(RichText::new("Drive formats: FAT32, exFAT (some players), HFS+ (USB only).").size(13.0));
-                ui.label(RichText::new("Files: MP3, AAC/M4A, WAV, AIFF, FLAC.").size(13.0));
-                ui.label(RichText::new("Device library: export.pdb + exportExt.pdb with analysis files (DAT / EXT / 2EX) and the music in /Contents.").size(12.0).color(DIM2));
+                kit::line(ui, "Drive formats: FAT32, exFAT (some players), HFS+ (USB only).");
+                kit::line(ui, "Files: MP3, AAC/M4A, WAV, AIFF, FLAC.");
+                note(ui, "Device library: export.pdb + exportExt.pdb with analysis files (DAT / EXT / 2EX) and the music in /Contents.");
             });
         }
     }
@@ -1083,7 +1195,7 @@ const RESERVED: [&str; 9] = ["Cmd+N", "Cmd+E", "Cmd+I", "Cmd+Z", "Shift+Cmd+Z", 
 fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
     let cat = ACTION_CATEGORIES[tab.min(ACTION_CATEGORIES.len() - 1)];
     card(ui, cat, |ui| {
-        ui.label(RichText::new("Click a shortcut, then press the new key for that action, with Ctrl, Opt, Shift or ⌘ if you like (Esc cancels, Delete clears).").size(12.0).color(DIM2));
+        kit::line(ui, "Click a shortcut, then press the new key for that action, with Ctrl, Opt, Shift or ⌘ if you like (Esc cancels, Delete clears).");
         let wait_id = egui::Id::new("key_wait");
         let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
         if let Some(action) = &waiting {
@@ -1112,35 +1224,35 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                 ui.ctx().data_mut(|d| d.insert_temp::<Option<String>>(wait_id, None));
             }
         }
-        egui::Grid::new(("keymap_grid", tab)).num_columns(3).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+        kit::block(ui, |ui| egui::Grid::new(("keymap_grid", tab)).num_columns(3).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
             for (id, label, def, c) in ACTIONS {
                 if c != cat {
                     continue;
                 }
-                ui.label(RichText::new(label).size(13.0));
+                ui.label(kit::text(label, 13.0).color(WHITE));
                 let shown = if waiting.as_deref() == Some(id) { "Press a key…".to_string() } else { app.prefs.shortcut_for(id).map(|k| key_text(&k)).unwrap_or_else(|| "—".into()) };
-                if ui.add(egui::Button::new(RichText::new(shown).size(13.0)).min_size(vec2(140.0, 22.0))).clicked() {
+                if ui.add(btn(shown).min_size(vec2(140.0, 22.0))).clicked() {
                     ui.ctx().data_mut(|d| d.insert_temp(wait_id, Some(id.to_string())));
                 }
                 let changed = app.prefs.keymap.contains_key(id);
-                if ui.add_enabled(changed, egui::Button::new(RichText::new("Default").size(11.0))).on_hover_text(if def.is_empty() { "Not assigned".to_string() } else { Shortcut::parse(def).map(|s| key_text(&s)).unwrap_or_default() }).clicked() {
+                if ui.add_enabled(changed, btn("Default").small()).on_hover_text(if def.is_empty() { "Not assigned".to_string() } else { Shortcut::parse(def).map(|s| key_text(&s)).unwrap_or_default() }).clicked() {
                     app.prefs.keymap.remove(id);
                 }
                 ui.end_row();
             }
-        });
+        }));
     });
     card(ui, "Keyboard shortcuts", |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Reset to defaults").clicked() {
+        kit::block(ui, |ui| ui.horizontal(|ui| {
+            if ui.add(btn("Reset to defaults")).clicked() {
                 app.dialogs.ext.reset_ask = Some(Some(3));
             }
-            if ui.button("Export…").clicked() {
+            if ui.add(btn("Export…")).clicked() {
                 if let Some(f) = rfd::FileDialog::new().set_file_name("recordbox-shortcuts.json").save_file() {
                     let _ = std::fs::write(f, serde_json::to_vec_pretty(&app.prefs.keymap).unwrap_or_default());
                 }
             }
-            if ui.button("Import…").clicked() {
+            if ui.add(btn("Import…")).clicked() {
                 if let Some(f) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                     match std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&b).ok()) {
                         Some(m) => app.prefs.keymap = m.into_iter().filter(|(k, v)| ACTIONS.iter().any(|a| a.0 == k) && (v.is_empty() || Shortcut::parse(v).is_some())).collect(),
@@ -1148,10 +1260,10 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
                     }
                 }
             }
-            if ui.button("Show all…").clicked() {
+            if ui.add(btn("Show all…")).clicked() {
                 app.dialogs.ext.shortcuts_open = true;
             }
-        });
+        }));
         note(ui, "⌘ and Ctrl shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
     });
 }
@@ -1163,21 +1275,25 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         0 => {
             card(ui, "Database management", |ui| {
                 sub(ui, "Location");
-                path_row(ui, &Some(crate::db::data_dir().display().to_string()), "");
+                kit::block(ui, |ui| path_row(ui, &Some(crate::db::data_dir().display().to_string()), ""));
                 note(ui, "Your music files are only read. Edits (tags, cues, grids) are kept in this private library.");
-                if ui.button("Show in Finder").clicked() {
-                    let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
-                }
-                ui.separator();
+                kit::block(ui, |ui| {
+                    if ui.add(btn("Show in Finder")).clicked() {
+                        let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+                    }
+                });
+                separator(ui);
                 sub(ui, "Library");
                 let busy = app.dialogs.ext.backup_job.is_some();
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Backup Library").size(14.0)).min_size(vec2(150.0, 26.0))).clicked() {
-                        crate::menus::handle(app, "backup");
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Restore Library").size(14.0)).min_size(vec2(150.0, 26.0))).clicked() {
-                        crate::menus::handle(app, "restore");
-                    }
+                kit::block(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy, btn("Backup Library").min_size(vec2(150.0, 22.0))).clicked() {
+                            crate::menus::handle(app, "backup");
+                        }
+                        if ui.add_enabled(!busy, btn("Restore Library").min_size(vec2(150.0, 22.0))).clicked() {
+                            crate::menus::handle(app, "restore");
+                        }
+                    });
                 });
                 note(ui, "A backup is one .zip file with the database, the artwork and, if you choose, the music files. Before a restore replaces the library, the present one is copied into the backups folder here.");
             });
@@ -1185,93 +1301,99 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         1 => {
             card(ui, "iTunes", |ui| {
                 sub(ui, "iTunes Library File");
-                path_row(ui, &app.prefs.itunes_xml, "no recently selected files");
-                ui.horizontal(|ui| {
-                    if ui.button("Browse").clicked() {
-                        if let Some(f) = rfd::FileDialog::new().add_filter("iTunes Library", &["xml"]).pick_file() {
-                            app.prefs.itunes_xml = Some(f.to_string_lossy().to_string());
+                kit::block(ui, |ui| {
+                    path_row(ui, &app.prefs.itunes_xml, "no recently selected files");
+                    ui.horizontal(|ui| {
+                        if ui.add(btn("Browse")).clicked() {
+                            if let Some(f) = rfd::FileDialog::new().add_filter("iTunes Library", &["xml"]).pick_file() {
+                                app.prefs.itunes_xml = Some(f.to_string_lossy().to_string());
+                            }
                         }
-                    }
-                    if app.prefs.itunes_xml.is_some() && ui.button("Clear").clicked() {
-                        app.prefs.itunes_xml = None;
-                    }
+                        if app.prefs.itunes_xml.is_some() && ui.add(btn("Clear")).clicked() {
+                            app.prefs.itunes_xml = None;
+                        }
+                    });
                 });
                 note(ui, "The library file the iTunes source of the Tree View reads. Without one, the usual places and the Music app are tried.");
             });
             card(ui, "rekordbox xml", |ui| {
                 sub(ui, "Imported Library");
-                path_row(ui, &app.prefs.rekordbox_xml_path, "no recently selected files");
-                ui.horizontal(|ui| {
-                    if ui.button("Browse").clicked() {
-                        if let Some(f) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
-                            app.prefs.rekordbox_xml_path = Some(f.to_string_lossy().to_string());
+                kit::block(ui, |ui| {
+                    path_row(ui, &app.prefs.rekordbox_xml_path, "no recently selected files");
+                    ui.horizontal(|ui| {
+                        if ui.add(btn("Browse")).clicked() {
+                            if let Some(f) = rfd::FileDialog::new().add_filter("XML", &["xml"]).pick_file() {
+                                app.prefs.rekordbox_xml_path = Some(f.to_string_lossy().to_string());
+                            }
                         }
-                    }
-                    let path = app.prefs.rekordbox_xml_path.clone();
-                    let exists = path.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
-                    if ui.add_enabled(exists, egui::Button::new("Import now")).on_disabled_hover_text("Choose a rekordbox xml file first.").clicked() {
-                        if let Some(p) = path {
-                            app.import_xml(std::path::Path::new(&p));
+                        let path = app.prefs.rekordbox_xml_path.clone();
+                        let exists = path.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
+                        if ui.add_enabled(exists, btn("Import now")).on_disabled_hover_text("Choose a rekordbox xml file first.").clicked() {
+                            if let Some(p) = path {
+                                app.import_xml(std::path::Path::new(&p));
+                            }
                         }
-                    }
-                    if app.prefs.rekordbox_xml_path.is_some() && ui.button("Clear").clicked() {
-                        app.prefs.rekordbox_xml_path = None;
-                    }
+                        if app.prefs.rekordbox_xml_path.is_some() && ui.add(btn("Clear")).clicked() {
+                            app.prefs.rekordbox_xml_path = None;
+                        }
+                    });
                 });
                 note(ui, "A collection exported from rekordbox (File > Export Collection in xml format).");
             });
             card(ui, "Auto Relocate Search Folders", |ui| {
                 note(ui, "Track > Relocate > Auto Relocate looks in these folders (and the folders inside them) for missing files.");
-                let mut remove = None;
-                for (i, f) in app.prefs.relocate_folders.iter().enumerate() {
+                kit::block(ui, |ui| {
+                    let mut remove = None;
+                    for (i, f) in app.prefs.relocate_folders.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            path_row(ui, &Some(f.clone()), "");
+                            if ui.add(btn("Remove").small()).clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        app.prefs.relocate_folders.remove(i);
+                    }
                     ui.horizontal(|ui| {
-                        path_row(ui, &Some(f.clone()), "");
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    app.prefs.relocate_folders.remove(i);
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Add").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                            let s = d.to_string_lossy().to_string();
-                            if !app.prefs.relocate_folders.contains(&s) {
-                                app.prefs.relocate_folders.push(s);
+                        if ui.add(btn("Add")).clicked() {
+                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                let s = d.to_string_lossy().to_string();
+                                if !app.prefs.relocate_folders.contains(&s) {
+                                    app.prefs.relocate_folders.push(s);
+                                }
                             }
                         }
-                    }
-                    let any = !app.prefs.relocate_folders.is_empty() && app.tracks.iter().any(|t| t.missing);
-                    if ui.add_enabled(any, egui::Button::new("Auto Relocate now")).on_disabled_hover_text("Needs a folder here and at least one missing file.").clicked() {
-                        app.auto_relocate(None);
-                    }
+                        let any = !app.prefs.relocate_folders.is_empty() && app.tracks.iter().any(|t| t.missing);
+                        if ui.add_enabled(any, btn("Auto Relocate now")).on_disabled_hover_text("Needs a folder here and at least one missing file.").clicked() {
+                            app.auto_relocate(None);
+                        }
+                    });
                 });
             });
         }
         _ => {
             card(ui, "Stem separation", |ui| {
                 if let Some(hw) = &app.stem.hw {
-                    ui.label(
-                        RichText::new(format!(
+                    kit::line(
+                        ui,
+                        &format!(
                             "This computer: {}{} cores, {:.0} GB memory, {}.",
                             if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
                             hw.cores,
                             hw.ram_gb,
                             if hw.gpu { "GPU (Metal) available" } else { "no usable GPU, separation runs on the CPU" }
-                        ))
-                        .size(12.0),
+                        ),
                     );
-                    ui.label(RichText::new(format!("Recommended model: {}", crate::stems::choose(hw).name)).size(12.0).color(DIM2));
+                    note(ui, &format!("Recommended model: {}", crate::stems::choose(hw).name));
                 } else {
-                    ui.label(RichText::new("Checking this computer…").size(12.0).color(DIM));
+                    note(ui, "Checking this computer…");
                 }
                 let cur = app.stem.model.clone().or_else(|| app.prefs.stem_model.clone()).unwrap_or_default();
                 for m in crate::stems::CATALOG.iter() {
                     let ready = crate::stems::model_ready(m);
                     let label = format!("{}{}", m.name, if ready { "  (downloaded)" } else { "" });
-                    if ui.radio(cur == m.id, RichText::new(label).size(13.0)).on_hover_text(m.about).clicked() && cur != m.id {
+                    if kit::row(ui, 16.0, |ui| kit::radio_raw(ui, cur == m.id, &label).on_hover_text(m.about).clicked()) && cur != m.id {
                         app.prefs.stem_model = Some(m.id.to_string());
                         app.stem.model = Some(m.id.to_string());
                         app.stem.model_ready = ready;
@@ -1279,23 +1401,27 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
                     note(ui, m.about);
                 }
                 toggle(ui, &mut app.prefs.stems_auto_download, "Download the model automatically at launch");
-                if !app.stem.model_ready && app.stem.downloading.is_none() && ui.button("Download now").clicked() {
+                if !app.stem.model_ready && app.stem.downloading.is_none() && kit::block(ui, |ui| ui.add(btn("Download now")).clicked()) {
                     app.stems_download();
                 }
                 if let Some((d, t)) = app.stem.downloading {
-                    ui.label(RichText::new(if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() }).size(12.0));
+                    kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
                 }
                 note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} GB in use.", crate::stems::cache_size() as f64 / 1e9));
-                if ui.button("Clear separated stems").clicked() {
-                    crate::stems::clear_cache();
-                }
+                kit::block(ui, |ui| {
+                    if ui.add(btn("Clear separated stems")).clicked() {
+                        crate::stems::clear_cache();
+                    }
+                });
             });
             card(ui, "rekordbox Library", |ui| {
                 toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when Recordbox starts");
                 note(ui, "Recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.");
-                if ui.add_enabled(app.rb_job.is_none(), egui::Button::new("Sync now")).clicked() {
-                    crate::menus::handle(app, "sync_rekordbox");
-                }
+                kit::block(ui, |ui| {
+                    if ui.add_enabled(app.rb_job.is_none(), btn("Sync now")).clicked() {
+                        crate::menus::handle(app, "sync_rekordbox");
+                    }
+                });
             });
         }
     }

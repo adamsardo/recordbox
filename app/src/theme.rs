@@ -48,9 +48,24 @@ pub fn hotcue_color(i: u8) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// Caps-label font (Arial Bold) at `size` pt.
+pub fn caps(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("caps".into()))
+}
+
 /// Bold system font at `size` pt.
 pub fn bold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("bold".into()))
+}
+
+/// rekordbox's browser face (Helvetica; the references fit it at 10.5 pt) at `size` pt.
+pub fn rb(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("rb".into()))
+}
+
+/// Bold of the browser face.
+pub fn rb_bold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("rb-bold".into()))
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -92,6 +107,28 @@ pub fn apply(ctx: &egui::Context) {
         fam.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
         fonts.families.insert(egui::FontFamily::Name(name.into()), fam);
     }
+    // The browser's face: Helvetica regular and bold (faces 0 and 1 of the system collection),
+    // falling back to the proportional list.
+    for (fam, face, idx) in [("rb", "rb-regular", 0u32), ("rb-bold", "rb-boldface", 1)] {
+        let mut list = vec![];
+        if let Ok(b) = std::fs::read("/System/Library/Fonts/Helvetica.ttc") {
+            let mut fd = egui::FontData::from_owned(b);
+            fd.index = idx;
+            fonts.font_data.insert(face.to_owned(), std::sync::Arc::new(fd));
+            list.push(face.to_owned());
+        }
+        let base = if idx == 1 { egui::FontFamily::Name("bold".into()) } else { egui::FontFamily::Proportional };
+        list.extend(fonts.families.get(&base).cloned().unwrap_or_default());
+        fonts.families.insert(egui::FontFamily::Name(fam.into()), list);
+    }
+    // Caps labels of the header and the player (EXPORT, CUE, MEMORY, …): Arial Bold, the face of
+    // rekordbox's own button artwork. Falls back to the bold family when it is not installed.
+    let mut caps_fam = fonts.families.get(&egui::FontFamily::Name("bold".into())).cloned().unwrap_or_default();
+    if let Ok(b) = std::fs::read("/System/Library/Fonts/Supplemental/Arial Bold.ttf") {
+        fonts.font_data.insert("arial-bold".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(b)));
+        caps_fam.insert(0, "arial-bold".to_owned());
+    }
+    fonts.families.insert(egui::FontFamily::Name("caps".into()), caps_fam);
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
     use egui::{FontFamily::Proportional, FontId, TextStyle};

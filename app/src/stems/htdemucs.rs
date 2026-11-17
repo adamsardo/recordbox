@@ -682,7 +682,7 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
                         y = y.narrow(0, s * 4, 4)?;
                         yt = yt.narrow(0, s * 2, 2)?;
                     }
-                    (y.flatten_all()?.to_vec1::<f32>()?, yt.flatten_all()?.to_vec1::<f32>()?)
+                    (metal_fast::read(&y)?, metal_fast::read(&yt)?)
                 };
                 if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
                     candle_core::bail!("stem post-processing stopped")

@@ -240,6 +240,25 @@ pub fn columns3(p: &Painter, r: Rect, c: Color32) {
     }
 }
 
+/// Playlist search tile glyph (skin: playlist_search, 23 x 23): a sheet of rows behind a magnifier.
+pub fn playlist_search(p: &Painter, r: Rect, c: Color32, bg: Color32) {
+    let q = |x: f32, y: f32| r.min + vec2(x * r.width() / 23.0, y * r.height() / 23.0);
+    p.rect_filled(Rect::from_min_max(q(5.0, 4.0), q(15.0, 16.0)), 0.0, c);
+    for y in [6.0, 9.0, 12.5] {
+        p.rect_filled(Rect::from_min_max(q(6.0, y), q(14.0, y + 1.5)), 0.0, bg);
+    }
+    p.circle_filled(q(12.44, 13.44), 5.5, bg);
+    p.circle_stroke(q(12.44, 13.44), 3.9, Stroke::new(1.1, c));
+    p.line_segment([q(15.4, 16.4), q(17.6, 18.6)], Stroke::new(1.2, c));
+}
+
+/// Sub-browser tile glyph as the references show it: a narrow pane beside a wide one.
+pub fn side_pane(p: &Painter, r: Rect, c: Color32) {
+    let t = T::new(r);
+    t.fill(p, 4.0, 4.0, 6.5, 14.0, c);
+    t.fill(p, 8.25, 4.0, 14.0, 14.0, c);
+}
+
 // ---------------------------------------------------------------- tree glyphs (skins: brows_treeicon_*)
 /// Disclosure triangle of a tree row: 8 x 6.5 pt, centred on `c`.
 pub fn tree_arrow(p: &Painter, c: Pos2, open: bool, col: Color32) {
@@ -344,24 +363,24 @@ pub fn funnel(p: &Painter, c: Pos2, col: Color32) {
     p.add(Shape::convex_polygon(vec![g.p(4.0, 4.6), g.p(6.0, 4.6), g.p(6.0, 10.0), g.p(4.0, 8.0)], col, Stroke::NONE));
 }
 
-/// Rating star (skins: rating_on / rating_off, 12 x 11): filled, or a thin outline.
-pub fn star(p: &Painter, c: Pos2, filled: bool, col: Color32, bg: Color32) {
-    let draw = |cc: Pos2, ro: f32, ri: f32, col: Color32| {
-        let pt = |i: usize, r: f32| {
-            let a = (-90.0 + 36.0 * i as f32).to_radians();
-            cc + vec2(a.cos(), a.sin()) * r
-        };
-        let inner: Vec<Pos2> = (0..5).map(|i| pt(2 * i + 1, ri)).collect();
+/// Rating star (skins: rating_on / rating_off, 12 x 11): filled, or a thin outline. The
+/// skin's star has an outer radius of 5.83 and an inner one of 2.27 and sits 0.67 below the
+/// box centre.
+pub fn star(p: &Painter, c: Pos2, filled: bool, col: Color32) {
+    let cc = c + vec2(0.0, 0.67);
+    let pt = |i: usize, r: f32| {
+        let a = (-90.0 + 36.0 * i as f32).to_radians();
+        cc + vec2(a.cos(), a.sin()) * r
+    };
+    if filled {
+        let inner: Vec<Pos2> = (0..5).map(|i| pt(2 * i + 1, 2.27)).collect();
         p.add(Shape::convex_polygon(inner.clone(), col, Stroke::NONE));
         for i in 0..5 {
-            p.add(Shape::convex_polygon(vec![inner[(i + 4) % 5], pt(2 * i, ro), inner[i]], col, Stroke::NONE));
+            p.add(Shape::convex_polygon(vec![inner[(i + 4) % 5], pt(2 * i, 5.83), inner[i]], col, Stroke::NONE));
         }
-    };
-    // The skin's star: outer radius 5.83, inner 2.27, centred 0.47 below the box centre.
-    let cc = c + vec2(0.0, 0.67);
-    draw(cc, 5.83, 2.27, col);
-    if !filled {
-        draw(cc, 4.45, 1.72, bg);
+    } else {
+        let pts: Vec<Pos2> = (0..10).map(|i| pt(i, if i % 2 == 0 { 5.7 } else { 2.2 })).collect();
+        p.add(Shape::closed_line(pts, Stroke::new(0.75, col)));
     }
 }
 
@@ -377,8 +396,8 @@ pub fn sort_arrow(p: &Painter, c: Pos2, up: bool, col: Color32) {
 pub fn search_select(p: &Painter, r: Rect, col: Color32) {
     let k = r.width() / 25.0;
     let q = |x: f32, y: f32| r.min + vec2(x, y) * k;
-    p.circle_stroke(q(4.98, 5.5), 4.3 * k, Stroke::new(1.45 * k, col));
-    p.line_segment([q(8.3, 8.8), q(12.0, 12.5)], Stroke::new(1.95 * k, col));
+    p.circle_stroke(q(4.98, 5.5), 4.25 * k, Stroke::new(1.7 * k, col));
+    p.line_segment([q(8.3, 8.8), q(12.0, 12.5)], Stroke::new(2.1 * k, col));
     p.add(Shape::convex_polygon(vec![q(17.58, 4.98), q(24.4, 4.98), q(21.0, 9.37)], col, Stroke::NONE));
 }
 

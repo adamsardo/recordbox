@@ -150,13 +150,13 @@ impl Col {
             // Default widths measured on the original's Collection view (pt).
             Col::Num => 60.0,
             Col::Status => 60.0,
-            Col::Preview => 140.0,
-            Col::Artwork => 79.0,
-            Col::Title | Col::Artist | Col::Album | Col::Genre => 128.5,
-            Col::Bpm => 79.0,
-            Col::Rating => 87.0,
-            Col::Time => 83.0,
-            Col::Key => 128.5,
+            Col::Preview => 141.0,
+            Col::Artwork => 80.0,
+            Col::Title | Col::Artist | Col::Album | Col::Genre => 128.0,
+            Col::Bpm => 80.0,
+            Col::Rating => 90.0,
+            Col::Time => 80.0,
+            Col::Key => 128.0,
             Col::DateAdded | Col::ReleaseDate | Col::DateCreated => 82.0,
             Col::Color => 46.0,
             Col::Location => 260.0,
@@ -1217,6 +1217,24 @@ impl App {
                             app.view = View::Playlist(p);
                             app.set_view(View::Collection);
                             app.set_view(View::Playlist(p));
+                        }
+                        // PREPDECK_SHOT_PLAYLIST=1: open the first playlist of 20+ tracks (its folders
+                        // expanded) and select its 29th row, the state of reference 04.
+                        if std::env::var("PREPDECK_SHOT_PLAYLIST").is_ok() {
+                            let pick = app.nodes.iter().find(|n| n.kind == NodeKind::Playlist && app.node_counts.get(&n.id).copied().unwrap_or(0) >= 20).cloned();
+                            if let Some(n) = pick {
+                                let mut up = n.parent;
+                                while up != 0 {
+                                    app.expanded.insert(up);
+                                    up = app.nodes.iter().find(|x| x.id == up).map(|x| x.parent).unwrap_or(0);
+                                }
+                                app.set_view(View::Playlist(n.id));
+                                app.rebuild_list();
+                                if let Some(id) = app.list.get(28).copied() {
+                                    app.selected.clear();
+                                    app.selected.insert(id);
+                                }
+                            }
                         }
                         if v == "smart" {
                             let n = app.nodes.iter().find(|n| n.kind == NodeKind::Smart).cloned();

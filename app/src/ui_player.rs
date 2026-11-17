@@ -37,21 +37,47 @@ pub fn icon_button(ui: &mut Ui, rect: Rect, id: &str, fill: Option<Color32>, dra
     } else if r.hovered() {
         ui.painter().rect_filled(rect, 2.0, hex(0x1A1A1A));
     }
-    draw(ui.painter(), rect, if r.hovered() { WHITE } else { TEXT });
+    draw(ui.painter(), rect, WHITE);
     r
 }
 
 /// Horizontal positions in the player are measured on a 1512 pt wide window, where the
-/// waveform area spans x = 81..1300. `sx` maps such an x to the current width.
+/// waveform area spans x = 80..1300. `sx` maps such an x to the current width.
 pub(crate) fn sx(main: Rect, x: f32) -> f32 {
-    main.min.x + (x - 81.0) * (main.width() / 1219.0)
+    main.min.x + (x - 80.0) * (main.width() / 1220.0)
+}
+
+/// The round CUE button (rekordbox's 36-unit button drawn `dia` pt across; 40 in the 1 Player
+/// layout): a ring 1.5 units thick around a face of radius 15 units. `lit`: full-colour ring;
+/// `loaded`: raised face, white label.
+pub(crate) fn cue_button_face(p: &egui::Painter, c: Pos2, dia: f32, lit: bool, loaded: bool, hovered: bool) {
+    let k = dia / 36.0;
+    // Unlit: the ring at 40 % over the #1E1E1E column.
+    crate::icons_player::ring(p, c, 17.25 * k, 1.5 * k, if lit { CUE_ORANGE } else { hex(0x785C28) });
+    p.circle_filled(c, 15.0 * k, if hovered { hex(0x2E2E2E) } else if loaded { BTN } else { BG2 });
+    p.text(c - vec2(0.0, 0.25), Align2::CENTER_CENTER, "CUE", caps(9.0 * k), if loaded { WHITE } else { hex(0x323232) });
+}
+
+/// The round PLAY button on the same grid: stopped, a 40 % green ring and a grey triangle;
+/// playing, the full ring, a raised face and white pause bars.
+pub(crate) fn play_button_face(p: &egui::Painter, c: Pos2, dia: f32, playing: bool, hovered: bool) {
+    let k = dia / 36.0;
+    crate::icons_player::ring(p, c, 17.25 * k, 1.5 * k, if playing { PLAY_GREEN } else { hex(0x246822) });
+    p.circle_filled(c, 15.0 * k, if hovered { hex(0x2A2A2A) } else if playing { BTN } else { BG2 });
+    if playing {
+        crate::icons_player::pause_bars(p, c, k, WHITE);
+    } else {
+        crate::icons_player::play_tri(p, c + vec2(0.4, 0.0), k, hex(0x646464));
+    }
 }
 
 pub fn player_panel(app: &mut App, ui: &mut Ui) {
+    // All positions below were measured on rekordbox 7.2.19 at 1512 pt (y from the player's
+    // top edge, which is 28 pt below the window's content top).
     let full = ui.max_rect();
     let p = ui.painter().clone();
     p.rect_filled(full, 0.0, BG);
-    let left = Rect::from_min_size(full.min, vec2(81.0, full.height()));
+    let left = Rect::from_min_size(full.min, vec2(80.0, full.height()));
     let right = Rect::from_min_max(pos2(full.max.x - 202.0, full.min.y), full.max);
     let main = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(full.max.x - 212.0, full.max.y));
     p.rect_filled(left, 0.0, BG2);
@@ -60,48 +86,43 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let playing = app.playing();
     let loaded = app.deck.track.is_some();
 
-    // ---------------- left column: jumps, beat jump, CUE, PLAY (centres measured in the original)
+    // ---------------- left column: 26 pt tiles at x 12–38 and 42–68; CUE and PLAY 40 pt across
     let lx = left.min.x;
     let ly = left.min.y;
-    let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_center_size(pos2(lx + x, ly + y), vec2(w, h));
-    // Previous Track / Next Track (the skin's export_prevTrack_btn / export_nextTrack_btn).
-    // Previous Track first returns to the start of the track, as on a player.
-    if tip(icon_button(ui, at(25.0, 34.0, 25.0, 22.0), "front", Some(BTN), crate::icons::jump_front), app, "Previous Track").clicked() {
+    let tile = |x: f32, y: f32| Rect::from_min_size(pos2(lx + x, ly + y), vec2(26.0, 26.0));
+    // Previous Track / Next Track. Previous Track first returns to the start of the track, as on a player.
+    if tip(icon_button(ui, tile(12.0, 22.0), "front", Some(BTN), |p, r, c| crate::icons_player::track_jump(p, r.center(), 1.5, c, -1.0)), app, "Previous Track").clicked() {
         app.previous_track();
     }
-    if tip(icon_button(ui, at(54.5, 34.0, 25.0, 22.0), "rear", Some(BTN), crate::icons::jump_rear), app, "Next Track").clicked() {
+    if tip(icon_button(ui, tile(42.0, 22.0), "rear", Some(BTN), |p, r, c| crate::icons_player::track_jump(p, r.center(), 1.5, c, 1.0)), app, "Next Track").clicked() {
         app.load_adjacent(1);
     }
     if app.searching() != 0 {
         app.search(0);
     }
     let bj = app.prefs.beat_jump;
-    if tip(icon_button(ui, at(25.0, 79.5, 25.0, 22.0), "bjl", Some(BTN), crate::icons::chevron_left), app, "Jump Reverse").clicked() {
+    if tip(icon_button(ui, tile(12.0, 68.0), "bjl", Some(BTN), |p, r, c| crate::icons_player::chevron_left(p, r.center(), 1.5, c)), app, "Jump Reverse").clicked() {
         app.beat_jump(-bj);
     }
-    if tip(icon_button(ui, at(54.5, 79.5, 25.0, 22.0), "bjr", Some(BTN), crate::icons::chevron_right), app, "Jump Forward").clicked() {
+    if tip(icon_button(ui, tile(42.0, 68.0), "bjr", Some(BTN), |p, r, c| crate::icons_player::chevron_right(p, r.center(), 1.5, c)), app, "Jump Forward").clicked() {
         app.beat_jump(bj);
     }
-    let bj_rect = at(40.0, 113.5, 54.0, 26.0);
+    // Jump length: a square-cornered 56 × 26 tile under the two arrows.
+    let bj_rect = Rect::from_min_size(pos2(lx + 12.0, ly + 98.0), vec2(56.0, 26.0));
     let bj_label = crate::player_ext::jump_label(bj, app.prefs.beat_jump_bars);
     let r = tip(ui.interact(bj_rect, ui.id().with("bjsize"), Sense::click()), app, "Select the beat/bar length jumping from the current position.");
-    p.rect_filled(bj_rect, 2.0, if r.hovered() { lighten(BTN) } else { BTN });
-    p.text(bj_rect.center() - vec2(0.0, 5.0), Align2::CENTER_CENTER, bj_label, bold(9.0), WHITE);
-    crate::icons::chevron_down(&p, Rect::from_center_size(bj_rect.center() + vec2(0.0, 6.0), vec2(12.0, 10.0)), WHITE);
+    p.rect_filled(bj_rect, 0.0, if r.hovered() { lighten(BTN) } else { BTN });
+    p.text(pos2(bj_rect.center().x, ly + 106.2), Align2::CENTER_CENTER, bj_label, bold(9.0), WHITE);
+    crate::icons_player::chevron_down(&p, pos2(lx + 40.75, ly + 118.0), 1.0, WHITE);
     crate::ui_browser::dropdown(ui, &r, "bjpop", |ui: &mut Ui| {
         crate::ui_player2::jump_size_menu(app, ui);
     });
     // CUE
-    let cue_c = pos2(lx + 40.0, ly + 162.5);
+    let cue_c = pos2(lx + 40.0, ly + 164.0);
     let cue_rect = Rect::from_center_size(cue_c, vec2(42.0, 42.0));
     let cr = ui.interact(cue_rect, ui.id().with("cuebtn"), Sense::click_and_drag());
     let cue_lit = loaded && (!playing || app.deck.cue_preview);
-    // Measured (references 01/02): 40 pt ring, 2 pt stroke; idle #745D31 with grey text; with a
-    // track loaded #F4BC53, white text and a #282828 face.
-    let face = if cr.hovered() { hex(0x2E2E2E) } else if loaded { hex(0x282828) } else { BG2 };
-    p.circle_filled(cue_c, 18.5, face);
-    p.circle_stroke(cue_c, 18.5, Stroke::new(2.0_f32, if cue_lit { hex(0xF4BC53) } else { hex(0x745D31) }));
-    p.text(cue_c, Align2::CENTER_CENTER, "CUE", bold(10.5), if loaded { WHITE } else { hex(0x323232) });
+    cue_button_face(&p, cue_c, 40.0, cue_lit, loaded, cr.hovered());
     if cr.is_pointer_button_down_on() && !app.deck.cue_preview && ui.input(|i| i.pointer.any_pressed()) {
         app.cue_down();
     }
@@ -110,56 +131,47 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         app.cue_up();
     }
     // PLAY
-    let play_c = pos2(lx + 40.0, ly + 213.0);
+    let play_c = pos2(lx + 40.0, ly + 214.0);
     let pr = ui.interact(Rect::from_center_size(play_c, vec2(42.0, 42.0)), ui.id().with("playbtn"), Sense::click());
-    p.circle_filled(play_c, 18.5, if pr.hovered() { hex(0x2A2A2A) } else { BG2 });
-    // Stopped: dim green ring and a grey triangle (references 01/02).
-    let ring = if playing { PLAY_GREEN } else { hex(0x38672C) };
-    p.circle_stroke(play_c, 18.5, Stroke::new(2.0_f32, ring));
-    if playing {
-        for dx in [-3.5, 3.5] {
-            p.rect_filled(Rect::from_center_size(play_c + vec2(dx, 0.0), vec2(3.5, 11.0)), 0.0, PLAY_GREEN);
-        }
-    } else {
-        p.add(Shape::convex_polygon(vec![play_c + vec2(-3.0, -5.5), play_c + vec2(5.0, 0.0), play_c + vec2(-3.0, 5.5)], hex(0x646464), Stroke::NONE));
-    }
+    play_button_face(&p, play_c, 40.0, playing, pr.hovered());
     if tip(pr, app, "Play/Pause").clicked() {
         app.play_pause();
     }
 
     let my = main.min.y;
-    // ---------------- enlarged waveform (drawn first; the zoom buttons sit on top of it)
-    let det = Rect::from_min_max(pos2(main.min.x, my + 87.0), pos2(main.max.x, my + 204.0));
-    draw_detail(app, ui, det, pos);
+    // ---------------- enlarged waveform (drawn first; the zoom buttons sit on top of it):
+    // beats from y 88 to 202, the playhead 692.5 pt from the window's left edge.
+    let det = Rect::from_min_max(pos2(main.min.x, my + 88.0), pos2(main.max.x, my + 202.0));
+    draw_detail_at(app, ui, det, pos, 2.5 * (main.width() / 1220.0));
 
     // ---------------- zoom column (overlaid on the left of the enlarged waveform), on an opaque
     // black strip so the waveform never shows through the buttons.
-    ui.painter().rect_filled(Rect::from_min_max(pos2(main.min.x, my + 98.0), pos2(main.min.x + 25.5, my + 176.0)), 0.0, Color32::BLACK);
-    let zc = |y: f32| Rect::from_center_size(pos2(main.min.x + 12.7, my + y), vec2(22.0, 20.0));
-    if tip(icon_button(ui, zc(112.0), "zin", None, |p, r, c| crate::icons::magnifier(p, r, c, 1)), app, "Zoom In").clicked() && app.prefs.zoom > 0 {
+    ui.painter().rect_filled(Rect::from_min_max(pos2(main.min.x, my + 100.0), pos2(main.min.x + 26.0, my + 176.0)), 0.0, Color32::BLACK);
+    let zc = |y: f32| Rect::from_center_size(pos2(main.min.x + 14.0, my + y), vec2(22.0, 20.0));
+    if tip(icon_button(ui, zc(113.0), "zin", None, |p, r, c| crate::icons_player::zoom(p, r.center(), 7.0 / 6.0, c, true)), app, "Zoom In").clicked() && app.prefs.zoom > 0 {
         app.prefs.zoom -= 1;
     }
-    if tip(button(ui, zc(137.0), "zrst", "RST", Color32::TRANSPARENT, TEXT, 9.0), app, "Reset Zoom").clicked() {
+    if tip(button(ui, zc(137.4), "zrst", "RST", Color32::TRANSPARENT, WHITE, 8.2), app, "Reset Zoom").clicked() {
         app.prefs.zoom = 2;
     }
-    if tip(icon_button(ui, zc(162.0), "zout", None, |p, r, c| crate::icons::magnifier(p, r, c, -1)), app, "Zoom Out").clicked() && app.prefs.zoom + 1 < ZOOMS.len() {
+    if tip(icon_button(ui, zc(163.0), "zout", None, |p, r, c| crate::icons_player::zoom(p, r.center(), 7.0 / 6.0, c, false)), app, "Zoom Out").clicked() && app.prefs.zoom + 1 < ZOOMS.len() {
         app.prefs.zoom += 1;
     }
 
     // ---------------- header row (title, artist, times, key, BPM)
-    let hy = my + 10.6;
     let track = app.deck.track.and_then(|id| app.track(id)).cloned();
     let dur = app.deck.duration;
-    let div = |x: f32| p.line_segment([pos2(x, hy - 7.5), pos2(x, hy + 7.5)], Stroke::new(1.0_f32, OFF));
+    // 1 pt dividers from y 2 to 19.
+    let div = |x: f32| p.rect_filled(Rect::from_min_max(pos2(x.floor(), my + 2.0), pos2(x.floor() + 1.0, my + 19.0)), 0.0, OFF);
     let x_artist = sx(main, 733.0);
     let x_time = sx(main, 1011.0);
     let x_key = sx(main, 1168.0);
-    let x_bpm = sx(main, 1225.0);
+    let x_bpm = sx(main, 1224.0);
     if let Some(t) = &track {
-        let clip = p.with_clip_rect(Rect::from_min_max(pos2(sx(main, 179.0), my), pos2(x_artist - 8.0, my + 22.0)));
-        clip.text(pos2(sx(main, 179.0), hy), Align2::LEFT_CENTER, t.display_title(), bold(15.0), WHITE);
-        let clip = p.with_clip_rect(Rect::from_min_max(pos2(x_artist, my), pos2(x_time - 8.0, my + 22.0)));
-        clip.text(pos2(x_artist + 17.0, hy), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.0), DIM);
+        let clip = p.with_clip_rect(Rect::from_min_max(pos2(sx(main, 179.0), my), pos2(x_artist - 8.0, my + 21.0)));
+        clip.text(pos2(sx(main, 179.0), my + HDR_TITLE_Y), Align2::LEFT_CENTER, t.display_title(), bold(15.5), WHITE);
+        let clip = p.with_clip_rect(Rect::from_min_max(pos2(x_artist, my), pos2(x_time - 8.0, my + 21.0)));
+        clip.text(pos2(x_artist + 16.5, my + HDR_TEXT_Y), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.25), DIM);
     }
     for x in [x_artist, x_time, x_key, x_bpm] {
         div(x);
@@ -168,27 +180,27 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let dim_t = if loaded { DIM } else { OFF };
     let bright_t = if loaded { WHITE } else { OFF };
     let (big, small) = split_time(if loaded { remain } else { 0.0 });
-    let tx = x_time + 21.0;
     let (c1, c2) = if app.prefs.time_remain { (bright_t, dim_t) } else { (dim_t, bright_t) };
-    let tr = p.text(pos2(tx, hy), Align2::LEFT_CENTER, format!("-{big}"), FontId::proportional(14.5), c1);
-    let tr2 = p.text(pos2(tr.max.x, hy + 1.5), Align2::LEFT_CENTER, format!(".{small}"), FontId::proportional(10.5), c1);
+    // Remaining time from x = 1032, elapsed from 1100.5; tenths in a smaller size on the same baseline.
+    let tr = p.text(pos2(x_time + 20.5, my + HDR_TIME_Y), Align2::LEFT_CENTER, format!("-{big}"), FontId::proportional(15.0), c1);
+    p.text(pos2(tr.max.x, my + HDR_TIME_Y + 1.4), Align2::LEFT_CENTER, format!(".{small}"), FontId::proportional(11.5), c1);
     let (big2, small2) = split_time(if loaded { pos } else { 0.0 });
-    let er = p.text(pos2(tr2.max.x + 13.0, hy), Align2::LEFT_CENTER, &big2, FontId::proportional(14.5), c2);
-    p.text(pos2(er.max.x, hy + 1.5), Align2::LEFT_CENTER, format!(".{small2}"), FontId::proportional(10.5), c2);
-    let time_hit = ui.interact(Rect::from_min_max(pos2(x_time, my), pos2(x_key, my + 22.0)), ui.id().with("timesw"), Sense::click());
+    let er = p.text(pos2(x_time + 89.0, my + HDR_TIME_Y), Align2::LEFT_CENTER, &big2, FontId::proportional(15.0), c2);
+    p.text(pos2(er.max.x, my + HDR_TIME_Y + 1.4), Align2::LEFT_CENTER, format!(".{small2}"), FontId::proportional(11.5), c2);
+    let time_hit = ui.interact(Rect::from_min_max(pos2(x_time, my), pos2(x_key, my + 21.0)), ui.id().with("timesw"), Sense::click());
     if tip(time_hit, app, "Switch Time/Remain").clicked() {
         app.prefs.time_remain = !app.prefs.time_remain;
     }
     if let Some(t) = &track {
-        p.text(pos2((x_key + x_bpm) / 2.0, hy), Align2::CENTER_CENTER, t.key_label(app.prefs.key_alnum), FontId::proportional(13.0), WHITE);
+        p.text(pos2((x_key + x_bpm) / 2.0 + 0.5, my + HDR_TEXT_Y - 0.5), Align2::CENTER_CENTER, t.key_label(app.prefs.key_alnum), FontId::proportional(13.0), WHITE);
     }
     if loaded {
         let b = app.current_bpm();
-        p.text(pos2(sx(main, 1263.0), hy), Align2::CENTER_CENTER, if b > 0.0 { format!("{b:.2}") } else { "--.--".into() }, FontId::proportional(13.0), WHITE);
+        p.text(pos2(sx(main, 1263.0), my + HDR_TEXT_Y - 0.5), Align2::CENTER_CENTER, if b > 0.0 { format!("{b:.2}") } else { "--.--".into() }, FontId::proportional(13.0), WHITE);
     }
 
-    // ---------------- artwork
-    let art = Rect::from_min_max(pos2(sx(main, 94.5), my + 16.6), pos2(sx(main, 94.5) + 49.0, my + 50.8));
+    // ---------------- artwork: 48 × 33 pt at x 95, y 18.5 (an empty deck shows a 48 pt tile from y 11)
+    let art = Rect::from_min_size(pos2(sx(main, 95.0), my + 18.5), vec2(48.0, 33.0));
     match &track {
         Some(t) => {
             if let Some(tex) = crate::ui_browser::artwork_texture(app, &t.artwork) {
@@ -199,13 +211,13 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
             }
         }
         None => {
-            // Empty deck (reference 01): a dark 47.5 × 46 pt tile with a grey disc and hub.
-            let tile = Rect::from_min_size(pos2(sx(main, 95.0), my + 11.0), vec2(47.5, 46.0));
+            // Empty deck (reference 01): a dark tile with a grey disc and hub.
+            let tile = Rect::from_min_size(pos2(sx(main, 95.0), my + 11.0), vec2(48.0, 48.0));
             p.rect_filled(tile, 0.0, hex(0x0F0F0F));
-            p.circle_filled(tile.center(), 19.5, hex(0x1E1E1E));
-            p.circle_stroke(tile.center(), 19.5, Stroke::new(1.0_f32, hex(0x262626)));
-            p.circle_filled(tile.center(), 3.0, hex(0x0F0F0F));
-            p.circle_stroke(tile.center(), 3.0, Stroke::new(1.0_f32, hex(0x262626)));
+            // The disc (radius 21.5) and its hub (radius 5.5) have soft edges.
+            for (rad, col) in [(21.5, 0x141414), (21.0, 0x181818), (20.5, 0x1D1D1D), (19.5, 0x1E1E1E), (6.5, 0x191919), (6.0, 0x141414), (5.5, 0x0F0F0F)] {
+                p.circle_filled(tile.center(), rad, hex(col));
+            }
         }
     }
 
@@ -216,11 +228,12 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         }
     }
 
-    // ---------------- overview waveform
-    let ov = Rect::from_min_max(pos2(sx(main, 159.0), my + 24.0), pos2(sx(main, 1293.0), my + 57.0));
+    // ---------------- overview waveform: track start at x 163.5, end at 1290; cue letters from
+    // y 21, baseline at 51.
+    let ov = Rect::from_min_max(pos2(sx(main, 163.5), my + 21.0), pos2(sx(main, 1290.0), my + 54.0));
     draw_overview(app, ui, ov, pos);
 
-    // ---------------- control strip
+    // ---------------- control strip: 48 pt tall, from y 208
     let strip = Rect::from_min_max(pos2(left.max.x, my + 208.0), pos2(main.max.x, full.max.y));
     control_strip(app, ui, strip, main);
 
@@ -234,6 +247,11 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         ui.ctx().request_repaint();
     }
 }
+
+/// Vertical centres of the header row's texts (from the player's top edge).
+const HDR_TITLE_Y: f32 = 10.8;
+const HDR_TEXT_Y: f32 = 11.2;
+const HDR_TIME_Y: f32 = 9.9;
 
 pub(crate) fn split_time(t: f64) -> (String, String) {
     let tenths = ((t * 10.0).floor() as i64).max(0);
@@ -272,9 +290,10 @@ pub fn wave_bars(mode: u8, v: [u8; 4]) -> Vec<(f32, Color32)> {
 pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     let p = ui.painter().clone();
     let dur = app.deck.duration.max(0.001);
-    // Measured from the original: baseline 29 pt below the top, bars up to 24 pt tall,
-    // a double progress rule at +33/+36 pt and minute ticks under it.
-    let base = r.min.y + 29.0;
+    // Measured from the original: baseline 30 pt below the top (the top 11 pt hold the hot cue
+    // letters), bars up to 24 pt tall, a 3 pt progress frame from 3 pt under the baseline and
+    // white minute ticks from 8 to 10 pt under it.
+    let base = r.min.y + 30.0;
     let full_h = 24.0;
     if let Some(w) = &app.deck.wave {
         let n = r.width().max(1.0) as usize;
@@ -331,7 +350,7 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     }
     // Phrase bar (as rekordbox shows phrase analysis): one coloured block per phrase.
     if let (Some(st), false, true) = (&app.deck.phrases, app.deck.beats.is_empty(), app.prefs.show_phrase_bar) {
-        let y0 = r.min.y + 38.5;
+        let y0 = base + 12.5;
         let beat_t = |b: u16| app.deck.beats.get((b.max(1) - 1) as usize).map(|x| x.time).unwrap_or(dur);
         for (k, ph) in st.phrases.iter().enumerate() {
             let t0 = beat_t(ph.beat);
@@ -349,22 +368,25 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
             p.rect_filled(Rect::from_min_max(pos2(x0 + 0.5, y0), pos2((x1 - 0.5).max(x0 + 1.0), y0 + 3.0)), 0.0, col);
         }
     }
-    // progress rule and minute ticks (nothing at all on an empty deck, as in reference 01)
+    // progress frame and minute ticks (nothing at all on an empty deck, as in reference 01)
     if app.deck.track.is_some() {
-        p.line_segment([pos2(r.min.x, r.min.y + 33.0), pos2(r.max.x, r.min.y + 33.0)], Stroke::new(1.0_f32, hex(0x5A5A5A)));
-        p.line_segment([pos2(r.min.x, r.min.y + 36.0), pos2(r.max.x, r.min.y + 36.0)], Stroke::new(1.0_f32, hex(0x3A3A3A)));
+        // The frame: #6B6B6B outside, #515151 inside, half a point each, around a 1 pt gap.
+        let fr = Rect::from_min_max(pos2(r.min.x - 1.0, base + 3.0), pos2(r.max.x, base + 6.0));
+        p.rect_filled(fr, 0.0, hex(0x6B6B6B));
+        p.rect_filled(fr.shrink(0.5), 0.0, hex(0x515151));
+        p.rect_filled(fr.shrink(1.0), 0.0, hex(0x020202));
         let minute = 60.0 / dur * r.width() as f64;
         let mut k = 1.0;
-        while k * minute < r.width() as f64 {
-            let x = r.min.x + (k * minute) as f32;
-            p.line_segment([pos2(x, r.min.y + 37.0), pos2(x, r.min.y + 39.0)], Stroke::new(1.0_f32, DIM2));
+        while k * minute < r.width() as f64 + 0.5 {
+            let x = (r.min.x + (k * minute) as f32 - 0.5).round();
+            p.rect_filled(Rect::from_min_max(pos2(x, base + 8.0), pos2(x + 1.0, base + 10.0)), 0.0, WHITE);
             k += 1.0;
         }
         let x_of = |t: f64| r.min.x + (t / dur) as f32 * r.width();
         // loops
         for c in &app.deck.cues {
             if let Some(e) = c.end.filter(|e| *e > c.start) {
-                p.rect_filled(Rect::from_min_max(pos2(x_of(c.start), r.min.y), pos2(x_of(e).max(x_of(c.start) + 1.0), r.max.y)), 0.0, LOOP.gamma_multiply(0.25));
+                p.rect_filled(Rect::from_min_max(pos2(x_of(c.start), r.min.y), pos2(x_of(e).max(x_of(c.start) + 1.0), base)), 0.0, LOOP.gamma_multiply(0.25));
             }
         }
         // memory cues (below) and hot cues (above)
@@ -375,18 +397,18 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
                 tri_up(&p, pos2(x, base + 0.5), 5.0, col);
             } else {
                 let col = hotcue_color(c.color);
-                // 10 pt box starting 4 pt left of the cue line (reference 02).
-                let lr = Rect::from_min_size(pos2(x - 4.0, r.min.y), vec2(10.0, 10.0));
-                p.rect_filled(lr, 0.0, col);
-                p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(8.0), WHITE);
+                // A 12 × 11 pt box around the cue line, with a black letter (reference 02).
                 p.line_segment([pos2(x, r.min.y), pos2(x, base)], Stroke::new(1.0_f32, col));
+                let lr = Rect::from_min_size(pos2(x - 5.5, r.min.y), vec2(12.0, 11.0));
+                p.rect_filled(lr, 0.0, col);
+                p.text(lr.center() + vec2(-0.25, 0.0), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(10.0), Color32::BLACK);
             }
         }
-        // cue point
-        tri_up(&p, pos2(x_of(app.deck.cue_point), base + 0.5), 6.0, CUE_MARK);
-        // playhead
+        // playhead: a 1 pt white line from under the letters to 12 pt under the baseline
         let px = x_of(pos);
-        p.line_segment([pos2(px, r.min.y + 2.0), pos2(px, base)], Stroke::new(1.5_f32, WHITE));
+        p.rect_filled(Rect::from_min_max(pos2(px - 0.5, r.min.y + 11.0), pos2(px + 0.5, base + 12.0)), 0.0, WHITE);
+        // cue point: the current-cue triangle, 9.5 pt tall, its apex just above the baseline
+        crate::icons_player::cue_tri(&p, pos2(x_of(app.deck.cue_point), base - 0.5), 9.5, CUE_MARK);
     }
     let resp = ui.interact(r.expand2(vec2(0.0, 4.0)), ui.id().with("overview"), Sense::click_and_drag());
     if (resp.clicked() || resp.dragged()) && app.deck.audio.is_some() {
@@ -406,17 +428,23 @@ pub(crate) fn tri_up(p: &egui::Painter, tip: Pos2, s: f32, c: Color32) {
 }
 
 pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
+    draw_detail_at(app, ui, r, pos, 0.0)
+}
+
+/// The enlarged waveform in `r`, with the playhead `cx_off` pt right of the middle of `r`
+/// (rekordbox's 1 Player layout has it 2.5 pt right of the middle).
+pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_off: f32) {
     // `r` is the beat/waveform area; the 19 pt row above it holds the bar.beat readout and the
     // hot cue letters (measured on reference 02).
-    let p = ui.painter_at(Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 8.0)));
+    let p = ui.painter_at(Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 6.0)));
     let span = ZOOMS[app.prefs.zoom.min(ZOOMS.len() - 1)];
     let px_per_s = r.width() as f64 / span;
-    let cx = r.center().x;
+    let cx = r.center().x + cx_off;
     let t_of = |x: f32| pos + (x - cx) as f64 / px_per_s;
     app.deck.detail_map = Some((r, pos, px_per_s));
     let x_of = |t: f64| cx + ((t - pos) * px_per_s) as f32;
-    let mid = r.center().y;
-    let half = r.height() / 2.0 - 10.0;
+    let mid = r.center().y + 0.5;
+    let half = r.height() / 2.0 - 9.0;
     let dur = app.deck.duration;
     // loops
     if app.loop_active().is_none() {
@@ -504,19 +532,24 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     let tr = t_of(r.max.x);
     let i0 = app.deck.beats.partition_point(|b| b.time < tl);
     for b in app.deck.beats[i0..].iter().take_while(|b| b.time <= tr) {
-        let x = x_of(b.time);
+        // Lines sit on whole points so that they stay 1 pt wide.
+        let x = (x_of(b.time) - 0.5).round() + 0.5;
         if b.beat == 1 {
             // Bar: red 5 × 4 pt triangles at both ends, a white line between them.
-            p.add(Shape::convex_polygon(vec![pos2(x - 2.5, r.min.y), pos2(x + 2.5, r.min.y), pos2(x, r.min.y + 4.0)], BAR_RED, Stroke::NONE));
-            p.add(Shape::convex_polygon(vec![pos2(x - 2.5, r.max.y), pos2(x, r.max.y - 4.0), pos2(x + 2.5, r.max.y)], BAR_RED, Stroke::NONE));
-            p.line_segment([pos2(x, r.min.y + 4.5), pos2(x, r.max.y - 4.5)], Stroke::new(1.0_f32, WHITE));
+            crate::icons_player::bar_cap(&p, x, r.min.y, 1.0, BAR_RED);
+            crate::icons_player::bar_cap(&p, x, r.max.y, -1.0, BAR_RED);
+            p.rect_filled(Rect::from_min_max(pos2(x - 0.5, r.min.y + 5.0), pos2(x + 0.5, r.max.y - 5.0)), 0.0, WHITE);
         } else {
-            // Beat: a 3 pt grey cap and a short tick at both ends.
-            for (y0, d) in [(r.min.y, 1.0f32), (r.max.y, -1.0)] {
-                p.line_segment([pos2(x - 1.5, y0 + d * 0.5), pos2(x + 1.5, y0 + d * 0.5)], Stroke::new(1.0_f32, hex(0x7C7C7C)));
-                p.line_segment([pos2(x, y0), pos2(x, y0 + d * 4.0)], Stroke::new(1.0_f32, hex(0x7C7C7C)));
-            }
+            // Beat: a 3 pt grey wedge with a 4 pt stem at both ends.
+            crate::icons_player::beat_cap(&p, x, r.min.y, 1.0, hex(0x7C7C7C));
+            crate::icons_player::beat_cap(&p, x, r.max.y, -1.0, hex(0x7C7C7C));
         }
+    }
+    if app.deck.track.is_some() {
+        // bar.beat readout, ending 2 pt left of the playhead (hot cue letters cover its end)
+        let mem: Vec<f64> = if app.prefs.beat_count_mode == 0 { vec![] } else { app.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).collect() };
+        let label = crate::player_ext::beat_count_label(&app.deck.beats, &mem, pos, app.prefs.beat_count_mode);
+        p.text(pos2(cx - 2.0, r.min.y - 10.2), Align2::RIGHT_CENTER, label, bold(14.0), BEAT_BLUE);
     }
     // cues
     for c in &app.deck.cues {
@@ -526,27 +559,24 @@ pub(crate) fn draw_detail(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         }
         if c.kind == CueKind::Hot {
             let col = hotcue_color(c.color);
-            // A 10 pt letter box centred on the cue, in the row above the beats (no comment
-            // text: the original shows none there).
-            p.line_segment([pos2(x, r.min.y - 2.0), pos2(x, r.max.y)], Stroke::new(1.5_f32, col));
-            let lr = Rect::from_center_size(pos2(x, r.min.y - 7.0), vec2(10.0, 10.0));
+            // An 11 pt letter box centred on the cue, in the row above the beats, with a black
+            // letter (no comment text: the original shows none there).
+            p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0_f32, col));
+            let lr = Rect::from_min_size(pos2(x - 5.5, r.min.y - 10.5), vec2(11.0, 11.0));
             p.rect_filled(lr, 0.0, col);
-            p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), bold(8.0), WHITE);
+            p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(10.0), Color32::BLACK);
         } else {
             let col = if c.color > 0 { label_color(c.color) } else { BAR_RED };
             tri_up(&p, pos2(x, r.max.y - 9.0), 6.0, col);
         }
     }
     if app.deck.track.is_some() {
-        tri_up(&p, pos2(x_of(app.deck.cue_point), r.max.y - 9.0), 7.0, CUE_MARK);
-    }
-    if app.deck.track.is_some() {
-        // playhead
-        p.line_segment([pos2(cx, r.min.y - 4.0), pos2(cx, r.max.y + 4.0)], Stroke::new(1.5_f32, WHITE));
-        p.rect_filled(Rect::from_center_size(pos2(cx, r.min.y + 2.0), vec2(6.0, 6.0)), 0.0, BAR_RED);
-        let mem: Vec<f64> = if app.prefs.beat_count_mode == 0 { vec![] } else { app.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).collect() };
-        let label = crate::player_ext::beat_count_label(&app.deck.beats, &mem, pos, app.prefs.beat_count_mode);
-        p.text(pos2(cx - 6.0, r.min.y - 9.0), Align2::RIGHT_CENTER, label, FontId::proportional(15.0), BEAT_BLUE);
+        // current cue: an 11.5 pt triangle whose base is 4.5 pt under the beats
+        crate::icons_player::cue_tri(&p, pos2(x_of(app.deck.cue_point), r.max.y - 7.0), 11.5, CUE_MARK);
+        // playhead: a 1 pt #E0E0E0 line with a 1 pt half-black edge on both sides
+        let ph = Rect::from_min_max(pos2(cx - 0.5, r.min.y - 18.0), pos2(cx + 0.5, r.max.y + 4.0));
+        p.rect_filled(ph.expand2(vec2(1.0, 0.0)), 0.0, Color32::from_black_alpha(128));
+        p.rect_filled(ph, 0.0, hex(0xE0E0E0));
     }
     // interaction: drag a cue marker to move it, drag elsewhere to scrub, scroll to move,
     // ctrl/cmd + scroll to zoom
@@ -685,38 +715,37 @@ pub fn moved_cue(c: &Cue, t: f64, duration: f64) -> Cue {
 
 fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let p = ui.painter().clone();
-    // The strip behind the pads is dark grey in the original, the pads darker still.
-    p.rect_filled(Rect::from_min_max(pos2(s.min.x + 81.5, s.min.y), pos2(main.max.x, s.max.y - 2.0)), 0.0, BG2);
-    // Tabs CUE/LOOP and GRID (stacked, as measured: x 83..162.5).
-    let tab1 = Rect::from_min_max(pos2(s.min.x + 2.0, s.min.y), pos2(s.min.x + 81.5, s.min.y + 23.0));
-    let tab2 = Rect::from_min_max(pos2(s.min.x + 2.0, s.min.y + 23.0), pos2(s.min.x + 81.5, s.max.y));
+    // The strip (#1E1E1E) runs from the tabs to the side panel; the tabs are 80 pt wide from
+    // 3 pt right of the transport column: CUE/LOOP 24 pt tall, GRID below it.
+    p.rect_filled(Rect::from_min_max(pos2(s.min.x + 83.0, s.min.y), pos2(main.max.x, s.max.y)), 0.0, BG2);
+    let tab1 = Rect::from_min_max(pos2(s.min.x + 3.0, s.min.y), pos2(s.min.x + 83.0, s.min.y + 24.0));
+    let tab2 = Rect::from_min_max(pos2(s.min.x + 3.0, s.min.y + 24.0), pos2(s.min.x + 83.0, s.max.y));
     if tab_button(ui, tab1, "tab_cue", "CUE/LOOP", app.deck.ctrl_tab == 0).clicked() {
         app.deck.ctrl_tab = 0;
     }
     if tab_button(ui, tab2, "tab_grid", "GRID", app.deck.ctrl_tab == 1).clicked() {
         app.deck.ctrl_tab = 1;
     }
-    let y = s.min.y + 22.6;
+    // Every control is centred 24 pt below the strip's top; buttons are 20 pt tall.
+    let y = s.min.y + 24.0;
     let x0 = sx(main, 407.9);
-    let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 23.0));
+    let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 20.0));
     if app.deck.ctrl_tab == 0 {
-        // hot cue pads: 28 pt dark squares on a 32.9 pt pitch starting at x = 420.4;
-        // a set cue shows as a 15 pt square of its colour behind the letter.
-        let mut x = x0;
+        // hot cue pads: 28 pt #0F0F0F squares on a 33 pt pitch from x = 407; a set cue shows
+        // as a 15 pt square of its colour behind a black letter.
         for slot in 0..8 {
-            let r = Rect::from_center_size(pos2(sx(main, 420.4 + slot as f32 * 32.9), y), vec2(28.0, 28.0));
-            let _ = x;
+            let r = Rect::from_center_size(pos2(sx(main, 421.0 + slot as f32 * 33.0), y), vec2(28.0, 28.0));
             let cue = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned();
             let resp = ui.interact(r, ui.id().with(("pad", slot)), Sense::click_and_drag());
-            p.rect_filled(r, 2.0, if resp.hovered() { hex(0x1A1A1A) } else { hex(0x121212) });
+            p.rect_filled(r, 1.0, if resp.hovered() { hex(0x1A1A1A) } else { hex(0x0F0F0F) });
             let tc = match &cue {
                 Some(c) => {
-                    p.rect_filled(Rect::from_center_size(r.center(), vec2(15.0, 15.0)), 0.0, hotcue_color(c.color));
-                    WHITE
+                    p.rect_filled(Rect::from_center_size(r.center() - vec2(0.5, 0.5), vec2(15.0, 15.0)), 0.0, hotcue_color(c.color));
+                    Color32::BLACK
                 }
-                None => hex(0x5F5F5F),
+                None => OFF,
             };
-            p.text(r.center(), Align2::CENTER_CENTER, ((b'A' + slot as u8) as char).to_string(), FontId::proportional(15.0), tc);
+            p.text(r.center() + vec2(-0.3, -1.1), Align2::CENTER_CENTER, ((b'A' + slot as u8) as char).to_string(), FontId::proportional(13.0), tc);
             if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
                 if ui.input(|i| i.modifiers.shift) {
                     if let Some(c) = &cue {
@@ -744,38 +773,37 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                     app.delete_cue(c.id);
                 }
             }
-            x += 32.9;
         }
-        // memory: MEMORY x 695.6..756, then ◀ ▶ ✕ at 769.6 / 796 / 821
-        if tip(bold_button(ui, at(725.8, 60.5), "mem", "MEMORY"), app, "Set Memory Cue(Loop)").clicked() {
+        // memory: MEMORY x 696..756, then 20 pt tiles at 761, 786 and 811 (◀ ▶ ✕)
+        if tip(bold_button(ui, at(726.0, 60.0), "mem", "MEMORY"), app, "Set Memory Cue(Loop)").clicked() {
             app.memory_set();
         }
-        if tip(icon_button(ui, at(769.6, 22.0), "memprev", Some(BG2), crate::icons::tri_left), app, "Call Previous Memory Cue").clicked() {
+        if tip(icon_button(ui, at(771.0, 20.0), "memprev", Some(BTN), |p, r, c| crate::icons_player::mem_tri(p, r.center() + vec2(-5.0, 0.0), -1.0, c)), app, "Call Previous Memory Cue").clicked() {
             app.memory_jump(-1);
         }
-        if tip(icon_button(ui, at(796.0, 22.0), "memnext", Some(BG2), crate::icons::tri_right), app, "Call Next Memory Cue").clicked() {
+        if tip(icon_button(ui, at(796.0, 20.0), "memnext", Some(BTN), |p, r, c| crate::icons_player::mem_tri(p, r.center() + vec2(5.0, 0.0), 1.0, c)), app, "Call Next Memory Cue").clicked() {
             app.memory_jump(1);
         }
-        if tip(icon_button(ui, at(821.0, 22.0), "memdel", Some(BG2), |p, r, c| crate::icons::cross(p, r, c, 1.6)), app, "Delete Memory Cue(Loop)").clicked() {
+        if tip(icon_button(ui, at(821.0, 20.0), "memdel", Some(BTN), |p, r, c| crate::icons_player::cross(p, r.center(), 10.0, 1.3, c)), app, "Delete Memory Cue(Loop)").clicked() {
             app.memory_delete_current();
         }
-        // loop group: AU 861..897.4, MA 900.4..936, ‹ 951.8, field 975..1032.7, › 1045.6
+        // loop group: AU 861..898, MA 900..937, ‹ tile 942..962, field 964..1034, › tile 1036..1056
         let au = app.prefs.loop_auto;
-        if tip(seg_button(ui, at(879.2, 36.4), "au", "AU", au), app, "Auto Beat Loop").clicked() {
+        if tip(seg_button(ui, at(879.5, 37.0), "au", "AU", au), app, "Auto Beat Loop").clicked() {
             app.prefs.loop_auto = true;
         }
-        if tip(seg_button(ui, at(918.2, 35.6), "ma", "MA", !au), app, "Manual Loop").clicked() {
+        if tip(seg_button(ui, at(918.5, 37.0), "ma", "MA", !au), app, "Manual Loop").clicked() {
             app.prefs.loop_auto = false;
         }
         if au {
-            if tip(icon_button(ui, at(951.8, 18.0), "lhalf", None, crate::icons::chevron_left), app, "Auto Beat Loop:\nMake Loop length shorter.").clicked() {
+            if tip(icon_button(ui, at(952.0, 20.0), "lhalf", Some(BTN), |p, r, c| crate::icons_player::chevron_left(p, r.center(), 1.25, c)), app, "Auto Beat Loop:\nMake Loop length shorter.").clicked() {
                 app.resize_loop(0.5);
             }
             let lb = app.prefs.loop_beats;
             let label = crate::player_ext::beats_text(lb);
             let active = app.loop_active().is_some();
-            let field = at(1003.9, 57.7);
-            if tip(button(ui, field, "lbeat", &label, if active { LOOP.gamma_multiply(0.7) } else { BTN }, WHITE, 11.5), app, "Auto Beat Loop:\nSet/Reset Loop of displayed beat length.").clicked() {
+            let field = at(999.0, 70.0);
+            if tip(button(ui, field, "lbeat", &label, if active { LOOP.gamma_multiply(0.7) } else { BTN }, WHITE, 11.0), app, "Auto Beat Loop:\nSet/Reset Loop of displayed beat length.").clicked() {
                 if active {
                     app.loop_exit();
                 } else {
@@ -785,25 +813,28 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             // Size list (1/64 … 512 beats): the small arrow at the field's right end.
             let dr = Rect::from_min_max(pos2(field.max.x - 14.0, field.min.y), field.max);
             let dresp = tip(ui.interact(dr, ui.id().with("lsize"), Sense::click()), app, "Beat Loop");
-            crate::icons::chevron_down(&p, Rect::from_center_size(dr.center(), vec2(10.0, 9.0)), if dresp.hovered() { WHITE } else { DIM });
+            // rekordbox shows no arrow in the field: ours appears only under the pointer.
+            if ui.rect_contains_pointer(field) {
+                crate::icons_player::chevron_down(&p, dr.center(), 0.9, if dresp.hovered() { WHITE } else { DIM });
+            }
             crate::ui_browser::dropdown(ui, &dresp, "lsizepop", |ui: &mut Ui| crate::ui_player2::loop_size_menu(app, ui));
-            if tip(icon_button(ui, at(1045.6, 18.0), "ldouble", None, crate::icons::chevron_right), app, "Auto Beat Loop:\nMake Loop length longer.").clicked() {
+            if tip(icon_button(ui, at(1046.0, 20.0), "ldouble", Some(BTN), |p, r, c| crate::icons_player::chevron_right(p, r.center(), 1.25, c)), app, "Auto Beat Loop:\nMake Loop length longer.").clicked() {
                 app.resize_loop(2.0);
             }
         } else {
             // Manual loop: IN 951..985, OUT 988..1022, RELOOP/EXIT 1025..1095.
             crate::ui_player2::manual_loop_buttons(app, ui, |x, w| at(x, w));
         }
-        // Q 1206.6..1238.4, menu 1259.5
+        // Q 1206..1239, menu: a 21 pt tile at 1249
         let q = app.prefs.quantize;
         if app.prefs.show_stems && tip(seg_button(ui, at(1165.0, 46.0), "stems_btn", "STEMS", false), app, "Show the stem (part) controls").clicked() {
             app.deck.ctrl_tab = 2;
         }
-        if tip(seg_button(ui, at(1222.5, 31.8), "quant", "Q", q), app, "Quantize ON/OFF").clicked() {
+        if tip(seg_button(ui, at(1222.5, 33.0), "quant", "Q", q), app, "Quantize ON/OFF").clicked() {
             app.prefs.quantize = !q;
             app.save_prefs();
         }
-        let menu_r = tip(icon_button(ui, at(1259.5, 22.0), "stripmenu", None, crate::icons::hamburger), app, "Show Menu items");
+        let menu_r = tip(icon_button(ui, Rect::from_center_size(pos2(sx(main, 1259.5), y - 0.5), vec2(21.0, 21.0)), "stripmenu", Some(BTN), |p, r, c| crate::icons_player::menu(p, r.center(), 1.625, c)), app, "Show Menu items");
         crate::ui_browser::dropdown(ui, &menu_r, "strippop", |ui: &mut Ui| {
             if ui.button("Clear all hot cues").clicked() {
                 let ids: Vec<i64> = app.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| c.id).collect();
@@ -846,7 +877,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
 /// use and separation progress.
 fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let p = ui.painter().clone();
-    let y = s.min.y + 22.6;
+    let y = s.min.y + 24.0;
     let at = |x: f32, w: f32| Rect::from_center_size(pos2(sx(main, x), y), vec2(w, 26.0));
     let have = app.player.state.lock().stems.is_some();
     let on = app.player.state.lock().stem_on;
@@ -917,7 +948,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
 pub(crate) fn bold_button(ui: &mut Ui, rect: Rect, id: &str, label: &str) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
     ui.painter().rect_filled(rect, 2.0, if r.is_pointer_button_down_on() { BG2 } else if r.hovered() { lighten(BTN) } else { BTN });
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, bold(9.0), WHITE);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, caps(8.8), WHITE);
     r
 }
 
@@ -925,19 +956,19 @@ pub(crate) fn bold_button(ui: &mut Ui, rect: Rect, id: &str, label: &str) -> Res
 fn tab_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, active: bool) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
     ui.painter().rect_filled(rect, 0.0, if active { BG2 } else { BG });
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, bold(9.5), WHITE);
+    ui.painter().text(rect.center() + vec2(0.0, -0.25), Align2::CENTER_CENTER, label, caps(8.8), WHITE);
     r
 }
 
-/// Toggle buttons (AU / MA / Q): blue when on, #1E1E1E with a hairline when off.
+/// Toggle buttons (AU / MA / Q, the panel tabs): blue when on, #1E1E1E with a 1 pt #646464 outline when off.
 pub(crate) fn seg_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, on: bool) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
     let fill = if on { BLUE } else if r.hovered() { hex(0x2A2A2A) } else { BG2 };
     ui.painter().rect_filled(rect, 2.0, fill);
     if !on {
-        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0_f32, hex(0x3C3C3C)), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0_f32, OFF), egui::StrokeKind::Inside);
     }
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, bold(9.0), WHITE);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, caps(8.8), WHITE);
     r
 }
 
@@ -973,15 +1004,14 @@ pub(crate) fn hot_cue_menu(app: &mut App, ui: &mut Ui, c: &Cue) {
 
 fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
-    // Measured: list x 1312..1504, y 5..222 below the player top; tabs y 229..247, 60.5 wide.
-    // Reference 01/03: a #1E1E1E panel (x 1303..1509, 259 pt tall) holding the list (x 1311..1501,
-    // from 5 pt) as separate rounded rows: MEMORY 10 × 21 pt on a 22 pt pitch, HOT CUE 8 × 26 pt
-    // on a 27 pt pitch.
-    let tabs_y = r.min.y + 229.0;
-    p.rect_filled(Rect::from_min_max(pos2(r.min.x - 7.0, r.min.y), pos2(r.max.x - 3.0, r.min.y + 259.0)), 0.0, hex(0x1E1E1E));
-    let list = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 5.0), pos2(r.max.x - 11.0, r.min.y + 224.0));
+    // Reference 01/03: a #1E1E1E panel (x 1303..1509, from 1 pt below the player's top) holding
+    // the list (x 1311..1501, from y 6) as separate rounded rows: MEMORY 10 × 21 pt on a 22 pt
+    // pitch, HOT CUE 8 × 26 pt on a 27 pt pitch; three 62 × 18 pt tabs at y 230.
+    let tabs_y = r.min.y + 230.0;
+    p.rect_filled(Rect::from_min_max(pos2(r.min.x - 7.0, r.min.y + 1.0), pos2(r.max.x - 3.0, r.max.y)), 0.0, hex(0x1E1E1E));
+    let list = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 6.0), pos2(r.max.x - 11.0, r.min.y + 225.0));
     for (i, name) in ["MEMORY", "HOT CUE", "INFO"].iter().enumerate() {
-        let tr = Rect::from_min_size(pos2(r.min.x + 1.0 + i as f32 * 64.0, tabs_y), vec2(60.5, 18.0));
+        let tr = Rect::from_min_size(pos2(r.min.x + 1.0 + i as f32 * 64.0, tabs_y), vec2(62.0, 18.0));
         let tipt = ["Show MEMORY Panel", "Show HOT CUE Panel", "Show INFO Panel"][i];
         if tip(seg_button(ui, tr, &format!("ptab{i}"), name, app.deck.panel_tab == i as u8), app, tipt).clicked() {
             app.deck.panel_tab = i as u8;
@@ -996,7 +1026,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let rr = Rect::from_min_size(pos2(list.min.x, list.min.y + i as f32 * row_h), vec2(list.width(), row_h - 1.0));
                 p.rect_filled(rr, 2.0, hex(0x0F0F0F));
                 let Some(c) = mems.get(i).cloned() else {
-                    close_cross(&p, pos2(rr.max.x - 10.25, rr.center().y), 7.0, hex(0x454545));
+                    crate::icons_player::cross(&p, pos2(rr.max.x - 10.0, rr.center().y - 0.5), 8.0, 0.9, hex(0x454545));
                     continue;
                 };
                 let col = if c.color > 0 { label_color(c.color) } else { BAR_RED };
@@ -1022,7 +1052,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 } else {
                     p.text(pos2(rr.min.x + 96.0, rr.center().y), Align2::LEFT_CENTER, &c.comment, FontId::proportional(10.5), DIM2);
                 }
-                close_cross(&p, pos2(rr.max.x - 10.25, rr.center().y), 7.0, WHITE);
+                crate::icons_player::cross(&p, pos2(rr.max.x - 10.0, rr.center().y - 0.5), 8.0, 0.9, WHITE);
                 let dr = child.interact(del, child.id().with(("memdel", c.id)), Sense::click());
                 if dr.clicked() {
                     app.delete_cue(c.id);
@@ -1083,13 +1113,13 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let rr = Rect::from_min_size(pos2(list.min.x, list.min.y + slot as f32 * 27.0), vec2(list.width(), 26.0));
                 p.rect_filled(rr, 2.0, hex(0x0F0F0F));
                 let c = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned();
-                let chip = Rect::from_center_size(pos2(rr.min.x + 15.0, rr.center().y), vec2(11.0, 11.0));
+                let chip = Rect::from_center_size(pos2(rr.min.x + 15.5, rr.center().y - 0.5), vec2(11.0, 11.0));
                 let letter = ((b'A' + slot as u8) as char).to_string();
                 match &c {
                     Some(c) => {
                         p.rect_filled(chip, 0.0, hotcue_color(c.color));
-                        p.text(chip.center(), Align2::CENTER_CENTER, &letter, FontId::proportional(10.0), WHITE);
-                        p.text(pos2(rr.min.x + 31.5, rr.center().y), Align2::LEFT_CENTER, fmt_time(c.start, false), FontId::proportional(11.0), WHITE);
+                        p.text(chip.center(), Align2::CENTER_CENTER, &letter, FontId::proportional(10.0), Color32::BLACK);
+                        p.text(pos2(rr.min.x + 31.5, rr.center().y - 0.5), Align2::LEFT_CENTER, fmt_time(c.start, false), FontId::proportional(10.7), WHITE);
                         let del = Rect::from_center_size(pos2(rr.max.x - 17.0, rr.center().y), vec2(18.0, rr.height()));
                         if app.deck.editing_comment == Some(c.id) {
                             let mut txt = c.comment.clone();
@@ -1105,9 +1135,9 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                                 app.deck.editing_comment = None;
                             }
                         } else {
-                            p.text(pos2(rr.min.x + 66.5, rr.center().y), Align2::LEFT_CENTER, &c.comment, FontId::proportional(11.0), WHITE);
+                            p.text(pos2(rr.min.x + 67.0, rr.center().y - 0.5), Align2::LEFT_CENTER, &c.comment, FontId::proportional(10.7), WHITE);
                         }
-                        close_cross(&p, pos2(rr.max.x - 17.0, rr.center().y), 8.0, WHITE);
+                        crate::icons_player::cross(&p, pos2(rr.max.x - 17.0, rr.center().y), 8.0, 1.0, WHITE);
                         if child.interact(del, child.id().with(("hcdel", slot)), Sense::click()).clicked() {
                             app.delete_cue(c.id);
                             continue;
@@ -1127,7 +1157,7 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     }
                     None => {
                         // An empty slot shows only its letter, in grey.
-                        p.text(chip.center(), Align2::CENTER_CENTER, &letter, FontId::proportional(11.0), hex(0x5A5A5A));
+                        p.text(chip.center() + vec2(0.0, -0.5), Align2::CENTER_CENTER, &letter, FontId::proportional(11.0), OFF);
                     }
                 }
             }
@@ -1136,48 +1166,44 @@ fn side_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     }
 }
 
+/// INFO panel (reference 04): a #0F0F0F sheet with a 3 pt scroll bar at its right and three
+/// ruled rows: rating (31 pt), colour (30 pt) and comment (47 pt). My Tag and the file's
+/// format follow underneath.
 fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
+    let p = ui.painter().clone();
+    let sheet = Rect::from_min_max(r.min, pos2(r.max.x - 5.0, r.max.y));
+    p.rect_filled(sheet, 0.0, hex(0x0F0F0F));
+    p.rect_filled(Rect::from_min_max(pos2(r.max.x - 3.0, r.min.y), pos2(r.max.x, r.max.y - 25.0)), 0.0, hex(0x555555));
+    let (x0, y0) = (r.min.x, r.min.y);
+    for (y, x1) in [(31.0, 179.0), (62.0, 179.0), (110.0, 170.0)] {
+        p.rect_filled(Rect::from_min_max(pos2(x0 + 10.0, y0 + y), pos2(x0 + x1, y0 + y + 1.0)), 0.0, BG2);
+    }
     let Some(id) = app.deck.track else {
         return;
     };
     let Some(t) = app.track(id).cloned() else { return };
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        for s in 1..=5u8 {
-            let (rr, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-            star(ui.painter(), rr.center(), 7.0, if t.rating >= s { WHITE } else { DIM }, t.rating >= s);
-            if resp.clicked() {
-                let nr = if t.rating == s { 0 } else { s };
-                if let Some(tm) = app.track_mut(id) {
-                    tm.rating = nr;
-                }
-                app.save_track(id);
-            }
-        }
-    });
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("💬").color(DIM));
-        let mut c = t.comment.clone();
-        let resp = ui.add_sized(vec2(r.width() - 44.0, 20.0), egui::TextEdit::singleline(&mut c).hint_text("Comments"));
-        if resp.changed() {
+    // Rating: five 10.5 pt stars on a 16 pt pitch.
+    for s in 1..=5u8 {
+        let c = pos2(x0 + 15.75 + (s - 1) as f32 * 16.0, y0 + 15.75);
+        let resp = ui.interact(Rect::from_center_size(c, vec2(16.0, 20.0)), ui.id().with(("infostar", s)), Sense::click());
+        crate::icons_player::star(&p, c, if t.rating >= s { WHITE } else { DIM }, t.rating >= s);
+        if resp.clicked() {
+            let nr = if t.rating == s { 0 } else { s };
             if let Some(tm) = app.track_mut(id) {
-                tm.comment = c;
+                tm.rating = nr;
             }
             app.save_track(id);
         }
-    });
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
+    }
+    // Colour: the track's colour and its name; the choices appear under the pointer.
+    let crow = Rect::from_min_max(pos2(x0, y0 + 32.0), pos2(sheet.max.x, y0 + 62.0));
+    if ui.rect_contains_pointer(crow) {
         for i in 0..9u8 {
-            let (rr, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
-            let col = if i == 0 { BG2 } else { label_color(i) };
-            ui.painter().rect_filled(rr, 2.0, col);
+            let rr = Rect::from_min_size(pos2(x0 + 10.0 + i as f32 * 18.0, y0 + 40.0), vec2(14.0, 14.0));
+            let resp = ui.interact(rr, ui.id().with(("infocol", i)), Sense::click());
+            p.rect_filled(rr, 2.0, if i == 0 { BG2 } else { label_color(i) });
             if t.color == i {
-                ui.painter().rect_stroke(rr, 2.0, Stroke::new(1.5_f32, WHITE), egui::StrokeKind::Inside);
+                p.rect_stroke(rr, 2.0, Stroke::new(1.5_f32, WHITE), egui::StrokeKind::Inside);
             }
             if resp.on_hover_text(app.prefs.color_name(i)).clicked() {
                 if let Some(tm) = app.track_mut(id) {
@@ -1186,17 +1212,29 @@ fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 app.save_track(id);
             }
         }
-    });
-    ui.add_space(6.0);
+    } else if t.color > 0 {
+        p.rect_filled(Rect::from_min_size(pos2(x0 + 10.0, y0 + 41.0), vec2(12.0, 12.0)), 2.0, label_color(t.color));
+        p.text(pos2(x0 + 28.0, y0 + 47.0), Align2::LEFT_CENTER, app.prefs.color_name(t.color), FontId::proportional(11.0), DIM2);
+    }
+    // Comment: the bubble mark and the text.
+    crate::icons_player::bubble(&p, pos2(x0 + 10.0, y0 + 72.0), DIM);
+    let mut c = t.comment.clone();
+    let er = Rect::from_min_max(pos2(x0 + 28.0, y0 + 67.0), pos2(sheet.max.x - 8.0, y0 + 87.0));
+    let resp = ui.put(er, egui::TextEdit::singleline(&mut c).frame(false).font(FontId::proportional(11.0)).text_color(WHITE));
+    if resp.changed() {
+        if let Some(tm) = app.track_mut(id) {
+            tm.comment = c;
+        }
+        app.save_track(id);
+    }
     let tags = app.tag_text(id);
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(if tags.is_empty() { "No My Tag".to_string() } else { tags }).color(DIM2).size(10.5));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(format!("{} · {} kbps · {} Hz", t.file_type.to_uppercase(), t.bitrate, t.sample_rate)).color(DIM).size(10.0));
-    });
+    if !tags.is_empty() {
+        p.with_clip_rect(sheet).text(pos2(x0 + 10.0, y0 + 126.0), Align2::LEFT_CENTER, tags, FontId::proportional(10.5), DIM2);
+    }
+    if ui.rect_contains_pointer(sheet) {
+        // The file's format, shown while the pointer is over the panel.
+        p.text(pos2(x0 + 10.0, r.max.y - 12.0), Align2::LEFT_CENTER, format!("{} · {} kbps · {} Hz", t.file_type.to_uppercase(), t.bitrate, t.sample_rate), FontId::proportional(10.0), OFF);
+    }
 }
 
 pub fn star(p: &egui::Painter, c: Pos2, r: f32, col: Color32, filled: bool) {
