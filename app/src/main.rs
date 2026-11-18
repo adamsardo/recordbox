@@ -20,6 +20,7 @@ mod jobs;
 mod key;
 mod library_ext;
 mod menus;
+mod mixer;
 mod model;
 mod manual;
 mod phrase;
@@ -38,6 +39,7 @@ mod ui_kit;
 mod ui_library_ext;
 mod ui_player;
 mod ui_prefs;
+mod ui_perf;
 mod ui_player2;
 mod xmlexport;
 
@@ -160,12 +162,14 @@ impl eframe::App for Gui {
         egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
-        if !app.prefs.browser_only {
+        if !app.prefs.browser_only || app.performance() {
             // The header is 28 pt and 1 Player / 2 Players 256 pt tall with no rule between them
             // (measured on rekordbox: the player ends 284 pt below the window top); the Simple
             // Player is one 58 pt row.
             let h = app.player_height();
-            egui::TopBottomPanel::top(egui::Id::new(("player", app.prefs.player_layout.min(3)))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+            let perf = app.performance();
+            egui::TopBottomPanel::top(egui::Id::new(("player", if perf { 9 } else { app.prefs.player_layout.min(3) }))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+                _ if perf => step!(ui_perf::performance(app, ui)),
                 1 | 3 => step!(ui_player2::two_players(app, ui)),
                 2 => step!(ui_player2::simple_player(app, ui)),
                 _ => step!(ui_player::player_panel(app, ui)),
@@ -210,6 +214,7 @@ impl eframe::App for Gui {
                     eprintln!("bench: {} frames, update avg {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}", v.len(), avg, v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1]);
                     use std::sync::atomic::Ordering::Relaxed;
                     eprintln!("bench: stems ready {}, separating {:?}, stem error {:?}", app.player.state.lock().stems.is_some(), app.stem.separating, app.stem.error);
+                    eprintln!("bench: mixer meters deck 1 {:.1} dB, master {:.1} dB, limiter on {}", app.px.mix[0].shown_db[0], app.px.master_db[0], audio::LIMITER_ON.load(Relaxed));
                     eprintln!("bench: audio callback found a deck held {} times, gave a buffer up {} times", audio::AUDIO_CONTENDED.load(Relaxed), audio::AUDIO_DROPPED.load(Relaxed));
                 }
             }

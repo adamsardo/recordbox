@@ -257,6 +257,15 @@ pub struct PlayState {
     /// (low, mid, high; 0.0 = killed).
     pub eq_on: bool,
     pub eq_gain: [f32; 3],
+    /// The Performance mixer's channel strip (`mixer.rs`). `strip`: 0 = none (the Export
+    /// layouts), 1 = equalizer, 2 = isolator. `eq_pos`: LOW / MID / HIGH knobs, 0..1.
+    pub strip: u8,
+    pub eq_pos: [f32; 3],
+    /// TRIM and channel fader gains (1.0 = unity).
+    pub trim: f32,
+    pub ch_fader: f32,
+    /// Highest level since the meter last read it, after the EQ and before the fader (L, R).
+    pub peak: [f32; 2],
     /// Beat times of the loaded track (seconds), for BEAT SYNC.
     pub grid: Option<Arc<Vec<f64>>>,
     /// BEAT SYNC: this deck follows the other deck's beat phase while both play.
@@ -292,6 +301,11 @@ impl Default for PlayState {
             fader: 1.0,
             eq_on: false,
             eq_gain: [1.0; 3],
+            strip: 0,
+            eq_pos: [0.5; 3],
+            trim: 1.0,
+            ch_fader: 1.0,
+            peak: [0.0; 2],
             grid: None,
             sync_follow: false,
             sync_bend: 0.0,
@@ -798,11 +812,15 @@ struct DeckDsp {
     fader: f32,
     /// Gains in use for the original and the four parts (moving toward their targets).
     stem_g: [f32; 5],
+    /// The Performance mixer's equalizer, and its TRIM x channel fader gains in use.
+    eq3: crate::mixer::Eq3,
+    trim: f32,
+    ch_fader: f32,
 }
 
 impl DeckDsp {
     fn new() -> DeckDsp {
-        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0] }
+        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0], eq3: crate::mixer::Eq3::new(), trim: 1.0, ch_fader: 1.0 }
     }
 }
 
@@ -864,6 +882,30 @@ fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize,
     for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
         render_deck(s, out, channels, rate);
     }
+    drop((a, b));
+    // The master section (Performance mixer): peak limiter, then the master level meter.
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(mut lim) = MASTER_LIMITER.try_lock() {
+        lim.process(out, channels, rate, LIMITER_ON.load(Relaxed));
+    }
+    for (c, m) in MASTER_PEAK.iter().enumerate().take(channels.min(2)) {
+        let p = out.iter().skip(c).step_by(channels.max(1)).fold(0.0f32, |a, v| a.max(v.abs()));
+        if p > f32::from_bits(m.load(Relaxed)) {
+            m.store(p.to_bits(), Relaxed);
+        }
+    }
+}
+
+static MASTER_LIMITER: Mutex<crate::mixer::Limiter> = Mutex::new(crate::mixer::Limiter::new());
+/// The master peak limiter is in the signal path (the Performance mixer; off in Export).
+pub static LIMITER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Highest master output level since the meter last read it (L, R; f32 bits).
+pub static MASTER_PEAK: [std::sync::atomic::AtomicU32; 2] = [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+
+/// Read and clear the master meter's peaks.
+pub fn take_master_peak() -> [f32; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [f32::from_bits(MASTER_PEAK[0].swap(0, Relaxed)), f32::from_bits(MASTER_PEAK[1].swap(0, Relaxed))]
 }
 
 /// Time a part takes to fade fully in or out when it is muted or unmuted.
@@ -933,10 +975,19 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     let stretch = (pitch - speed).abs() > 1e-9;
     let hop = ((rate as usize) / 50).clamp(64, 4096);
     let fader_k = (1.0 / (0.005 * rate as f32)).min(1.0);
-    let eq_on = s.eq_on;
+    // The channel strip: none (Export), the equalizer, or the isolator (rekordbox's band
+    // gains: kill at the left end, flat at the centre, +6 dB at the right, the same curve as
+    // STEM ISO).
+    let strip = s.strip;
+    let eq_on = s.eq_on || strip == 2;
     if eq_on {
         s.dsp.eq.prepare(rate);
     }
+    if strip == 1 {
+        s.dsp.eq3.prepare(rate, s.eq_pos, out.len() / channels.max(1));
+    }
+    let iso_gain = if strip == 2 { [stem_iso_gain(s.eq_pos[0]), stem_iso_gain(s.eq_pos[1]), stem_iso_gain(s.eq_pos[2])] } else { s.eq_gain };
+    let mut peak = s.peak;
     if !stretch {
         s.dsp.st.active = false;
     }
@@ -971,13 +1022,26 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
         if eq_on {
             let d = &mut s.dsp;
             for k in 0..3 {
-                d.eq.g[k] += (s.eq_gain[k] - d.eq.g[k]) * fader_k;
+                d.eq.g[k] += (iso_gain[k] - d.eq.g[k]) * fader_k;
             }
             l = d.eq.run(0, l);
             r = d.eq.run(1, r);
         }
+        if strip != 0 {
+            s.dsp.trim += (s.trim - s.dsp.trim) * fader_k;
+            l *= s.dsp.trim;
+            r *= s.dsp.trim;
+            if strip == 1 {
+                l = s.dsp.eq3.run(0, l);
+                r = s.dsp.eq3.run(1, r);
+            }
+            // The level meter's tap: after the EQ, before the faders (with the track's gain).
+            peak[0] = peak[0].max((l * s.gain).abs());
+            peak[1] = peak[1].max((r * s.gain).abs());
+        }
+        s.dsp.ch_fader += (s.ch_fader - s.dsp.ch_fader) * fader_k;
         s.dsp.fader += (s.fader - s.dsp.fader) * fader_k;
-        let vol = vol * s.dsp.fader;
+        let vol = vol * s.dsp.fader * s.dsp.ch_fader;
         let mut click = 0.0f32;
         if let Some(beats) = metro.as_ref() {
             // The beat list can be replaced by a shorter one (another track, a grid edit).
@@ -1010,6 +1074,7 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
         s.pos += step * speed;
         s.dsp.st.expect = s.pos;
     }
+    s.peak = peak;
 }
 
 /// Metronome click level for the three volume steps of the GRID panel (1 = quiet … 3 = loud).

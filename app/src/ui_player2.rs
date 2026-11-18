@@ -514,7 +514,7 @@ pub fn grid_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
 
 /// CUE and PLAY/PAUSE as round buttons of radius `rad` (18.5 pt in the 1 Player layout).
 /// `keys`: this deck is the one the keyboard operates.
-fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, keys: bool) {
+pub(crate) fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, keys: bool) {
     let p = ui.painter().clone();
     let loaded = app.deck.track.is_some();
     let playing = app.playing();
@@ -540,7 +540,7 @@ fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, rad: f32, key
 }
 
 /// Artwork tile; a click unloads the track.
-fn artwork(app: &mut App, ui: &mut Ui, art: Rect, track: &Option<Track>) {
+pub(crate) fn artwork(app: &mut App, ui: &mut Ui, art: Rect, track: &Option<Track>) {
     let p = ui.painter().clone();
     match track {
         Some(t) => {

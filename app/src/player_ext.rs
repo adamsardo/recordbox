@@ -51,13 +51,16 @@ pub struct DeckExt {
     /// and the one being worked out in the background.
     pub stem_wave: Option<([bool; 4], Waveform)>,
     pub stem_wave_rx: Option<(i64, [bool; 4], crossbeam_channel::Receiver<Waveform>)>,
+    /// Performance: how many steps the platter's tempo range is past its default of ±10
+    /// (0 = ±10, 1 = ±16, 2 = WIDE, 3 = ±6).
+    pub tempo_range: u8,
 }
 
 impl DeckExt {
     /// What stays on a deck when another track is loaded or it is emptied: the switches of
     /// the deck itself (MT, BEAT SYNC, KEY SYNC, isolator), not the settings made for a track.
     pub fn carried(&self) -> DeckExt {
-        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, ..Default::default() }
+        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, tempo_range: self.tempo_range, ..Default::default() }
     }
 }
 
@@ -79,16 +82,58 @@ pub struct PlayerExt {
     pub dual_control: bool,
     /// The waveform link: scrubbing or scrolling one enlarged waveform moves both decks.
     pub wave_link: bool,
+    /// The Performance mixer, per deck (index 0 = deck 1). Not kept between runs, as in
+    /// rekordbox.
+    pub mix: [MixStrip; 2],
+    /// Headphones MIX and LEVEL knobs (0..1).
+    pub hp_mix: f32,
+    pub hp_level: f32,
+    /// Master level meter as shown (dB, L and R).
+    pub master_db: [f32; 2],
+    /// Pad mode of each deck: 0 = HOT CUE, 1 = STEMS.
+    pub pad_mode: [u8; 2],
+    /// Loop box of each deck shows the manual loop buttons (MA) instead of the auto loop (AU).
+    pub loop_manual: [bool; 2],
+    /// STEM FX switches (VOCAL, INST, BASS, DRUMS), all on at start, as in rekordbox.
+    pub stem_fx: [bool; 4],
+}
+
+/// One channel strip of the Performance mixer (knob and fader positions, 0..1).
+#[derive(Clone, Copy)]
+pub struct MixStrip {
+    pub trim: f32,
+    /// LOW, MID, HIGH.
+    pub eq: [f32; 3],
+    pub fader: f32,
+    /// Headphones CUE.
+    pub cue: bool,
+    /// STEM ISO mode: the three knobs set the level of VOCAL, INST (with BASS) and DRUMS.
+    pub stem_iso_on: bool,
+    /// DRUMS, INST, VOCAL (bottom to top, like LOW / MID / HIGH).
+    pub stem_iso: [f32; 3],
+    /// Crossfader side: 0 = THRU, 1 = A, 2 = B.
+    pub assign: u8,
+    /// Level meter as shown (dB, L and R).
+    pub shown_db: [f32; 2],
+}
+
+impl MixStrip {
+    fn new(assign: u8) -> MixStrip {
+        MixStrip { trim: 0.5, eq: [0.5; 3], fader: 1.0, cue: false, stem_iso_on: false, stem_iso: [0.5; 3], assign, shown_db: [-120.0; 2] }
+    }
 }
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false }
+        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 2], loop_manual: [false; 2], stem_fx: [true; 4] }
     }
 }
 
-/// Tempo range of the TEMPO controls and typed BPM values (±16 %).
+/// Tempo range of the TEMPO controls and typed BPM values (±16 %) outside Performance mode.
 pub const TEMPO_RANGE: f64 = 0.16;
+/// Performance: the ranges the platter's range label steps through (±6, ±10, ±16, WIDE), in
+/// percent. rekordbox keeps the slider position when the range changes.
+pub const TEMPO_RANGES: [f64; 4] = [6.0, 10.0, 16.0, 100.0];
 /// One click of TEMPO − / + (0.1 % of the track's tempo).
 pub const TEMPO_STEP: f64 = 0.001;
 /// Speed change while a pitch bend button is held (4 %).
@@ -314,12 +359,57 @@ impl App {
     // ------------------------------------------------------------------ decks and layouts
     /// A layout with both decks is showing (2 Players or Dual Player).
     pub fn two_players(&self) -> bool {
-        !self.prefs.browser_only && matches!(self.prefs.player_layout, 1 | 3)
+        self.performance() || (!self.prefs.browser_only && matches!(self.prefs.player_layout, 1 | 3))
     }
 
     /// The Dual Player layout is showing.
     pub fn dual_player(&self) -> bool {
-        !self.prefs.browser_only && self.prefs.player_layout == 3
+        !self.performance() && !self.prefs.browser_only && self.prefs.player_layout == 3
+    }
+
+    /// PERFORMANCE mode (decks with a mixer) is showing.
+    pub fn performance(&self) -> bool {
+        self.prefs.app_mode == 1
+    }
+
+    /// Key shift is on screen (Dual Player and Performance).
+    pub fn key_controls(&self) -> bool {
+        self.dual_player() || self.performance()
+    }
+
+    /// EXPORT (0) or PERFORMANCE (1).
+    pub fn set_app_mode(&mut self, mode: u8) {
+        self.prefs.app_mode = mode.min(1);
+        self.poll_decks();
+        self.save_prefs();
+    }
+
+    /// The active deck's tempo range as a fraction (0.16 = ±16 %).
+    pub fn tempo_range(&self) -> f64 {
+        if self.performance() {
+            TEMPO_RANGES[(self.deck.x.tempo_range as usize + 1) % 4] / 100.0
+        } else {
+            TEMPO_RANGE
+        }
+    }
+
+    /// Performance: the next tempo range (6, 10, 16, WIDE, 6 ...). The tempo is rescaled so
+    /// that the slider position stays where it is, as in rekordbox (only with a track loaded).
+    pub fn tempo_range_next(&mut self) {
+        let old = self.tempo_range();
+        self.deck.x.tempo_range = (self.deck.x.tempo_range + 1) % 4;
+        let new = self.tempo_range();
+        if self.deck.track.is_some() && !self.sync_follower() {
+            self.deck.x.tempo_adj = self.deck.x.tempo_adj * new / old;
+        }
+        self.push_deck_controls();
+    }
+
+    /// Height of the Performance player area: the stacked waveforms (143 pt), the decks
+    /// (225 pt, 21 pt more with the stem part buttons) and the mixer's bottom row (43 pt).
+    /// rekordbox 7.2.19: 368 + 43 (+ 21).
+    pub fn performance_height(&self) -> f32 {
+        368.0 + 43.0 + if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 }
     }
 
     fn swap_decks(&mut self) {
@@ -380,6 +470,9 @@ impl App {
     /// Height of the player area for the layout showing (measured on rekordbox 7.2.19:
     /// 1 Player 256 pt, 2 Players and Dual Player 375 pt, Simple Player 59 pt).
     pub fn player_height(&self) -> f32 {
+        if self.performance() {
+            return self.performance_height();
+        }
         match self.prefs.player_layout {
             1 | 3 => 375.0,
             2 => crate::ui_player2::SIMPLE_HEIGHT,
@@ -424,6 +517,10 @@ impl App {
     fn push_deck_controls(&mut self) {
         let two = self.two_players();
         let dual = self.dual_player();
+        let perf = self.performance();
+        let keys = self.key_controls();
+        let (isolator, curve, three) = (self.prefs.eq_isolator, self.prefs.ch_fader_curve, self.prefs.stem_parts == 3);
+        crate::audio::LIMITER_ON.store(perf, std::sync::atomic::Ordering::Relaxed);
         let act = self.px.active;
         let master = self.px.master.min(1);
         let faders = crate::audio::crossfader_gains(self.px.crossfader);
@@ -475,8 +572,33 @@ impl App {
             s.tempo = tempo;
             s.bend = if two { x.bend as f64 * BEND_AMOUNT } else { 0.0 };
             s.master_tempo = two && x.master_tempo;
-            s.key_shift = if dual { x.key_shift as f32 } else { 0.0 };
-            s.fader = if two { if n == 0 { faders.0 } else { faders.1 } } else { 1.0 };
+            s.key_shift = if keys { x.key_shift as f32 } else { 0.0 };
+            let m = self.px.mix[n as usize];
+            s.fader = if perf {
+                // Crossfader side as assigned (THRU: not through the crossfader at all).
+                match m.assign {
+                    1 => faders.0,
+                    2 => faders.1,
+                    _ => 1.0,
+                }
+            } else if two {
+                if n == 0 { faders.0 } else { faders.1 }
+            } else {
+                1.0
+            };
+            // The Performance channel strip. In STEM ISO mode the knobs set the parts' levels
+            // (INST also sets BASS) and the EQ is out of the way.
+            s.strip = if !perf { 0 } else if isolator { 2 } else { 1 };
+            s.trim = if perf { crate::mixer::trim_gain(m.trim) } else { 1.0 };
+            s.ch_fader = if perf { crate::mixer::channel_fader_gain(m.fader, curve) } else { 1.0 };
+            s.eq_pos = if perf && !m.stem_iso_on { m.eq } else { [0.5; 3] };
+            let _ = three;
+            s.stem_iso = if perf && m.stem_iso_on {
+                let g = |v: f32| crate::audio::stem_iso_gain(v);
+                [g(m.stem_iso[0]), g(m.stem_iso[1]), g(m.stem_iso[1]), g(m.stem_iso[2])]
+            } else {
+                [1.0; 4]
+            };
             s.eq_on = dual;
             s.eq_gain = if dual { [!x.eq_kill[0] as u8 as f32, !x.eq_kill[1] as u8 as f32, !x.eq_kill[2] as u8 as f32] } else { [1.0; 3] };
             s.sync_follow = synced;
@@ -509,7 +631,8 @@ impl App {
             return;
         }
         let v = ((self.deck.x.tempo_adj + dir.signum() as f64 * TEMPO_STEP) * 1000.0).round() / 1000.0;
-        self.deck.x.tempo_adj = v.clamp(-TEMPO_RANGE, TEMPO_RANGE);
+        let range = self.tempo_range();
+        self.deck.x.tempo_adj = v.clamp(-range, range);
         self.push_deck_controls();
     }
 
@@ -538,7 +661,8 @@ impl App {
             return;
         }
         let adj = v / own - 1.0;
-        if !(-TEMPO_RANGE - 1e-9..=TEMPO_RANGE + 1e-9).contains(&adj) {
+        let range = self.tempo_range();
+        if !(-range - 1e-9..=range + 1e-9).contains(&adj) {
             self.toast_err("Invalid Operation. Enter a BPM value within the Tempo Range.");
             return;
         }
@@ -640,7 +764,7 @@ impl App {
     /// The key the active deck sounds in (the track's key moved by the key shift), as shown.
     pub fn result_key_label(&self) -> String {
         let Some(t) = self.deck.track.and_then(|id| self.track(id)) else { return String::new() };
-        let shift = if self.dual_player() { self.deck.x.key_shift } else { 0 };
+        let shift = if self.key_controls() { self.deck.x.key_shift } else { 0 };
         if shift == 0 {
             t.key_label(self.prefs.key_alnum)
         } else {

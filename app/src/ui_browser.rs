@@ -47,6 +47,92 @@ pub fn artwork_texture(app: &mut App, path: &str) -> Option<egui::TextureHandle>
 
 // ------------------------------------------------------------------------------------ header
 /// Header bar, 28 pt. Positions measured in the original (x in pt from the window's left edge;
+/// The rest of the top bar in PERFORMANCE mode (rekordbox 7.2.19, `MainComponent::resized`):
+/// the layout selector, the panel buttons (20 pt tiles from x 195, 37 pt apart: FX, SAMPLER,
+/// Groove Circuit, MIXER, REC), then on the right the gear, the master level meter and the
+/// clock.
+fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
+    let p = ui.painter().clone();
+    // Layout selector: 2Deck Horizontal is the layout that exists so far.
+    let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
+    let lay = ui.interact(lay_r, ui.id().with("perflayout"), Sense::click());
+    let lc = pos2(r.min.x + 145.0, r.min.y + 14.0);
+    p.rect_filled(Rect::from_center_size(lc - vec2(0.0, 3.0), vec2(18.0, 2.0)), 0.0, WHITE);
+    p.rect_filled(Rect::from_center_size(lc + vec2(0.0, 3.0), vec2(18.0, 2.0)), 0.0, WHITE);
+    crate::icons_player::chevron_down(&p, pos2(r.min.x + 170.75, r.min.y + 14.5), 1.0, WHITE);
+    dropdown(ui, &lay, "perflayoutpop", |ui| {
+        let _ = ui.selectable_label(true, "2Deck Horizontal");
+        for name in ["2Deck Vertical", "4Deck Horizontal", "4Deck Vertical", "Browse"] {
+            ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
+        }
+    });
+    // Panel buttons. Only the mixer exists; the others are shown unlit with the reason.
+    for (i, (name, built)) in [("FX", false), ("Sampler", false), ("Groove Circuit", false), ("Mixer", true), ("Rec", false)].iter().enumerate() {
+        let tr = Rect::from_min_size(pos2(r.min.x + 195.0 + 37.0 * i as f32, r.min.y + 4.0), vec2(20.0, 20.0));
+        let resp = ui.interact(tr, ui.id().with(("panel", i)), Sense::hover());
+        p.rect_filled(tr, 2.0, if *built { BLUE } else { BTN });
+        let c = tr.center();
+        let col = if *built { WHITE } else { hex(0x8C8C8C) };
+        match i {
+            0 => {
+                p.text(c, Align2::CENTER_CENTER, "FX", caps(8.5), col);
+            }
+            1 => {
+                for (k, h) in [4.0, 9.0, 6.0, 11.0, 5.0].iter().enumerate() {
+                    p.rect_filled(Rect::from_center_size(pos2(c.x - 6.0 + 3.0 * k as f32, c.y), vec2(1.5, *h)), 0.0, col);
+                }
+            }
+            2 => {
+                for gx in 0..3 {
+                    for gy in 0..3 {
+                        p.rect_filled(Rect::from_center_size(c + vec2((gx as f32 - 1.0) * 4.5, (gy as f32 - 1.0) * 4.5), vec2(3.5, 3.5)), 0.0, col);
+                    }
+                }
+            }
+            3 => {
+                for (k, y) in [2.5, -3.0, 1.0].iter().enumerate() {
+                    let x = c.x - 5.0 + 5.0 * k as f32;
+                    p.rect_filled(Rect::from_center_size(pos2(x, c.y), vec2(1.5, 13.0)), 0.0, col);
+                    p.rect_filled(Rect::from_center_size(pos2(x, c.y + *y), vec2(4.5, 2.5)), 0.0, col);
+                }
+            }
+            _ => crate::icons_player::record(&p, c, col),
+        }
+        let _ = resp.on_hover_text(if *built { format!("Show/Hide {name} panel") } else { format!("{name} panel: not built in recordbox yet.") });
+    }
+    let rx = r.max.x;
+    let ty = r.min.y;
+    let now = chrono::Local::now().format("%H:%M").to_string();
+    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
+    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
+    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
+    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
+    if gear.on_hover_text("Preferences").clicked() {
+        app.dialogs.prefs_open = true;
+    }
+    // Master level meter: two 3 pt bars (L over R), 80 pt wide.
+    for c in 0..2 {
+        let br = Rect::from_min_size(pos2(rx - 204.0, ty + 9.5 + 6.0 * c as f32), vec2(80.0, 3.0));
+        p.rect_filled(br, 0.0, hex(0x323232));
+        let db = app.px.master_db[c];
+        let f = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
+        if f > 0.0 {
+            p.rect_filled(Rect::from_min_size(br.min, vec2(br.width() * f, 3.0)), 0.0, if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) });
+        }
+    }
+    // Master volume (the same slider as in EXPORT mode's top bar).
+    let vr = Rect::from_min_max(pos2(rx - 105.0, ty + 6.0), pos2(rx - 70.0, ty + 22.0));
+    let vresp = ui.interact(vr, ui.id().with("perfvol"), Sense::click_and_drag());
+    let mut vol = app.player.state.lock().volume;
+    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on()) {
+        vol = ((pp.x - vr.min.x) / vr.width()).clamp(0.0, 1.0);
+        app.player.state.lock().volume = vol;
+    }
+    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.max.x, ty + 15.5)), 0.0, hex(0x323232));
+    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.min.x + vr.width() * vol, ty + 15.5)), 0.0, BLUE);
+    let _ = vresp.on_hover_text("Master Volume");
+}
+
 /// right-hand items measured from the right edge of a 1512 pt window).
 pub fn header_bar(app: &mut App, ui: &mut Ui) {
     let r = ui.max_rect();
@@ -57,10 +143,27 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     // Measured on rekordbox (28 pt header): EXPORT in 10.3 pt Arial Bold from x = 16.5 (caps
     // 9.5–17), pull-down chevrons (8 × 4, 1 pt) centred at 115.75 and 170.75, y 14.5.
     let ip = crate::icons_player::chevron_down;
-    p.text(pos2(r.min.x + 16.0, r.min.y + 14.0), Align2::LEFT_CENTER, "EXPORT", caps(10.3), WHITE);
+    let perf = app.performance();
+    p.text(pos2(r.min.x + 16.0, r.min.y + 14.0), Align2::LEFT_CENTER, if perf { "PERFORMANCE" } else { "EXPORT" }, caps(10.3), WHITE);
     let mode_r = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y), pos2(r.min.x + 124.0, r.max.y));
     ip(&p, pos2(r.min.x + 115.75, r.min.y + 14.5), 1.0, WHITE);
-    let _ = tipf(ui.interact(mode_r, ui.id().with("mode"), Sense::hover()), "This app covers EXPORT mode: library, preparation and USB export.");
+    // The mode list: EXPORT and PERFORMANCE (rekordbox also has LIGHTING and EDIT).
+    let mode = ui.interact(mode_r, ui.id().with("mode"), Sense::click());
+    dropdown(ui, &mode, "modepop", |ui| {
+        for (i, name) in ["EXPORT", "PERFORMANCE"].iter().enumerate() {
+            if ui.selectable_label(perf == (i == 1), *name).clicked() {
+                app.set_app_mode(i as u8);
+                ui.close_menu();
+            }
+        }
+        for name in ["LIGHTING", "EDIT"] {
+            ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
+        }
+    });
+    if perf {
+        performance_header(app, ui, r);
+        return;
+    }
     // Layout selector: an 18 × 9 frame at x 136–154, y 9.5–18.5.
     let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
     let lay = ui.interact(lay_r, ui.id().with("layout"), Sense::click());

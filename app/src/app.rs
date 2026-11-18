@@ -209,6 +209,12 @@ pub struct Prefs {
     pub stem_model: Option<String>,
     /// Download the chosen model in the background at launch.
     pub stems_auto_download: bool,
+    /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
+    pub app_mode: u8,
+    /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
+    /// and the channel fader curve (0 Exponential, 1 Linear, 2 Logarithmic).
+    pub eq_isolator: bool,
+    pub ch_fader_curve: u8,
     /// Separate a track when it is loaded, as rekordbox does while its STEMS function is on.
     pub stems_auto_separate: bool,
     /// Most disk space the kept stems may use, in GB (the least recently used go first).
@@ -695,6 +701,9 @@ impl Default for Prefs {
             usb_browse: Default::default(),
             stem_model: None,
             stems_auto_download: true,
+            app_mode: 0,
+            eq_isolator: false,
+            ch_fader_curve: 1,
             stems_auto_separate: true,
             stem_cache_gb: 20,
             import_device_history: true,
@@ -1460,6 +1469,7 @@ impl App {
                     "confirmremove" => app.dialogs.confirm_remove = Some(app.tracks.iter().take(3).map(|t| t.id).collect()),
                     "confirmdelete" => app.dialogs.confirm_delete_node = Some((0, "Warm Up".into(), false)),
                     "about" => app.dialogs.about = true,
+                    "performance" => app.prefs.app_mode = 1,
                     other => crate::library_ext::shot_view(&mut app, other),
                 }
             }
