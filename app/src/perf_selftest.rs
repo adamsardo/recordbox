@@ -116,6 +116,45 @@ impl App {
                 st("wait 13", p(sx + 300.0, sy - 40.0)),
                 st("wait 14: pattern 1 has been round", p(sx + 300.0, sy - 40.0)),
                 st("SMP eject slot 10", p(1512.0 - 4.0 - 3.0 * 179.0 + 62.0, py + 34.0)),
+                // Keys of rekordbox's Performance preset, the deck pads (deck 1 is in SAMPLER
+                // mode, deck 2 in SEQ. CALL), MASTER, a typed BPM, a slot colour, loop capture,
+                // Sequence Load and a slot dragged to another slot.
+                st("KEY:Cmd+Y|Playback Sequence (stops the sequence that plays)", p(900.0, py - 20.0)),
+                st("SMP Q (off, so that pads start at once)", p(510.5, py + 104.0)),
+                st("KEY:X|held: slot 1 (gate) plays while the key is down", p(900.0, py - 20.0)),
+                st("KEY:Cmd+Y|Playback Sequence (starts)", p(900.0, py - 20.0)),
+                st("KEY:Cmd+K|Next Sequence (waits for the bar)", p(900.0, py - 20.0)),
+                st("KEY:Cmd+Y|Playback Sequence (stop: the pattern stays 1)", p(900.0, py - 20.0)),
+                st("DECKPAD slot 2 on deck 1 (SAMPLER pad mode; a loop)", p(128.0, ly + 38.7)),
+                st("KEY:Shift+C|Pause slot 2", p(900.0, py - 20.0)),
+                st("SEQ REC (armed)", p(sx + 10.0, sy + 15.0)),
+                st("KEY:X|held: with REC armed the key starts the pattern and is recorded", p(900.0, py - 20.0)),
+                st("SEQ REC off", p(sx + 10.0, sy + 15.0)),
+                st("KEY:Cmd+Y|Playback Sequence (stop)", p(900.0, py - 20.0)),
+                st("SEQCALL pattern 1 on deck 2 (starts it)", p(812.0 + 297.0 + 60.0, ly + 16.0)),
+                st("CALL:seqload|Sequence Load (Deck2)", p(900.0, py - 20.0)),
+                st("CALL:seqload-check|a moment later: deck 2 plays the sequence", p(900.0, py - 20.0)),
+                st("SEQCALL pattern 3 on deck 2 (on the next bar)", p(812.0 + 297.0 + 60.0, ly + 16.0 + 2.0 * 22.7)),
+                st("wait 15", p(sx + 300.0, sy - 40.0)),
+                st("wait 16", p(sx + 300.0, sy - 40.0)),
+                st("wait 17", p(sx + 300.0, sy - 40.0)),
+                st("wait 18", p(sx + 300.0, sy - 40.0)),
+                st("wait 19", p(sx + 300.0, sy - 40.0)),
+                st("wait 20: pattern 3 plays", p(sx + 300.0, sy - 40.0)),
+                st("KEY:Cmd+Y|Playback Sequence (stop)", p(900.0, py - 20.0)),
+                st("SMP MASTER (the sampler is the sync master)", p(649.0, py + 103.0)),
+                st("DBL sampler BPM (opens the field)", p(756.0, py + 78.0)),
+                st("TYPE:128.5|typed BPM", p(756.0, py + 78.0)),
+                st("RIGHT click on PLAY of slot 2 (colour menu)", p(183.0 + 19.0, py + 34.0)),
+                st("SMP colour swatch 5 of the menu", p(183.0 + 19.0 + 15.0, py + 34.0 + 56.0)),
+                st("loop size on deck 1 (start a loop)", p(446.0, ly + 22.0)),
+                st("DECKPAD slot 4 on deck 1 (empty: captures the loop)", p(128.0, ly + 16.0 + 3.0 * 22.7)),
+                st("wait 21: the capture is read", p(sx + 300.0, sy - 40.0)),
+                ("DRAG slot 1 to slot 3", pos2(60.0, py + 18.0), pos2(4.0 + 2.0 * 179.0 + 90.0, py + 26.0)),
+                st("BEAT SYNC deck 1 (the sampler is MASTER: the deck takes its 128.5 BPM)", p(700.0 - 79.0 + 22.0, my + 18.5)),
+                st("DROP:|a file from Finder let go over slot 5", p(90.0, py + 70.0)),
+                ("DRAG deck 1's title to slot 6", pos2(110.0, my + 15.0), pos2(183.0 + 90.0, py + 70.0)),
+                st("wait 22: the files are read", p(sx + 300.0, sy - 40.0)),
             ]
         } else if four {
             let y1 = t + 198.0;
@@ -151,6 +190,71 @@ impl App {
                 e.silent = true;
             }
         }
+        // A key of the keyboard: pressed on frame 3, let go on frame 12.
+        if let Some(rest) = name.strip_prefix("KEY:") {
+            let combo = rest.split('|').next().unwrap_or("");
+            if let Some(sc) = Shortcut::parse(combo) {
+                let modifiers = egui::Modifiers { alt: sc.alt, ctrl: sc.ctrl, shift: sc.shift, mac_cmd: sc.cmd, command: sc.cmd };
+                let key = |pressed: bool| egui::Event::Key { key: sc.key, physical_key: None, pressed, repeat: false, modifiers };
+                match f {
+                    3 => {
+                        raw.modifiers = modifiers;
+                        raw.events.push(key(true));
+                    }
+                    4..=11 => raw.modifiers = modifiers,
+                    10 if name.contains("held") => {}
+                    12 => raw.events.push(key(false)),
+                    30 => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
+                    _ => {}
+                }
+                if f == 10 && name.contains("held") {
+                    eprintln!("perftest: {name} (while held): {}", self.perf_state_sampler());
+                }
+            }
+            return;
+        }
+        // Text typed into the field that has the focus, then Return.
+        if let Some(rest) = name.strip_prefix("TYPE:") {
+            let text = rest.split('|').next().unwrap_or("");
+            let key = |key: egui::Key, modifiers: egui::Modifiers, pressed: bool| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            match f {
+                3 => {
+                    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::MAC_CMD;
+                    raw.events.push(key(egui::Key::A, raw.modifiers, true));
+                }
+                6 => raw.events.push(egui::Event::Text(text.to_string())),
+                9 => raw.events.push(key(egui::Key::Enter, Default::default(), true)),
+                10 => raw.events.push(key(egui::Key::Enter, Default::default(), false)),
+                30 => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
+                _ => {}
+            }
+            return;
+        }
+        // A file dropped from Finder: the drop comes without a pointer position; the pointer's
+        // next move (two frames later) says where it was let go.
+        if name.starts_with("DROP:") {
+            match f {
+                3 => {
+                    if let Some(t) = self.tracks.iter().find(|t| !t.missing) {
+                        raw.dropped_files.push(egui::DroppedFile { path: Some(std::path::PathBuf::from(&t.path)), ..Default::default() });
+                    }
+                }
+                5 => raw.events.push(egui::Event::PointerMoved(a)),
+                30 => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
+                _ => {}
+            }
+            return;
+        }
+        if name.starts_with("CALL:seqload") {
+            if f == 3 && !name.contains("check") {
+                self.sampler_sequence_load(1);
+            }
+            if f == 30 {
+                let t = self.deck_of(1).track.and_then(|id| self.track(id)).map(|t| (t.display_title(), t.bpm, t.path.clone()));
+                eprintln!("perftest: {name}: deck 2 now holds {t:?} playing {} | {}", self.player.decks[1].lock().playing, self.perf_state_sampler());
+            }
+            return;
+        }
         if name.starts_with("wait") {
             // (The run is not tied to the screen's refresh: a wait step is made to last about
             // 0.65 s, so that the pattern, which runs in real time, gets somewhere.)
@@ -163,14 +267,20 @@ impl App {
             }
             return;
         }
-        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let which = if name.starts_with("RIGHT") { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos, button: which, pressed, modifiers: Default::default() };
         match f {
             0 => raw.events.push(egui::Event::PointerMoved(a)),
             3 => {
                 raw.events.push(button(a, true));
-                if name.starts_with("quick") {
+                if name.starts_with("quick") || name.starts_with("DBL") {
                     raw.events.push(button(a, false));
                 }
+            }
+            // (The second click of a double click.)
+            6 if name.starts_with("DBL") => {
+                raw.events.push(button(a, true));
+                raw.events.push(button(a, false));
             }
             10 if smp && name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state_sampler()),
             10 if name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state()),
@@ -181,7 +291,7 @@ impl App {
                 }
             }
             12 => {
-                if !name.starts_with("quick") {
+                if !name.starts_with("quick") && !name.starts_with("DBL") {
                     raw.events.push(button(b, false));
                 }
             }
@@ -228,8 +338,15 @@ impl App {
             None => String::new(),
         };
         let saved: Vec<String> = sp.seq.patterns.iter().enumerate().filter_map(|(i, p)| p.as_ref().map(|p| format!("{}: {} bars, {} notes", i + 1, p.bars, p.events.len()))).collect();
+        let d1 = {
+            let s = self.player.decks[0].lock();
+            format!("deck 1 tempo {:.4} follows {}", s.tempo, s.sync_follow)
+        };
+        let colours: Vec<String> = loaded.iter().map(|i| format!("{}:{}", i, self.sampler_color_code(i - 1))).collect();
         format!(
-            "loaded {loaded:?} | playing pads {playing:?} | slot 1 (loop, gate) {s1:?} | bank {} Q {} sync {} bpm {:.2} volume {} gain {} | SEQ {seq} | saved {saved:?} current {} metronome {} vol {}",
+            "loaded {loaded:?} colours {colours:?} master {} ({d1}) bpm field open {} | playing pads {playing:?} | slot 1 (loop, gate) {s1:?} | bank {} Q {} sync {} bpm {:.2} volume {} gain {} | SEQ {seq} | saved {saved:?} current {} metronome {} vol {}",
+            self.px.sampler.master,
+            self.px.sampler.bpm_open(),
             sp.bank + 1,
             sp.quantize,
             sp.sync,

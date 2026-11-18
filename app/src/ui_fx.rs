@@ -57,6 +57,7 @@ pub fn sync(app: &mut App) {
         }
     }
     bpm[fx::MASTER] = bpm[app.px.master.min(3) as usize];
+    bpm[fx::SAMPLER] = app.prefs.sampler.bpm.clamp(40.0, 499.0);
     let mut g = fx::RACK.lock();
     let rack = g.get_or_insert_with(|| Box::new(fx::Rack::new()));
     rack.enabled = true;
@@ -91,9 +92,10 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(x0 + x, y0 + y), vec2(w, h));
         p.text(pos2(x0 + 11.0, y0 + 14.0), Align2::LEFT_CENTER, format!("FX{}", u + 1), bold(11.5), hex(0x8C8C8C));
         // Assign: decks 1 and 2 and the master (M alone, as in rekordbox: lighting M clears
-        // the decks, lighting a deck clears M). Decks 3 and 4 and the sampler do not exist.
+        // the decks, lighting a deck clears M). S is the sampler deck; decks 3 and 4 exist in
+        // the 4-deck layout.
         let four = app.deck_count() == 4;
-        let labels = [("1", Some(0usize)), ("2", Some(1)), ("S", None), ("3", if four { Some(2) } else { None }), ("4", if four { Some(3) } else { None }), ("M", Some(fx::MASTER))];
+        let labels = [("1", Some(0usize)), ("2", Some(1)), ("S", Some(fx::SAMPLER)), ("3", if four { Some(2) } else { None }), ("4", if four { Some(3) } else { None }), ("M", Some(fx::MASTER))];
         for (i, (label, ch)) in labels.iter().enumerate() {
             let br = at(76.0 + (i % 3) as f32 * 21.5, 10.0 + (i / 3) as f32 * 18.0, 18.0, 15.0);
             let lit = ch.map(|c| app.px.fx[u].params.assign[c]).unwrap_or(false);
@@ -104,8 +106,10 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     a[*c] = !a[*c];
                     if a[*c] {
                         if *c == fx::MASTER {
-                            for d in a.iter_mut().take(4) {
-                                *d = false;
+                            for (i, d) in a.iter_mut().enumerate() {
+                                if i != fx::MASTER {
+                                    *d = false;
+                                }
                             }
                         } else {
                             a[fx::MASTER] = false;
@@ -339,17 +343,24 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
     if let Some(v) = crate::ui_perf::knob(ui, pos2(x0 + 580.0 * k, cy), "cfxparam", app.px.cfx_param, 0.5, BLUE) {
         app.px.cfx_param = v;
     }
-    // COLOR knobs. Decks 1 and 2 and the master are live.
+    // COLOR knobs. S (the sampler deck) is live when "Apply CFX to Sampler" is ticked in
+    // Preferences > Controller > Effect.
     let four = app.deck_count() == 4;
-    for (label, x, ch) in [("S", 647.0, None), ("3", 742.0, if four { Some(2usize) } else { None }), ("1", 836.0, Some(0)), ("2", 929.0, Some(1)), ("4", 1024.0, if four { Some(3) } else { None }), ("M", 1119.0, Some(4))] {
+    let smp = if app.prefs.sampler.cfx_on_sampler { Some(fx::SAMPLER) } else { None };
+    for (label, x, ch) in [("S", 647.0, smp), ("3", 742.0, if four { Some(2usize) } else { None }), ("1", 836.0, Some(0)), ("2", 929.0, Some(1)), ("4", 1024.0, if four { Some(3) } else { None }), ("M", 1119.0, Some(4))] {
         p.text(pos2(x0 + x * k, cy), Align2::CENTER_CENTER, label, caps(8.5), if ch.is_some() { WHITE } else { OFF });
         let kc = pos2(x0 + (x + 27.0) * k, cy);
         match ch {
             Some(c) => {
-                let v = app.px.cfx_color[c];
+                let v = if c == fx::SAMPLER { app.px.sampler.cfx_color } else { app.px.cfx_color[c] };
                 if let Some(nv) = crate::ui_perf::knob(ui, kc, ("cfxcolor", c), v, 0.5, if (v - 0.5).abs() > 0.012 { BLUE } else { WHITE }) {
                     // A small catch at the centre, so the knob comes to rest on "off".
-                    app.px.cfx_color[c] = if (nv - 0.5).abs() < 0.015 { 0.5 } else { nv };
+                    let nv = if (nv - 0.5).abs() < 0.015 { 0.5 } else { nv };
+                    if c == fx::SAMPLER {
+                        app.px.sampler.cfx_color = nv;
+                    } else {
+                        app.px.cfx_color[c] = nv;
+                    }
                 }
             }
             None => {

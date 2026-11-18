@@ -133,8 +133,8 @@ pub fn is_sampler_action(id: &str) -> bool {
 
 /// Where captured loops and loaded sequences are written (rekordbox: `SamplerSaveDirectory`,
 /// by default `Music/rekordbox/Sampler/Capture`; here under recordbox's own data folder).
-pub fn capture_dir() -> std::path::PathBuf {
-    crate::db::data_dir().join("Sampler").join("Capture")
+pub fn capture_dir(chosen: &str) -> std::path::PathBuf {
+    if chosen.trim().is_empty() { crate::db::data_dir().join("Sampler").join("Capture") } else { std::path::PathBuf::from(chosen.trim()) }
 }
 
 /// rekordbox's file name for a capture: the first 48 characters of the title, a suffix,
@@ -304,7 +304,7 @@ impl App {
         if f1 <= f0 + 1 {
             return false;
         }
-        let dir = capture_dir();
+        let dir = capture_dir(&self.prefs.sampler.capture_dir);
         let path = capture_name(&dir, &title, "_capture");
         if std::fs::create_dir_all(&dir).and_then(|_| crate::player_ext::write_wav16(&path, audio.sr, 2, &audio.samples[f0 * 2..f1 * 2])).is_err() {
             self.toast_err("The captured loop could not be written.");
@@ -337,7 +337,7 @@ impl App {
         if (secs * bpm as f64 / 60.0 + 0.5).floor() < 4.0 || secs <= 0.1 {
             return;
         }
-        let dir = capture_dir();
+        let dir = capture_dir(&self.prefs.sampler.capture_dir);
         let name = self.prefs.sampler.seq.name(cur);
         let path = capture_name(&dir, &name, "");
         if std::fs::create_dir_all(&dir).and_then(|_| crate::player_ext::write_wav16(&path, rate, 2, &audio)).is_err() {
@@ -358,20 +358,44 @@ impl App {
                 }
             },
         };
+        // (The pattern starts on its first frame at the sampler's tempo: that is its grid.)
+        let _ = self.db.save_grid(id, &crate::model::BeatGrid::constant(0.0, bpm as f64, 1));
         self.reload_tracks();
-        let autoplay = self.prefs.sampler.seq.load_autoplay;
-        self.with_deck(deck, |a| {
-            a.load_track_here(id);
-            if autoplay && !a.playing() {
-                a.play_pause();
+        self.with_deck(deck, |a| a.load_track_here(id));
+        // "Load the sequence and automatically play.": once the deck has read the file.
+        if self.prefs.sampler.seq.load_autoplay {
+            self.px.sampler.autoplay = Some((deck, id, 0));
+        }
+    }
+
+    /// Once per frame: start the deck a sequence was loaded on, when its audio is there.
+    pub fn sampler_autoplay_poll(&mut self) {
+        let Some((deck, id, frames)) = self.px.sampler.autoplay else { return };
+        let d = (deck as usize).min(3);
+        let (ready, playing) = {
+            let s = self.player.decks[d].lock();
+            (s.audio.is_some(), s.playing)
+        };
+        if self.deck_of(deck).track != Some(id) || frames > 1800 {
+            self.px.sampler.autoplay = None;
+        } else if ready {
+            self.px.sampler.autoplay = None;
+            if !playing {
+                self.with_deck(deck, |a| a.play_pause());
             }
-        });
+        } else {
+            self.px.sampler.autoplay = Some((deck, id, frames + 1));
+        }
     }
 
     /// Carry out a keyboard action of the sampler deck.
     pub fn sampler_action(&mut self, act: SmpAct) {
         if !self.performance() {
             return;
+        }
+        // Auto Panel Mode: a sampler or sequencer key shows the sampler panel first.
+        if !self.prefs.sampler.auto_panel_disable && !self.prefs.perf_sampler && !matches!(act, SmpAct::PadMode(_)) {
+            self.prefs.perf_sampler = true;
         }
         let with_engine = |f: &mut dyn FnMut(&mut sampler::Engine)| {
             if let Some(e) = sampler::SAMPLER.lock().as_mut() {

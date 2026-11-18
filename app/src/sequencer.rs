@@ -477,6 +477,31 @@ mod tests {
         (evs, clicks)
     }
 
+    #[test]
+    fn a_pattern_can_start_part_way_in_and_be_called_again_on_the_beat() {
+        let on = |t: f64, pad: u8| Event { t, pad, bank: 0, on: true, vel: 1.0, fresh: false };
+        let mut s = Sequencer::new();
+        s.set_pattern(0, &Pattern { bars: 1, events: vec![on(0.25, 1), on(1.0, 2)] });
+        // advance once so the tempo is known, then start half a beat in (BPM SYNC start).
+        s.advance(1, BPF, |_, _| {}, |_| {});
+        s.play_from(0.5);
+        assert!((s.pos() - 0.5).abs() < 1e-9);
+        let (evs, _) = run(&mut s, 0, 22050, 512, BPF);
+        // The note at 0.25 is behind the start; the one at beat 1 comes half a beat later.
+        assert_eq!(evs.iter().map(|(f, e)| (*f, e.pad)).collect::<Vec<_>>(), vec![(11025, 2)]);
+        // SEQ. CALL of the playing pattern: from its start again on the next beat (beat 2).
+        s.restart_on(1.0);
+        assert_eq!(s.reserved(), Some(0));
+        let (evs, _) = run(&mut s, 22050, 22050, 512, BPF);
+        // Beat 2 is 11025 frames on; the pattern is back at 0, so 0.25 follows 5512.5 later.
+        assert_eq!(evs.iter().map(|(f, e)| (*f, e.pad)).collect::<Vec<_>>(), vec![(22050 + 11025 + 5513, 1)]);
+        assert_eq!((s.passes, s.current()), (1, 0));
+        // Stopped, restart_on does nothing.
+        s.stop();
+        s.restart_on(1.0);
+        assert_eq!(s.reserved(), None);
+    }
+
     fn recording() -> Sequencer {
         let mut s = Sequencer::new();
         s.set_rec(true);

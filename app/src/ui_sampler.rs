@@ -113,7 +113,7 @@ pub struct SamplerPrefs {
     /// keeps it per content in its database, `setSamplerCustomColor`).
     pub colors: std::collections::HashMap<String, u8>,
     /// rekordbox's SamplerSlotIs16 (SLOT 16 / 8), SamplerLoadLockAtLoadedSlot ("Do not
-    /// overwrite the loaded Slot."), ShouldLoopCaptureIfEmptySlot, VelocityCurve (1..4),
+    /// overwrite the loaded Slot."), ShouldLoopCaptureIfEmptySlot, VelocityCurve (1..4, default 3),
     /// EffectorCFxOnSampler and the output the sampler deck goes to (0 = master,
     /// 1 = headphones).
     pub slots16: bool,
@@ -122,11 +122,16 @@ pub struct SamplerPrefs {
     pub velocity_curve: u8,
     pub cfx_on_sampler: bool,
     pub output: u8,
+    /// rekordbox's SamplerSaveDirectory (empty: recordbox's own folder), SlicerCaptureSaveBank
+    /// (1..4) and the "Disable" switch of Auto Panel Mode.
+    pub capture_dir: String,
+    pub slicer_bank: u8,
+    pub auto_panel_disable: bool,
 }
 
 impl Default for SamplerPrefs {
     fn default() -> SamplerPrefs {
-        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false, seq: SeqPrefs::default(), colors: Default::default(), slots16: true, load_lock: false, capture_empty: true, velocity_curve: 1, cfx_on_sampler: false, output: 0 }
+        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false, seq: SeqPrefs::default(), colors: Default::default(), slots16: true, load_lock: false, capture_empty: true, velocity_curve: 3, cfx_on_sampler: false, output: 0, capture_dir: String::new(), slicer_bank: 4, auto_panel_disable: false }
     }
 }
 
@@ -168,6 +173,9 @@ pub struct SamplerUi {
     master_was_playing: bool,
     /// Where the decks are on screen (for dropping the sequencer strip on one).
     pub deck_rects: [Rect; 4],
+    /// A sequence was loaded on a deck and should play once the deck has read it:
+    /// (deck, track, frames waited).
+    pub autoplay: Option<(u8, i64, u32)>,
 }
 
 impl SamplerUi {
@@ -189,6 +197,9 @@ impl SamplerUi {
             *slot = Some(w);
         }
     }
+    pub fn bpm_open(&self) -> bool {
+        self.bpm_edit.is_some()
+    }
     pub fn close_edit(&mut self) {
         self.edit = None;
     }
@@ -198,7 +209,7 @@ impl SamplerUi {
     }
 
     pub fn new() -> SamplerUi {
-        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None, seq_mode: 0, master: false, cfx_color: 0.5, drag_slot: None, drag_seq: false, bpm_edit: None, name_edit: None, dropped: None, master_was_playing: false, deck_rects: [Rect::NOTHING; 4] }
+        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None, seq_mode: 0, master: false, cfx_color: 0.5, drag_slot: None, drag_seq: false, bpm_edit: None, name_edit: None, dropped: None, master_was_playing: false, deck_rects: [Rect::NOTHING; 4], autoplay: None }
     }
 }
 
@@ -335,6 +346,7 @@ impl App {
                 }
             }
         }
+        self.sampler_autoplay_poll();
         let mut done = Vec::new();
         self.px.sampler.loading.retain(|(i, rx)| match rx.try_recv() {
             Ok(r) => {

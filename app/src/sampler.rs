@@ -795,6 +795,70 @@ mod tests {
     }
 
     #[test]
+    fn bpm_sync_pulls_the_clock_onto_the_masters_beats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut e = Engine::new();
+        e.bpm = 120.0;
+        e.follow = true;
+        // The master is 0.3 of a beat ahead of where the sampler's clock starts.
+        let bpf = 120.0 / 60.0 / 44100.0;
+        let mut master = 0.3f64;
+        let mut out = vec![0.0; 1024];
+        for _ in 0..(44100 * 8 / 512) {
+            FOLLOW_PHASE.store(master.rem_euclid(1.0).to_bits(), Relaxed);
+            e.process(&mut out, &mut [], 44100);
+            master += 512.0 * bpf;
+        }
+        let d = phase_diff(e.clock().rem_euclid(1.0), master.rem_euclid(1.0));
+        assert!(d.abs() < 0.01, "{d}");
+        // With the sequencer started while it follows, the pattern begins at the master's
+        // place in the beat.
+        FOLLOW_PHASE.store(0.4f64.to_bits(), Relaxed);
+        e.seq_play();
+        assert!((e.seq.pos() - 0.4).abs() < 1e-6 && (e.clock() - 0.4).abs() < 1e-9);
+        FOLLOW_PHASE.store(f64::NAN.to_bits(), Relaxed);
+        assert!((phase_diff(0.9, 0.1) + 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_pattern_renders_to_one_pass_of_audio_for_sequence_load() {
+        let mut e = Engine::new();
+        e.bpm = 120.0;
+        e.gain = 0.0;
+        e.set_clip(0, 0, Some(clip(1000, 0)));
+        assert!(e.render_pattern(44100).is_none(), "nothing recorded: nothing to load");
+        e.seq.set_pattern(0, &crate::sequencer::Pattern { bars: 1, events: vec![ev(0.0, 0, true), ev(2.0, 0, true)] });
+        let out = e.render_pattern(44100).unwrap();
+        // One bar at 120 BPM, whatever the sampler's GAIN is; the engine itself is untouched.
+        assert_eq!(out.len(), 88200 * 2);
+        let starts: Vec<usize> = (0..88200).filter(|i| out[i * 2] != 0.0 && (*i == 0 || out[i * 2 - 2] == 0.0)).collect();
+        assert_eq!(starts, vec![0, 44100]);
+        assert!(!e.seq.playing);
+    }
+
+    #[test]
+    fn the_mix_can_be_taken_for_effects_instead_of_going_straight_out() {
+        let mut e = Engine::new();
+        e.set_clip(0, 0, Some(clip(10_000, 0)));
+        e.volume = 0.5;
+        e.direct = false;
+        e.launch(0, 0, 1.0);
+        let mut out = vec![0.0; 2000];
+        e.process(&mut out, &mut [], 44100);
+        assert!(out.iter().all(|v| *v == 0.0));
+        assert!(e.sounding && (e.mix_mut(1000)[1000] - 0.5).abs() < 1e-4);
+        assert_eq!(e.out_gains(), (0.5, 0.0));
+        // Headphones only: nothing to the master.
+        e.route = 1;
+        assert_eq!(e.out_gains(), (0.0, 0.5));
+        // Once the slot is silent the taken mix is silence (effect tails still get input).
+        e.stop(0, 0, true);
+        e.process(&mut out, &mut [], 44100);
+        e.process(&mut out, &mut [], 44100);
+        assert!(!e.sounding && e.mix_mut(1000).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
     fn a_muted_slot_is_silent_in_a_pattern_and_silent_mode_gives_no_output() {
         let mut e = Engine::new();
         e.set_clip(0, 0, Some(clip(1000, 0)));

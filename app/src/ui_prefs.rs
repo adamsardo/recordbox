@@ -46,13 +46,21 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
         6 => &["STEMS"],
-        7 => &["Deck", "Mixer"],
+        7 => &["Deck", "Mixer", "Effect", "Sampler", "Others"],
         _ => &["Database", "Browse", "Others"],
     }
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 105] = [
+const SETTINGS: [(u8, usize, &str); 113] = [
+    (7, 2, "Apply CFX to Sampler using MIC COLOR control knob."),
+    (7, 3, "SLOT"),
+    (7, 3, "Do not overwrite the loaded Slot."),
+    (7, 3, "Capture the loop in an empty slot"),
+    (7, 3, "Auto Panel Mode"),
+    (7, 3, "Sequence Load"),
+    (7, 3, "Velocity Curve"),
+    (7, 4, "SEQUENCER"),
     (0, 0, "Language"),
     (0, 0, "Show Tooltips"),
     (0, 0, "Font Size"),
@@ -429,7 +437,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 5 => page_audio(app, ui, sub_tab),
                 6 => page_stems(app, ui),
                 7 if sub_tab == 0 => page_deck(app, ui),
-                7 => page_mixer(app, ui),
+                7 if sub_tab == 1 => page_mixer(app, ui),
+                7 if sub_tab == 2 => page_effect(app, ui),
+                7 if sub_tab == 3 => page_sampler(app, ui),
+                7 => page_controller_others(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }
         }
@@ -1679,6 +1690,145 @@ fn page_mixer(app: &mut App, ui: &mut Ui) {
     });
     if changed {
         app.poll_decks();
+        app.save_prefs();
+    }
+}
+
+/// A section title over the cards (rekordbox's "SAMPLER", "SEQUENCER", "Quantize").
+fn section(ui: &mut Ui, title: &str) {
+    // (25 pt in, like a card's title; its middle 17 pt above the card: reference preferences/10.)
+    ui.add_space(20.0);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(kit::CARD_W), 22.0), egui::Sense::hover());
+    ui.painter().text(pos2(r.min.x + 25.0, r.center().y), egui::Align2::LEFT_CENTER, title, inter_bold(16.0), WHITE);
+    ui.add_space(4.0);
+}
+
+/// Controller > Effect: the CFX switch for the sampler deck. (rekordbox shows this row with
+/// hardware that has a MIC COLOR knob; recordbox has the knob on screen, S in the CFX row.)
+fn page_effect(app: &mut App, ui: &mut Ui) {
+    let mut changed = false;
+    card(ui, "CFX", |ui| {
+        changed |= toggle(ui, &mut app.prefs.sampler.cfx_on_sampler, "Apply CFX to Sampler using MIC COLOR control knob.");
+        note(ui, "The S knob of the CFX row in the FX panel then acts on the sampler deck.");
+    });
+    if changed {
+        app.save_prefs();
+    }
+}
+
+/// Controller > Sampler, after rekordbox 7.2.19 (reference preferences/10): SLOT, Capture,
+/// Auto Panel Mode and Sequence Load, with rekordbox's labels and defaults.
+fn page_sampler(app: &mut App, ui: &mut Ui) {
+    let mut changed = false;
+    section(ui, "SAMPLER");
+    card(ui, "SLOT", |ui| {
+        if radio(ui, app.prefs.sampler.slots16, "16") {
+            app.prefs.sampler.slots16 = true;
+            changed = true;
+        }
+        if radio(ui, !app.prefs.sampler.slots16, "8") {
+            app.prefs.sampler.slots16 = false;
+            changed = true;
+        }
+        ui.add_space(6.0);
+        changed |= toggle(ui, &mut app.prefs.sampler.load_lock, "Do not overwrite the loaded Slot.");
+    });
+    card(ui, "Capture", |ui| {
+        sub(ui, "Location of Files");
+        let dir = crate::sampler_ext::capture_dir(&app.prefs.sampler.capture_dir).to_string_lossy().to_string();
+        // (A long path shows its end: the box is 410 pt wide, as in rekordbox.)
+        let n = dir.chars().count();
+        let shown = if n > 48 { format!("…{}", dir.chars().skip(n - 47).collect::<String>()) } else { dir.clone() };
+        kit::combo_row(ui, 22.0, |ui| {
+            kit::combo("smp_capdir", 410.0, shown, 14.0).show_ui(ui, |ui| {
+                if ui.selectable_label(app.prefs.sampler.capture_dir.is_empty(), crate::sampler_ext::capture_dir("").to_string_lossy()).clicked() {
+                    app.prefs.sampler.capture_dir.clear();
+                    changed = true;
+                }
+            });
+            ui.add_space(10.0);
+            if ui.add(btn("Browse").min_size(vec2(100.0, 22.0))).clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_title("Location of Files").pick_folder() {
+                    app.prefs.sampler.capture_dir = d.to_string_lossy().to_string();
+                    changed = true;
+                }
+            }
+        });
+        sub(ui, "Location of a Bank for Slicer Capture");
+        kit::combo_row(ui, 22.0, |ui| {
+            let b = app.prefs.sampler.slicer_bank.clamp(1, 4);
+            kit::combo("smp_slicerbank", 520.0, format!("Bank{b}"), 14.0).show_ui(ui, |ui| {
+                for k in 1..=4u8 {
+                    if ui.selectable_label(b == k, format!("Bank{k}")).clicked() {
+                        app.prefs.sampler.slicer_bank = k;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        kit::indent(ui, 52.0);
+        ui.add_space(7.0);
+        changed |= toggle(ui, &mut app.prefs.sampler.capture_empty, "Capture the loop in an empty slot");
+    });
+    card(ui, "Auto Panel Mode", |ui| {
+        changed |= toggle(ui, &mut app.prefs.sampler.auto_panel_disable, "Disable");
+    });
+    section(ui, "SEQUENCER");
+    card(ui, "Sequence Load", |ui| {
+        changed |= toggle(ui, &mut app.prefs.sampler.seq.load_autoplay, "Load the sequence and automatically play.");
+    });
+    // (rekordbox shows this card only with a DDJ-RZX connected; the setting is kept for
+    // velocity pads, which recordbox has no hardware path for yet.)
+    card(ui, "Velocity Curve", |ui| {
+        kit::combo_row(ui, 22.0, |ui| {
+            let c = app.prefs.sampler.velocity_curve.clamp(1, 4);
+            kit::combo("smp_velocity", 500.0, format!("Curve {c}"), 14.0).show_ui(ui, |ui| {
+                for k in 1..=4u8 {
+                    if ui.selectable_label(c == k, format!("Curve {k}")).clicked() {
+                        app.prefs.sampler.velocity_curve = k;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        note(ui, "For velocity pads of a controller. Not used yet: recordbox has no controller pads.");
+    });
+    if changed {
+        app.save_prefs();
+    }
+}
+
+/// Controller > Others, as far as it is built: the SEQUENCER row of Quantize > Type >
+/// QUANTIZE (rekordbox's SequencerQuantizeStatus and SequencerQuantize; reference
+/// preferences/13). It takes effect while the sampler's Q is on.
+fn page_controller_others(app: &mut App, ui: &mut Ui) {
+    let mut changed = false;
+    section(ui, "Quantize");
+    card(ui, "Type", |ui| {
+        sub(ui, "QUANTIZE");
+        kit::combo_row(ui, 22.0, |ui| {
+            // (Label 89 pt in, switch 264, list 385: reference preferences/13.)
+            ui.add_space(5.0);
+            let x0 = ui.cursor().min.x;
+            ui.label(kit::text("SEQUENCER", 14.0).color(WHITE));
+            ui.add_space((175.0 - (ui.cursor().min.x - x0)).max(4.0));
+            let x1 = ui.cursor().min.x;
+            changed |= kit::toggle_raw(ui, &mut app.prefs.sampler.seq.quantize_on, "Enable");
+            ui.add_space((121.0 - (ui.cursor().min.x - x1)).max(4.0));
+            const NAMES: [&str; 6] = ["1/32", "1/16", "1/8", "1/4", "1/2", "1/1"];
+            let q = app.prefs.sampler.seq.quantize.clamp(1, 6);
+            kit::combo("seq_quantize", 200.0, NAMES[q as usize - 1], 14.0).show_ui(ui, |ui| {
+                for k in 1..=6u8 {
+                    if ui.selectable_label(q == k, NAMES[k as usize - 1]).clicked() {
+                        app.prefs.sampler.seq.quantize = k;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        note(ui, "Notes recorded into a sequence go to the nearest line of this grid (1/4 = one beat) while the sampler's Q is on.");
+    });
+    if changed {
         app.save_prefs();
     }
 }

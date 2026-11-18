@@ -1508,10 +1508,25 @@ impl App {
                         if let Some(Some(sl)) = app.prefs.sampler.slots.get_mut(1) {
                             sl.looped = true;
                         }
+                        // Deck 1's pads play the sampler, deck 2's call the sequences.
+                        app.px.pad_mode = [crate::ui_perf::PAD_SAMPLER, crate::ui_perf::PAD_SEQ_CALL, 0, 0];
                     }
                     "perf4" => {
                         app.prefs.app_mode = 1;
                         app.prefs.perf_four = true;
+                    }
+                    // 4Deck Horizontal with the sampler: decks 1 and 3 in SAMPLER pad mode,
+                    // decks 2 and 4 in SEQ. CALL.
+                    "perf4sampler" => {
+                        app.prefs.app_mode = 1;
+                        app.prefs.perf_four = true;
+                        app.prefs.perf_sampler = true;
+                        app.prefs.perf_fx = false;
+                        let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing).take(3).map(|t| t.id).collect();
+                        for (i, id) in ids.into_iter().enumerate() {
+                            app.sampler_load([0usize, 1, 9][i], id);
+                        }
+                        app.px.pad_mode = [crate::ui_perf::PAD_SAMPLER, crate::ui_perf::PAD_SEQ_CALL, crate::ui_perf::PAD_SAMPLER, crate::ui_perf::PAD_SEQ_CALL];
                     }
                     // Performance with the FX panel open.
                     "perffx" => {
