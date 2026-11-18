@@ -218,6 +218,10 @@ pub struct Prefs {
     pub perf_fx: bool,
     /// Performance: 4Deck Horizontal instead of 2Deck Horizontal.
     pub perf_four: bool,
+    /// Performance: the sampler panel is shown.
+    pub perf_sampler: bool,
+    /// The sampler deck: its slots and settings.
+    pub sampler: crate::ui_sampler::SamplerPrefs,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
@@ -717,6 +721,8 @@ impl Default for Prefs {
             instant_doubles: false,
             perf_fx: false,
             perf_four: false,
+            perf_sampler: false,
+            sampler: Default::default(),
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -1488,6 +1494,21 @@ impl App {
                     "about" => app.dialogs.about = true,
                     "performance" => app.prefs.app_mode = 1,
                     // Performance, 4Deck Horizontal.
+                    // Performance with the sampler panel.
+                    "perfsampler" => {
+                        app.prefs.app_mode = 1;
+                        app.prefs.perf_sampler = true;
+                        app.prefs.perf_four = false;
+                        app.prefs.perf_fx = false;
+                        // Three slots loaded (one a loop), for the screenshot.
+                        let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing).take(3).map(|t| t.id).collect();
+                        for (i, id) in ids.into_iter().enumerate() {
+                            app.sampler_load([0usize, 1, 9][i], id);
+                        }
+                        if let Some(Some(sl)) = app.prefs.sampler.slots.get_mut(1) {
+                            sl.looped = true;
+                        }
+                    }
                     "perf4" => {
                         app.prefs.app_mode = 1;
                         app.prefs.perf_four = true;

@@ -53,7 +53,10 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     let _ = (DECK_W, DECK2_X, MIXER_X);
     let stems_row = if app.prefs.show_stems { STEM_ROW } else { 0.0 };
     let phrase_h = if app.prefs.show_phrase_bar { PHRASE_ROW } else { 0.0 };
-    let deck_bottom = full.max.y - 43.0;
+    // The sampler panel, when shown, is the last row, under the mixer's bottom row.
+    let sampler_h = if app.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 };
+    app.sampler_poll();
+    let deck_bottom = full.max.y - 43.0 - sampler_h;
     let waves_h = if four { 198.0 } else { WAVES_H };
     let count = app.deck_count();
     let pressed = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None });
@@ -97,8 +100,11 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     // ---- mixer
     let mr = Rect::from_min_max(pos2(mixer_x, t + waves_h), pos2(mixer_x + mixer_w, deck_bottom));
     if four { mixer4(app, ui, mr) } else { mixer(app, ui, mr) }
-    let br = Rect::from_min_max(pos2(l, deck_bottom + 1.5), pos2(full.max.x, full.max.y));
+    let br = Rect::from_min_max(pos2(l, deck_bottom + 1.5), pos2(full.max.x, full.max.y - sampler_h));
     bottom_row(app, ui, br, cx);
+    if sampler_h > 0.0 {
+        crate::ui_sampler::panel(app, ui, Rect::from_min_max(pos2(l, full.max.y - sampler_h), full.max));
+    }
 
     // The deck that was pressed becomes the active one (keyboard shortcuts follow it).
     if let Some(pp) = pressed.filter(|pp| full.contains(*pp)) {

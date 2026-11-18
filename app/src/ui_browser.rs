@@ -81,11 +81,19 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
         }
     });
     // Panel buttons. Only the mixer exists; the others are shown unlit with the reason.
-    for (i, (name, built)) in [("FX", true), ("Sampler", false), ("Groove Circuit", false), ("Mixer", true), ("Rec", false)].iter().enumerate() {
+    for (i, (name, built)) in [("FX", true), ("Sampler", true), ("Groove Circuit", false), ("Mixer", true), ("Rec", false)].iter().enumerate() {
         let tr = Rect::from_min_size(pos2(r.min.x + 195.0 + 37.0 * i as f32, r.min.y + 4.0), vec2(20.0, 20.0));
         let resp = ui.interact(tr, ui.id().with(("panel", i)), Sense::click());
         // The FX button shows and hides the FX panel; the mixer is always shown so far.
-        let lit = if i == 0 { app.prefs.perf_fx } else { *built };
+        let lit = match i {
+            0 => app.prefs.perf_fx,
+            1 => app.prefs.perf_sampler,
+            _ => *built,
+        };
+        if i == 1 && resp.clicked() {
+            app.prefs.perf_sampler = !app.prefs.perf_sampler;
+            app.save_prefs();
+        }
         if i == 0 && resp.clicked() {
             app.prefs.perf_fx = !app.prefs.perf_fx;
             app.save_prefs();

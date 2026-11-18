@@ -719,6 +719,45 @@ impl Src<'_> {
 const ST_WIN: usize = 16384;
 const ST_TMPL: usize = 1024;
 
+/// Reads a sampler clip: plainly, or through the time stretcher when its pitch is held (MT)
+/// while its speed follows the sampler's BPM.
+pub struct ClipReader {
+    st: Stretch,
+}
+
+impl ClipReader {
+    pub fn new() -> ClipReader {
+        ClipReader { st: Stretch::new() }
+    }
+    pub fn reset(&mut self) {
+        self.st.active = false;
+    }
+    /// Left and right at source frame `pos`. `step`: source frames the position moves per
+    /// output frame; `pitch_step`: source frames per output frame the sound is read at.
+    #[inline]
+    pub fn frame(&mut self, audio: &Decoded, pos: f64, step: f64, pitch_step: f64, hop: usize) -> (f32, f32) {
+        let src = Src { audio, frames: audio.frames(), stems: None, g: std::cell::Cell::new([1.0, 0.0, 0.0, 0.0, 0.0]), stem_ratio: 1.0 };
+        if (step - pitch_step).abs() > 1e-9 {
+            self.st.frame(&src, pos, pitch_step, hop)
+        } else {
+            self.st.active = false;
+            src.at(pos)
+        }
+    }
+}
+
+/// The sampler deck joins the mix after the decks (before the master's effects and limiter).
+fn mix_sampler(out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
+    if channels != 2 {
+        return;
+    }
+    if let Some(mut g) = lock_for_audio(&crate::sampler::SAMPLER) {
+        if let Some(e) = g.as_deref_mut() {
+            e.process(out, cue, rate);
+        }
+    }
+}
+
 /// Time stretcher (WSOLA: waveform-similarity overlap-add). The output is made of 40 ms
 /// grains of the source, read at the wanted pitch and cross-faded every 20 ms; each new grain
 /// starts where the play position says, moved by up to ±12 ms to the place where it best
@@ -987,12 +1026,14 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
                 }
                 rack.scratch[i] = buf;
             }
+            mix_sampler(out, cue, channels, rate);
             rack.process(crate::fx::MASTER, out, rate);
         }
         None => {
             for s in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
                 render_deck_cue(s, out, cue, channels, rate);
             }
+            mix_sampler(out, cue, channels, rate);
         }
     }
     drop(rack);

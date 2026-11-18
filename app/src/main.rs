@@ -24,6 +24,8 @@ mod library_ext;
 mod menus;
 mod mixer;
 mod perf_selftest;
+mod sampler;
+mod ui_sampler;
 mod model;
 mod manual;
 mod phrase;

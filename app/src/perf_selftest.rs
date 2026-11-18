@@ -58,7 +58,29 @@ impl App {
         // The 4Deck Horizontal layout has its own positions (decks 655 pt wide, mixer from 661,
         // decks 2 and 4 from 855; the second row of decks 190 pt further down).
         let four = self.prefs.perf_four;
-        let steps = if four {
+        // The sampler panel (PREPDECK_SHOT_VIEW=perfsampler, 2-deck layout): its own steps.
+        let smp = self.prefs.perf_sampler && !four;
+        let steps = if smp {
+            let py = by - 1.5 + 43.0;
+            let p = |x: f32, y: f32| (pos2(x, y), pos2(x, y));
+            let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
+            vec![
+                st("SMP PLAY slot 1 (one-shot)", p(23.0, py + 34.0)),
+                st("SMP Shift-free second PLAY restarts it", p(23.0, py + 34.0)),
+                st("SMP PLAY slot 2 (loop)", p(183.0 + 19.0, py + 34.0)),
+                st("SMP EDIT slot 1", p(4.0 + 179.0 - 32.0, py + 34.0)),
+                st("SMP gate button in EDIT", p(183.0 + 17.0 + 59.0, py + 6.0 + 15.0)),
+                st("SMP EDIT slot 1 (close)", p(4.0 + 179.0 - 32.0, py + 34.0)),
+                st("SMP PLAY slot 1 held (gate)", p(23.0, py + 34.0)),
+                st("SMP Q", p(510.5, py + 104.0)),
+                st("SMP BPM +", p(744.0, py + 103.0)),
+                st("SMP BPM SYNC", p(570.0, py + 103.0)),
+                ("SMP volume fader down", pos2(775.0, py + 22.0), pos2(775.0, py + 42.0)),
+                st("SMP BANK 2", p(82.0, py + 104.0)),
+                st("SMP BANK 1", p(54.0, py + 104.0)),
+                st("SMP eject slot 10", p(1512.0 - 4.0 - 3.0 * 179.0 + 62.0, py + 34.0)),
+            ]
+        } else if four {
             let y1 = t + 198.0;
             let y3 = y1 + 190.0 + extra;
             let ly3 = y3 + 76.0 + extra;
@@ -95,6 +117,7 @@ impl App {
                     raw.events.push(button(a, false));
                 }
             }
+            10 if smp && name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state_sampler()),
             10 if name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state()),
             4..=11 => {
                 if a != b {
@@ -108,10 +131,22 @@ impl App {
                 }
             }
             // The loop is left running for a while before its state is read.
+            30 if smp => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
             30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),
             30 => eprintln!("perftest: {name}: {}", self.perf_state()),
             _ => {}
         }
+    }
+
+    fn perf_state_sampler(&self) -> String {
+        let sp = &self.prefs.sampler;
+        let playing: Vec<usize> = match crate::sampler::SAMPLER.lock().as_ref() {
+            Some(e) => (0..16).filter(|pad| e.slot_state(*pad, sp.bank as usize).0).map(|pad| pad + 1).collect(),
+            None => Vec::new(),
+        };
+        let loaded: Vec<usize> = sp.slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| i + 1).collect();
+        let s1 = sp.slots[0].as_ref().map(|s| (s.looped, s.gate));
+        format!("loaded {loaded:?} | playing pads {playing:?} | slot 1 (loop, gate) {s1:?} | bank {} Q {} sync {} bpm {:.2} volume {} gain {}", sp.bank + 1, sp.quantize, sp.sync, sp.bpm, sp.volume, sp.gain)
     }
 
     fn perf_state4(&self) -> String {

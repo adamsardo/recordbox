@@ -128,6 +128,8 @@ pub struct PlayerExt {
     pub parked_quantize: [bool; 4],
     /// Each deck's auto loop size while it is not the active deck.
     pub parked_loop: [Option<f64>; 4],
+    /// The sampler panel's state.
+    pub sampler: crate::ui_sampler::SamplerUi,
 }
 
 /// One channel strip of the Performance mixer (knob and fader positions, 0..1).
@@ -157,7 +159,7 @@ impl MixStrip {
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], parked_quantize: [true; 4], parked_loop: [None; 4] }
+        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], parked_quantize: [true; 4], parked_loop: [None; 4], sampler: crate::ui_sampler::SamplerUi::new() }
     }
 }
 
@@ -444,7 +446,7 @@ impl App {
         // 4Deck Horizontal: 576 + 43, and the per-deck rows count twice (two rows of decks).
         let rows = if self.prefs.perf_four { 2.0 } else { 1.0 };
         let base = if self.prefs.perf_four { 576.0 } else { 368.0 };
-        base + 43.0 + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + rows * (if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 })
+        base + 43.0 + if self.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 } + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + rows * (if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 })
     }
 
     /// How many decks exist in the layout showing: 4 (Performance, 4Deck), 2 or 1.
