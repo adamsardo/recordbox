@@ -4,10 +4,14 @@
 //! and in gate mode only sounds while its pad is held. Loop clips with SYNC follow the sampler
 //! deck's BPM; with MT their pitch stays where it was.
 //!
+//! The sequencer (`sequencer.rs`) runs on the same clock. Each buffer it hands over the pad
+//! events that fall inside it, and they start or stop their clip on their exact frame.
+//!
 //! The interface thread owns the settings and writes them here under the lock; the audio
 //! thread takes the lock for the length of one buffer (`audio::render_cue`).
 
 use crate::audio::{ClipReader, Decoded};
+use crate::sequencer::Sequencer;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -21,6 +25,20 @@ pub const MODE_GATE: u8 = 2;
 /// Fade used when a clip is stopped or restarted (rekordbox fades out before it moves the
 /// play position; its fade length was not traced).
 const FADE_SECS: f32 = 0.003;
+
+/// rekordbox's metronome gains for its volume settings 0, 1, 2 (table at 0x10375D144).
+pub const METRONOME_GAINS: [f32; 3] = [0.17741, 0.26611, 0.35481];
+
+/// A start or stop on a given frame of the buffer being made.
+#[derive(Clone, Copy)]
+struct Sched {
+    frame: u32,
+    bank: u8,
+    on: bool,
+    vel: f32,
+}
+
+const SCHED_MAX: usize = 8;
 
 pub struct Clip {
     pub audio: Arc<Decoded>,
@@ -49,13 +67,16 @@ struct Voice {
     pending: Option<(usize, f32, f64)>,
     /// A launch waiting for the fade-out of what is playing.
     restart: Option<(usize, f32)>,
+    /// Starts and stops inside the buffer being made, in frame order.
+    sched: [Sched; SCHED_MAX],
+    nsched: usize,
     reader: ClipReader,
     peak: f32,
 }
 
 impl Voice {
     fn new() -> Voice {
-        Voice { clips: [None, None, None, None], bank: 0, pos: 0.0, playing: false, level: 0.0, target: 0.0, velocity: 1.0, pending: None, restart: None, reader: ClipReader::new(), peak: 0.0 }
+        Voice { clips: [None, None, None, None], bank: 0, pos: 0.0, playing: false, level: 0.0, target: 0.0, velocity: 1.0, pending: None, restart: None, sched: [Sched { frame: 0, bank: 0, on: false, vel: 0.0 }; SCHED_MAX], nsched: 0, reader: ClipReader::new(), peak: 0.0 }
     }
 
     fn start(&mut self, bank: usize, velocity: f32) {
@@ -79,6 +100,41 @@ impl Voice {
             self.start(bank, velocity);
         }
     }
+
+    /// Fade out (Shift + PLAY, a gate release, the sequencer's stop).
+    fn fade_out(&mut self) {
+        if self.playing {
+            self.target = 0.0;
+            self.restart = None;
+        }
+    }
+
+    /// Keep a start or stop for frame `frame` of the buffer being made (more than eight in
+    /// one buffer on one pad: the rest are dropped).
+    fn schedule(&mut self, frame: usize, bank: usize, on: bool, vel: f32) {
+        if self.nsched >= SCHED_MAX {
+            return;
+        }
+        let mut i = self.nsched;
+        while i > 0 && self.sched[i - 1].frame as usize > frame {
+            self.sched[i] = self.sched[i - 1];
+            i -= 1;
+        }
+        self.sched[i] = Sched { frame: frame as u32, bank: (bank % BANKS) as u8, on, vel };
+        self.nsched += 1;
+    }
+
+    fn run_sched(&mut self, s: Sched) {
+        let bank = s.bank as usize;
+        if s.on {
+            if self.clips[bank].is_some() {
+                self.launch_now(bank, s.vel);
+            }
+        } else if self.playing && self.bank == bank && self.clips[bank].as_ref().is_some_and(|c| c.mode & MODE_GATE != 0) {
+            // A note-off only ends gate clips.
+            self.fade_out();
+        }
+    }
 }
 
 pub struct Engine {
@@ -95,13 +151,70 @@ pub struct Engine {
     clock: f64,
     buf: Vec<f32>,
     peak: [f32; 2],
+    pub seq: Sequencer,
+    /// The metronome's sound, its level, and where its playback is (source frames).
+    click: Arc<Decoded>,
+    pub click_gain: f32,
+    click_pos: Option<f64>,
+    click_at: [u32; 4],
+    nclick: usize,
+    /// For the scripted test run: everything works, nothing is heard.
+    pub silent: bool,
+}
+
+/// The metronome's sound when rekordbox's own click file is not there to read: 42 ms of a
+/// 1 kHz tone that dies away quickly.
+fn default_click() -> Decoded {
+    let (sr, frames) = (44100u32, 1856usize);
+    let mut samples = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let t = i as f32 / sr as f32;
+        let v = (std::f32::consts::TAU * 1000.0 * t).sin() * (-t * 140.0).exp() * (1.0 - i as f32 / frames as f32);
+        samples.push(v);
+        samples.push(v);
+    }
+    Decoded { sr, samples, raw_frames: frames, damaged: 0, truncated: false }
 }
 
 pub static SAMPLER: Mutex<Option<Box<Engine>>> = Mutex::new(None);
 
 impl Engine {
     pub fn new() -> Engine {
-        Engine { voices: (0..PADS).map(|_| Voice::new()).collect(), gain: 1.0, volume: 1.0, cue_gain: 0.0, bpm: 120.0, quantize: false, q_beats: 1.0, clock: 0.0, buf: vec![0.0; 8192], peak: [0.0; 2] }
+        Engine { voices: (0..PADS).map(|_| Voice::new()).collect(), gain: 1.0, volume: 1.0, cue_gain: 0.0, bpm: 120.0, quantize: false, q_beats: 1.0, clock: 0.0, buf: vec![0.0; 8192], peak: [0.0; 2], seq: Sequencer::new(), click: Arc::new(default_click()), click_gain: METRONOME_GAINS[1], click_pos: None, click_at: [0; 4], nclick: 0, silent: false }
+    }
+
+    /// The metronome's sound (stereo).
+    pub fn set_click(&mut self, click: Arc<Decoded>) {
+        if click.frames() >= 2 {
+            self.click = click;
+            self.click_pos = None;
+        }
+    }
+
+    /// Sequencer PLAY: the pattern starts from its beginning, and the sampler's beat clock
+    /// with it, so that Q launches and the pattern share one grid.
+    pub fn seq_play(&mut self) {
+        if self.seq.playing {
+            return;
+        }
+        let clock = self.clock;
+        for v in self.voices.iter_mut() {
+            if let Some(p) = v.pending.as_mut() {
+                p.2 -= clock;
+            }
+        }
+        self.clock = 0.0;
+        self.seq.play();
+    }
+
+    /// Sequencer stop: back to the start, REC off, and every pad stops (rekordbox sends
+    /// all-notes-off to the 16 tracks).
+    pub fn seq_stop(&mut self) {
+        self.seq.stop();
+        for v in self.voices.iter_mut() {
+            v.pending = None;
+            v.fade_out();
+        }
     }
 
     /// Put a clip in a slot (or take it out); whatever the slot was playing stops at once.
@@ -122,18 +235,31 @@ impl Engine {
     }
 
     /// PLAY pressed (a note-on in rekordbox): start the clip, from its start if it is playing.
-    pub fn launch(&mut self, pad: usize, bank: usize, velocity: f32) {
+    /// With the sequencer's REC armed, the first press starts the pattern, and the press is
+    /// recorded. Loop samples are not recorded: the answer is then `true` (rekordbox shows
+    /// "Loop record error").
+    pub fn launch(&mut self, pad: usize, bank: usize, velocity: f32) -> bool {
+        let Some(mode) = self.voices[pad % PADS].clips[bank % BANKS].as_ref().map(|c| c.mode) else { return false };
+        let mut loop_refused = false;
+        if self.seq.rec {
+            if !self.seq.playing {
+                self.seq_play();
+            }
+            if mode & MODE_LOOP != 0 {
+                loop_refused = true;
+            } else {
+                self.seq.note_on(pad % PADS, bank % BANKS, velocity, mode & MODE_GATE != 0);
+            }
+        }
         let (quantize, q, clock) = (self.quantize, self.q_beats.max(1.0 / 32.0), self.clock);
         let v = &mut self.voices[pad % PADS];
-        if v.clips[bank % BANKS].is_none() {
-            return;
-        }
         if quantize {
             let at = (clock / q).ceil() * q;
             v.pending = Some((bank % BANKS, velocity, at));
         } else {
             v.launch_now(bank % BANKS, velocity);
         }
+        loop_refused
     }
 
     /// PLAY released, or Shift + PLAY (`force`): only gate clips stop on a release; a launch
@@ -144,12 +270,15 @@ impl Engine {
         if !(force || gate) {
             return;
         }
+        if gate && !force {
+            self.seq.note_off(pad % PADS, bank % BANKS);
+        }
+        let v = &mut self.voices[pad % PADS];
         if matches!(v.pending, Some((b, _, _)) if b == bank % BANKS) {
             v.pending = None;
         }
         if v.playing && v.bank == bank % BANKS {
-            v.target = 0.0;
-            v.restart = None;
+            v.fade_out();
         }
     }
 
@@ -180,9 +309,38 @@ impl Engine {
         let beats_per_frame = self.bpm.clamp(40.0, 499.0) as f64 / 60.0 / rate.max(1) as f64;
         let (c0, c1) = (self.clock, self.clock + n as f64 * beats_per_frame);
         self.clock = c1;
-        if !self.voices.iter().any(|v| v.playing || v.pending.is_some()) {
-            return;
+        // The sequencer: its events of this buffer go to their pads, each with its frame.
+        self.nclick = 0;
+        {
+            let Engine { seq, voices, click_at, nclick, .. } = self;
+            seq.advance(
+                n,
+                beats_per_frame,
+                |frame, e| voices[e.pad as usize % PADS].schedule(frame, e.bank as usize, e.on, e.vel),
+                |frame| {
+                    if *nclick < click_at.len() {
+                        click_at[*nclick] = frame as u32;
+                        *nclick += 1;
+                    }
+                },
+            );
         }
+        // A quantized launch that falls inside this buffer starts at its frame.
+        for v in self.voices.iter_mut() {
+            if let Some((bank, vel, at)) = v.pending {
+                if at < c1 {
+                    v.schedule((((at - c0) / beats_per_frame).max(0.0) as usize).min(n - 1), bank, true, vel);
+                    v.pending = None;
+                }
+            }
+        }
+        if self.voices.iter().any(|v| v.playing || v.nsched > 0) {
+            self.render_voices(out, cue, rate, n);
+        }
+        self.render_click(out, rate, n);
+    }
+
+    fn render_voices(&mut self, out: &mut [f32], cue: &mut [f32], rate: u32, n: usize) {
         if self.buf.len() < n * 2 {
             // (Only when the device asks for a larger buffer than was foreseen.)
             self.buf.resize(n * 2, 0.0);
@@ -193,40 +351,32 @@ impl Engine {
         let hop = ((rate as usize) / 50).clamp(64, 4096);
         let bpm = self.bpm;
         for v in self.voices.iter_mut() {
-            // A quantized launch that falls inside this buffer starts at its frame.
-            let mut start_at = None;
-            if let Some((bank, vel, at)) = v.pending {
-                if at < c1 {
-                    start_at = Some((((at - c0) / beats_per_frame).max(0.0) as usize).min(n - 1));
-                    v.pending = None;
-                    v.restart = Some((bank, vel));
-                }
-            }
-            for i in 0..n {
-                if start_at == Some(i) {
-                    if let Some((bank, vel)) = v.restart.take() {
-                        if v.playing {
-                            v.restart = Some((bank, vel));
-                            v.target = 0.0;
-                        } else {
-                            v.start(bank, vel);
-                        }
-                    }
+            let (mut k, mut i) = (0usize, 0usize);
+            while i < n {
+                while k < v.nsched && v.sched[k].frame as usize <= i {
+                    let s = v.sched[k];
+                    k += 1;
+                    v.run_sched(s);
                 }
                 if !v.playing {
-                    if start_at.is_some_and(|s| s > i) {
+                    // Nothing sounds until the next start, if there is one in this buffer.
+                    if k < v.nsched {
+                        i = (v.sched[k].frame as usize).max(i + 1).min(n);
+                        if i >= n {
+                            break;
+                        }
                         continue;
                     }
                     break;
                 }
                 let Some(c) = v.clips[v.bank].as_ref() else {
                     v.playing = false;
-                    break;
+                    continue;
                 };
                 let frames = c.audio.frames();
                 if frames < 2 {
                     v.playing = false;
-                    break;
+                    continue;
                 }
                 let ratio = c.audio.sr as f64 / rate.max(1) as f64;
                 let looped = c.mode & MODE_LOOP != 0;
@@ -259,7 +409,18 @@ impl Engine {
                         }
                     }
                 }
+                i += 1;
             }
+            // Starts and stops the loop did not reach (the pad was silent to the end).
+            while k < v.nsched {
+                let s = v.sched[k];
+                k += 1;
+                v.run_sched(s);
+            }
+            v.nsched = 0;
+        }
+        if self.silent {
+            return;
         }
         let g = self.gain * self.volume;
         let cue_g = if cue.len() >= out.len() { self.gain * self.cue_gain } else { 0.0 };
@@ -276,6 +437,41 @@ impl Engine {
             }
         }
         self.peak = peak;
+    }
+
+    /// The metronome: its click starts on the frames the sequencer named. It goes to the
+    /// master output at its own level (not through the sampler's GAIN and volume).
+    fn render_click(&mut self, out: &mut [f32], rate: u32, n: usize) {
+        if self.nclick == 0 && self.click_pos.is_none() {
+            return;
+        }
+        let frames = self.click.frames();
+        let step = self.click.sr as f64 / rate.max(1) as f64;
+        let g = if self.silent { 0.0 } else { self.click_gain };
+        let mut k = 0;
+        for i in 0..n {
+            while k < self.nclick && self.click_at[k] as usize <= i {
+                self.click_pos = Some(0.0);
+                k += 1;
+            }
+            let Some(pos) = self.click_pos else {
+                if k >= self.nclick {
+                    break;
+                }
+                continue;
+            };
+            let j = pos as usize;
+            if j + 1 >= frames {
+                self.click_pos = None;
+                continue;
+            }
+            let f = (pos - j as f64) as f32;
+            let s = &self.click.samples;
+            out[i * 2] += (s[j * 2] + (s[j * 2 + 2] - s[j * 2]) * f) * g;
+            out[i * 2 + 1] += (s[j * 2 + 1] + (s[j * 2 + 3] - s[j * 2 + 1]) * f) * g;
+            self.click_pos = Some(pos + step);
+        }
+        self.nclick = 0;
     }
 }
 
@@ -384,5 +580,136 @@ mod tests {
         e.process(&mut out, &mut cue, 44100);
         assert!((out[1000] - 0.5 * 0.5 * 0.25).abs() < 1e-4, "{}", out[1000]);
         assert!((cue[1000] - 0.5 * 0.5 * 0.5).abs() < 1e-4, "{}", cue[1000]);
+    }
+
+    fn ev(t: f64, pad: u8, on: bool) -> crate::sequencer::Event {
+        crate::sequencer::Event { t, pad, bank: 0, on, vel: 1.0, fresh: false }
+    }
+
+    /// Run in buffers of `block` frames (as the audio callback does).
+    fn run_blocks(e: &mut Engine, frames: usize, block: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames * 2];
+        let mut done = 0;
+        while done < frames {
+            let n = block.min(frames - done);
+            e.process(&mut out[done * 2..(done + n) * 2], &mut [], 44100);
+            done += n;
+        }
+        out
+    }
+
+    #[test]
+    fn a_pattern_starts_its_pads_on_the_exact_frame_every_pass() {
+        for block in [64usize, 512, 4096] {
+            let mut e = Engine::new();
+            e.bpm = 120.0;
+            e.set_clip(0, 0, Some(clip(1000, 0)));
+            e.set_clip(5, 0, Some(clip(1000, 0)));
+            e.seq.set_pattern(0, &crate::sequencer::Pattern { bars: 1, events: vec![ev(0.0, 0, true), ev(2.5, 5, true)] });
+            e.seq_play();
+            let out = run_blocks(&mut e, 88200 * 3, block);
+            let starts: Vec<usize> = (0..out.len() / 2).filter(|i| out[i * 2] != 0.0 && (*i == 0 || out[i * 2 - 2] == 0.0)).collect();
+            // One bar at 120 BPM is 88200 frames; beat 2.5 is 55125 frames in.
+            assert_eq!(starts, vec![0, 55125, 88200, 88200 + 55125, 176400, 176400 + 55125], "block {block}");
+            assert_eq!(e.seq.passes, 2);
+        }
+    }
+
+    #[test]
+    fn pressing_a_pad_with_rec_armed_starts_the_pattern_and_records_the_press() {
+        let mut e = Engine::new();
+        e.bpm = 120.0;
+        e.quantize = true;
+        e.set_clip(0, 0, Some(clip(1000, 0)));
+        e.set_clip(1, 0, Some(clip(1000, MODE_LOOP)));
+        run(&mut e, 5000);
+        e.seq.set_rec(true);
+        assert!(!e.seq.playing);
+        assert!(!e.launch(0, 0, 1.0));
+        assert!(e.seq.playing && e.seq.rec);
+        // The pattern and the clock start together, so the quantized press sounds at once.
+        let out = run(&mut e, 22050 + 6000);
+        assert!(out[0] != 0.0);
+        // A second press a little after beat 1: recorded on beat 1, heard on beat 2.
+        e.launch(0, 0, 1.0);
+        // A loop sample is refused (and still plays).
+        assert!(e.launch(1, 0, 1.0));
+        let p = e.seq.pattern(0);
+        assert_eq!(p.events.iter().map(|x| (x.t, x.pad, x.on)).collect::<Vec<_>>(), vec![(0.0, 0, true), (1.0, 0, true)]);
+        let out = run(&mut e, 22050);
+        let first = (0..22050).find(|i| out[i * 2] != 0.0).unwrap();
+        assert!((first as i64 - (22050 - 6000)).abs() <= 2, "{first}");
+        // Stop: REC off, the position back at the start, the loop pad silent after its fade.
+        e.seq_stop();
+        assert!(!e.seq.playing && !e.seq.rec && e.seq.pos() == 0.0);
+        let out = run(&mut e, 2000);
+        assert_eq!(out[2 * 1500], 0.0);
+        assert!(!e.slot_state(1, 0).0);
+        // Played back: beat 0 and beat 1.
+        e.quantize = false;
+        e.seq_play();
+        let out = run(&mut e, 88200);
+        let starts: Vec<usize> = (0..88200).filter(|i| out[i * 2] != 0.0 && (*i == 0 || out[i * 2 - 2] == 0.0)).collect();
+        assert_eq!(starts, vec![0, 22050]);
+    }
+
+    #[test]
+    fn a_recorded_gate_note_ends_where_the_pad_was_released() {
+        let mut e = Engine::new();
+        e.bpm = 120.0;
+        e.seq.rec_unit = 0.0;
+        e.set_clip(2, 0, Some(clip(100_000, MODE_GATE)));
+        e.seq.set_rec(true);
+        e.launch(2, 0, 1.0);
+        run(&mut e, 10000);
+        e.stop(2, 0, false);
+        run(&mut e, 78200);
+        e.seq.set_rec(false);
+        // The next pass plays it without the pad: about 10000 frames of sound, then silence.
+        let out = run(&mut e, 88200);
+        assert!(out[2 * 5000] != 0.0 && out[2 * 9000] != 0.0);
+        assert_eq!(out[2 * 12000], 0.0);
+        assert_eq!(e.seq.pattern(0).events.len(), 2);
+    }
+
+    #[test]
+    fn the_metronome_clicks_on_the_beats_at_its_own_level() {
+        let mut e = Engine::new();
+        e.bpm = 120.0;
+        e.gain = 0.0;
+        e.volume = 0.0;
+        // A click that is easy to find: 100 frames of 1.0.
+        e.set_click(Arc::new(Decoded { sr: 44100, samples: vec![1.0; 200], raw_frames: 100, damaged: 0, truncated: false }));
+        e.click_gain = METRONOME_GAINS[2];
+        e.seq.metronome = true;
+        let out = run_blocks(&mut e, 44100, 512);
+        assert!(out.iter().all(|v| *v == 0.0), "no clicks while the sequencer is stopped");
+        e.seq_play();
+        let out = run_blocks(&mut e, 88200 + 22050, 512);
+        let starts: Vec<usize> = (0..out.len() / 2).filter(|i| out[i * 2] != 0.0 && (*i == 0 || out[i * 2 - 2] == 0.0)).collect();
+        assert_eq!(starts, vec![0, 22050, 44100, 66150, 88200]);
+        assert!((out[2 * 22060] - METRONOME_GAINS[2]).abs() < 1e-6 && (out[2 * 22060 + 1] - METRONOME_GAINS[2]).abs() < 1e-6);
+        assert_eq!(out[2 * 22200], 0.0);
+        e.seq.metronome = false;
+        let out = run_blocks(&mut e, 44100, 512);
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_muted_slot_is_silent_in_a_pattern_and_silent_mode_gives_no_output() {
+        let mut e = Engine::new();
+        e.set_clip(0, 0, Some(clip(1000, 0)));
+        e.seq.set_pattern(0, &crate::sequencer::Pattern { bars: 1, events: vec![ev(0.0, 0, true)] });
+        e.clip_mut(0, 0).unwrap().mute = true;
+        e.seq_play();
+        let out = run(&mut e, 2000);
+        assert!(out.iter().all(|v| *v == 0.0));
+        assert_eq!(e.seq.fired, 1);
+        e.clip_mut(0, 0).unwrap().mute = false;
+        e.silent = true;
+        e.seq.metronome = true;
+        let out = run(&mut e, 88200);
+        assert!(out.iter().all(|v| *v == 0.0));
+        assert_eq!(e.seq.fired, 2);
     }
 }

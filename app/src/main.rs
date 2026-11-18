@@ -25,6 +25,7 @@ mod menus;
 mod mixer;
 mod perf_selftest;
 mod sampler;
+mod sequencer;
 mod ui_sampler;
 mod model;
 mod manual;
