@@ -49,7 +49,7 @@ pub fn sync(app: &mut App) {
         return;
     }
     // Tempo per channel: each deck's own, and the master deck's for the master.
-    let mut bpm = [120.0f32; 5];
+    let mut bpm = [120.0f32; fx::CHANNELS];
     for n in 0..app.deck_count() {
         let b = app.with_deck(n, |a| if a.deck.track.is_some() { a.effective_bpm() } else { 0.0 });
         if b > 0.0 {
@@ -63,7 +63,7 @@ pub fn sync(app: &mut App) {
     rack.master_cfx_set = (if app.px.cfx_user { app.px.cfx_kind } else { 0 }, app.px.cfx_color[4], app.px.cfx_param);
     for (u, ui) in rack.units.iter_mut().zip(app.px.fx.iter()) {
         let mut p = ui.params;
-        p.bpm = if ui.auto { bpm } else { [ui.tap_bpm; 5] };
+        p.bpm = if ui.auto { bpm } else { [ui.tap_bpm; fx::CHANNELS] };
         u.prepare(&p.assign);
         u.params = p;
     }

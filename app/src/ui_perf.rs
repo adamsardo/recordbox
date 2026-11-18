@@ -188,6 +188,16 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
         None => ("Not Loaded.".to_string(), String::new()),
     };
     let key_w = 170.0;
+    // The deck's place (the sequencer strip can be dropped on it), and its title as a handle:
+    // dragged to a sampler slot, the deck's track loads there.
+    app.px.sampler.deck_rects[(n as usize).min(3)] = r;
+    if let Some(id) = app.deck.track {
+        let hr = at(tx0, 4.0, (w - tx0 - key_w - 170.0).clamp(60.0, 240.0), if c4 { 20.0 } else { 26.0 });
+        let hresp = ui.interact(hr, ui.id().with("deckdrag"), Sense::drag());
+        if hresp.drag_started() && app.drag.is_none() {
+            app.drag = Some(vec![id]);
+        }
+    }
     let text_clip = p.with_clip_rect(at(tx0, 0.0, (w - tx0 - key_w - 170.0).max(60.0), hdr));
     text_clip.text(pos2(x0 + tx0, y0 + title_y), Align2::LEFT_CENTER, title, bold(title_f), if loaded { WHITE } else { dim });
     let artist_clip = p.with_clip_rect(at(tx0, 0.0, if c4 { 104.0 } else { 116.0 }, hdr));
@@ -240,7 +250,7 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     if tip(bresp, app, "BEAT SYNC").clicked() {
         app.toggle_beat_sync();
     }
-    let is_master = app.px.master == n;
+    let is_master = app.px.master == n && !app.sampler_is_master();
     let mrect = if c4 { Rect::from_min_size(pos2(rx - 77.0, y0 + 29.5), vec2(69.0, 11.0)) } else { Rect::from_min_size(pos2(rx - 79.0, y0 + 33.5), vec2(70.0, 12.0)) };
     let mresp = ui.interact(mrect, ui.id().with("master"), Sense::click());
     p.rect_filled(mrect, 1.0, if mresp.hovered() { lighten(BTN) } else { BTN });
@@ -301,6 +311,11 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     loop_box(app, ui, pos2(x0 + loop_x, ly + top), n, c4);
     platter_panel(app, ui, pos2(x0 + panel_x, ly + if c4 { 0.0 } else { -3.0 }), n, is_active, c4);
 }
+
+/// Pad modes of `PlayerExt::pad_mode` beyond HOT CUE (0), STEMS (1), BEAT JUMP (2) and
+/// BEAT LOOP (3).
+pub const PAD_SAMPLER: u8 = 4;
+pub const PAD_SEQ_CALL: u8 = 5;
 
 /// The pad area: eight pads in two columns and the pad mode pull-down under them.
 fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
@@ -370,6 +385,93 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
                 }
             }
         }
+    } else if mode == PAD_SAMPLER {
+        // SAMPLER: the pads play the slots of the sampler's bank (1-8; the second page 9-16),
+        // in the slot's colour with its sample's name. They follow the sequencer's MUTE /
+        // ERASE modes, Shift stops, and an empty pad pressed while this deck loops captures
+        // the loop (`Sampler.pad.csv`, `deviceSamplerPadSelectedSlot`).
+        let bank = app.prefs.sampler.bank.min(3) as usize;
+        let shift = ui.input(|i| i.modifiers.shift);
+        let released = ui.input(|i| i.pointer.any_released());
+        let pads_on = app.sampler_pads();
+        for i in 0..8usize {
+            let slot = i + 8 * page as usize;
+            let idx = bank * 16 + slot;
+            let pr = pad(i / 4, i % 4);
+            let resp = ui.interact(pr, ui.id().with(("smppad", i)), Sense::click_and_drag());
+            let used = slot < pads_on;
+            let name = app.prefs.sampler.slots.get(idx).and_then(|s| s.as_ref()).map(|s| s.name.clone()).filter(|_| used);
+            let ready = name.is_some() && app.px.sampler.ready(idx);
+            let playing = ready && crate::sampler::SAMPLER.lock().as_ref().is_some_and(|e| e.slot_state(slot, bank).0);
+            let muted = app.px.sampler.is_muted(idx);
+            match &name {
+                Some(nm) => {
+                    let code = app.sampler_color_code(idx);
+                    let col = if playing { hex(crate::sampler_ext::PAD_COLORS[code as usize]) } else { crate::sampler_ext::pad_color(code) };
+                    let col = if muted || !ready { col.gamma_multiply(0.45) } else { col };
+                    p.rect_filled(pr, 0.0, if resp.hovered() { lighten(col) } else { col });
+                    p.text(pos2(pr.min.x + 9.0, pr.center().y), Align2::LEFT_CENTER, format!("{}", slot + 1), bold(10.5), hex(0xF4F4F4));
+                    p.with_clip_rect(pr).text(pos2(pr.min.x + 26.0, pr.center().y), Align2::LEFT_CENTER, nm, FontId::proportional(10.5), hex(0xF4F4F4));
+                }
+                None => {
+                    p.rect_filled(pr, 0.0, if resp.hovered() && used { hex(0x1E1E1E) } else { hex(0x161616) });
+                    p.text(pos2(pr.min.x + 9.0, pr.center().y), Align2::LEFT_CENTER, format!("{}", slot + 1), FontId::proportional(10.5), if used { hex(0x8C8C8C) } else { hex(0x3C3C3C) });
+                }
+            }
+            if press_fired(ui, &resp) && used {
+                app.sampler_deck_pad_down(n, slot, shift);
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("smppad_held", n)), slot));
+            }
+            if released {
+                if let Some(h) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(egui::Id::new(("smppad_held", n)))) {
+                    app.sampler_pad_up(h);
+                }
+            }
+        }
+    } else if mode == PAD_SEQ_CALL {
+        // SEQ. CALL: the eight patterns ("P1".."P8", the name, "<n>Bars"). A press starts the
+        // pattern, Shift + press stops it; right-click names it; the cross clears a saved one.
+        let shift = ui.input(|i| i.modifiers.shift);
+        let (cur, reserved, playing, bars) = match crate::sampler::SAMPLER.lock().as_ref() {
+            Some(e) => (e.seq.current(), e.seq.reserved(), e.seq.playing, std::array::from_fn::<u8, 8, _>(|k| e.seq.pattern(k).bars)),
+            None => (0, None, false, [1; 8]),
+        };
+        let blink = (ui.input(|i| i.time) / 0.3) as i64 % 2 == 0;
+        for i in 0..8usize {
+            let pr = pad(i / 4, i % 4);
+            let resp = ui.interact(pr, ui.id().with(("seqpad", i)), Sense::click());
+            let saved = app.prefs.sampler.seq.patterns.get(i).is_some_and(|x| x.is_some());
+            let lit = (playing && cur == i && reserved.is_none()) || (reserved == Some(i) && blink);
+            p.rect_filled(pr, 0.0, if lit { BLUE } else if resp.hovered() { hex(0x1E1E1E) } else { hex(0x161616) });
+            let tc = if saved || lit { hex(0xF4F4F4) } else { hex(0x8C8C8C) };
+            p.text(pos2(pr.min.x + 9.0, pr.center().y), Align2::LEFT_CENTER, format!("P{}", i + 1), bold(10.5), tc);
+            p.with_clip_rect(Rect::from_min_max(pr.min, pos2(pr.max.x - 56.0, pr.max.y))).text(pos2(pr.min.x + 30.0, pr.center().y), Align2::LEFT_CENTER, app.prefs.sampler.seq.name(i), FontId::proportional(10.5), tc);
+            p.text(pos2(pr.max.x - 20.0, pr.center().y), Align2::RIGHT_CENTER, if bars[i] == 1 { "1Bar".to_string() } else { format!("{}Bars", bars[i]) }, FontId::proportional(9.5), tc);
+            if saved {
+                let dr = Rect::from_center_size(pos2(pr.max.x - 9.0, pr.center().y), vec2(12.0, 12.0));
+                let dresp = ui.interact(dr, ui.id().with(("seqpad_del", i)), Sense::click());
+                let (c, col) = (dr.center(), if dresp.hovered() { WHITE } else { hex(0xA0A0A0) });
+                p.line_segment([c + vec2(-3.0, -3.0), c + vec2(3.0, 3.0)], Stroke::new(1.2_f32, col));
+                p.line_segment([c + vec2(-3.0, 3.0), c + vec2(3.0, -3.0)], Stroke::new(1.2_f32, col));
+                if dresp.on_hover_text("Delete selected sequence").clicked() {
+                    app.sampler_seq_delete(i);
+                    continue;
+                }
+            }
+            if press_fired(ui, &resp) {
+                app.sampler_seq_call(i, shift);
+            }
+            resp.context_menu(|ui| {
+                let mut name = app.prefs.sampler.seq.name(i);
+                ui.label("Name");
+                if ui.add(egui::TextEdit::singleline(&mut name).char_limit(32).desired_width(140.0)).changed() {
+                    let sq = &mut app.prefs.sampler.seq;
+                    sq.names.resize(8, String::new());
+                    sq.names[i] = if name.trim() == format!("PATTERN {}", i + 1) { String::new() } else { name.trim().to_string() };
+                    app.save_prefs();
+                }
+            });
+        }
     } else if mode == 3 {
         // BEAT LOOP: the 16 lengths, 1/64 to 2 beats on the first page and 4 to 512 on the
         // second; the running loop's length is lit, and pressing it again ends the loop.
@@ -427,6 +529,8 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
         1 => "STEMS",
         2 => "BEAT JUMP",
         3 => "BEAT LOOP",
+        PAD_SAMPLER => "SAMPLER",
+        PAD_SEQ_CALL => "SEQ. CALL",
         _ => "HOT CUE",
     };
     let mw = 70.0;
@@ -451,17 +555,29 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
                 ui.memory_mut(|m| m.close_popup());
             }
         }
-        for name in ["PAD FX", "SLICER", "KEYBOARD", "KEY SHIFT", "SEQ. CALL", "ACT. CENSR", "MEMORY CUE"] {
+        if ui.selectable_label(mode == PAD_SEQ_CALL, "SEQ. CALL").clicked() {
+            app.px.pad_mode[n as usize] = PAD_SEQ_CALL;
+            ui.memory_mut(|m| m.close_popup());
+        }
+        for name in ["PAD FX", "SLICER", "KEYBOARD", "KEY SHIFT", "ACT. CENSR", "MEMORY CUE"] {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
+        }
+        // (In rekordbox SAMPLER is a pad mode of the controllers only; recordbox has no
+        // controller pads yet, so it is offered here.)
+        ui.separator();
+        if ui.selectable_label(mode == PAD_SAMPLER, "SAMPLER").clicked() {
+            app.px.pad_mode[n as usize] = PAD_SAMPLER;
+            ui.memory_mut(|m| m.close_popup());
         }
     });
     // Page buttons beside the pull-down (HOT CUE: A-H / I-P; BEAT JUMP and BEAT LOOP: their
     // second page). Where rekordbox puts its page control on screen is not known.
-    if mode != 1 {
+    if mode != 1 && mode != PAD_SEQ_CALL {
         let px = if n % 2 == 0 { mr.max.x + 6.0 } else { mr.min.x - 52.0 };
         let names = match mode {
             2 => ["1 - 128", "1/8 - 1/2"],
             3 => ["1/64 - 2", "4 - 512"],
+            PAD_SAMPLER => ["1 - 8", "9 - 16"],
             _ => ["A - H", "I - P"],
         };
         let pr = Rect::from_min_size(pos2(px, mr.min.y), vec2(46.0, mr.height()));

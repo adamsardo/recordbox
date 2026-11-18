@@ -84,7 +84,7 @@ impl Prefs {
 // ------------------------------------------------------------------ keyboard actions
 
 /// (id, label, default shortcut in stored form or "" for none, category).
-pub const ACTIONS: [(&str, &str, &str, &str); 79] = [
+pub const ACTIONS: [(&str, &str, &str, &str); 140] = [
     ("play", "Play/Pause", "Space", "Player"),
     ("cue", "Cue", "C", "Player"),
     ("jump_back", "Jump Reverse", "ArrowLeft", "Player"),
@@ -150,6 +150,69 @@ pub const ACTIONS: [(&str, &str, &str, &str); 79] = [
     ("grid_right", "Move the beat grid to the right", "Alt+Period", "Grid"),
     ("grid_downbeat", "Set the first beat of a bar to the current position.", "Alt+B", "Grid"),
     ("grid_tap", "Set BPM with the tapping interval", "Alt+T", "Grid"),
+    // The sampler deck (PERFORMANCE mode): rekordbox's `SamplerControlPanel` commands with the
+    // keys of its "Performance 1" preset (`getCommandInfo` 0x100b15b8c).
+    ("smp_play1", "Playback slot 1", "X", "Sampler"),
+    ("smp_play2", "Playback slot 2", "C", "Sampler"),
+    ("smp_play3", "Playback slot 3", "V", "Sampler"),
+    ("smp_play4", "Playback slot 4", "B", "Sampler"),
+    ("smp_play5", "Playback slot 5", "", "Sampler"),
+    ("smp_play6", "Playback slot 6", "", "Sampler"),
+    ("smp_play7", "Playback slot 7", "", "Sampler"),
+    ("smp_play8", "Playback slot 8", "", "Sampler"),
+    ("smp_play9", "Playback slot 9", "M", "Sampler"),
+    ("smp_play10", "Playback slot 10", "Comma", "Sampler"),
+    ("smp_play11", "Playback slot 11", "Period", "Sampler"),
+    ("smp_play12", "Playback slot 12", "Slash", "Sampler"),
+    ("smp_play13", "Playback slot 13", "", "Sampler"),
+    ("smp_play14", "Playback slot 14", "", "Sampler"),
+    ("smp_play15", "Playback slot 15", "", "Sampler"),
+    ("smp_play16", "Playback slot 16", "", "Sampler"),
+    ("smp_pause1", "Pause slot 1", "Shift+X", "Sampler"),
+    ("smp_pause2", "Pause slot 2", "Shift+C", "Sampler"),
+    ("smp_pause3", "Pause slot 3", "Shift+V", "Sampler"),
+    ("smp_pause4", "Pause slot 4", "Shift+B", "Sampler"),
+    ("smp_pause5", "Pause slot 5", "", "Sampler"),
+    ("smp_pause6", "Pause slot 6", "", "Sampler"),
+    ("smp_pause7", "Pause slot 7", "", "Sampler"),
+    ("smp_pause8", "Pause slot 8", "", "Sampler"),
+    ("smp_pause9", "Pause slot 9", "Shift+M", "Sampler"),
+    ("smp_pause10", "Pause slot 10", "Shift+Comma", "Sampler"),
+    ("smp_pause11", "Pause slot 11", "Shift+Period", "Sampler"),
+    ("smp_pause12", "Pause slot 12", "Shift+Slash", "Sampler"),
+    ("smp_pause13", "Pause slot 13", "", "Sampler"),
+    ("smp_pause14", "Pause slot 14", "", "Sampler"),
+    ("smp_pause15", "Pause slot 15", "", "Sampler"),
+    ("smp_pause16", "Pause slot 16", "", "Sampler"),
+    ("smp_bank1", "Select Sampler Bank 1", "", "Sampler"),
+    ("smp_bank2", "Select Sampler Bank 2", "", "Sampler"),
+    ("smp_bank3", "Select Sampler Bank 3", "", "Sampler"),
+    ("smp_bank4", "Select Sampler Bank 4", "", "Sampler"),
+    ("smp_gain_up", "Increase Sampler Gain value", "", "Sampler"),
+    ("smp_gain_down", "Decrease Sampler Gain value", "", "Sampler"),
+    ("smp_vol_up", "Increase Sampler Gain volume", "", "Sampler"),
+    ("smp_vol_down", "Decrease Sampler Gain volume", "", "Sampler"),
+    ("smp_quantize", "Quantize (Sampler)", "", "Sampler"),
+    ("smp_sync", "Sampler Sync", "", "Sampler"),
+    ("smp_master", "Sampler Sync Master", "", "Sampler"),
+    ("smp_bpm_up", "Increase Sampler BPM", "", "Sampler"),
+    ("smp_bpm_up_large", "Increase Sampler BPM (large)", "", "Sampler"),
+    ("smp_bpm_down", "Decrease Sampler BPM", "", "Sampler"),
+    ("smp_bpm_down_large", "Decrease Sampler BPM (large)", "", "Sampler"),
+    ("seq_rec", "REC Sequence", "", "Sampler"),
+    ("seq_play", "Playback Sequence", "Cmd+Y", "Sampler"),
+    ("seq_save", "Save Sequence", "", "Sampler"),
+    ("seq_prev", "Previous Sequence", "Cmd+J", "Sampler"),
+    ("seq_next", "Next Sequence", "Cmd+K", "Sampler"),
+    ("seq_delete", "Delete Sequence", "", "Sampler"),
+    ("seq_mute", "Sequence Mute mode", "", "Sampler"),
+    ("seq_erase", "Sequence Erase mode", "", "Sampler"),
+    ("seq_load1", "Sequence Load (Deck1)", "", "Sampler"),
+    ("seq_load2", "Sequence Load (Deck2)", "", "Sampler"),
+    ("seq_load3", "Sequence Load (Deck3)", "", "Sampler"),
+    ("seq_load4", "Sequence Load (Deck4)", "", "Sampler"),
+    ("padmode_sampler", "Pad mode - Sampler", "", "Sampler"),
+    ("padmode_seqcall", "Pad mode - Sequence Call", "", "Sampler"),
     ("list_up", "Up", "ArrowUp", "Browse"),
     ("list_down", "Down", "ArrowDown", "Browse"),
     ("load", "Load track to player 1", "Enter", "Browse"),
@@ -167,7 +230,7 @@ pub const ACTIONS: [(&str, &str, &str, &str); 79] = [
 ];
 
 /// Categories in the order the Keyboard page shows them.
-pub const ACTION_CATEGORIES: [&str; 7] = ["Player", "Hot Cue", "Memory Cue", "Loop", "Grid", "Browse", "Others"];
+pub const ACTION_CATEGORIES: [&str; 8] = ["Player", "Hot Cue", "Memory Cue", "Loop", "Grid", "Sampler", "Browse", "Others"];
 
 /// Actions the key loop in main.rs handles itself, because they react to key releases,
 /// key repeats or held modifiers.
@@ -201,6 +264,7 @@ pub enum Act {
     Focus,
     Filter,
     Menu(&'static str),
+    Sampler(crate::sampler_ext::SmpAct),
 }
 
 impl Act {
@@ -246,6 +310,8 @@ impl Act {
                     Act::MemCall(n - 1)
                 } else if let Some(n) = num("mem_delete").filter(|n| (1..=10).contains(n)) {
                     Act::MemDelete(n - 1)
+                } else if let Some(a) = crate::sampler_ext::SmpAct::parse(id) {
+                    Act::Sampler(a)
                 } else {
                     return None;
                 }
@@ -254,7 +320,7 @@ impl Act {
     }
     /// Held keys repeat the action (searching, volume, grid nudges).
     pub fn repeats(&self) -> bool {
-        matches!(self, Act::Volume(_) | Act::GridShift(_))
+        matches!(self, Act::Volume(_) | Act::GridShift(_)) || matches!(self, Act::Sampler(a) if a.repeats())
     }
 }
 
@@ -320,6 +386,7 @@ pub fn run_action(app: &mut App, act: Act) {
         }
         Act::Filter => crate::menus::handle(app, "filter"),
         Act::Menu(id) => crate::menus::handle(app, id),
+        Act::Sampler(a) => app.sampler_action(a),
     }
 }
 
@@ -721,7 +788,10 @@ mod tests {
             if !def.is_empty() {
                 let sc = Shortcut::parse(def).unwrap_or_else(|| panic!("{id}: {def} is not a shortcut"));
                 assert_eq!(Shortcut::parse(&sc.name()), Some(sc), "{id}: stored form reads back");
-                if let Some(other) = keys.insert(def, id) {
+                // (The sampler deck's keys are rekordbox's Performance preset; the others are
+                // its Export preset. The two share keys, and in PERFORMANCE mode the
+                // sampler's come first.)
+                if let Some(other) = keys.insert((crate::sampler_ext::is_sampler_action(id), def), id) {
                     panic!("{id} and {other} share {def}");
                 }
             }
@@ -733,7 +803,7 @@ mod tests {
             assert!(matches!(Act::parse(a), Some(Act::Menu(_))), "{a}");
         }
         // Shift+arrow left/right stay free: beat jumps use Shift for a one-beat jump.
-        assert!(!keys.contains_key("Shift+ArrowLeft") && !keys.contains_key("Shift+ArrowRight"));
+        assert!(!keys.contains_key(&(false, "Shift+ArrowLeft")) && !keys.contains_key(&(false, "Shift+ArrowRight")));
         assert_eq!(Act::parse("clear_hot8"), Some(Act::ClearHot(7)));
         assert_eq!(Act::parse("mem_call10"), Some(Act::MemCall(9)));
         assert_eq!(Act::parse("mem_delete3"), Some(Act::MemDelete(2)));

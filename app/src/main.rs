@@ -25,6 +25,7 @@ mod menus;
 mod mixer;
 mod perf_selftest;
 mod sampler;
+mod sampler_ext;
 mod sequencer;
 mod ui_sampler;
 mod model;
@@ -325,8 +326,13 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     let shortcuts: std::collections::HashMap<&str, app::Shortcut> = recordbox_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
     let key = |a: &str| shortcuts.get(a).map(|s| s.key);
     // A press of the action's key with exactly its modifiers (beat jumps also take Shift).
+    // The sampler deck's keys work in PERFORMANCE mode only, and there they come before
+    // another action on the same key (they are rekordbox's Performance preset).
+    let perf = app.performance();
+    let smp_keys: Vec<app::Shortcut> = if perf { shortcuts.iter().filter(|(a, _)| sampler_ext::is_sampler_action(a)).map(|(_, s)| *s).collect() } else { vec![] };
     let hit = |a: &str, repeats: bool| {
         let Some(sc) = shortcuts.get(a) else { return false };
+        if sampler_ext::is_sampler_action(a) { if !perf { return false; } } else if smp_keys.contains(sc) { return false; }
         let free_shift = a == "jump_back" || a == "jump_fwd";
         ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat, modifiers, .. } if *key == sc.key && (repeats || !*repeat) && sc.mods_match(modifiers, free_shift))))
     };
@@ -374,6 +380,14 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     }
     for act in acts {
         prefs_ext::run_action(app, act);
+    }
+    // A sampler pad's key let go: gate samples stop.
+    if perf {
+        for n in 0..16usize {
+            if released(&format!("smp_play{}", n + 1)) {
+                app.sampler_pad_up(n);
+            }
+        }
     }
     // Search Backward / Forward run while their key is held.
     for (id, dir) in [("search_back", -1), ("search_fwd", 1)] {

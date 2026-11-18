@@ -747,16 +747,42 @@ impl ClipReader {
 }
 
 /// The sampler deck joins the mix after the decks (before the master's effects and limiter).
-fn mix_sampler(out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
+/// With `rack`, and the sampler assigned to a Beat FX unit or CFX set to act on it, its mix
+/// goes through them first (after its GAIN, before its fader: the decks' order).
+fn mix_sampler(out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32, rack: Option<&mut crate::fx::Rack>) {
     if channels != 2 {
         return;
     }
     if let Some(mut g) = lock_for_audio(&crate::sampler::SAMPLER) {
         if let Some(e) = g.as_deref_mut() {
+            let fx = rack.filter(|r| r.sampler_in_use());
+            e.direct = fx.is_none();
             e.process(out, cue, rate);
+            if let Some(rack) = fx {
+                let n = out.len() / 2;
+                let (g, cue_g) = e.out_gains();
+                let cue_g = if cue.len() >= out.len() { cue_g } else { 0.0 };
+                let buf = e.mix_mut(n);
+                rack.process(crate::fx::SAMPLER, buf, rate);
+                let mut peak = (0.0f32, 0.0f32);
+                for i in 0..n {
+                    let (l, r) = (buf[i * 2], buf[i * 2 + 1]);
+                    out[i * 2] += l * g;
+                    out[i * 2 + 1] += r * g;
+                    peak = (peak.0.max((l * g).abs()), peak.1.max((r * g).abs()));
+                    if cue_g > 0.0 {
+                        cue[i * 2] += l * cue_g;
+                        cue[i * 2 + 1] += r * cue_g;
+                    }
+                }
+                e.note_peak(peak.0, peak.1);
+            }
         }
     }
 }
+
+/// The sampler deck is the sync master: BEAT SYNC followers hold their beats on its clock.
+pub static SAMPLER_MASTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Time stretcher (WSOLA: waveform-similarity overlap-add). The output is made of 40 ms
 /// grains of the source, read at the wanted pitch and cross-faded every 20 ms; each new grain
@@ -1005,6 +1031,30 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
             }
         }
     }
+    // The sampler deck in the sync: as the master, every BEAT SYNC follower is held on its
+    // beat clock; with its own BPM SYNC on, it is told where the master deck is in its beat.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut phase = f64::NAN;
+        if SAMPLER_MASTER.load(Relaxed) {
+            let c = f64::from_bits(crate::sampler::CLOCK_BITS.load(Relaxed)).rem_euclid(1.0);
+            for f in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
+                f.sync_bend = 0.0;
+                if f.sync_follow && f.playing && f.search == 0.0 {
+                    if let (Some(gf), Some(af)) = (&f.grid, &f.audio) {
+                        if let Some(p) = beat_phase(gf, f.pos / af.sr as f64) {
+                            f.sync_bend = sync_correction(crate::sampler::phase_diff(p, c));
+                        }
+                    }
+                }
+            }
+        } else if let Some(m) = guards.get(master).and_then(|g| g.as_deref()) {
+            if let (true, true, Some(gm), Some(am)) = (m.playing, m.search == 0.0, &m.grid, &m.audio) {
+                phase = beat_phase(gm, m.pos / am.sr as f64).unwrap_or(f64::NAN);
+            }
+        }
+        crate::sampler::FOLLOW_PHASE.store(phase.to_bits(), Relaxed);
+    }
     // With Beat FX in use each deck is rendered on its own, sent through the FX units
     // assigned to it (after its faders, as in rekordbox), then mixed; the master's effects
     // take the mix. Otherwise the decks go straight into the output.
@@ -1026,14 +1076,14 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
                 }
                 rack.scratch[i] = buf;
             }
-            mix_sampler(out, cue, channels, rate);
+            mix_sampler(out, cue, channels, rate, Some(&mut *rack));
             rack.process(crate::fx::MASTER, out, rate);
         }
         None => {
             for s in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
                 render_deck_cue(s, out, cue, channels, rate);
             }
-            mix_sampler(out, cue, channels, rate);
+            mix_sampler(out, cue, channels, rate, None);
         }
     }
     drop(rack);

@@ -653,7 +653,7 @@ impl App {
     /// Hand each deck's tempo, Master Tempo, key shift, crossfader gain, isolator switches,
     /// BEAT SYNC state and beat grid to the audio thread. Outside the two-deck layouts the
     /// deck plays plainly (those controls are not on screen there).
-    fn push_deck_controls(&mut self) {
+    pub(crate) fn push_deck_controls(&mut self) {
         let two = self.two_players();
         let dual = self.dual_player();
         let perf = self.performance();
@@ -666,7 +666,9 @@ impl App {
         crate::audio::LIMITER_ON.store(perf, std::sync::atomic::Ordering::Relaxed);
         let count = self.deck_count();
         let master = self.px.master.min(count.saturating_sub(1));
-        crate::audio::MASTER_DECK.store(master, std::sync::atomic::Ordering::Relaxed);
+        // The sampler deck as the sync master: every deck is a follower of its tempo.
+        let smp_master = self.sampler_is_master();
+        crate::audio::MASTER_DECK.store(if smp_master { 255 } else { master }, std::sync::atomic::Ordering::Relaxed);
         let faders = crate::audio::crossfader_gains(self.px.crossfader);
         // Each deck's position, own BPM there and key.
         let mut infos = [(0.0f64, 0.0f64, -1i32); 4];
@@ -685,13 +687,13 @@ impl App {
             let mx = &self.deck_of(master).x;
             (mx.tempo_adj, mx.key_shift)
         };
-        let master_bpm = i_m.1 * (1.0 + m_adj);
+        let master_bpm = if smp_master { self.prefs.sampler.bpm.clamp(40.0, 499.0) as f64 } else { i_m.1 * (1.0 + m_adj) };
         let master_key = shift_key(i_m.2, m_shift);
         for n in 0..count {
             let (own_bpm, own_key) = (infos[n as usize].1, infos[n as usize].2);
             let d = self.deck_of_mut(n);
-            let follower = two && n != master;
-            if follower && d.x.key_sync && d.track.is_some() {
+            let follower = two && (n != master || smp_master);
+            if follower && !smp_master && d.x.key_sync && d.track.is_some() {
                 d.x.key_shift = key_sync_shift(own_key, master_key);
             }
             let synced = follower && d.x.beat_sync && own_bpm > 0.0 && master_bpm > 0.0;
@@ -774,7 +776,7 @@ impl App {
 
     /// The active deck follows the master's tempo (BEAT SYNC on, and it is not the master).
     pub fn sync_follower(&self) -> bool {
-        self.two_players() && self.deck.x.beat_sync && self.px.active != self.px.master
+        self.two_players() && self.deck.x.beat_sync && (self.px.active != self.px.master || self.sampler_is_master())
     }
 
     /// TEMPO − / +: one step slower or faster, inside the tempo range.
@@ -836,9 +838,15 @@ impl App {
         }
     }
 
+    /// The sampler deck is the sync master (PERFORMANCE mode only).
+    pub fn sampler_is_master(&self) -> bool {
+        self.performance() && self.px.sampler.master
+    }
+
     /// MASTER: the active deck becomes the one BEAT SYNC and KEY SYNC follow.
     pub fn set_master(&mut self) {
         self.px.master = self.px.active;
+        self.px.sampler.master = false;
         self.push_deck_controls();
     }
 
@@ -866,7 +874,8 @@ impl App {
     /// Move the active deck (a playing BEAT SYNC follower) by less than a beat so that its
     /// beats fall on the master's.
     pub fn sync_align(&mut self) {
-        if !self.sync_follower() {
+        // (With the sampler deck as master the audio thread pulls the deck onto its beats.)
+        if !self.sync_follower() || self.sampler_is_master() {
             return;
         }
         let (pf, pm, gf, gm, both) = {

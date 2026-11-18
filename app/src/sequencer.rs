@@ -197,6 +197,18 @@ impl Sequencer {
         self.fired = 0;
     }
 
+    /// PLAY from `pos` beats into the pattern (the sampler starting in step with the master).
+    pub fn play_from(&mut self, pos: f64) {
+        if self.playing {
+            return;
+        }
+        self.play();
+        if pos > 0.0 {
+            self.anchor = pos.min(self.beats() - 1e-6);
+            self.resync();
+        }
+    }
+
     /// Stop: back to the start; REC goes off (rekordbox's `doStop` clears the rec mode).
     pub fn stop(&mut self) {
         self.playing = false;
@@ -337,6 +349,16 @@ impl Sequencer {
         } else {
             self.cur = slot;
             self.rewind();
+        }
+    }
+
+    /// Start the current pattern again from its beginning on the next multiple of `unit`
+    /// beats (SEQ. CALL of the pattern that is playing).
+    pub fn restart_on(&mut self, unit: f64) {
+        if self.playing {
+            let (len, pos) = (self.beats(), self.pos());
+            let at = if unit > 0.0 { ((pos / unit).floor() + 1.0) * unit } else { pos };
+            self.reserve = Some((self.cur, at.min(len)));
         }
     }
 

@@ -124,19 +124,19 @@ pub struct SlotParams {
 #[derive(Clone, Copy)]
 pub struct UnitParams {
     /// Decks 1 to 4, then the master.
-    pub assign: [bool; 5],
+    pub assign: [bool; CHANNELS],
     pub slots: [SlotParams; 3],
     /// RELEASE FX held: which one and its beats.
     pub release: Option<(u8, f32)>,
     /// Tempo each channel's effects run at (BPM).
-    pub bpm: [f32; 5],
+    pub bpm: [f32; CHANNELS],
 }
 
 impl UnitParams {
     pub fn new() -> UnitParams {
         let s = |kind| SlotParams { kind, on: false, level: 0.5, value: beat_table(kind).0[beat_table(kind).1] };
         // rekordbox's default slots: DELAY, ECHO, SPIRAL.
-        UnitParams { assign: [false; 5], slots: [s(Kind::Delay), s(Kind::Echo), s(Kind::Spiral)], release: None, bpm: [120.0; 5] }
+        UnitParams { assign: [false; CHANNELS], slots: [s(Kind::Delay), s(Kind::Echo), s(Kind::Spiral)], release: None, bpm: [120.0; CHANNELS] }
     }
 }
 
@@ -548,17 +548,20 @@ impl Channel {
 
 /// The master's channel index in `UnitParams::assign`.
 pub const MASTER: usize = 4;
+/// The sampler deck's channel index (FX assign "S").
+pub const SAMPLER: usize = 5;
+pub const CHANNELS: usize = 6;
 
 pub struct Unit {
     pub params: UnitParams,
     /// One effect state per channel, made (by the interface, not the audio thread) the first
     /// time the unit is assigned to that channel: each holds about 10 MB of delay lines.
-    channels: [Option<Box<Channel>>; 5],
+    channels: [Option<Box<Channel>>; CHANNELS],
 }
 
 impl Unit {
     /// Make the effect states of the channels this unit is assigned to.
-    pub fn prepare(&mut self, assign: &[bool; 5]) {
+    pub fn prepare(&mut self, assign: &[bool; CHANNELS]) {
         for (c, a) in self.channels.iter_mut().zip(assign) {
             if *a && c.is_none() {
                 *c = Some(Box::new(Channel::new()));
@@ -576,25 +579,37 @@ pub struct Rack {
     /// The master's Sound Color FX: effect, COLOR (0.5 = off), PARAM.
     pub master_cfx: crate::cfx::Cfx,
     pub master_cfx_set: (u8, f32, f32),
+    /// CFX on the sampler deck (kind, COLOR, PARAM); COLOR 0.5 = off.
+    pub sampler_cfx: crate::cfx::Cfx,
+    pub sampler_cfx_set: (u8, f32, f32),
 }
 
 impl Rack {
     pub fn new() -> Rack {
-        let unit = || Unit { params: UnitParams::new(), channels: [None, None, None, None, None] };
-        Rack { units: [unit(), unit()], scratch: std::array::from_fn(|_| vec![0.0; 16384]), enabled: false, master_cfx: crate::cfx::Cfx::new(), master_cfx_set: (0, 0.5, 0.5) }
+        let unit = || Unit { params: UnitParams::new(), channels: [None, None, None, None, None, None] };
+        Rack { units: [unit(), unit()], scratch: std::array::from_fn(|_| vec![0.0; 16384]), enabled: false, master_cfx: crate::cfx::Cfx::new(), master_cfx_set: (0, 0.5, 0.5), sampler_cfx: crate::cfx::Cfx::new(), sampler_cfx_set: (0, 0.5, 0.5) }
     }
 
     /// Something is assigned and switched on (or held, or still fading): the effects must run.
     pub fn active(&self) -> bool {
-        self.enabled && (self.units.iter().any(|u| u.params.assign.iter().any(|a| *a)) || (self.master_cfx_set.1 - 0.5).abs() > 0.011)
+        self.enabled && (self.units.iter().any(|u| u.params.assign.iter().any(|a| *a)) || (self.master_cfx_set.1 - 0.5).abs() > 0.011 || (self.sampler_cfx_set.1 - 0.5).abs() > 0.011)
+    }
+
+    /// The sampler's mix has to come through here (a unit is assigned to it, or its CFX is on).
+    pub fn sampler_in_use(&self) -> bool {
+        self.enabled && (self.units.iter().any(|u| u.params.assign[SAMPLER]) || (self.sampler_cfx_set.1 - 0.5).abs() > 0.011)
     }
 
     /// Run one channel's audio (stereo interleaved) through the units assigned to it.
-    /// `ch`: 0..3 = decks 1 to 4, 4 = the master.
+    /// `ch`: 0..3 = decks 1 to 4, 4 = the master, 5 = the sampler.
     pub fn process(&mut self, ch: usize, buf: &mut [f32], rate: u32) {
         if ch == MASTER {
             let (k, c, p) = self.master_cfx_set;
             self.master_cfx.process(k, c, p, buf, rate);
+        }
+        if ch == SAMPLER && (self.sampler_cfx_set.1 - 0.5).abs() > 0.011 {
+            let (k, c, p) = self.sampler_cfx_set;
+            self.sampler_cfx.process(k, c, p, buf, rate);
         }
         for u in self.units.iter_mut() {
             if u.params.assign[ch] {
@@ -671,9 +686,9 @@ mod tests {
 
     fn unit(kind: Kind, value: f32, level: f32) -> UnitParams {
         let mut p = UnitParams::new();
-        p.assign = [true, false, false, false, false];
+        p.assign = [true, false, false, false, false, false];
         p.slots[0] = SlotParams { kind, on: true, level, value };
-        p.bpm = [120.0; 5];
+        p.bpm = [120.0; CHANNELS];
         p
     }
 
@@ -681,7 +696,7 @@ mod tests {
     fn nothing_on_leaves_the_sound_untouched() {
         let mut rack = Rack::new();
         rack.enabled = true;
-        rack.units[0].params.assign = [true, true, false, false, true];
+        rack.units[0].params.assign = [true, true, false, false, true, false];
         let a = rack.units[0].params.assign;
         rack.units[0].prepare(&a);
         let x = tone(4800, 440.0);
@@ -759,7 +774,7 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         // History: a rising ramp, so a frame's value tells where it came from.
-        rack.units[0].params.assign = [true, false, false, false, false];
+        rack.units[0].params.assign = [true, false, false, false, false, false];
             let a = rack.units[0].params.assign;
             rack.units[0].prepare(&a);
         let mut hist: Vec<f32> = (0..48000).flat_map(|i| { let v = i as f32 / 48000.0; [v, v] }).collect();
@@ -821,7 +836,7 @@ mod tests {
         for kind in 0..3u8 {
             let mut rack = Rack::new();
             rack.enabled = true;
-            rack.units[0].params.assign = [true, false, false, false, false];
+            rack.units[0].params.assign = [true, false, false, false, false, false];
             let a = rack.units[0].params.assign;
             rack.units[0].prepare(&a);
             let mut hist = tone(48000, 440.0);

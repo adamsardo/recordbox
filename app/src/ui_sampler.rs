@@ -69,11 +69,25 @@ pub struct SeqPrefs {
     /// 4 = one beat). They take effect while the sampler's Q is on.
     pub quantize_on: bool,
     pub quantize: u8,
+    /// The patterns' names (empty: rekordbox's default, "PATTERN n").
+    pub names: Vec<String>,
+    /// rekordbox's SequenceLoadAutoPlay: "Load the sequence and automatically play."
+    pub load_autoplay: bool,
 }
 
 impl Default for SeqPrefs {
     fn default() -> SeqPrefs {
-        SeqPrefs { patterns: vec![None; PATTERNS], current: 0, metronome: false, metronome_vol: 1, quantize_on: true, quantize: 4 }
+        SeqPrefs { patterns: vec![None; PATTERNS], current: 0, metronome: false, metronome_vol: 1, quantize_on: true, quantize: 4, names: vec![String::new(); PATTERNS], load_autoplay: true }
+    }
+}
+
+impl SeqPrefs {
+    /// A pattern's name as shown.
+    pub fn name(&self, slot: usize) -> String {
+        match self.names.get(slot).map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => format!("PATTERN {}", slot + 1),
+        }
     }
 }
 
@@ -95,11 +109,24 @@ pub struct SamplerPrefs {
     pub sync: bool,
     pub cue: bool,
     pub seq: SeqPrefs,
+    /// The colour chosen for a sample: file path -> rekordbox pad colour code (rekordbox
+    /// keeps it per content in its database, `setSamplerCustomColor`).
+    pub colors: std::collections::HashMap<String, u8>,
+    /// rekordbox's SamplerSlotIs16 (SLOT 16 / 8), SamplerLoadLockAtLoadedSlot ("Do not
+    /// overwrite the loaded Slot."), ShouldLoopCaptureIfEmptySlot, VelocityCurve (1..4),
+    /// EffectorCFxOnSampler and the output the sampler deck goes to (0 = master,
+    /// 1 = headphones).
+    pub slots16: bool,
+    pub load_lock: bool,
+    pub capture_empty: bool,
+    pub velocity_curve: u8,
+    pub cfx_on_sampler: bool,
+    pub output: u8,
 }
 
 impl Default for SamplerPrefs {
     fn default() -> SamplerPrefs {
-        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false, seq: SeqPrefs::default() }
+        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false, seq: SeqPrefs::default(), colors: Default::default(), slots16: true, load_lock: false, capture_empty: true, velocity_curve: 1, cfx_on_sampler: false, output: 0 }
     }
 }
 
@@ -121,6 +148,26 @@ pub struct SamplerUi {
     held: Option<usize>,
     /// The sequencer's pad mode: 0 none, 1 MUTE, 2 ERASE (only while it plays).
     pub seq_mode: u8,
+    /// MASTER: the sampler deck is the sync master (not kept between sessions, as in
+    /// rekordbox).
+    pub master: bool,
+    /// The sampler's CFX COLOR knob (0.5 = off).
+    pub cfx_color: f32,
+    /// The slot being dragged to another slot.
+    pub drag_slot: Option<usize>,
+    /// The sequencer strip is being dragged (to a deck: Sequence Load).
+    pub drag_seq: bool,
+    /// The BPM field while a tempo is typed into it.
+    bpm_edit: Option<String>,
+    /// The pattern whose name is being typed.
+    name_edit: Option<(usize, String)>,
+    /// Files dropped from Finder, waiting for the pointer's place (the window gets no
+    /// pointer positions while a file is dragged over it), and when they came.
+    dropped: Option<(Vec<std::path::PathBuf>, f64)>,
+    /// Was the master deck playing last frame (BPM SYNC starts and stops the sequencer with it).
+    master_was_playing: bool,
+    /// Where the decks are on screen (for dropping the sequencer strip on one).
+    pub deck_rects: [Rect; 4],
 }
 
 impl SamplerUi {
@@ -129,8 +176,29 @@ impl SamplerUi {
         self.mute.get(idx).copied().unwrap_or(false)
     }
 
+    pub fn toggle_mute(&mut self, idx: usize) {
+        if let Some(m) = self.mute.get_mut(idx) {
+            *m = !*m;
+        }
+    }
+    pub fn take_wave(&mut self, idx: usize) -> Option<Vec<u8>> {
+        self.wave.get_mut(idx).and_then(|w| w.take())
+    }
+    pub fn put_wave(&mut self, idx: usize, w: Vec<u8>) {
+        if let Some(slot) = self.wave.get_mut(idx) {
+            *slot = Some(w);
+        }
+    }
+    pub fn close_edit(&mut self) {
+        self.edit = None;
+    }
+    /// The slot's sample has been read and can play.
+    pub fn ready(&self, idx: usize) -> bool {
+        self.wave.get(idx).is_some_and(|w| w.is_some())
+    }
+
     pub fn new() -> SamplerUi {
-        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None, seq_mode: 0 }
+        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None, seq_mode: 0, master: false, cfx_color: 0.5, drag_slot: None, drag_seq: false, bpm_edit: None, name_edit: None, dropped: None, master_was_playing: false, deck_rects: [Rect::NOTHING; 4] }
     }
 }
 
@@ -166,22 +234,51 @@ impl App {
             self.toast_err(format!("The file for \"{}\" cannot be found.", t.display_title()));
             return;
         }
-        let mut s = self.prefs.sampler.slots.get(idx).cloned().flatten().unwrap_or_default();
-        s.track = id;
-        s.path = t.path.clone();
-        s.name = t.display_title();
-        s.bpm = t.bpm as f32;
-        s.offset_ms = 0.0;
+        if self.sampler_locked(idx) {
+            return;
+        }
+        self.sampler_put(idx, id, t.path.clone(), t.display_title(), t.bpm as f32);
+    }
+
+    /// Load an audio file that need not be in the collection (a file dropped from Finder, a
+    /// captured loop). `bpm`: its tempo when known (0: it plays at its own speed).
+    pub fn sampler_load_file(&mut self, idx: usize, path: String, name: String, bpm: f32) {
+        if self.sampler_locked(idx) {
+            return;
+        }
+        // A file of the collection brings its title and tempo.
+        if let Some(t) = self.db.track_by_path(&path).and_then(|id| self.track(id)).cloned() {
+            self.sampler_put(idx, t.id, t.path.clone(), t.display_title(), t.bpm as f32);
+        } else {
+            self.sampler_put(idx, 0, path, name, bpm);
+        }
+    }
+
+    fn sampler_put(&mut self, idx: usize, id: i64, path: String, name: String, bpm: f32) {
+        if idx >= 64 {
+            return;
+        }
         if self.prefs.sampler.slots.len() < 64 {
             self.prefs.sampler.slots.resize(64, None);
         }
+        let mut s = self.prefs.sampler.slots[idx].clone().unwrap_or_default();
+        s.track = id;
+        s.path = path.clone();
+        s.name = name;
+        s.bpm = bpm;
+        s.offset_ms = 0.0;
         self.prefs.sampler.slots[idx] = Some(s);
+        self.sampler_decode(idx, path);
+        self.save_prefs();
+    }
+
+    /// Read a slot's file in the background; the slot is silent until it is there.
+    pub fn sampler_decode(&mut self, idx: usize, path: String) {
         self.px.sampler.wave[idx] = None;
         if let Some(e) = sampler::SAMPLER.lock().as_mut() {
             e.set_clip(idx % PADS, idx / PADS, None);
         }
-        decode_in_background(&mut self.px.sampler, idx, t.path);
-        self.save_prefs();
+        decode_in_background(&mut self.px.sampler, idx, path);
     }
 
     pub fn sampler_eject(&mut self, idx: usize) {
@@ -215,6 +312,7 @@ impl App {
             sq.current = sq.current.min(PATTERNS as u8 - 1);
             sq.metronome_vol = sq.metronome_vol.min(2);
             sq.quantize = sq.quantize.clamp(1, 6);
+            sq.names.resize(PATTERNS, String::new());
             let click = if std::path::Path::new(CLICK_FILE).exists() { crate::audio::decode_file(CLICK_FILE).ok().map(Arc::new) } else { None };
             if let Some(e) = sampler::SAMPLER.lock().as_mut() {
                 for (i, p) in sq.patterns.iter().enumerate() {
@@ -262,15 +360,39 @@ impl App {
                 }
             }
         }
-        // BPM SYNC: the sampler follows the master deck's tempo.
-        let sp = &self.prefs.sampler;
-        let mut bpm = sp.bpm;
-        if sp.sync {
+        // BPM SYNC: the sampler follows the master deck's tempo (and, in the audio thread,
+        // its beats). As the MASTER it keeps its own tempo and the decks follow it.
+        let master = self.px.sampler.master;
+        let follows = self.prefs.sampler.sync && !master;
+        let mut bpm = self.prefs.sampler.bpm;
+        if follows {
             let m = self.px.master.min(self.deck_count().saturating_sub(1));
             let b = self.with_deck(m, |a| if a.deck.track.is_some() { a.effective_bpm() } else { 0.0 });
             if b > 0.0 {
                 bpm = b as f32;
             }
+            // The sequencer starts and stops with the sync master (rekordbox's
+            // `syncStartStopStatus`).
+            let playing = self.player.decks[m as usize].lock().playing;
+            if playing != self.px.sampler.master_was_playing {
+                if let Some(e) = sampler::SAMPLER.lock().as_mut() {
+                    if playing {
+                        e.follow = true;
+                        e.seq_play();
+                    } else {
+                        e.seq_stop();
+                    }
+                }
+            }
+            self.px.sampler.master_was_playing = playing;
+        } else {
+            self.px.sampler.master_was_playing = false;
+        }
+        crate::audio::SAMPLER_MASTER.store(master && self.performance(), std::sync::atomic::Ordering::Relaxed);
+        // CFX on the sampler (Preferences > Controller > Effect), only with the FX panel shown.
+        let cfx = if self.prefs.sampler.cfx_on_sampler && self.prefs.perf_fx { self.px.sampler.cfx_color } else { 0.5 };
+        if let Some(r) = crate::fx::RACK.lock().as_mut() {
+            r.sampler_cfx_set = (if self.px.cfx_user { self.px.cfx_kind } else { 0 }, cfx, self.px.cfx_param);
         }
         let sp = &self.prefs.sampler;
         let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
@@ -282,6 +404,8 @@ impl App {
             e.cue_gain = cue_gain;
             e.bpm = bpm.clamp(40.0, 499.0);
             e.quantize = sp.quantize;
+            e.follow = follows;
+            e.route = if sp.output == 1 && hp_on { 1 } else { 0 };
             // The record quantize follows Q (rekordbox: `SequencerQuantize` while Q is on and
             // `SequencerQuantizeStatus` is 2, else off).
             e.seq.rec_unit = if sp.quantize && sp.seq.quantize_on { crate::sequencer::quantize_unit(sp.seq.quantize) } else { 0.0 };
@@ -292,7 +416,7 @@ impl App {
 
     /// The BPM the sampler deck shows: its own, or the master deck's while BPM SYNC is on.
     fn sampler_shown_bpm(&mut self) -> f32 {
-        if self.prefs.sampler.sync {
+        if self.prefs.sampler.sync && !self.px.sampler.master {
             let m = self.px.master.min(self.deck_count().saturating_sub(1));
             let b = self.with_deck(m, |a| if a.deck.track.is_some() { a.effective_bpm() } else { 0.0 });
             if b > 0.0 {
@@ -302,7 +426,7 @@ impl App {
         self.prefs.sampler.bpm
     }
 
-    fn sampler_push_slot(&mut self, idx: usize) {
+    pub fn sampler_push_slot(&mut self, idx: usize) {
         let Some(s) = self.prefs.sampler.slots[idx].clone() else { return };
         let mute = self.px.sampler.mute[idx];
         if let Some(e) = sampler::SAMPLER.lock().as_mut() {
@@ -387,13 +511,65 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let shift = ui.input(|i| i.modifiers.shift);
     let released = ui.input(|i| i.pointer.any_released());
     let pointer = ui.ctx().pointer_latest_pos();
+    let pads_on = app.sampler_pads();
+    let now = ui.input(|i| i.time);
+
+    // Files dropped from Finder. The window is told no pointer position while a file is
+    // dragged over it, so the files wait for the pointer's next move (it comes at once when
+    // the mouse is let go): on a slot the first audio file loads there, anywhere else the
+    // files are imported as the browser does it.
+    let files: Vec<std::path::PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+    if !files.is_empty() {
+        ui.ctx().input_mut(|i| i.raw.dropped_files.clear());
+        app.px.sampler.dropped = Some((files, now));
+    }
+    if let Some((files, t0)) = app.px.sampler.dropped.clone() {
+        let moved = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        if moved || now - t0 > 0.6 {
+            app.px.sampler.dropped = None;
+            let slot = pointer.filter(|_| moved).and_then(|pp| (0..pads_on).find(|pad| slot_rect(*pad).contains(pp)));
+            match slot {
+                Some(pad) => match crate::importer::collect_audio(&files).into_iter().find(|f| f.is_file()) {
+                    Some(f) => {
+                        let name = f.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        app.sampler_load_file(bank * PADS + pad, f.to_string_lossy().to_string(), name, 0.0);
+                    }
+                    None => app.toast_err("This file cannot be loaded into the sampler."),
+                },
+                None if !app.ext.in_sub => app.import_paths(files, app.is_manual_playlist()),
+                None => {}
+            }
+        } else {
+            ui.ctx().request_repaint();
+        }
+    }
+    let mut move_to: Option<(usize, usize)> = None;
     for pad in 0..PADS {
         let idx = bank * PADS + pad;
         let sr = slot_rect(pad);
         let (sx, sy, sw) = (sr.min.x, sr.min.y, sr.width());
         let s_at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(sx + x, sy + y), vec2(w, h));
         p.rect_filled(sr.shrink(4.0), 0.0, Color32::BLACK);
+        if pad >= pads_on {
+            // SLOT 8: pads 9 to 16 are out of use (the bank still holds their samples).
+            p.rect_filled(sr.shrink(4.0), 0.0, hex(0x141414));
+            continue;
+        }
         let slot = app.prefs.sampler.slots.get(idx).cloned().flatten();
+        if slot.is_none() {
+            // An empty slot: right-click to capture a deck's loop into it.
+            let bg = ui.interact(sr.shrink(4.0), ui.id().with(("smp_empty", idx)), Sense::click());
+            let decks = app.deck_count();
+            bg.context_menu(|ui| {
+                for d in 0..decks {
+                    let looping = app.player.decks[d as usize].lock().loop_range.is_some();
+                    if ui.add_enabled(looping, egui::Button::new(format!("Capture the loop of DECK {}", d + 1))).on_disabled_hover_text("Invalid operation. Capture is available during Loop or Slicer performance.").clicked() {
+                        app.sampler_capture_loop(d, Some(idx));
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
         let loading = app.px.sampler.loading.iter().any(|(i, _)| *i == idx);
         let (playing, frac) = states[pad];
         let hovered = pointer.is_some_and(|pp| sr.contains(pp));
@@ -428,29 +604,50 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         }
 
         // PLAY (26 x 14): fires on mouse-down; Shift + PLAY stops; the release stops gate modes.
+        // It has the sample's colour (rekordbox's pad colour at alpha 0.8; full while it plays).
         let pr = s_at(6.0, 23.0, 26.0, 14.0);
-        let presp = ui.interact(pr, ui.id().with(("smp_play", idx)), Sense::click_and_drag());
         let loaded = slot.is_some() && app.px.sampler.wave[idx].is_some();
-        p.rect_filled(pr, 2.0, if !loaded { OFF } else if playing { BLUE } else if presp.hovered() { lighten(hex(0x0F4FA8)) } else { hex(0x0F4FA8) });
+        // The waveform is the handle for dragging a sample to another slot: only when it is
+        // loaded, not playing, and the sequencer's REC is off.
+        if loaded && !playing && !sv.rec {
+            let dresp = ui.interact(wr, ui.id().with(("smp_drag", idx)), Sense::drag());
+            if dresp.drag_started() {
+                app.px.sampler.drag_slot = Some(idx);
+            }
+        }
+        let presp = ui.interact(pr, ui.id().with(("smp_play", idx)), Sense::click_and_drag());
+        let code = app.sampler_color_code(idx);
+        let col = crate::sampler_ext::pad_color(code);
+        p.rect_filled(pr, 2.0, if !loaded { OFF } else if playing { hex(crate::sampler_ext::PAD_COLORS[code as usize]) } else if presp.hovered() { lighten(col) } else { col });
         if loaded {
             let c = pr.center();
             p.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -4.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 4.0)], WHITE, Stroke::NONE));
             if crate::ui_player::press_fired(ui, &presp) {
                 // (With the sequencer's REC armed the engine starts the pattern on this press
                 // and records it.)
-                let mut loop_refused = false;
-                if let Some(e) = sampler::SAMPLER.lock().as_mut() {
-                    if shift {
-                        e.stop(pad, bank, true);
-                    } else {
-                        loop_refused = e.launch(pad, bank, 1.0);
-                    }
-                }
-                if loop_refused {
-                    app.toast_err("Loop record error. Loop sample can not be recorded as a sequence.");
-                }
+                app.sampler_pad_down(pad, 1.0, shift, true);
                 app.px.sampler.held = Some(pad);
             }
+            // Right- or Ctrl-click: Reset and the 16 colours of rekordbox's `SamplerColorPicker`.
+            presp.context_menu(|ui| {
+                if ui.button("Reset").clicked() {
+                    app.sampler_set_color(idx, None);
+                    ui.close_menu();
+                }
+                let (grid, _) = ui.allocate_exact_size(vec2(4.0 * 20.0 - 2.0, 4.0 * 20.0 - 2.0), Sense::hover());
+                for (k, c) in crate::sampler_ext::PICKER.iter().enumerate() {
+                    let rr = Rect::from_min_size(grid.min + vec2((k % 4) as f32 * 20.0, (k / 4) as f32 * 20.0), vec2(18.0, 18.0));
+                    let r = ui.interact(rr, ui.id().with(("smp_col", idx, k)), Sense::click());
+                    ui.painter().rect_filled(rr, 0.0, crate::sampler_ext::pad_color(*c));
+                    if *c == code || r.hovered() {
+                        ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0_f32, WHITE), egui::StrokeKind::Inside);
+                    }
+                    if r.clicked() {
+                        app.sampler_set_color(idx, Some(*c));
+                        ui.close_menu();
+                    }
+                }
+            });
         }
         if app.px.sampler.held == Some(pad) && released {
             if let Some(e) = sampler::SAMPLER.lock().as_mut() {
@@ -476,7 +673,7 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let muted = app.px.sampler.mute[idx];
                 let mresp = box_button(ui, s_at(34.0, 23.0, 16.0, 14.0), ("smp_mute", idx), "M", muted);
                 if tip(mresp, app, "Mute").clicked() {
-                    app.px.sampler.mute[idx] = !muted;
+                    app.px.sampler.toggle_mute(idx);
                     app.sampler_push_slot(idx);
                 }
             }
@@ -519,7 +716,7 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
             }
         }
 
-        // A track dragged from the browser loads here.
+        // A track dragged from the browser or from a deck loads here.
         if let Some(ids) = app.drag.clone() {
             if hovered {
                 p.rect_stroke(sr.shrink(3.0), 0.0, Stroke::new(2.0_f32, BLUE), egui::StrokeKind::Inside);
@@ -528,6 +725,30 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                         app.sampler_load(idx, *id);
                     }
                 }
+            }
+        }
+        // Another slot's sample dragged here moves here.
+        if let Some(from) = app.px.sampler.drag_slot.filter(|f| *f != idx) {
+            if hovered {
+                p.rect_stroke(sr.shrink(3.0), 0.0, Stroke::new(2.0_f32, BLUE), egui::StrokeKind::Inside);
+                if released {
+                    move_to = Some((from, idx));
+                }
+            }
+        }
+    }
+    if let Some(from) = app.px.sampler.drag_slot {
+        if let (Some(pp), Some(s)) = (pointer, app.prefs.sampler.slots.get(from).cloned().flatten()) {
+            let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("smp_dragl")));
+            let rr = Rect::from_min_size(pp + vec2(12.0, 6.0), vec2(8.0 + s.name.chars().count().min(40) as f32 * 6.5, 18.0));
+            lp.rect_filled(rr, 3.0, app.sampler_color(from));
+            lp.with_clip_rect(rr).text(rr.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, &s.name, FontId::proportional(10.5), WHITE);
+            ui.ctx().request_repaint();
+        }
+        if released || !ui.input(|i| i.pointer.any_down()) {
+            app.px.sampler.drag_slot = None;
+            if let Some((from, to)) = move_to {
+                app.sampler_move(from, to);
             }
         }
     }
@@ -564,19 +785,46 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     p.rect_filled(Rect::from_center_size(pos2(fx, hy), vec2(24.0, 2.0)), 0.0, if fresp.hovered() || fresp.dragged() { WHITE } else { hex(0x646464) });
 
     // BPM (bold 18, 52 x 20): drag up or down, or the wheel; + and - under it.
-    let synced = sp.sync;
+    // (While it follows the master deck, + / - and typing are off; as the MASTER it is free.)
+    let synced = sp.sync && !app.px.sampler.master;
     let shown = app.sampler_shown_bpm();
     let br = at(w / 2.0 - 26.0, 68.0, 52.0, 20.0);
-    let bresp = ui.interact(br, ui.id().with("smp_bpm"), Sense::click_and_drag());
-    let whole = format!("{}", shown.floor() as i32);
-    let frac = format!(".{:02}", ((shown - shown.floor()) * 100.0).round().min(99.0) as i32);
-    let g1 = p.layout_no_wrap(whole, bold(16.5), WHITE);
-    let g2 = p.layout_no_wrap(frac, bold(12.5), WHITE);
-    let tx = br.center().x - (g1.size().x + g2.size().x) / 2.0;
-    let base = br.center().y + g1.size().y / 2.0;
-    p.galley(pos2(tx, base - g1.size().y), g1.clone(), WHITE);
-    p.galley(pos2(tx + g1.size().x, base - g2.size().y - 1.0), g2, WHITE);
-    if !synced {
+    let typing = app.px.sampler.bpm_edit.is_some();
+    let bresp = ui.interact(br, ui.id().with("smp_bpm"), if typing { Sense::hover() } else { Sense::click_and_drag() });
+    if let Some(mut text) = app.px.sampler.bpm_edit.take() {
+        // A tempo typed in (double-click): 40 to 499, else rekordbox's range message.
+        let id = ui.id().with("smp_bpm_edit");
+        let te = ui.put(br.expand2(vec2(6.0, 0.0)), egui::TextEdit::singleline(&mut text).id(id).font(bold(13.0)).horizontal_align(egui::Align::Center).margin(vec2(2.0, 2.0)));
+        if !te.has_focus() && !te.lost_focus() {
+            te.request_focus();
+        }
+        if te.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                match text.trim().replace(',', ".").parse::<f32>().ok().filter(|v| (40.0..=499.0).contains(v)) {
+                    Some(v) => {
+                        sp.bpm = (v * 100.0).round() / 100.0;
+                        changed = true;
+                    }
+                    None => app.toast_err("BPM value should be between 40 and 499."),
+                }
+            }
+        } else {
+            app.px.sampler.bpm_edit = Some(text);
+        }
+    } else {
+        let whole = format!("{}", shown.floor() as i32);
+        let frac = format!(".{:02}", ((shown - shown.floor()) * 100.0).round().min(99.0) as i32);
+        let g1 = p.layout_no_wrap(whole, bold(16.5), WHITE);
+        let g2 = p.layout_no_wrap(frac, bold(12.5), WHITE);
+        let tx = br.center().x - (g1.size().x + g2.size().x) / 2.0;
+        let base = br.center().y + g1.size().y / 2.0;
+        p.galley(pos2(tx, base - g1.size().y), g1.clone(), WHITE);
+        p.galley(pos2(tx + g1.size().x, base - g2.size().y - 1.0), g2, WHITE);
+        if bresp.double_clicked() && !synced {
+            app.px.sampler.bpm_edit = Some(format!("{:.2}", sp.bpm));
+        }
+    }
+    if !synced && !typing {
         if bresp.dragged() {
             sp.bpm = (sp.bpm - bresp.drag_delta().y * 0.2).clamp(40.0, 499.0);
             changed = true;
@@ -590,7 +838,6 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let _ = bresp.on_hover_text("Sampler BPM");
     // + / -: 0.01 on the press; held, it repeats every 100 ms after 500 ms: nine steps of
     // 0.01, twenty of 0.1, then 0.2.
-    let now = ui.input(|i| i.time);
     for (dir, x, label) in [(1.0f32, w / 2.0 - 22.0, "+"), (-1.0, w / 2.0 + 2.0, "-")] {
         let rr = at(x, h - 25.0, 20.0, 20.0);
         let resp = ui.interact(rr, ui.id().with(("smp_bpm_step", label)), Sense::click_and_drag());
@@ -650,13 +897,29 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         sp.sync = !sp.sync;
         changed = true;
     }
-    let _ = text_button(ui, master_r, "smp_master", "MASTER", false, false).on_hover_text("MASTER (the sampler as sync master): not built in recordbox yet.");
+    if text_button(ui, master_r, "smp_master", "MASTER", app.px.sampler.master, true).on_hover_text("MASTER: the sampler deck becomes the sync master; decks with BEAT SYNC follow its BPM and beats").clicked() {
+        app.sampler_toggle_master();
+    }
+    // The output the sampler deck goes to: only when the audio device has a second pair
+    // (the headphones output), as rekordbox shows one button per output pair.
+    if hp_on {
+        let or = Rect::from_min_size(pos2(q_r.min.x - 96.0, sync_r.min.y - 2.0), vec2(74.0, 14.0));
+        let oresp = box_button(ui, or, "smp_out", if sp.output == 1 { "HEADPHONES" } else { "MASTER OUT" }, false);
+        if oresp.on_hover_text("Select audio output of the sampler deck.").clicked() {
+            sp.output = 1 - sp.output.min(1);
+            changed = true;
+        }
+    }
 
     // ---- the sequencer strip (590 x 30 from the centre + 40)
     sequencer_strip(app, ui, pos2(x0 + (w / 2.0).floor() + 40.0, y0 + h - 30.0), &sv, &mut sp, &mut changed);
 
     if changed {
-        app.prefs.sampler = sp;
+        // (Only what this strip edits: slots, colours, names and patterns are written where
+        // they change.)
+        let d = &mut app.prefs.sampler;
+        (d.gain, d.volume, d.bpm, d.bank, d.quantize, d.sync, d.cue, d.output) = (sp.gain, sp.volume, sp.bpm, sp.bank, sp.quantize, sp.sync, sp.cue, sp.output);
+        (d.seq.metronome, d.seq.metronome_vol) = (sp.seq.metronome, sp.seq.metronome_vol);
         app.save_prefs();
     }
 
@@ -731,18 +994,7 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
     p.rect_filled(save, 2.0, hex(0x0A0A0A));
     p.text(save.center(), Align2::CENTER_CENTER, "SAVE", caps(10.5), if !sv.dirty { hex(0x303030) } else if resp.hovered() { WHITE } else { hex(0x8C8C8C) });
     if tip(resp, app, "Sequence Save:\nSave Sampler sequence").clicked() && sv.dirty {
-        let mut saved = None;
-        with_engine(&mut |e| {
-            saved = Some(e.seq.pattern(sv.cur).clone());
-            e.seq.mark_saved(sv.cur);
-        });
-        if let Some(mut pat) = saved {
-            pat.events.iter_mut().for_each(|ev| ev.fresh = false);
-            pat.events.shrink_to_fit();
-            sp.seq.patterns.resize(PATTERNS, None);
-            sp.seq.patterns[sv.cur] = Some(pat);
-            *changed = true;
-        }
+        app.sampler_seq_save();
     }
 
     // The pattern between its arrows (`LengthRoll_ArrowL/R.svg`, 5 x 8, rgb 150).
@@ -765,9 +1017,47 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
         }
     }
     let slot_r = q_at(112.0, 5.0, 86.0, 20.0);
-    let resp = ui.interact(slot_r, ui.id().with("seq_slot"), Sense::hover());
+    let resp = ui.interact(slot_r, ui.id().with("seq_slot"), Sense::click_and_drag());
     let slot_hover = resp.hovered();
-    let saved_slot = sp.seq.patterns.get(sv.cur).is_some_and(|x| x.is_some());
+    let saved_slot = app.prefs.sampler.seq.patterns.get(sv.cur).is_some_and(|x| x.is_some());
+    // Dragged onto a deck: Sequence Load. Right-click: the name, and Sequence Load by deck.
+    if resp.drag_started() {
+        app.px.sampler.drag_seq = true;
+    }
+    if app.px.sampler.drag_seq {
+        let ptr = ui.ctx().pointer_latest_pos();
+        let over = ptr.and_then(|pp| (0..app.deck_count()).find(|d| app.px.sampler.deck_rects[*d as usize].contains(pp)));
+        if let Some(pp) = ptr {
+            let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("seq_dragl")));
+            let rr = Rect::from_min_size(pp + vec2(12.0, 6.0), vec2(110.0, 18.0));
+            lp.rect_filled(rr, 3.0, BLUE);
+            lp.text(rr.center(), Align2::CENTER_CENTER, "Sequence Load", FontId::proportional(10.5), WHITE);
+            if let Some(d) = over {
+                lp.rect_stroke(app.px.sampler.deck_rects[d as usize].shrink(1.0), 0.0, Stroke::new(2.0_f32, BLUE), egui::StrokeKind::Inside);
+            }
+            ui.ctx().request_repaint();
+        }
+        if ui.input(|i| i.pointer.any_released()) || !ui.input(|i| i.pointer.any_down()) {
+            app.px.sampler.drag_seq = false;
+            if let Some(d) = over {
+                app.sampler_sequence_load(d);
+            }
+        }
+    }
+    let decks = app.deck_count();
+    resp.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            app.px.sampler.name_edit = Some((sv.cur, app.prefs.sampler.seq.name(sv.cur)));
+            ui.close_menu();
+        }
+        ui.separator();
+        for d in 0..decks {
+            if ui.button(format!("Sequence Load (Deck{})", d + 1)).clicked() {
+                app.sampler_sequence_load(d);
+                ui.close_menu();
+            }
+        }
+    });
     // White: saved. Grey: not saved. Grey with a red dot: recorded, not saved yet.
     let temp = sv.dirty && sv.has_events;
     let blink = (ui.input(|i| i.time) / 0.3) as i64 % 2 == 0;
@@ -776,7 +1066,26 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
         Some(n) => (n, if blink { WHITE } else { hex(0x505050) }),
         None => (sv.cur, if saved_slot && !sv.dirty { WHITE } else { hex(0x505050) }),
     };
-    p.text(q_at(100.0, 4.5, 110.0, 20.0).center(), Align2::CENTER_CENTER, format!("PATTERN {}", name_no + 1), caps(9.0), name_col);
+    if let Some((slot, mut text)) = app.px.sampler.name_edit.take() {
+        // The pattern's name being typed (Enter keeps it; empty: back to "PATTERN n").
+        let te = ui.put(slot_r, egui::TextEdit::singleline(&mut text).id(ui.id().with("seq_name_edit")).font(FontId::proportional(10.5)).char_limit(32));
+        if !te.has_focus() && !te.lost_focus() {
+            te.request_focus();
+        }
+        if te.lost_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let sq = &mut app.prefs.sampler.seq;
+                sq.names.resize(PATTERNS, String::new());
+                let t = text.trim();
+                sq.names[slot % PATTERNS] = if t == format!("PATTERN {}", slot + 1) { String::new() } else { t.to_string() };
+                app.save_prefs();
+            }
+        } else {
+            app.px.sampler.name_edit = Some((slot, text));
+        }
+    } else {
+        p.with_clip_rect(q_at(112.0, 4.5, 86.0, 20.0)).text(q_at(100.0, 4.5, 110.0, 20.0).center(), Align2::CENTER_CENTER, app.prefs.sampler.seq.name(name_no), caps(9.0), name_col);
+    }
     if temp && sv.reserved.is_none() {
         p.circle_filled(so + vec2(120.0, 15.0), 4.0, RED);
     }
@@ -790,10 +1099,7 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
         p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], Stroke::new(1.3_f32, col));
         p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], Stroke::new(1.3_f32, col));
         if tip(dresp, app, "Delete selected sequence").clicked() {
-            with_engine(&mut |e| e.seq.clear(sv.cur));
-            sp.seq.patterns.resize(PATTERNS, None);
-            sp.seq.patterns[sv.cur] = None;
-            *changed = true;
+            app.sampler_seq_delete(sv.cur);
         }
     }
 

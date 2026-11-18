@@ -40,6 +40,7 @@ struct Sched {
 
 const SCHED_MAX: usize = 8;
 
+#[derive(Clone)]
 pub struct Clip {
     pub audio: Arc<Decoded>,
     pub mode: u8,
@@ -158,8 +159,18 @@ pub struct Engine {
     click_pos: Option<f64>,
     click_at: [u32; 4],
     nclick: usize,
+    /// The last buffer had sound from the slots (`mix` holds it).
+    pub sounding: bool,
     /// For the scripted test run: everything works, nothing is heard.
     pub silent: bool,
+    /// BPM SYNC is on and the sampler is not the sync master: its beats are held on the
+    /// master deck's (`FOLLOW_PHASE`).
+    pub follow: bool,
+    /// The sampler's own mix of the last buffer goes to `out` (false: the caller takes it
+    /// from `take_mix`, to send it through effects first).
+    pub direct: bool,
+    /// 0 = master output, 1 = headphones output only.
+    pub route: u8,
 }
 
 /// The metronome's sound when rekordbox's own click file is not there to read: 42 ms of a
@@ -178,9 +189,22 @@ fn default_click() -> Decoded {
 
 pub static SAMPLER: Mutex<Option<Box<Engine>>> = Mutex::new(None);
 
+/// The sampler's beat clock at the start of the next buffer (f64 bits). The decks' BEAT SYNC
+/// reads it while the sampler is the sync master.
+pub static CLOCK_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The master deck's place in its beat (0..1, f64 bits; NaN: it is not playing or has no
+/// grid), written by the audio callback before the sampler runs. BPM SYNC holds the
+/// sampler's clock on it.
+pub static FOLLOW_PHASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(f64::NAN.to_bits());
+
+/// The sampler's beat phase minus the master's, wrapped to -0.5..0.5 beats.
+pub fn phase_diff(own: f64, master: f64) -> f64 {
+    (own - master + 0.5).rem_euclid(1.0) - 0.5
+}
+
 impl Engine {
     pub fn new() -> Engine {
-        Engine { voices: (0..PADS).map(|_| Voice::new()).collect(), gain: 1.0, volume: 1.0, cue_gain: 0.0, bpm: 120.0, quantize: false, q_beats: 1.0, clock: 0.0, buf: vec![0.0; 8192], peak: [0.0; 2], seq: Sequencer::new(), click: Arc::new(default_click()), click_gain: METRONOME_GAINS[1], click_pos: None, click_at: [0; 4], nclick: 0, silent: false }
+        Engine { voices: (0..PADS).map(|_| Voice::new()).collect(), gain: 1.0, volume: 1.0, cue_gain: 0.0, bpm: 120.0, quantize: false, q_beats: 1.0, clock: 0.0, buf: vec![0.0; 8192], peak: [0.0; 2], seq: Sequencer::new(), click: Arc::new(default_click()), click_gain: METRONOME_GAINS[1], click_pos: None, click_at: [0; 4], nclick: 0, sounding: false, silent: false, follow: false, direct: true, route: 0 }
     }
 
     /// The metronome's sound (stereo).
@@ -197,14 +221,79 @@ impl Engine {
         if self.seq.playing {
             return;
         }
-        let clock = self.clock;
+        // While the sampler follows the master deck, the pattern starts at the master's place
+        // in its beat, so its beats fall on the master's from the first one.
+        let m = f64::from_bits(FOLLOW_PHASE.load(std::sync::atomic::Ordering::Relaxed));
+        let start = if self.follow && m.is_finite() { m.clamp(0.0, 0.999) } else { 0.0 };
+        let shift = self.clock - start;
         for v in self.voices.iter_mut() {
             if let Some(p) = v.pending.as_mut() {
-                p.2 -= clock;
+                p.2 -= shift;
             }
         }
-        self.clock = 0.0;
-        self.seq.play();
+        self.clock = start;
+        self.seq.play_from(start);
+    }
+
+    /// The sampler's beat clock (beats since it was last set).
+    pub fn clock(&self) -> f64 {
+        self.clock
+    }
+
+    /// Every loaded slot's clip (pad, bank), for a copy of the engine.
+    pub fn clip(&self, pad: usize, bank: usize) -> Option<&Clip> {
+        self.voices[pad % PADS].clips[bank % BANKS].as_ref()
+    }
+
+    /// One pass of the current pattern as audio (interleaved stereo at `rate`), made away
+    /// from the audio thread on a copy of the engine: what Sequence Load puts on a deck. The
+    /// second of two passes is taken, so a sample that rings over the end of the pattern is
+    /// there at its start, as it is when the pattern goes round. The slots' own gains count;
+    /// the sampler's GAIN and fader do not.
+    pub fn render_pattern(&self, rate: u32) -> Option<Vec<f32>> {
+        let pat = self.seq.pattern(self.seq.current()).clone();
+        if !pat.events.iter().any(|e| e.on) {
+            return None;
+        }
+        let mut e = Engine::new();
+        for pad in 0..PADS {
+            for bank in 0..BANKS {
+                if let Some(c) = self.clip(pad, bank) {
+                    e.set_clip(pad, bank, Some(c.clone()));
+                }
+            }
+        }
+        e.bpm = self.bpm;
+        let mut p = pat.clone();
+        p.events.iter_mut().for_each(|ev| ev.fresh = false);
+        e.seq.set_pattern(0, &p);
+        e.seq.select(0, 0.0);
+        e.seq_play();
+        let frames = (pat.beats() * 60.0 / e.bpm.clamp(40.0, 499.0) as f64 * rate as f64).round() as usize;
+        let mut out = vec![0.0f32; frames * 4];
+        for chunk in out.chunks_mut(1024) {
+            e.process(chunk, &mut [], rate);
+        }
+        Some(out.split_off(frames * 2))
+    }
+
+    /// The sampler's mix of the last buffer when it was not sent out directly: (master part,
+    /// headphones part), both already at their levels.
+    pub fn mix_mut(&mut self, n: usize) -> &mut [f32] {
+        if self.buf.len() < n * 2 {
+            self.buf.resize(n * 2, 0.0);
+        }
+        if !self.sounding {
+            self.buf[..n * 2].iter_mut().for_each(|v| *v = 0.0);
+        }
+        &mut self.buf[..n * 2]
+    }
+    /// The level of the sampler's output for the meter, when the caller mixed it.
+    pub fn note_peak(&mut self, l: f32, r: f32) {
+        self.peak = [self.peak[0].max(l), self.peak[1].max(r)];
+    }
+    pub fn out_gains(&self) -> (f32, f32) {
+        if self.silent { (0.0, 0.0) } else if self.route == 1 { (0.0, self.gain * self.volume) } else { (self.gain * self.volume, self.gain * self.cue_gain) }
     }
 
     /// Sequencer stop: back to the start, REC off, and every pad stops (rekordbox sends
@@ -306,9 +395,18 @@ impl Engine {
         if n == 0 {
             return;
         }
-        let beats_per_frame = self.bpm.clamp(40.0, 499.0) as f64 / 60.0 / rate.max(1) as f64;
+        let mut beats_per_frame = self.bpm.clamp(40.0, 499.0) as f64 / 60.0 / rate.max(1) as f64;
+        if self.follow {
+            // BPM SYNC: the clock runs a little faster or slower until its beats are on the
+            // master deck's (the same correction the decks' BEAT SYNC uses).
+            let m = f64::from_bits(FOLLOW_PHASE.load(std::sync::atomic::Ordering::Relaxed));
+            if m.is_finite() {
+                beats_per_frame *= 1.0 + crate::audio::sync_correction(phase_diff(self.clock.rem_euclid(1.0), m));
+            }
+        }
         let (c0, c1) = (self.clock, self.clock + n as f64 * beats_per_frame);
         self.clock = c1;
+        CLOCK_BITS.store(c1.to_bits(), std::sync::atomic::Ordering::Relaxed);
         // The sequencer: its events of this buffer go to their pads, each with its frame.
         self.nclick = 0;
         {
@@ -334,7 +432,8 @@ impl Engine {
                 }
             }
         }
-        if self.voices.iter().any(|v| v.playing || v.nsched > 0) {
+        self.sounding = self.voices.iter().any(|v| v.playing || v.nsched > 0);
+        if self.sounding {
             self.render_voices(out, cue, rate, n);
         }
         self.render_click(out, rate, n);
@@ -345,6 +444,7 @@ impl Engine {
             // (Only when the device asks for a larger buffer than was foreseen.)
             self.buf.resize(n * 2, 0.0);
         }
+        let (g, cue_g) = self.out_gains();
         let buf = &mut self.buf[..n * 2];
         buf.iter_mut().for_each(|v| *v = 0.0);
         let fade_k = 1.0 / (FADE_SECS * rate as f32);
@@ -419,11 +519,10 @@ impl Engine {
             }
             v.nsched = 0;
         }
-        if self.silent {
+        if self.silent || !self.direct {
             return;
         }
-        let g = self.gain * self.volume;
-        let cue_g = if cue.len() >= out.len() { self.gain * self.cue_gain } else { 0.0 };
+        let cue_g = if cue.len() >= out.len() { cue_g } else { 0.0 };
         let mut peak = self.peak;
         for i in 0..n {
             let (l, r) = (buf[i * 2], buf[i * 2 + 1]);
