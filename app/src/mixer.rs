@@ -85,6 +85,25 @@ pub fn mid_db_q(pos: f32) -> (f32, f32) {
     (through(&GAIN, k), through(&Q, k))
 }
 
+/// Headphones MIX knob (0 = CUE, 1 = MASTER) to the master's share; the cued decks get
+/// `cue_master_balance(1 - mix)`. rekordbox's table: silent at the far end, rising in a
+/// straight line to full at the centre and full from there on, so the centre has both.
+pub fn cue_master_balance(mix: f32) -> f32 {
+    let i = (mix.clamp(0.0, 1.0) * 255.0).round();
+    if i <= 2.0 { 0.0 } else { ((i - 2.0) / 122.0).min(1.0) }
+}
+
+/// Headphones LEVEL knob to gain: silent at the left end, -15.7 dB at the centre, 0 dB at the
+/// right end (points read off rekordbox's table).
+pub fn headphones_level(pos: f32) -> f32 {
+    let k = pos.clamp(0.0, 1.0) * 255.0;
+    if k < 3.0 {
+        return 0.0;
+    }
+    const PTS: [(f32, f32); 11] = [(3.0, -124.8), (8.0, -84.3), (16.0, -65.2), (32.0, -48.0), (64.0, -31.6), (96.0, -22.2), (127.0, -15.7), (160.0, -10.5), (191.0, -6.4), (224.0, -2.8), (255.0, 0.0)];
+    db(through(&PTS, k))
+}
+
 /// One second-order section, in double precision as the original, transposed direct form II.
 #[derive(Clone, Copy, Default)]
 pub struct Biquad {
@@ -321,6 +340,18 @@ mod tests {
         let want = quiet.clone();
         lim.process(&mut quiet, 2, 48000, true);
         assert_eq!(quiet, want);
+    }
+
+    #[test]
+    fn headphones_mix_and_level() {
+        // MIX at the CUE end: no master. Centre: both full. MASTER end: no cue.
+        assert_eq!(cue_master_balance(0.0), 0.0);
+        assert_eq!(cue_master_balance(0.5), 1.0);
+        assert_eq!(cue_master_balance(1.0), 1.0);
+        assert!((cue_master_balance(0.25) - 0.508).abs() < 0.01);
+        assert_eq!(headphones_level(0.0), 0.0);
+        assert!((20.0 * headphones_level(0.5).log10() + 15.7).abs() < 0.3);
+        assert!((headphones_level(1.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -13,7 +13,8 @@ impl App {
         if !std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "perftest")).unwrap_or(false) {
             return;
         }
-        let t = 28.0;
+        let fxh = if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 };
+        let t = 28.0 + fxh;
         let extra = if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 };
         let ly = t + 143.0 + 99.5 + extra;
         let o = pos2(490.0, ly - 3.0);
@@ -39,6 +40,16 @@ impl App {
             ("STEM (STEM ISO) 1", pos2(729.5, my + 234.5), pos2(729.5, my + 234.5)),
             ("MASTER deck 2", pos2(1512.0 - 79.0 + 35.0, my + 39.5), pos2(1512.0 - 79.0 + 35.0, my + 39.5)),
             ("BEAT SYNC deck 1", pos2(700.0 - 79.0 + 22.0, my + 18.5), pos2(700.0 - 79.0 + 22.0, my + 18.5)),
+            // The FX panel (shown by PREPDECK_SHOT_VIEW=perffx, 52 pt above the rest): assign FX1
+            // to deck 1, switch ECHO on, step its beat down, hold RELEASE FX.
+            ("FX1 assign deck 1", pos2(85.0, t - fxh + 17.5), pos2(85.0, t - fxh + 17.5)),
+            ("FX1 ECHO on", pos2(193.0 + 111.0 + 40.0, t - fxh + 17.5), pos2(193.0 + 111.0 + 40.0, t - fxh + 17.5)),
+            ("FX1 ECHO beat down", pos2(193.0 + 111.0 + 39.0, t - fxh + 36.5), pos2(193.0 + 111.0 + 39.0, t - fxh + 36.5)),
+            ("FX1 RELEASE FX held", pos2(576.0, t - fxh + 17.5), pos2(576.0, t - fxh + 18.5)),
+            // Quick clicks: press and release in the same frame (found by hand: sliders missed them).
+            ("quick click on channel fader 2, half way", pos2(782.0, my + 194.5), pos2(782.0, my + 194.5)),
+            ("quick click on the crossfader, a quarter in", pos2(733.5, by + 21.5), pos2(733.5, by + 21.5)),
+            ("quick click on master volume, half way", pos2(1512.0 - 87.5, 14.0), pos2(1512.0 - 87.5, 14.0)),
             ("PLAY/PAUSE deck 1 (pause)", o + egui::vec2(20.0, 102.0), o + egui::vec2(20.0, 102.0)),
         ];
         let _ = d2;
@@ -53,14 +64,24 @@ impl App {
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         match f {
             0 => raw.events.push(egui::Event::PointerMoved(a)),
-            3 => raw.events.push(button(a, true)),
+            3 => {
+                raw.events.push(button(a, true));
+                if name.starts_with("quick") {
+                    raw.events.push(button(a, false));
+                }
+            }
+            10 if name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state()),
             4..=11 => {
                 if a != b {
                     let k = (f - 3) as f32 / 8.0;
                     raw.events.push(egui::Event::PointerMoved(a + (b - a) * k));
                 }
             }
-            12 => raw.events.push(button(b, false)),
+            12 => {
+                if !name.starts_with("quick") {
+                    raw.events.push(button(b, false));
+                }
+            }
             // The loop is left running for a while before its state is read.
             30 => eprintln!("perftest: {name}: {}", self.perf_state()),
             _ => {}
@@ -76,7 +97,13 @@ impl App {
         let m = self.px.mix[0];
         let q1 = if act == 0 { self.prefs.quantize } else { self.px.other_quantize };
         format!(
-            "playing {} pos {:.2}s loop {:?} slip {} bg {:?} hot {:?} range step {} Q {} MT {} key {:+} | fader {:.2} (gain {:.3}) high {:.2} (pos {:.2}) xfade {:.2} assign {} xf-gain {:.2} stem-iso {} | master deck {} beat-sync {} tempo {:.4}",
+            "fx1 assign {:?} echo on {} value {} release {:?} | fader2 {:.2} volume {:.2} | playing {} pos {:.2}s loop {:?} slip {} bg {:?} hot {:?} range step {} Q {} MT {} key {:+} | fader {:.2} (gain {:.3}) high {:.2} (pos {:.2}) xfade {:.2} assign {} xf-gain {:.2} stem-iso {} | master deck {} beat-sync {} tempo {:.4}",
+            self.px.fx[0].params.assign,
+            self.px.fx[0].params.slots[1].on,
+            self.px.fx[0].params.slots[1].value,
+            self.px.fx[0].params.release.is_some(),
+            self.px.mix[1].fader,
+            s.volume,
             s.playing,
             secs,
             s.loop_range.map(|l| ((l.0 * 100.0).round() / 100.0, (l.1 * 100.0).round() / 100.0)),

@@ -962,6 +962,7 @@ fn audio_io(app: &mut App, ui: &mut Ui, info: &AudioInfo) {
     let cur = if app.prefs.audio_channel + 1 < chans { app.prefs.audio_channel } else { 0 };
     let name = |ch: u16| if dev.is_empty() { format!("{}", ch + 1) } else { format!("{dev} : {}", ch + 1) };
     let mut new_ch = None;
+    let mut new_hp: Option<Option<u16>> = None;
     card(ui, "Output channels", |ui| {
         sub(ui, "Master Output");
         // The pair moves together: the right channel is always the one after the left.
@@ -984,9 +985,43 @@ fn audio_io(app: &mut App, ui: &mut Ui, info: &AudioInfo) {
                 });
             });
         }
+        // Headphones Output: another pair of the same device (an interface or controller
+        // with four or more outputs), or none.
+        sub(ui, "Headphones Output");
+        let hp = app.prefs.hp_channel.filter(|h| h + 1 < chans && *h != cur);
+        for (side, label) in ["L", "R"].iter().enumerate() {
+            kit::row_at(ui, kit::Kind::Ctl, 22.0, 89.5, |ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(40.5, 22.0), egui::Sense::hover());
+                kit::paint_text(ui, pos2(r.min.x, r.center().y), egui::Align2::LEFT_CENTER, label, inter(14.0), WHITE, 0.0);
+                let shown = hp.map(|h| name(h + side as u16)).unwrap_or_else(|| "-".to_string());
+                kit::combo(("audio_hp", side), 340.0, shown, 14.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(hp.is_none(), "-").clicked() {
+                        new_hp = Some(None);
+                    }
+                    let mut first = 0;
+                    while first + 1 < chans {
+                        if first != cur && ui.selectable_label(hp == Some(first), name(first + side as u16)).clicked() {
+                            new_hp = Some(Some(first));
+                        }
+                        first += 2;
+                    }
+                    if chans <= 2 {
+                        ui.label(kit::text("This device has one stereo output: choose a device with four or more outputs (an audio interface, a controller, or an Aggregate Device made in Audio MIDI Setup) to hear the CUE in headphones.", 11.0).color(DIM));
+                    }
+                });
+            });
+        }
     });
     if let Some(c) = new_ch.filter(|c| *c != app.prefs.audio_channel) {
         app.prefs.audio_channel = c;
+        // A headphones pair on the same channels gives way.
+        if app.prefs.hp_channel == Some(c) {
+            app.prefs.hp_channel = None;
+        }
+        apply_audio(app);
+    }
+    if let Some(h) = new_hp.filter(|h| *h != app.prefs.hp_channel) {
+        app.prefs.hp_channel = h;
         apply_audio(app);
     }
 }

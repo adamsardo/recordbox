@@ -271,6 +271,11 @@ pub struct PlayState {
     /// of them clicks. The app always sets it; off by default so that tests of the plain
     /// signal path see every sample.
     pub smooth: bool,
+    /// Which deck this is (0 = deck 1), for the FX units' assignment.
+    pub deck_no: u8,
+    /// Headphones CUE: how much of this deck (after its EQ, before its faders) goes to the
+    /// headphones output; 0 when CUE is off.
+    pub cue_gain: f32,
     /// SLIP: while a loop runs or a hot cue is held (`slip_hold`), the position the track
     /// would have reached keeps moving in the background (`slip_pos`, source frames), and
     /// playback returns to it when the loop ends or the pad is released.
@@ -318,6 +323,8 @@ impl Default for PlayState {
             ch_fader: 1.0,
             peak: [0.0; 2],
             smooth: false,
+            deck_no: 0,
+            cue_gain: 0.0,
             slip: false,
             slip_hold: false,
             slip_pos: None,
@@ -415,9 +422,32 @@ impl Player {
             cpal::SampleFormat::F32 => {
                 let lost = lost.clone();
                 let mut pair: Vec<f32> = Vec::with_capacity(8192);
+                let mut phones: Vec<f32> = Vec::with_capacity(8192);
+                // Headphones on their own channel pair of the same device, when it has one
+                // besides the master's (an interface or controller with four outputs).
+                let hp = usize::try_from(HP_CHANNEL.load(std::sync::atomic::Ordering::Relaxed)).ok().filter(|h| h + 1 < channels && *h != first_ch && h + 1 != first_ch && *h != first_ch + 1);
+                HP_ACTIVE.store(hp.is_some(), std::sync::atomic::Ordering::Relaxed);
                 dev.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| if first_ch == 0 { render(&st, data, channels, rate) } else { crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)) },
+                move |data: &mut [f32], _| match hp {
+                    Some(h) => {
+                        let frames = data.len() / channels.max(1);
+                        pair.clear();
+                        pair.resize(frames * 2, 0.0);
+                        phones.clear();
+                        phones.resize(frames * 2, 0.0);
+                        render_cue(&st, &mut pair, &mut phones, 2, rate);
+                        data.fill(0.0);
+                        for ((f, m), c) in data.chunks_mut(channels).zip(pair.chunks(2)).zip(phones.chunks(2)) {
+                            f[first_ch] = m[0];
+                            f[first_ch + 1] = m[1];
+                            f[h] = c[0].clamp(-1.0, 1.0);
+                            f[h + 1] = c[1].clamp(-1.0, 1.0);
+                        }
+                    }
+                    None if first_ch == 0 => render(&st, data, channels, rate),
+                    None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
+                },
                 move |e| {
                     eprintln!("audio error: {e}");
                     if matches!(e, cpal::StreamError::DeviceNotAvailable) {
@@ -868,7 +898,7 @@ pub static AUDIO_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// a single `try_lock` loses now and then, and losing means a whole buffer of silence: an
 /// audible click. Waiting out such a hold costs far less than a buffer, so the callback spins
 /// for it, and gives up only after a quarter of a millisecond (something is then really wrong).
-fn lock_for_audio(m: &Mutex<PlayState>) -> Option<parking_lot::MutexGuard<'_, PlayState>> {
+fn lock_for_audio<T>(m: &Mutex<T>) -> Option<parking_lot::MutexGuard<'_, T>> {
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(g) = m.try_lock() {
         return Some(g);
@@ -891,6 +921,22 @@ fn lock_for_audio(m: &Mutex<PlayState>) -> Option<parking_lot::MutexGuard<'_, Pl
 
 /// The audio callback: both decks mixed into `out`.
 fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize, rate: u32) {
+    render_cue(states, out, &mut [], channels, rate)
+}
+
+/// The master share of the headphones output (MIX and LEVEL; f32 bits).
+pub static HP_MASTER_GAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The open output stream has a headphones pair.
+pub static HP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// First channel of the headphones pair wanted (Preferences > Audio > Input/Output); -1 = none.
+pub static HP_CHANNEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// `render`, also filling the headphones output `cue` (stereo; empty = none): the cued decks
+/// before their faders plus the master mix, as the MIX knob balances them.
+fn render_cue(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
+    for v in cue.iter_mut() {
+        *v = 0.0;
+    }
     for v in out.iter_mut() {
         *v = 0.0;
     }
@@ -900,14 +946,48 @@ fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize,
         update_sync(a, b);
         update_sync(b, a);
     }
-    for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
-        render_deck(s, out, channels, rate);
+    // With Beat FX in use each deck is rendered on its own, sent through the FX units
+    // assigned to it (after its faders, as in rekordbox), then mixed; the master's effects
+    // take the mix. Otherwise the decks go straight into the output.
+    // (Waited for like the decks' state: the interface holds it only to copy the settings.)
+    let mut rack = lock_for_audio(&crate::fx::RACK);
+    match rack.as_deref_mut().and_then(|r| r.as_deref_mut()).filter(|r| r.active() && channels == 2) {
+        Some(rack) => {
+            for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
+                let i = (s.deck_no as usize).min(1);
+                let mut buf = std::mem::take(&mut rack.scratch[i]);
+                if buf.len() < out.len() {
+                    buf.resize(out.len(), 0.0);
+                }
+                buf[..out.len()].iter_mut().for_each(|v| *v = 0.0);
+                render_deck_cue(s, &mut buf[..out.len()], cue, channels, rate);
+                rack.process(i, &mut buf[..out.len()], rate);
+                for (o, v) in out.iter_mut().zip(&buf) {
+                    *o += *v;
+                }
+                rack.scratch[i] = buf;
+            }
+            rack.process(2, out, rate);
+        }
+        None => {
+            for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
+                render_deck_cue(s, out, cue, channels, rate);
+            }
+        }
     }
+    drop(rack);
     drop((a, b));
     // The master section (Performance mixer): peak limiter, then the master level meter.
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(mut lim) = MASTER_LIMITER.try_lock() {
         lim.process(out, channels, rate, LIMITER_ON.load(Relaxed));
+    }
+    // Headphones: the master mix joins the cued decks.
+    let hp_master = f32::from_bits(HP_MASTER_GAIN.load(Relaxed));
+    if hp_master > 0.0 && channels == 2 && cue.len() >= out.len() {
+        for (c, o) in cue.iter_mut().zip(out.iter()) {
+            *c += *o * hp_master;
+        }
     }
     for (c, m) in MASTER_PEAK.iter().enumerate().take(channels.min(2)) {
         let p = out.iter().skip(c).step_by(channels.max(1)).fold(0.0f32, |a, v| a.max(v.abs()));
@@ -959,6 +1039,12 @@ fn search_grain(rate: u32) -> usize {
 
 /// Add one deck's audio to `out` (which the caller has cleared) and advance its position.
 pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u32) {
+    render_deck_cue(s, out, &mut [], channels, rate)
+}
+
+/// `render_deck`, also adding the deck's headphones CUE feed to `cue` (stereo, as long as
+/// `out` in frames; empty when there is no headphones output).
+pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
     let searching = s.search != 0.0;
     let smooth = s.smooth;
     if !s.playing && !searching && (!smooth || s.dsp.gate <= 0.0) {
@@ -1036,7 +1122,8 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     if smooth && s.playing && s.dsp.gate > 0.0 && (s.pos - s.dsp.expect).abs() > 2.0 * step.max(1.0) {
         s.dsp.xf = Some((s.dsp.expect, fade_n));
     }
-    for f in out.chunks_mut(channels) {
+    let cue_gain = if cue.len() * channels.max(1) >= out.len() * 2 { s.cue_gain * s.gain } else { 0.0 };
+    for (fi, f) in out.chunks_mut(channels).enumerate() {
         // Fading out after pause: the sound carries on from where it was for the length of
         // the fade, while the deck's position already stands where it was put.
         let fading_out = smooth && !s.playing && !searching;
@@ -1112,6 +1199,11 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             // The level meter's tap: after the EQ, before the faders (with the track's gain).
             peak[0] = peak[0].max((l * s.gain).abs());
             peak[1] = peak[1].max((r * s.gain).abs());
+            // The headphones CUE feed is taken at the same point.
+            if cue_gain > 0.0 {
+                cue[fi * 2] += l * cue_gain;
+                cue[fi * 2 + 1] += r * cue_gain;
+            }
         }
         s.dsp.ch_fader += (s.ch_fader - s.dsp.ch_fader) * fader_k;
         s.dsp.fader += (s.fader - s.dsp.fader) * fader_k;
@@ -1815,5 +1907,34 @@ mod smooth_tests {
         s.slip_hold = false;
         run(&mut s, 10);
         assert!((s.pos - 3010.0).abs() < 1.5, "{}", s.pos);
+    }
+}
+
+#[cfg(test)]
+mod cue_tests {
+    use super::*;
+
+    #[test]
+    fn a_cued_deck_reaches_the_headphones_before_its_fader() {
+        let n = 44100;
+        let x: Vec<f32> = (0..n).flat_map(|_| [0.25f32, 0.25]).collect();
+        let deck = || PlayState { audio: Some(Arc::new(Decoded { sr: 44100, samples: x.clone(), raw_frames: n, damaged: 0, truncated: false })), playing: true, volume: 1.0, gain: 1.0, strip: 1, ..Default::default() };
+        // Fader down, CUE on: silent on the master, present in the headphones.
+        let mut s = PlayState { ch_fader: 0.0, cue_gain: 0.5, ..deck() };
+        s.dsp.ch_fader = 0.0;
+        let mut out = vec![0.0f32; 2048];
+        let mut cue = vec![0.0f32; 2048];
+        render_deck_cue(&mut s, &mut out, &mut cue, 2, 44100);
+        assert!(out.iter().all(|v| v.abs() < 1e-6));
+        assert!((cue[2000] - 0.125).abs() < 0.01, "{}", cue[2000]);
+        // CUE off: nothing in the headphones. Outside Performance (no strip): nothing either.
+        let mut s = deck();
+        let mut cue = vec![0.0f32; 2048];
+        render_deck_cue(&mut s, &mut vec![0.0f32; 2048], &mut cue, 2, 44100);
+        assert!(cue.iter().all(|v| *v == 0.0));
+        let mut s = PlayState { strip: 0, cue_gain: 1.0, ..deck() };
+        let mut cue = vec![0.0f32; 2048];
+        render_deck_cue(&mut s, &mut vec![0.0f32; 2048], &mut cue, 2, 44100);
+        assert!(cue.iter().all(|v| *v == 0.0));
     }
 }

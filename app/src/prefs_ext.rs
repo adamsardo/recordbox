@@ -432,6 +432,7 @@ pub static STREAM_OPTS: parking_lot::Mutex<(u32, u32, u16)> = parking_lot::Mutex
 
 pub fn set_stream_opts(p: &Prefs) {
     *STREAM_OPTS.lock() = (p.audio_rate, p.audio_buffer, p.audio_channel);
+    crate::audio::HP_CHANNEL.store(p.hp_channel.map(|c| c as i32).unwrap_or(-1), std::sync::atomic::Ordering::Relaxed);
     CLICK_SOUND.store(p.metronome_sound.min(2), std::sync::atomic::Ordering::Relaxed);
 }
 

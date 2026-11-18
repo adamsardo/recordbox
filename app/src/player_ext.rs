@@ -100,6 +100,8 @@ pub struct PlayerExt {
     pub loop_manual: [bool; 2],
     /// STEM FX switches (VOCAL, INST, BASS, DRUMS), all on at start, as in rekordbox.
     pub stem_fx: [bool; 4],
+    /// The two FX units of the Performance FX panel.
+    pub fx: [crate::ui_fx::FxUi; 2],
     /// Quantize of the deck that is not active (`Prefs::quantize` is the active deck's): each
     /// deck has its own Q, as in rekordbox.
     pub other_quantize: bool,
@@ -132,7 +134,7 @@ impl MixStrip {
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 2], loop_manual: [false; 2], stem_fx: [true; 4], other_quantize: true }
+        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 2], loop_manual: [false; 2], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], other_quantize: true }
     }
 }
 
@@ -416,7 +418,7 @@ impl App {
     /// (225 pt, 21 pt more with the stem part buttons) and the mixer's bottom row (43 pt).
     /// rekordbox 7.2.19: 368 + 43 (+ 21).
     pub fn performance_height(&self) -> f32 {
-        368.0 + 43.0 + if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 }
+        368.0 + 43.0 + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 }
     }
 
     fn swap_decks(&mut self) {
@@ -554,6 +556,7 @@ impl App {
             o.muted = self.px.muted;
         }
         self.push_deck_controls();
+        crate::ui_fx::sync(self);
     }
 
     /// Hand each deck's tempo, Master Tempo, key shift, crossfader gain, isolator switches,
@@ -564,6 +567,10 @@ impl App {
         let dual = self.dual_player();
         let perf = self.performance();
         let keys = self.key_controls();
+        let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        let (hp_mix, hp_level) = (self.px.hp_mix, crate::mixer::headphones_level(self.px.hp_level));
+        let hp_master = if perf && hp_on { crate::mixer::cue_master_balance(hp_mix) * hp_level } else { 0.0 };
+        crate::audio::HP_MASTER_GAIN.store(hp_master.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let (isolator, curve, three) = (self.prefs.eq_isolator, self.prefs.ch_fader_curve, self.prefs.stem_parts == 3);
         crate::audio::LIMITER_ON.store(perf, std::sync::atomic::Ordering::Relaxed);
         let act = self.px.active;
@@ -619,6 +626,9 @@ impl App {
             s.master_tempo = two && x.master_tempo;
             s.key_shift = if keys { x.key_shift as f32 } else { 0.0 };
             s.smooth = true;
+            // Headphones CUE: the deck's share, by the MIX and LEVEL knobs (rekordbox's law).
+            s.cue_gain = if perf && hp_on && self.px.mix[n as usize].cue { crate::mixer::cue_master_balance(1.0 - hp_mix) * hp_level } else { 0.0 };
+            s.deck_no = n;
             s.slip = perf && x.slip;
             let m = self.px.mix[n as usize];
             s.fader = if perf {

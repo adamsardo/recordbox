@@ -34,7 +34,12 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     let p = ui.painter().clone();
     p.rect_filled(full, 0.0, BG);
-    let (l, t) = (full.min.x, full.min.y);
+    let (l, mut t) = (full.min.x, full.min.y);
+    // The FX panel, when shown, sits above the waveforms.
+    if app.prefs.perf_fx {
+        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), crate::ui_fx::FX_H - 1.0)));
+        t += crate::ui_fx::FX_H;
+    }
     // Wider or narrower windows: the mixer stays centred and the decks take what is left.
     let k = full.width() / 1512.0;
     let cx = full.center().x;
@@ -620,7 +625,7 @@ fn repeat(ui: &Ui, resp: &egui::Response) -> bool {
 
 /// A rotary knob 24 pt across: drag up or down to turn (a full sweep over 150 pt), double
 /// click for `reset`. Returns the new value when it changed.
-fn knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, reset: f32, colour: Color32) -> Option<f32> {
+pub(crate) fn knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, reset: f32, colour: Color32) -> Option<f32> {
     let p = ui.painter().clone();
     let r = Rect::from_center_size(c, vec2(24.0, 24.0));
     let resp = ui.interact(r, ui.id().with(id), Sense::click_and_drag());
@@ -693,7 +698,8 @@ fn mixer(app: &mut App, ui: &mut Ui, r: Rect) {
         let cresp = ui.interact(cr, ui.id().with(("cue", n)), Sense::click());
         p.rect_filled(cr, 2.0, if m.cue { hex(0xFFA500) } else if cresp.hovered() { lighten(BTN) } else { BTN });
         p.text(cr.center(), Align2::CENTER_CENTER, "CUE", caps(8.5), if m.cue { BG } else { WHITE });
-        if cresp.on_hover_text("Headphones CUE.\n(recordbox has one stereo output so far: the switch is kept, the headphones bus is not built.)").clicked() {
+        let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        if cresp.on_hover_text(if hp_on { "Headphones CUE" } else { "Headphones CUE.\nNo headphones output is set: choose one in Preferences > Audio > Input/Output (it needs a device with four or more outputs)." }).clicked() {
             m.cue = !m.cue;
             changed = true;
         }
@@ -792,7 +798,7 @@ fn bottom_row(app: &mut App, ui: &mut Ui, r: Rect, cx: f32) {
     p.add(egui::Shape::line((0..=16).map(|i| { let a = (180.0 + 180.0 * i as f32 / 16.0).to_radians(); hc + vec2(a.cos() * 7.5, a.sin() * 7.5 + 2.0) }).collect(), Stroke::new(1.8_f32, WHITE)));
     p.rect_filled(Rect::from_min_size(hc + vec2(-9.0, 1.5), vec2(3.5, 7.0)), 1.0, WHITE);
     p.rect_filled(Rect::from_min_size(hc + vec2(5.5, 1.5), vec2(3.5, 7.0)), 1.0, WHITE);
-    let note = "Headphones.\n(recordbox has one stereo output so far: the knobs are kept, the headphones bus is not built.)";
+    let note = if crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) { "Headphones: MIX balances the cued decks (left) and the master (right); LEVEL is the headphones volume." } else { "Headphones.\nNo headphones output is set: choose one in Preferences > Audio > Input/Output (it needs a device with four or more outputs)." };
     if let Some(v) = knob(ui, pos2(x(490.0), cy), "hpmix", app.px.hp_mix, 0.5, WHITE) {
         app.px.hp_mix = v;
     }

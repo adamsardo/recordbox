@@ -214,6 +214,8 @@ pub struct Prefs {
     /// takes over its position, tempo and play state. Both off by default, as in rekordbox.
     pub deck_load_lock: bool,
     pub instant_doubles: bool,
+    /// Performance: the FX panel is shown.
+    pub perf_fx: bool,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
@@ -282,6 +284,9 @@ pub struct Prefs {
     pub audio_buffer: u32,
     pub audio_rate: u32,
     pub audio_channel: u16,
+    /// First channel of the headphones output pair on the same device (None: no headphones
+    /// output).
+    pub hp_channel: Option<u16>,
     /// DJ System > General: Background Color (0 Default Color, 1..8 Pink..Purple).
     pub device_bg_color: u8,
     /// DJ System > Device: "Delete from the device after importing the play history".
@@ -708,6 +713,7 @@ impl Default for Prefs {
             stems_auto_download: true,
             deck_load_lock: false,
             instant_doubles: false,
+            perf_fx: false,
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -742,6 +748,7 @@ impl Default for Prefs {
             audio_buffer: 0,
             audio_rate: 0,
             audio_channel: 0,
+            hp_channel: None,
             device_bg_color: 0,
             delete_history_after_import: false,
             device_import_dir: String::new(),
@@ -1477,6 +1484,11 @@ impl App {
                     "confirmdelete" => app.dialogs.confirm_delete_node = Some((0, "Warm Up".into(), false)),
                     "about" => app.dialogs.about = true,
                     "performance" => app.prefs.app_mode = 1,
+                    // Performance with the FX panel open.
+                    "perffx" => {
+                        app.prefs.app_mode = 1;
+                        app.prefs.perf_fx = true;
+                    }
                     // Performance with BEAT JUMP pads on deck 1 and BEAT LOOP pads on deck 2.
                     "perfpads" => {
                         app.prefs.app_mode = 1;
