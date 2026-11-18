@@ -3797,6 +3797,25 @@ impl App {
         }
         self.push_grid(g);
     }
+    /// Double (`true`) or halve the BPM. For the whole grid this follows rekordbox's traced
+    /// `bpmToDouble` / `bpmToHalf` (beats kept in place, every tempo change kept, beat numbers
+    /// remapped); "from the current position" changes the tempo from the playhead on.
+    pub fn grid_double_half(&mut self, double: bool) {
+        if self.prefs.grid_from_current {
+            self.grid_scale_bpm(|v| if double { v * 2.0 } else { v / 2.0 });
+            return;
+        }
+        if !self.grid_editable() {
+            return;
+        }
+        let dur = self.deck.beats.last().map(|b| b.time + 1e-3).unwrap_or(0.0);
+        let g = if double { self.deck.grid.doubled(dur) } else { self.deck.grid.halved(dur) };
+        if g.anchors.is_empty() || g.anchors.iter().any(|a| !(40.0..=499.0).contains(&a.bpm)) {
+            self.toast_err("BPM value should be between 40 and 499.");
+            return;
+        }
+        self.push_grid(g);
+    }
     pub fn grid_set_bpm(&mut self, bpm: f64) {
         if !(40.0..=499.0).contains(&bpm) {
             self.toast_err("BPM value should be between 40 and 499.");

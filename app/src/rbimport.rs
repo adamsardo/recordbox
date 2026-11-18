@@ -77,7 +77,62 @@ pub fn open_snapshot(db: &Path) -> Result<rusqlite::Connection> {
     if check != "ok" {
         return Err(anyhow!("the copy of the rekordbox library failed its integrity check ({check}); try again with rekordbox closed"));
     }
+    check_schema(&c)?;
     Ok(c)
+}
+
+/// The tables and columns the importer reads by name. History tables are optional.
+const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
+    ("djmdContent", &["ID", "FolderPath", "AnalysisDataPath", "FileType", "Rating", "ColorID", "DJPlayCount", "BPM", "rb_local_deleted"]),
+    ("djmdCue", &["ContentID", "InMsec", "OutMsec", "Kind", "Color", "ActiveLoop", "Comment", "updated_at", "rb_local_deleted"]),
+    ("djmdKey", &["ID", "ScaleName", "rb_local_deleted"]),
+    ("djmdMyTag", &["ID", "Name", "ParentID", "Seq", "Attribute", "rb_local_deleted"]),
+    ("djmdSongMyTag", &["ContentID", "MyTagID", "rb_local_deleted"]),
+    ("djmdPlaylist", &["ID", "Seq", "Name", "Attribute", "ParentID", "SmartList", "rb_local_deleted"]),
+    ("djmdSongPlaylist", &["PlaylistID", "ContentID", "TrackNo", "rb_local_deleted"]),
+];
+
+/// Check, before anything is imported, that the library has the layout the importer was
+/// written for (LIB-015). A rekordbox update that renames or drops something then gives one
+/// clear message naming what is missing, not a half-imported library or an SQL error.
+pub fn check_schema(c: &rusqlite::Connection) -> Result<()> {
+    let mut missing = vec![];
+    for (table, cols) in REQUIRED_SCHEMA {
+        let have: Vec<String> = c
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .and_then(|mut st| st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect()))
+            .unwrap_or_default();
+        if have.is_empty() {
+            missing.push(table.to_string());
+            continue;
+        }
+        for col in cols.iter() {
+            if !have.iter().any(|h| h.eq_ignore_ascii_case(col)) {
+                missing.push(format!("{table}.{col}"));
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("this rekordbox library has a layout recordbox does not know (missing: {}); nothing was imported", missing.join(", ")))
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    #[test]
+    fn schema_check_names_what_is_missing() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        for (t, cols) in super::REQUIRED_SCHEMA {
+            c.execute(&format!("CREATE TABLE {t} ({})", cols.join(", ")), []).unwrap();
+        }
+        assert!(super::check_schema(&c).is_ok());
+        c.execute("ALTER TABLE djmdCue RENAME COLUMN InMsec TO InMs", []).unwrap();
+        c.execute("DROP TABLE djmdKey", []).unwrap();
+        let e = super::check_schema(&c).unwrap_err().to_string();
+        assert!(e.contains("djmdCue.InMsec") && e.contains("djmdKey") && !e.contains("djmdPlaylist"), "{e}");
+    }
 }
 
 

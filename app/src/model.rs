@@ -348,6 +348,50 @@ impl BeatGrid {
         let beats = self.beats(duration);
         nearest_beat(&beats, t).map(|b| b.time).unwrap_or(t)
     }
+    /// The grid at double tempo, following rekordbox's traced `bpmToDouble`: every beat stays
+    /// and one is added halfway to the next; beat numbers map 1→1, 2→3, 3→1, 4→3. Where the
+    /// interval across a tempo change is not a whole beat, the added beat sits at its midpoint.
+    pub fn doubled(&self, duration: f64) -> BeatGrid {
+        let beats = self.beats(duration);
+        let map = |n: u8| -> u8 {
+            match n {
+                2 | 4 => 3,
+                _ => 1,
+            }
+        };
+        let mut out = vec![];
+        for (i, a) in self.anchors.iter().enumerate() {
+            out.push(GridAnchor { time: a.time, bpm: a.bpm * 2.0, beat: map(a.beat) });
+            let Some(n) = self.anchors.get(i + 1) else { continue };
+            let lo = if i == 0 { f64::MIN } else { a.time - 1e-9 };
+            let Some(last) = beats.iter().rev().find(|b| b.time < n.time - 1e-9 && b.time >= lo) else { continue };
+            let gap = n.time - last.time;
+            if (gap - 60.0 / a.bpm.max(1.0)).abs() > 1e-6 {
+                out.push(GridAnchor { time: last.time + gap / 2.0, bpm: a.bpm * 2.0, beat: map(last.beat) % 4 + 1 });
+            }
+        }
+        BeatGrid { anchors: out }
+    }
+    /// The grid at half tempo, following rekordbox's traced `bpmToHalf`: beats 0, 2, 4… counted
+    /// from the first beat of the track stay where they are, and the first beat's number picks
+    /// the new start of the 1–4 cycle (1→1, 2→4, 3→4, 4→1).
+    pub fn halved(&self, duration: f64) -> BeatGrid {
+        let beats = self.beats(duration);
+        let Some(first) = beats.first() else { return self.clone() };
+        let start: usize = match first.beat {
+            2 | 3 => 4,
+            _ => 1,
+        };
+        let mut out = vec![];
+        for (i, a) in self.anchors.iter().enumerate() {
+            let lo = if i == 0 { f64::MIN } else { a.time - 1e-9 };
+            let hi = self.anchors.get(i + 1).map(|n| n.time - 1e-9).unwrap_or(f64::MAX);
+            if let Some(b) = beats.iter().find(|b| b.index % 2 == 0 && b.time >= lo && b.time < hi) {
+                out.push(GridAnchor { time: b.time, bpm: a.bpm / 2.0, beat: ((start - 1 + b.index / 2) % 4 + 1) as u8 });
+            }
+        }
+        BeatGrid { anchors: out }
+    }
 }
 
 pub fn nearest_beat(beats: &[Beat], t: f64) -> Option<Beat> {
@@ -472,6 +516,37 @@ pub struct MyTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn times(g: &BeatGrid, d: f64) -> Vec<(i64, u8)> {
+        g.beats(d).iter().map(|b| ((b.time * 1e6).round() as i64, b.beat)).collect()
+    }
+    #[test]
+    fn double_and_half_grid_follow_rekordbox() {
+        // Constant grid: first beat at 0.1 s numbered 2.
+        let g = BeatGrid::constant(0.1, 120.0, 2);
+        let d = g.doubled(4.0);
+        let db = times(&d, 4.0);
+        assert_eq!(&db[..4], &[(100_000, 3), (350_000, 4), (600_000, 1), (850_000, 2)]);
+        // Half: beats 0, 2, 4… stay; a first beat numbered 2 starts the cycle at 4.
+        let h = g.halved(4.0);
+        assert_eq!(&times(&h, 4.0)[..3], &[(100_000, 4), (1_100_000, 1), (2_100_000, 2)]);
+        // Doubling then halving gives the original beat times back.
+        let back: Vec<i64> = times(&d.halved(4.0), 4.0).iter().map(|x| x.0).collect();
+        let orig: Vec<i64> = times(&g, 4.0).iter().map(|x| x.0).collect();
+        assert_eq!(back, orig);
+        // Two tempos with an uneven interval (0.7 s, not 0.5) across the change: every original
+        // beat is kept and the added one sits at the midpoint of that interval.
+        let g2 = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.2, bpm: 100.0, beat: 1 }] };
+        let d2: Vec<i64> = times(&g2.doubled(5.0), 5.0).iter().map(|x| x.0).collect();
+        for t in times(&g2, 5.0) {
+            assert!(d2.contains(&t.0), "beat at {} lost", t.0);
+        }
+        assert!(d2.contains(&1_850_000) && !d2.contains(&1_750_000));
+        assert_eq!(d2.len(), times(&g2, 5.0).len() * 2);
+        // Halving keeps both tempos instead of flattening the grid to one.
+        let h2 = g2.halved(5.0);
+        assert_eq!(h2.anchors.len(), 2);
+        assert_eq!((h2.anchors[0].bpm, h2.anchors[1].bpm), (60.0, 50.0));
+    }
     #[test]
     fn imported_key_spelling_is_shown_until_the_key_changes() {
         let mut t = Track { key: parse_key("7A"), key_text: "7A".into(), ..Default::default() };

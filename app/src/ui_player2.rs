@@ -418,10 +418,10 @@ pub fn grid_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         app.grid_scale_bpm(|v| ((v + 0.01) * 100.0).round() / 100.0);
     }
     if ib(ui, app, 422.0, "g2", GridIcon::Double, "Double the BPM value", false).clicked() {
-        app.grid_scale_bpm(|v| v * 2.0);
+        app.grid_double_half(true);
     }
     if ib(ui, app, 451.0, "gh", GridIcon::Half, "Halve the BPM value", false).clicked() {
-        app.grid_scale_bpm(|v| v / 2.0);
+        app.grid_double_half(false);
     }
     // Range of the changes: the one in use is the raised one.
     if ib(ui, app, 485.0, "gwhole", GridIcon::Whole, "Adjust whole Beatgrid", fc).clicked() {
