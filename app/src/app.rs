@@ -216,6 +216,8 @@ pub struct Prefs {
     pub instant_doubles: bool,
     /// Performance: the FX panel is shown.
     pub perf_fx: bool,
+    /// Performance: 4Deck Horizontal instead of 2Deck Horizontal.
+    pub perf_four: bool,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
@@ -714,6 +716,7 @@ impl Default for Prefs {
             deck_load_lock: false,
             instant_doubles: false,
             perf_fx: false,
+            perf_four: false,
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -1484,6 +1487,11 @@ impl App {
                     "confirmdelete" => app.dialogs.confirm_delete_node = Some((0, "Warm Up".into(), false)),
                     "about" => app.dialogs.about = true,
                     "performance" => app.prefs.app_mode = 1,
+                    // Performance, 4Deck Horizontal.
+                    "perf4" => {
+                        app.prefs.app_mode = 1;
+                        app.prefs.perf_four = true;
+                    }
                     // Performance with the FX panel open.
                     "perffx" => {
                         app.prefs.app_mode = 1;
@@ -1492,7 +1500,7 @@ impl App {
                     // Performance with BEAT JUMP pads on deck 1 and BEAT LOOP pads on deck 2.
                     "perfpads" => {
                         app.prefs.app_mode = 1;
-                        app.px.pad_mode = [2, 3];
+                        app.px.pad_mode = [2, 3, 0, 0];
                     }
                     other => crate::library_ext::shot_view(&mut app, other),
                 }
@@ -2437,7 +2445,7 @@ impl App {
     /// track that is no longer on a deck is stopped.
     fn stems_for_loaded(&mut self, id: i64) {
         if let Some((sid, _)) = self.stem.separating {
-            if sid != id && self.px.other.track != Some(sid) {
+            if sid != id && !(0..self.deck_count()).any(|n| self.deck_of(n).track == Some(sid)) {
                 self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 self.stem.separating = None;
             }
@@ -3478,8 +3486,10 @@ impl App {
                 if self.deck.track == Some(track) {
                     self.deck.cues = self.db.cues(track).unwrap_or_default();
                 }
-                if self.px.other.track == Some(track) {
-                    self.px.other.cues = self.db.cues(track).unwrap_or_default();
+                for d in self.px.parked.iter_mut() {
+                    if d.track == Some(track) {
+                        d.cues = self.db.cues(track).unwrap_or_default();
+                    }
                 }
                 let cues = self.db.cues(track).unwrap_or_default();
                 let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
@@ -3509,9 +3519,11 @@ impl App {
                     return;
                 }
                 let _ = self.db.save_grid(track, &before);
-                if self.px.other.track == Some(track) {
-                    let g = before.clone();
-                    self.with_deck(1 - self.px.active, |a| a.set_deck_grid(g, false));
+                for n in 0..4u8 {
+                    if n != self.px.active && self.px.parked[n as usize].track == Some(track) {
+                        let g = before.clone();
+                        self.with_deck(n, |a| a.set_deck_grid(g, false));
+                    }
                 }
                 if self.deck.track == Some(track) {
                     self.set_deck_grid(before, false);

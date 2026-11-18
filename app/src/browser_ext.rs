@@ -230,11 +230,7 @@ impl App {
 
     /// Track loaded on player `n` (0 = A, 1 = B), whichever deck is the active one.
     fn deck_track(&self, n: u8) -> Option<i64> {
-        if self.px.active == n {
-            self.deck.track
-        } else {
-            self.px.other.track
-        }
+        self.deck_of(n).track
     }
 
     /// Tracks a sub-window searches: the collection, or a playlist / folder.

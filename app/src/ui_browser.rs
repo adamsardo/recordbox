@@ -61,8 +61,22 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
     p.rect_filled(Rect::from_center_size(lc + vec2(0.0, 3.0), vec2(18.0, 2.0)), 0.0, WHITE);
     crate::icons_player::chevron_down(&p, pos2(r.min.x + 170.75, r.min.y + 14.5), 1.0, WHITE);
     dropdown(ui, &lay, "perflayoutpop", |ui| {
-        let _ = ui.selectable_label(true, "2Deck Horizontal");
-        for name in ["2Deck Vertical", "4Deck Horizontal", "4Deck Vertical", "Browse"] {
+        // rekordbox's order: 2Deck Horizontal, 2Deck Vertical, 4Deck Horizontal, 4Deck Vertical, Browse.
+        let four = app.prefs.perf_four;
+        if ui.selectable_label(!four, "2Deck Horizontal").clicked() {
+            app.prefs.perf_four = false;
+            app.poll_decks();
+            app.save_prefs();
+            ui.memory_mut(|m| m.close_popup());
+        }
+        ui.add_enabled(false, egui::SelectableLabel::new(false, "2Deck Vertical")).on_disabled_hover_text("Not built in recordbox yet.");
+        if ui.selectable_label(four, "4Deck Horizontal").clicked() {
+            app.prefs.perf_four = true;
+            app.poll_decks();
+            app.save_prefs();
+            ui.memory_mut(|m| m.close_popup());
+        }
+        for name in ["4Deck Vertical", "Browse"] {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
     });

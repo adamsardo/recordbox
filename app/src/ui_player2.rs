@@ -660,7 +660,7 @@ pub fn two_players(app: &mut App, ui: &mut Ui) {
     if let Some(pp) = pressed.filter(|pp| full.contains(*pp)) {
         app.activate_deck(if pp.y < mid { 0 } else { 1 });
     }
-    let any = app.playing() || app.player.other.lock().playing || app.px.other.loading.is_some() || app.deck.loading.is_some() || app.searching() != 0;
+    let any = app.playing() || app.player.decks[app.partner() as usize].lock().playing || app.other_deck().loading.is_some() || app.deck.loading.is_some() || app.searching() != 0;
     if any {
         ui.ctx().request_repaint();
     }

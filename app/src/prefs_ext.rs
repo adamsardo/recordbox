@@ -517,7 +517,7 @@ pub fn stem_part_click(app: &mut App, srcs: &[usize]) {
 /// back to MUTE keeps the parts as they are.
 pub fn set_stem_solo(app: &mut App, solo: bool) {
     if solo && !app.prefs.stem_solo {
-        for st in [&app.player.state, &app.player.other] {
+        for st in app.player.decks.iter() {
             let mut s = st.lock();
             s.stem_on = stems_entering_solo(s.stem_on, app.prefs.stem_parts == 3);
         }

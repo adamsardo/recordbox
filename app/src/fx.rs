@@ -123,20 +123,20 @@ pub struct SlotParams {
 
 #[derive(Clone, Copy)]
 pub struct UnitParams {
-    /// Deck 1, deck 2, master.
-    pub assign: [bool; 3],
+    /// Decks 1 to 4, then the master.
+    pub assign: [bool; 5],
     pub slots: [SlotParams; 3],
     /// RELEASE FX held: which one and its beats.
     pub release: Option<(u8, f32)>,
     /// Tempo each channel's effects run at (BPM).
-    pub bpm: [f32; 3],
+    pub bpm: [f32; 5],
 }
 
 impl UnitParams {
     pub fn new() -> UnitParams {
         let s = |kind| SlotParams { kind, on: false, level: 0.5, value: beat_table(kind).0[beat_table(kind).1] };
         // rekordbox's default slots: DELAY, ECHO, SPIRAL.
-        UnitParams { assign: [false; 3], slots: [s(Kind::Delay), s(Kind::Echo), s(Kind::Spiral)], release: None, bpm: [120.0; 3] }
+        UnitParams { assign: [false; 5], slots: [s(Kind::Delay), s(Kind::Echo), s(Kind::Spiral)], release: None, bpm: [120.0; 5] }
     }
 }
 
@@ -546,38 +546,63 @@ impl Channel {
     }
 }
 
+/// The master's channel index in `UnitParams::assign`.
+pub const MASTER: usize = 4;
+
 pub struct Unit {
     pub params: UnitParams,
-    channels: [Channel; 3],
+    /// One effect state per channel, made (by the interface, not the audio thread) the first
+    /// time the unit is assigned to that channel: each holds about 10 MB of delay lines.
+    channels: [Option<Box<Channel>>; 5],
+}
+
+impl Unit {
+    /// Make the effect states of the channels this unit is assigned to.
+    pub fn prepare(&mut self, assign: &[bool; 5]) {
+        for (c, a) in self.channels.iter_mut().zip(assign) {
+            if *a && c.is_none() {
+                *c = Some(Box::new(Channel::new()));
+            }
+        }
+    }
 }
 
 /// Both FX units and the scratch buffers the decks are rendered into on their way through them.
 pub struct Rack {
     pub units: [Unit; 2],
-    pub scratch: [Vec<f32>; 2],
+    pub scratch: [Vec<f32>; 4],
     /// The interface has the FX panel in use (else the audio path skips the rack entirely).
     pub enabled: bool,
+    /// The master's Sound Color FX: effect, COLOR (0.5 = off), PARAM.
+    pub master_cfx: crate::cfx::Cfx,
+    pub master_cfx_set: (u8, f32, f32),
 }
 
 impl Rack {
     pub fn new() -> Rack {
-        let unit = || Unit { params: UnitParams::new(), channels: [Channel::new(), Channel::new(), Channel::new()] };
-        Rack { units: [unit(), unit()], scratch: [vec![0.0; 16384], vec![0.0; 16384]], enabled: false }
+        let unit = || Unit { params: UnitParams::new(), channels: [None, None, None, None, None] };
+        Rack { units: [unit(), unit()], scratch: std::array::from_fn(|_| vec![0.0; 16384]), enabled: false, master_cfx: crate::cfx::Cfx::new(), master_cfx_set: (0, 0.5, 0.5) }
     }
 
     /// Something is assigned and switched on (or held, or still fading): the effects must run.
     pub fn active(&self) -> bool {
-        self.enabled && self.units.iter().any(|u| u.params.assign.iter().any(|a| *a))
+        self.enabled && (self.units.iter().any(|u| u.params.assign.iter().any(|a| *a)) || (self.master_cfx_set.1 - 0.5).abs() > 0.011)
     }
 
     /// Run one channel's audio (stereo interleaved) through the units assigned to it.
-    /// `ch`: 0 = deck 1, 1 = deck 2, 2 = master.
+    /// `ch`: 0..3 = decks 1 to 4, 4 = the master.
     pub fn process(&mut self, ch: usize, buf: &mut [f32], rate: u32) {
+        if ch == MASTER {
+            let (k, c, p) = self.master_cfx_set;
+            self.master_cfx.process(k, c, p, buf, rate);
+        }
         for u in self.units.iter_mut() {
             if u.params.assign[ch] {
                 let p = u.params;
-                u.channels[ch].remember(buf);
-                u.channels[ch].process(&p, ch, buf, rate);
+                if let Some(c) = u.channels[ch].as_deref_mut() {
+                    c.remember(buf);
+                    c.process(&p, ch, buf, rate);
+                }
             }
         }
     }
@@ -646,9 +671,9 @@ mod tests {
 
     fn unit(kind: Kind, value: f32, level: f32) -> UnitParams {
         let mut p = UnitParams::new();
-        p.assign = [true, false, false];
+        p.assign = [true, false, false, false, false];
         p.slots[0] = SlotParams { kind, on: true, level, value };
-        p.bpm = [120.0; 3];
+        p.bpm = [120.0; 5];
         p
     }
 
@@ -656,11 +681,13 @@ mod tests {
     fn nothing_on_leaves_the_sound_untouched() {
         let mut rack = Rack::new();
         rack.enabled = true;
-        rack.units[0].params.assign = [true, true, true];
+        rack.units[0].params.assign = [true, true, false, false, true];
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let x = tone(4800, 440.0);
         let mut y = x.clone();
         rack.process(0, &mut y, 48000);
-        rack.process(2, &mut y, 48000);
+        rack.process(MASTER, &mut y, 48000);
         assert_eq!(x, y);
     }
 
@@ -672,6 +699,8 @@ mod tests {
             let mut rack = Rack::new();
             rack.enabled = true;
             rack.units[0].params = unit(kind, 1.0, 0.75);
+            let a = rack.units[0].params.assign;
+            rack.units[0].prepare(&a);
             let mut x = burst(48000 * 2);
             rack.process(0, &mut x, 48000);
             let at = |f: usize| rms(&x[f * 2..(f + 480) * 2]);
@@ -693,6 +722,8 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params = unit(Kind::Echo, 1.0, 0.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let x = tone(48000, 440.0);
         let mut y = x.clone();
         rack.process(0, &mut y, 48000);
@@ -700,6 +731,8 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params = unit(Kind::Echo, 1.0, 1.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let mut y = x.clone();
         rack.process(0, &mut y, 48000);
         // Before the first repeat arrives there is only the (removed) dry signal.
@@ -711,6 +744,8 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params = unit(Kind::Trans, 1.0, 1.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let mut x = tone(48000, 440.0);
         rack.process(0, &mut x, 48000);
         // 1 beat at 120 BPM = 24,000 frames: open for the first half, closed for the second.
@@ -724,12 +759,16 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         // History: a rising ramp, so a frame's value tells where it came from.
-        rack.units[0].params.assign = [true, false, false];
+        rack.units[0].params.assign = [true, false, false, false, false];
+            let a = rack.units[0].params.assign;
+            rack.units[0].prepare(&a);
         let mut hist: Vec<f32> = (0..48000).flat_map(|i| { let v = i as f32 / 48000.0; [v, v] }).collect();
         rack.process(0, &mut hist, 48000);
         // ROLL on, 1/4 beat = 6,000 frames. It catches what was heard up to the buffer in
         // which it is switched on (here one of 64 frames, silent), and repeats that.
         rack.units[0].params = unit(Kind::Roll, 0.25, 1.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let mut first = vec![0.0f32; 64 * 2];
         rack.process(0, &mut first, 48000);
         let mut x = vec![0.0f32; 20000 * 2];
@@ -749,6 +788,8 @@ mod tests {
             rack.enabled = true;
             let (t, i, _) = beat_table(kind);
             rack.units[0].params = unit(kind, t[i], 0.8);
+            let a = rack.units[0].params.assign;
+            rack.units[0].prepare(&a);
             let x = tone(48000 * 3, 330.0);
             let mut y = x.clone();
             rack.process(0, &mut y, 48000);
@@ -764,6 +805,8 @@ mod tests {
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params = unit(Kind::Trans, 1.0, 1.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
         let mut x = tone(20000, 440.0);
         rack.process(0, &mut x, 48000);
         rack.units[0].params.slots[0].on = false;
@@ -778,7 +821,9 @@ mod tests {
         for kind in 0..3u8 {
             let mut rack = Rack::new();
             rack.enabled = true;
-            rack.units[0].params.assign = [true, false, false];
+            rack.units[0].params.assign = [true, false, false, false, false];
+            let a = rack.units[0].params.assign;
+            rack.units[0].prepare(&a);
             let mut hist = tone(48000, 440.0);
             rack.process(0, &mut hist, 48000);
             rack.units[0].params.release = Some((kind, 1.0));

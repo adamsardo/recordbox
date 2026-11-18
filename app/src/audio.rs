@@ -273,6 +273,10 @@ pub struct PlayState {
     pub smooth: bool,
     /// Which deck this is (0 = deck 1), for the FX units' assignment.
     pub deck_no: u8,
+    /// Sound Color FX on this channel: the effect, its COLOR knob (0.5 = off) and PARAM.
+    pub cfx_kind: u8,
+    pub cfx_color: f32,
+    pub cfx_param: f32,
     /// Headphones CUE: how much of this deck (after its EQ, before its faders) goes to the
     /// headphones output; 0 when CUE is off.
     pub cue_gain: f32,
@@ -325,6 +329,9 @@ impl Default for PlayState {
             smooth: false,
             deck_no: 0,
             cue_gain: 0.0,
+            cfx_kind: 0,
+            cfx_color: 0.5,
+            cfx_param: 0.5,
             slip: false,
             slip_hold: false,
             slip_pos: None,
@@ -342,9 +349,9 @@ impl Default for PlayState {
 pub struct Player {
     /// The active deck's playback state.
     pub state: Arc<Mutex<PlayState>>,
-    /// The other deck's (2 Players layout); both are mixed to the output. The two are swapped
-    /// when the active deck changes, so `state` always belongs to the deck being operated.
-    pub other: Arc<Mutex<PlayState>>,
+    /// All four decks' playback states by deck number (0 = deck 1); all are mixed to the
+    /// output. `state` is the same object as `decks[active]`: it follows the active deck.
+    pub decks: [Arc<Mutex<PlayState>>; 4],
     /// Set by the stream when its device stops working (unplugged, switched off).
     pub lost: Arc<std::sync::atomic::AtomicBool>,
     _stream: Option<cpal::Stream>,
@@ -360,12 +367,12 @@ impl Player {
 
     /// Open the named output device (None: the system's default output).
     pub fn with_device(device: Option<&str>) -> Player {
-        let state = Arc::new(Mutex::new(PlayState::default()));
-        let other = Arc::new(Mutex::new(PlayState::default()));
+        let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
+        let state = decks[0].clone();
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match Self::open_stream([state.clone(), other.clone()], device, lost.clone()) {
-            Ok((s, rate)) => Player { state, other, lost, _stream: Some(s), device_rate: rate, error: None },
-            Err(e) => Player { state, other, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
+        match Self::open_stream(decks.clone(), device, lost.clone()) {
+            Ok((s, rate)) => Player { state, decks, lost, _stream: Some(s), device_rate: rate, error: None },
+            Err(e) => Player { state, decks, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
         }
     }
 
@@ -396,7 +403,7 @@ impl Player {
 
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
-        let (s, rate) = Self::open_stream([self.state.clone(), self.other.clone()], device, self.lost.clone())?;
+        let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone())?;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
         self._stream = Some(s);
         self.device_rate = rate;
@@ -404,7 +411,7 @@ impl Player {
         Ok(())
     }
 
-    fn open_stream(state: [Arc<Mutex<PlayState>>; 2], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
+    fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
@@ -867,24 +874,12 @@ struct DeckDsp {
     xf: Option<(f64, u32)>,
     /// Play / pause fade in use (0 silent .. 1 playing).
     gate: f32,
+    cfx: crate::cfx::Cfx,
 }
 
 impl DeckDsp {
     fn new() -> DeckDsp {
-        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0], eq3: crate::mixer::Eq3::new(), trim: 1.0, ch_fader: 1.0, expect: 0.0, xf: None, gate: 0.0 }
-    }
-}
-
-/// BEAT SYNC, on the audio thread where both decks' positions are read at the same instant:
-/// the speed correction that holds `follower` on the other deck's beat phase.
-fn update_sync(follower: &mut PlayState, master: &PlayState) {
-    follower.sync_bend = 0.0;
-    if !follower.sync_follow || !follower.playing || !master.playing || follower.search != 0.0 || master.search != 0.0 {
-        return;
-    }
-    let (Some(gf), Some(gm), Some(af), Some(am)) = (&follower.grid, &master.grid, &follower.audio, &master.audio) else { return };
-    if let Some(e) = phase_error(gf, follower.pos / af.sr as f64, gm, master.pos / am.sr as f64) {
-        follower.sync_bend = sync_correction(e);
+        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0], eq3: crate::mixer::Eq3::new(), trim: 1.0, ch_fader: 1.0, expect: 0.0, xf: None, gate: 0.0, cfx: crate::cfx::Cfx::new() }
     }
 }
 
@@ -920,9 +915,12 @@ fn lock_for_audio<T>(m: &Mutex<T>) -> Option<parking_lot::MutexGuard<'_, T>> {
 }
 
 /// The audio callback: both decks mixed into `out`.
-fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize, rate: u32) {
+fn render(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], channels: usize, rate: u32) {
     render_cue(states, out, &mut [], channels, rate)
 }
+
+/// The deck BEAT SYNC followers hold their phase to (0 = deck 1).
+pub static MASTER_DECK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// The master share of the headphones output (MIX and LEVEL; f32 bits).
 pub static HP_MASTER_GAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -933,18 +931,40 @@ pub static HP_CHANNEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 
 /// `render`, also filling the headphones output `cue` (stereo; empty = none): the cued decks
 /// before their faders plus the master mix, as the MIX knob balances them.
-fn render_cue(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
+fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32) {
     for v in cue.iter_mut() {
         *v = 0.0;
     }
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    let mut a = lock_for_audio(&states[0]);
-    let mut b = lock_for_audio(&states[1]);
-    if let (Some(a), Some(b)) = (a.as_deref_mut(), b.as_deref_mut()) {
-        update_sync(a, b);
-        update_sync(b, a);
+    // Up to four decks. BEAT SYNC: every follower is held on the master deck's beat phase,
+    // read here where all positions belong to the same instant.
+    let mut guards: [Option<parking_lot::MutexGuard<'_, PlayState>>; 4] = [None, None, None, None];
+    for (g, st) in guards.iter_mut().zip(states.iter()) {
+        *g = lock_for_audio(st);
+    }
+    let master = MASTER_DECK.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if master < states.len() {
+        // The master's part of the comparison, taken before the followers are changed.
+        let m = guards[master].as_deref().map(|m| (m.playing, m.search, m.grid.clone(), m.audio.as_ref().map(|a| a.sr), m.pos));
+        for (i, g) in guards.iter_mut().enumerate() {
+            if let Some(f) = g.as_deref_mut() {
+                f.sync_bend = 0.0;
+                if i == master {
+                    continue;
+                }
+                if let Some((true, search, Some(gm), Some(sr), pos)) = m.clone() {
+                    if f.sync_follow && f.playing && f.search == 0.0 && search == 0.0 {
+                        if let (Some(gf), Some(af)) = (&f.grid, &f.audio) {
+                            if let Some(e) = phase_error(gf, f.pos / af.sr as f64, &gm, pos / sr as f64) {
+                                f.sync_bend = sync_correction(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     // With Beat FX in use each deck is rendered on its own, sent through the FX units
     // assigned to it (after its faders, as in rekordbox), then mixed; the master's effects
@@ -953,8 +973,8 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], cue: &mut [f
     let mut rack = lock_for_audio(&crate::fx::RACK);
     match rack.as_deref_mut().and_then(|r| r.as_deref_mut()).filter(|r| r.active() && channels == 2) {
         Some(rack) => {
-            for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
-                let i = (s.deck_no as usize).min(1);
+            for s in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
+                let i = (s.deck_no as usize).min(3);
                 let mut buf = std::mem::take(&mut rack.scratch[i]);
                 if buf.len() < out.len() {
                     buf.resize(out.len(), 0.0);
@@ -967,16 +987,16 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], cue: &mut [f
                 }
                 rack.scratch[i] = buf;
             }
-            rack.process(2, out, rate);
+            rack.process(crate::fx::MASTER, out, rate);
         }
         None => {
-            for s in [a.as_deref_mut(), b.as_deref_mut()].into_iter().flatten() {
+            for s in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
                 render_deck_cue(s, out, cue, channels, rate);
             }
         }
     }
     drop(rack);
-    drop((a, b));
+    drop(guards);
     // The master section (Performance mixer): peak limiter, then the master level meter.
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(mut lim) = MASTER_LIMITER.try_lock() {
@@ -1102,6 +1122,7 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     }
     let iso_gain = if strip == 2 { [stem_iso_gain(s.eq_pos[0]), stem_iso_gain(s.eq_pos[1]), stem_iso_gain(s.eq_pos[2])] } else { s.eq_gain };
     let mut peak = s.peak;
+    let cfx_on = strip != 0;
     if !stretch {
         s.dsp.st.active = false;
     }
@@ -1195,6 +1216,13 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
             if strip == 1 {
                 l = s.dsp.eq3.run(0, l);
                 r = s.dsp.eq3.run(1, r);
+            }
+            // Sound Color FX: after the EQ, before the meter, the CUE feed and the faders.
+            if cfx_on {
+                let mut fr = [l, r];
+                s.dsp.cfx.process(s.cfx_kind, s.cfx_color, s.cfx_param, &mut fr, rate);
+                l = fr[0];
+                r = fr[1];
             }
             // The level meter's tap: after the EQ, before the faders (with the track's gain).
             peak[0] = peak[0].max((l * s.gain).abs());

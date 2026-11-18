@@ -10,8 +10,9 @@ use crate::ui_player::{lighten, tip};
 use eframe::egui;
 use egui::{pos2, vec2, Align2, Rect, Sense, Stroke, Ui};
 
-/// Height of the FX row.
-pub const FX_H: f32 = 52.0;
+/// Height of the FX panel: the Beat FX row (52 pt) and the CFX row (26 pt).
+pub const FX_H: f32 = 78.0;
+const BEAT_H: f32 = 52.0;
 
 /// One FX unit as the interface holds it.
 pub struct FxUi {
@@ -48,22 +49,22 @@ pub fn sync(app: &mut App) {
         return;
     }
     // Tempo per channel: each deck's own, and the master deck's for the master.
-    let act = app.px.active;
-    let mut bpm = [120.0f32; 3];
-    for n in 0..2u8 {
+    let mut bpm = [120.0f32; 5];
+    for n in 0..app.deck_count() {
         let b = app.with_deck(n, |a| if a.deck.track.is_some() { a.effective_bpm() } else { 0.0 });
         if b > 0.0 {
             bpm[n as usize] = b as f32;
         }
     }
-    let _ = act;
-    bpm[2] = bpm[app.px.master.min(1) as usize];
+    bpm[fx::MASTER] = bpm[app.px.master.min(3) as usize];
     let mut g = fx::RACK.lock();
     let rack = g.get_or_insert_with(|| Box::new(fx::Rack::new()));
     rack.enabled = true;
+    rack.master_cfx_set = (if app.px.cfx_user { app.px.cfx_kind } else { 0 }, app.px.cfx_color[4], app.px.cfx_param);
     for (u, ui) in rack.units.iter_mut().zip(app.px.fx.iter()) {
         let mut p = ui.params;
-        p.bpm = if ui.auto { bpm } else { [ui.tap_bpm; 3] };
+        p.bpm = if ui.auto { bpm } else { [ui.tap_bpm; 5] };
+        u.prepare(&p.assign);
         u.params = p;
     }
 }
@@ -79,6 +80,9 @@ fn small(ui: &mut Ui, r: Rect, id: impl std::hash::Hash, label: &str, lit: bool,
 /// The FX row: FX1 in the left half of `r`, FX2 in the right half.
 pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
+    let full = r;
+    let r = Rect::from_min_size(r.min, vec2(r.width(), BEAT_H - 1.0));
+    cfx_row(app, ui, Rect::from_min_max(pos2(full.min.x, full.min.y + BEAT_H), full.max));
     p.rect_filled(r, 0.0, hex(0x1E1E1E));
     p.rect_filled(Rect::from_min_max(pos2(r.center().x - 0.5, r.min.y), pos2(r.center().x + 0.5, r.max.y)), 0.0, BG);
     for u in 0..2usize {
@@ -88,7 +92,8 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         p.text(pos2(x0 + 11.0, y0 + 14.0), Align2::LEFT_CENTER, format!("FX{}", u + 1), bold(11.5), hex(0x8C8C8C));
         // Assign: decks 1 and 2 and the master (M alone, as in rekordbox: lighting M clears
         // the decks, lighting a deck clears M). Decks 3 and 4 and the sampler do not exist.
-        let labels = [("1", Some(0usize)), ("2", Some(1)), ("S", None), ("3", None), ("4", None), ("M", Some(2))];
+        let four = app.deck_count() == 4;
+        let labels = [("1", Some(0usize)), ("2", Some(1)), ("S", None), ("3", if four { Some(2) } else { None }), ("4", if four { Some(3) } else { None }), ("M", Some(fx::MASTER))];
         for (i, (label, ch)) in labels.iter().enumerate() {
             let br = at(76.0 + (i % 3) as f32 * 21.5, 10.0 + (i / 3) as f32 * 18.0, 18.0, 15.0);
             let lit = ch.map(|c| app.px.fx[u].params.assign[c]).unwrap_or(false);
@@ -98,11 +103,12 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     let a = &mut app.px.fx[u].params.assign;
                     a[*c] = !a[*c];
                     if a[*c] {
-                        if *c == 2 {
-                            a[0] = false;
-                            a[1] = false;
+                        if *c == fx::MASTER {
+                            for d in a.iter_mut().take(4) {
+                                *d = false;
+                            }
                         } else {
-                            a[2] = false;
+                            a[fx::MASTER] = false;
                         }
                     }
                 }
@@ -262,4 +268,93 @@ fn set_index(app: &mut App, u: usize, s: usize, idx: usize) {
     let table = fx::beat_table(f.params.slots[s].kind).0;
     f.idx[s] = idx.min(table.len() - 1);
     f.params.slots[s].value = table[f.idx[s]];
+}
+
+/// The CFX row (single mode): DEFAULT / USER, the effect, PARAM, and a COLOR knob per channel
+/// in rekordbox's order S, 3, 1, 2, 4, M. Measured on reference performance/06 at 1512 pt.
+fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
+    let p = ui.painter().clone();
+    p.rect_filled(r, 0.0, hex(0x1E1E1E));
+    let (x0, cy) = (r.min.x, r.center().y);
+    let k = r.width() / 1512.0;
+    let at = |x: f32, w: f32, h: f32| Rect::from_center_size(pos2(x0 + x * k, cy), vec2(w, h));
+    p.text(pos2(x0 + 11.0, cy), Align2::LEFT_CENTER, "CFX", bold(11.5), hex(0x8C8C8C));
+    // Mode: single (one effect for all channels) is what exists.
+    let multi = at(92.0, 22.0, 15.0);
+    p.rect_stroke(multi, 2.0, Stroke::new(1.0_f32, hex(0x646464)), egui::StrokeKind::Inside);
+    for d in -1..=1 {
+        p.circle_filled(multi.center() + vec2(d as f32 * 5.0, 0.0), 1.5, hex(0x8C8C8C));
+    }
+    let _ = ui.interact(multi, ui.id().with("cfxmulti"), Sense::hover()).on_hover_text("CFX multi-mode: an effect per channel.\n(Not built in recordbox yet.)");
+    let single = at(116.0, 22.0, 15.0);
+    p.rect_filled(single, 2.0, BLUE);
+    p.circle_filled(single.center(), 1.5, WHITE);
+    // DEFAULT (FILTER) / USER (the chosen effect).
+    let user = app.px.cfx_user;
+    let dr = at(218.5, 78.0, 15.0);
+    let dresp = ui.interact(dr, ui.id().with("cfxdefault"), Sense::click());
+    p.rect_filled(dr, 2.0, if !user { BLUE } else { hex(0x141414) });
+    if user {
+        p.rect_stroke(dr, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
+    }
+    p.text(dr.center(), Align2::CENTER_CENTER, "DEFAULT", caps(8.0), WHITE);
+    if dresp.clicked() {
+        app.px.cfx_user = false;
+    }
+    let ur = at(298.0, 78.0, 15.0);
+    let uresp = ui.interact(ur, ui.id().with("cfxuser"), Sense::click());
+    p.rect_filled(ur, 2.0, if user { BLUE } else { hex(0x141414) });
+    if !user {
+        p.rect_stroke(ur, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
+    }
+    p.text(ur.center(), Align2::CENTER_CENTER, "USER", caps(8.0), WHITE);
+    if uresp.clicked() {
+        app.px.cfx_user = true;
+    }
+    // The effect: FILTER in DEFAULT; in USER a click lists the nine types.
+    let kind = if user { app.px.cfx_kind } else { 0 };
+    let er = at(414.0, 68.0, 15.0);
+    let eresp = ui.interact(er, ui.id().with("cfxeffect"), Sense::click());
+    p.rect_filled(er, 2.0, hex(0x141414));
+    p.rect_stroke(er, 2.0, Stroke::new(1.0_f32, BLUE), egui::StrokeKind::Inside);
+    p.text(er.center(), Align2::CENTER_CENTER, crate::cfx::name(kind), caps(8.0), WHITE);
+    if user {
+        crate::ui_browser::dropdown(ui, &eresp, "cfxpop", |ui| {
+            for (name, k) in crate::cfx::LIST {
+                match k {
+                    Some(k) => {
+                        if ui.selectable_label(kind == k, name).clicked() {
+                            app.px.cfx_kind = k;
+                            ui.memory_mut(|m| m.close_popup());
+                        }
+                    }
+                    None => {
+                        ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
+                    }
+                }
+            }
+        });
+    }
+    p.text(pos2(x0 + 543.0 * k, cy), Align2::CENTER_CENTER, "PARAM", caps(8.0), WHITE);
+    if let Some(v) = crate::ui_perf::knob(ui, pos2(x0 + 580.0 * k, cy), "cfxparam", app.px.cfx_param, 0.5, BLUE) {
+        app.px.cfx_param = v;
+    }
+    // COLOR knobs. Decks 1 and 2 and the master are live.
+    let four = app.deck_count() == 4;
+    for (label, x, ch) in [("S", 647.0, None), ("3", 742.0, if four { Some(2usize) } else { None }), ("1", 836.0, Some(0)), ("2", 929.0, Some(1)), ("4", 1024.0, if four { Some(3) } else { None }), ("M", 1119.0, Some(4))] {
+        p.text(pos2(x0 + x * k, cy), Align2::CENTER_CENTER, label, caps(8.5), if ch.is_some() { WHITE } else { OFF });
+        let kc = pos2(x0 + (x + 27.0) * k, cy);
+        match ch {
+            Some(c) => {
+                let v = app.px.cfx_color[c];
+                if let Some(nv) = crate::ui_perf::knob(ui, kc, ("cfxcolor", c), v, 0.5, if (v - 0.5).abs() > 0.012 { BLUE } else { WHITE }) {
+                    // A small catch at the centre, so the knob comes to rest on "off".
+                    app.px.cfx_color[c] = if (nv - 0.5).abs() < 0.015 { 0.5 } else { nv };
+                }
+            }
+            None => {
+                p.circle_stroke(kc, 9.5, Stroke::new(2.5_f32, hex(0x282828)));
+            }
+        }
+    }
 }

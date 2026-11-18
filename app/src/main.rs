@@ -6,6 +6,7 @@ mod app;
 mod audio;
 mod backup;
 mod brand;
+mod cfx;
 mod browser_ext;
 mod db;
 mod demo;

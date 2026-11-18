@@ -46,6 +46,8 @@ impl App {
             ("FX1 ECHO on", pos2(193.0 + 111.0 + 40.0, t - fxh + 17.5), pos2(193.0 + 111.0 + 40.0, t - fxh + 17.5)),
             ("FX1 ECHO beat down", pos2(193.0 + 111.0 + 39.0, t - fxh + 36.5), pos2(193.0 + 111.0 + 39.0, t - fxh + 36.5)),
             ("FX1 RELEASE FX held", pos2(576.0, t - fxh + 17.5), pos2(576.0, t - fxh + 18.5)),
+            // The CFX row under the Beat FX row: turn deck 1's COLOR knob to the left (drag down).
+            ("CFX COLOR knob of deck 1 to the left", pos2(863.0, t - fxh + 65.0), pos2(863.0, t - fxh + 65.0 + 60.0)),
             // Quick clicks: press and release in the same frame (found by hand: sliders missed them).
             ("quick click on channel fader 2, half way", pos2(782.0, my + 194.5), pos2(782.0, my + 194.5)),
             ("quick click on the crossfader, a quarter in", pos2(733.5, by + 21.5), pos2(733.5, by + 21.5)),
@@ -90,14 +92,16 @@ impl App {
 
     fn perf_state(&self) -> String {
         let act = self.px.active as usize;
-        let (d1, s1) = if act == 0 { (&self.deck, &self.player.state) } else { (&self.px.other, &self.player.other) };
+        let (d1, s1) = (self.deck_of(0), &self.player.decks[0]);
         let s = s1.lock();
         let secs = s.audio.as_ref().map(|a| s.pos / a.sr as f64).unwrap_or(0.0);
         let hot: Vec<i32> = d1.cues.iter().filter(|c| c.kind == crate::model::CueKind::Hot).map(|c| c.slot).collect();
         let m = self.px.mix[0];
-        let q1 = if act == 0 { self.prefs.quantize } else { self.px.other_quantize };
+        let q1 = if act == 0 { self.prefs.quantize } else { self.px.parked_quantize[0] };
         format!(
-            "fx1 assign {:?} echo on {} value {} release {:?} | fader2 {:.2} volume {:.2} | playing {} pos {:.2}s loop {:?} slip {} bg {:?} hot {:?} range step {} Q {} MT {} key {:+} | fader {:.2} (gain {:.3}) high {:.2} (pos {:.2}) xfade {:.2} assign {} xf-gain {:.2} stem-iso {} | master deck {} beat-sync {} tempo {:.4}",
+            "cfx color {:?} (deck {:.2}) | fx1 assign {:?} echo on {} value {} release {:?} | fader2 {:.2} volume {:.2} | playing {} pos {:.2}s loop {:?} slip {} bg {:?} hot {:?} range step {} Q {} MT {} key {:+} | fader {:.2} (gain {:.3}) high {:.2} (pos {:.2}) xfade {:.2} assign {} xf-gain {:.2} stem-iso {} | master deck {} beat-sync {} tempo {:.4}",
+            self.px.cfx_color,
+            s.cfx_color,
             self.px.fx[0].params.assign,
             self.px.fx[0].params.slots[1].on,
             self.px.fx[0].params.slots[1].value,
