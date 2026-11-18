@@ -5,10 +5,13 @@
 //! performance/08-sampler.
 //!
 //! 16 slots per bank, four banks. A slot is loaded by dropping a track on it. The sequencer
-//! strip is drawn but not built yet.
+//! strip at the right of the bottom line works the engine's sequencer (`sequencer.rs`): its
+//! icons are drawn from the skin's SVGs (`sampler_recBtn`, `sampler_playBtn`, `metronome_*`,
+//! `LengthRoll_Arrow*`) and the beat counter from `p13015..17_beatcounter*.png`.
 
 use crate::app::*;
 use crate::sampler::{self, Clip, MODE_GATE, MODE_LOOP, PADS};
+use crate::sequencer::{Pattern, PATTERNS};
 use crate::theme::*;
 use crate::ui_player::{lighten, tip};
 use eframe::egui;
@@ -50,6 +53,34 @@ impl SlotPrefs {
     }
 }
 
+/// The sequencer, as it is kept between sessions. rekordbox keeps each saved pattern in a
+/// MIDI file (`Sequences/SEQ.<n>.mid`) and these settings in its setting file; here they sit
+/// with the sampler's other settings.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct SeqPrefs {
+    /// The eight pattern slots: what SAVE put there.
+    pub patterns: Vec<Option<Pattern>>,
+    pub current: u8,
+    pub metronome: bool,
+    /// rekordbox's MetronomeVolume: 0..2.
+    pub metronome_vol: u8,
+    /// rekordbox's SequencerQuantizeStatus (on) and SequencerQuantize (1..6 = 1/32 .. 1/1 note;
+    /// 4 = one beat). They take effect while the sampler's Q is on.
+    pub quantize_on: bool,
+    pub quantize: u8,
+}
+
+impl Default for SeqPrefs {
+    fn default() -> SeqPrefs {
+        SeqPrefs { patterns: vec![None; PATTERNS], current: 0, metronome: false, metronome_vol: 1, quantize_on: true, quantize: 4 }
+    }
+}
+
+/// rekordbox's click (read where rekordbox is installed; never changed). Without it the
+/// engine's own short click is used.
+const CLICK_FILE: &str = "/Applications/rekordbox 7/rekordbox.app/Contents/Resources/binary/Click Sound 01 Electronic.wav";
+
 /// rekordbox's defaults: GAIN 50, volume 100, 120 BPM, bank 1, Q and BPM SYNC off.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -63,11 +94,12 @@ pub struct SamplerPrefs {
     pub quantize: bool,
     pub sync: bool,
     pub cue: bool,
+    pub seq: SeqPrefs,
 }
 
 impl Default for SamplerPrefs {
     fn default() -> SamplerPrefs {
-        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false }
+        SamplerPrefs { slots: vec![None; 64], gain: 50.0, volume: 100.0, bpm: 120.0, bank: 0, quantize: false, sync: false, cue: false, seq: SeqPrefs::default() }
     }
 }
 
@@ -87,11 +119,18 @@ pub struct SamplerUi {
     bpm_hold: Option<(f32, f64, u32)>,
     /// The pad whose PLAY button the pointer holds.
     held: Option<usize>,
+    /// The sequencer's pad mode: 0 none, 1 MUTE, 2 ERASE (only while it plays).
+    pub seq_mode: u8,
 }
 
 impl SamplerUi {
+    /// The slot's mute button is on.
+    pub fn is_muted(&self, idx: usize) -> bool {
+        self.mute.get(idx).copied().unwrap_or(false)
+    }
+
     pub fn new() -> SamplerUi {
-        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None }
+        SamplerUi { restored: false, loading: Vec::new(), wave: vec![None; 64], edit: None, mute: vec![false; 64], pad_db: [-120.0; PADS], bpm_hold: None, held: None, seq_mode: 0 }
     }
 }
 
@@ -170,6 +209,24 @@ impl App {
                 self.prefs.sampler.slots.resize(64, None);
             }
             sampler::SAMPLER.lock().get_or_insert_with(|| Box::new(sampler::Engine::new()));
+            // The saved patterns, the pattern that was chosen, and the metronome's sound.
+            let sq = &mut self.prefs.sampler.seq;
+            sq.patterns.resize(PATTERNS, None);
+            sq.current = sq.current.min(PATTERNS as u8 - 1);
+            sq.metronome_vol = sq.metronome_vol.min(2);
+            sq.quantize = sq.quantize.clamp(1, 6);
+            let click = if std::path::Path::new(CLICK_FILE).exists() { crate::audio::decode_file(CLICK_FILE).ok().map(Arc::new) } else { None };
+            if let Some(e) = sampler::SAMPLER.lock().as_mut() {
+                for (i, p) in sq.patterns.iter().enumerate() {
+                    if let Some(p) = p {
+                        e.seq.set_pattern(i, p);
+                    }
+                }
+                e.seq.select(sq.current as usize, 0.0);
+                if let Some(c) = click {
+                    e.set_click(c);
+                }
+            }
             let saved: Vec<(usize, String)> = self.prefs.sampler.slots.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| (i, s.path.clone()))).collect();
             for (i, path) in saved {
                 // A file that is gone leaves its slot empty (rekordbox removes it the same way).
@@ -225,6 +282,11 @@ impl App {
             e.cue_gain = cue_gain;
             e.bpm = bpm.clamp(40.0, 499.0);
             e.quantize = sp.quantize;
+            // The record quantize follows Q (rekordbox: `SequencerQuantize` while Q is on and
+            // `SequencerQuantizeStatus` is 2, else off).
+            e.seq.rec_unit = if sp.quantize && sp.seq.quantize_on { crate::sequencer::quantize_unit(sp.seq.quantize) } else { 0.0 };
+            e.seq.metronome = sp.seq.metronome;
+            e.click_gain = sampler::METRONOME_GAINS[sp.seq.metronome_vol.min(2) as usize];
         }
     }
 
@@ -286,9 +348,13 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let slot_w = ((w - 80.0) / 8.0).floor().max(146.0);
     let dt = ui.input(|i| i.stable_dt).min(0.1);
 
-    // Levels and play positions of the visible bank, read once.
+    // Levels and play positions of the visible bank, and the sequencer, read once.
     let mut states = [(false, 0.0f32); PADS];
+    let mut sv = SeqView { playing: false, rec: false, pos: 0.0, beats: 4.0, bars: 1, cur: 0, reserved: None, dirty: false, has_events: false };
     if let Some(e) = sampler::SAMPLER.lock().as_mut() {
+        let q = &e.seq;
+        let cur = q.current();
+        sv = SeqView { playing: q.playing, rec: q.rec, pos: q.pos(), beats: q.beats(), bars: q.pattern(cur).bars, cur, reserved: q.reserved(), dirty: q.dirty(cur), has_events: !q.pattern(cur).events.is_empty() };
         for (pad, st) in states.iter_mut().enumerate() {
             *st = e.slot_state(pad, bank);
             let pk = e.take_pad_peak(pad);
@@ -296,8 +362,20 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
             app.px.sampler.pad_db[pad] = crate::mixer::meter_fall(app.px.sampler.pad_db[pad], db, dt);
         }
     }
-    if states.iter().any(|s| s.0) || app.px.sampler.pad_db.iter().any(|d| *d > -100.0) || !app.px.sampler.loading.is_empty() {
+    if states.iter().any(|s| s.0) || app.px.sampler.pad_db.iter().any(|d| *d > -100.0) || !app.px.sampler.loading.is_empty() || sv.playing {
         ui.ctx().request_repaint();
+    }
+    // MUTE and ERASE only last while the sequencer plays; EDIT is not available then.
+    if !sv.playing {
+        app.px.sampler.seq_mode = 0;
+    } else {
+        app.px.sampler.edit = None;
+    }
+    let seq_mode = app.px.sampler.seq_mode;
+    // A pattern change that waited for its bar has happened: remember the pattern.
+    if app.prefs.sampler.seq.current as usize != sv.cur {
+        app.prefs.sampler.seq.current = sv.cur as u8;
+        app.save_prefs();
     }
 
     // ---- the 16 slots: pads 1-4 and 5-8 on the left, 9-12 and 13-16 on the right
@@ -358,12 +436,18 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
             let c = pr.center();
             p.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -4.0), c + vec2(4.0, 0.0), c + vec2(-3.0, 4.0)], WHITE, Stroke::NONE));
             if crate::ui_player::press_fired(ui, &presp) {
+                // (With the sequencer's REC armed the engine starts the pattern on this press
+                // and records it.)
+                let mut loop_refused = false;
                 if let Some(e) = sampler::SAMPLER.lock().as_mut() {
                     if shift {
                         e.stop(pad, bank, true);
                     } else {
-                        e.launch(pad, bank, 1.0);
+                        loop_refused = e.launch(pad, bank, 1.0);
                     }
+                }
+                if loop_refused {
+                    app.toast_err("Loop record error. Loop sample can not be recorded as a sequence.");
                 }
                 app.px.sampler.held = Some(pad);
             }
@@ -379,19 +463,40 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         if let Some(s) = &slot {
             let editing = app.px.sampler.edit == Some(idx);
             let tools = hovered || editing;
+            // In the sequencer's MUTE mode every slot shows its mute button, in ERASE mode
+            // its erase button (where EDIT is otherwise).
+            let (mute_mode, erase_mode) = (seq_mode == 1, seq_mode == 2);
             // Title (from x 38), shortened while the slot's buttons show.
-            let tx = if tools { 74.0 } else { 38.0 };
-            let tw = sw - 53.0 - (tx - 38.0) - if tools { 34.0 } else { 0.0 };
+            let tx = if tools { 74.0 } else if mute_mode { 54.0 } else { 38.0 };
+            let tw = sw - 53.0 - (tx - 38.0) - if tools || erase_mode { 34.0 } else { 0.0 };
             let clip = p.with_clip_rect(s_at(tx, 24.0, tw.max(10.0), 14.0));
             clip.text(pos2(sx + tx, sy + 31.0), Align2::LEFT_CENTER, &s.name, FontId::proportional(10.5), WHITE);
-            if tools {
-                // Mute (16 x 14), Eject (16 x 14) and EDIT (30 x 14).
+            if tools || mute_mode {
+                // Mute (16 x 14).
                 let muted = app.px.sampler.mute[idx];
                 let mresp = box_button(ui, s_at(34.0, 23.0, 16.0, 14.0), ("smp_mute", idx), "M", muted);
                 if tip(mresp, app, "Mute").clicked() {
                     app.px.sampler.mute[idx] = !muted;
                     app.sampler_push_slot(idx);
                 }
+            }
+            if erase_mode {
+                // Erase (30 x 14, `samplerSlot_btnErase`): the slot's notes leave the pattern.
+                let er = s_at(sw - 47.0, 23.0, 30.0, 14.0);
+                let eresp = ui.interact(er, ui.id().with(("smp_seq_erase", idx)), Sense::click());
+                let down = eresp.is_pointer_button_down_on();
+                p.rect_filled(er, 2.0, if down { hex(0x007DE1) } else { OFF });
+                let (c, xc) = (er.center(), if down { WHITE } else { DIM });
+                p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], Stroke::new(1.4_f32, xc));
+                p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], Stroke::new(1.4_f32, xc));
+                if tip(eresp, app, "Erase button:\nErase Sampler sequence per Sampler Slot.").clicked() {
+                    if let Some(e) = sampler::SAMPLER.lock().as_mut() {
+                        e.seq.erase_track(pad);
+                    }
+                }
+            }
+            if tools {
+                // Eject (16 x 14) and EDIT (30 x 14).
                 let er = s_at(54.0, 23.0, 16.0, 14.0);
                 let eresp = box_button(ui, er, ("smp_eject", idx), "", false);
                 let c = er.center();
@@ -401,9 +506,15 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     app.sampler_eject(idx);
                     continue;
                 }
-                let dresp = box_button(ui, s_at(sw - 47.0, 23.0, 30.0, 14.0), ("smp_edit", idx), "EDIT", editing);
-                if tip(dresp, app, "EDIT").clicked() {
-                    app.px.sampler.edit = if editing { None } else { Some(idx) };
+                if !erase_mode {
+                    let dresp = box_button(ui, s_at(sw - 47.0, 23.0, 30.0, 14.0), ("smp_edit", idx), "EDIT", editing);
+                    if tip(dresp, app, "EDIT").clicked() {
+                        if sv.playing {
+                            app.toast_err("Invalid operation. EDIT is not available during sequencer playback/recording.");
+                        } else {
+                            app.px.sampler.edit = if editing { None } else { Some(idx) };
+                        }
+                    }
                 }
             }
         }
@@ -541,48 +652,8 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     }
     let _ = text_button(ui, master_r, "smp_master", "MASTER", false, false).on_hover_text("MASTER (the sampler as sync master): not built in recordbox yet.");
 
-    // ---- the sequencer strip (590 x 30 from the centre + 40): drawn, not built yet
-    let so = pos2(x0 + (w / 2.0).floor() + 40.0, y0 + h - 30.0);
-    let q_at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(so + vec2(x, y), vec2(w, h));
-    let not_yet = "Sequencer: not built in recordbox yet.";
-    let rec = q_at(0.0, 5.0, 20.0, 20.0);
-    p.rect_filled(rec, 2.0, hex(0x141414));
-    p.circle_filled(rec.center(), 5.5, hex(0xC81E1E));
-    p.circle_stroke(rec.center(), 7.0, Stroke::new(1.0_f32, hex(0x8C1414)));
-    let play = q_at(25.0, 5.0, 20.0, 20.0);
-    p.rect_filled(play, 2.0, hex(0x141414));
-    let pc = play.center();
-    p.add(egui::Shape::convex_polygon(vec![pc + vec2(-3.5, -5.0), pc + vec2(5.0, 0.0), pc + vec2(-3.5, 5.0)], WHITE, Stroke::NONE));
-    let save = q_at(50.0, 5.0, 46.0, 20.0);
-    p.rect_filled(save, 2.0, hex(0x0A0A0A));
-    p.text(save.center(), Align2::CENTER_CENTER, "SAVE", caps(9.5), hex(0x424242));
-    let dimc = hex(0x646464);
-    let al = q_at(105.0, 11.0, 5.0, 8.0);
-    p.add(egui::Shape::line(vec![al.right_top(), al.left_center(), al.right_bottom()], Stroke::new(1.0_f32, dimc)));
-    p.text(q_at(100.0, 5.0, 110.0, 20.0).center(), Align2::CENTER_CENTER, "PATTERN 1", caps(9.5), hex(0x424242));
-    let ar = q_at(200.0, 11.0, 5.0, 8.0);
-    p.add(egui::Shape::line(vec![ar.left_top(), ar.right_center(), ar.left_bottom()], Stroke::new(1.0_f32, dimc)));
-    let len = q_at(213.0, 6.0, 48.0, 18.0);
-    p.text(len.left_center() + vec2(2.0, 0.0), Align2::LEFT_CENTER, "1Bar", FontId::proportional(11.0), WHITE);
-    crate::icons_player::chevron_down(&p, len.right_center() - vec2(6.0, 0.0), 1.0, WHITE);
-    let beat = q_at(270.0, 10.0, 163.0, 12.0);
-    p.rect_filled(Rect::from_min_max(pos2(beat.min.x, beat.center().y - 2.5), pos2(beat.max.x, beat.center().y + 2.5)), 0.0, Color32::BLACK);
-    for k in 1..4 {
-        let x = beat.min.x + beat.width() * k as f32 / 4.0;
-        p.rect_filled(Rect::from_min_max(pos2(x, beat.center().y - 3.5), pos2(x + 1.0, beat.center().y - 2.5)), 0.0, hex(0x323232));
-    }
-    p.rect_filled(Rect::from_min_size(pos2(beat.min.x, beat.min.y), vec2(4.0, 12.0)), 1.0, WHITE);
-    p.text(q_at(445.0, 5.0, 46.0, 20.0).center(), Align2::CENTER_CENTER, "MUTE", caps(9.5), hex(0x424242));
-    p.text(q_at(488.0, 5.0, 46.0, 20.0).center(), Align2::CENTER_CENTER, "ERASE", caps(9.5), hex(0x424242));
-    // Metronome and its volume.
-    let mc = q_at(545.0, 4.0, 20.0, 20.0).center();
-    p.add(egui::Shape::closed_line(vec![mc + vec2(-3.0, 5.0), mc + vec2(-1.5, -5.0), mc + vec2(1.5, -5.0), mc + vec2(3.0, 5.0)], Stroke::new(1.0_f32, WHITE)));
-    p.line_segment([mc + vec2(0.0, 3.0), mc + vec2(3.5, -4.0)], Stroke::new(1.0_f32, WHITE));
-    let vc = q_at(570.0, 4.0, 20.0, 20.0).center();
-    for (k, hh) in [6.0f32, 10.0].iter().enumerate() {
-        p.rect_filled(Rect::from_center_size(vc + vec2(-2.0 + 4.0 * k as f32, 0.0), vec2(2.5, *hh)), 0.0, BLUE);
-    }
-    let _ = ui.interact(q_at(0.0, 0.0, 590.0, 30.0), ui.id().with("smp_seq"), Sense::hover()).on_hover_text(not_yet);
+    // ---- the sequencer strip (590 x 30 from the centre + 40)
+    sequencer_strip(app, ui, pos2(x0 + (w / 2.0).floor() + 40.0, y0 + h - 30.0), &sv, &mut sp, &mut changed);
 
     if changed {
         app.prefs.sampler = sp;
@@ -597,6 +668,223 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         let ex = if (pad & !4) == 11 { sr.min.x - sr.width() + 2.0 } else { sr.max.x };
         let er = Rect::from_min_size(pos2(ex, y0 + 6.0), vec2(slot_w - 2.0, 2.0 * SLOT_H - 4.0));
         edit_panel(app, ui, er, idx, slot_w);
+    }
+}
+
+/// The sequencer as the panel shows it.
+struct SeqView {
+    playing: bool,
+    rec: bool,
+    pos: f64,
+    beats: f64,
+    bars: u8,
+    cur: usize,
+    reserved: Option<usize>,
+    dirty: bool,
+    has_events: bool,
+}
+
+/// The box of REC and PLAY (20 x 20 in the reference, half a point in from the left). Gives
+/// back where the 19 x 18 icon of `sampler_recBtn_*.svg` / `sampler_playBtn_*.svg` starts:
+/// the reference shows it at its own size in the middle of the box.
+fn seq_box(p: &egui::Painter, r: Rect, fill: Color32) -> Pos2 {
+    let b = Rect::from_min_size(r.min + vec2(0.5, 0.0), vec2(20.0, 20.0));
+    p.rect_filled(b, 2.0, fill);
+    r.min + vec2(0.5, 1.0)
+}
+
+/// The sequencer strip: REC, PLAY, SAVE, the pattern with its arrows, the length, the beat
+/// counter, MUTE, ERASE, the metronome and its volume. `so`: its top left corner.
+fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut SamplerPrefs, changed: &mut bool) {
+    let p = ui.painter().clone();
+    let q_at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(so + vec2(x, y), vec2(w, h));
+    let with_engine = |f: &mut dyn FnMut(&mut sampler::Engine)| {
+        if let Some(e) = sampler::SAMPLER.lock().as_mut() {
+            f(e);
+        }
+    };
+    const RED: Color32 = hex(0xFF0000);
+
+    // REC: arms recording; it runs while the pattern plays (a pad starts it).
+    let rr = q_at(0.0, 5.0, 21.0, 20.0);
+    let resp = ui.interact(rr, ui.id().with("seq_rec"), Sense::click());
+    let o = seq_box(&p, rr, if sv.rec { RED } else { BTN });
+    let ic = if sv.rec { WHITE } else { RED };
+    p.circle_filled(o + vec2(9.5, 9.0), 3.0, ic);
+    p.circle_stroke(o + vec2(9.5, 9.0), 4.5, Stroke::new(1.0_f32, ic));
+    if tip(resp, app, "Sequence Rec:\nRec Sampler Sequence").clicked() {
+        with_engine(&mut |e| e.seq.set_rec(!sv.rec));
+    }
+
+    // PLAY: from the start of the pattern; again: stop (REC goes off, every pad stops).
+    let pr = q_at(25.0, 5.0, 21.0, 20.0);
+    let resp = ui.interact(pr, ui.id().with("seq_play"), Sense::click());
+    let o = seq_box(&p, pr, if sv.playing { BLUE } else { BTN });
+    p.add(egui::Shape::convex_polygon(vec![o + vec2(6.2, 5.7), o + vec2(12.2, 9.0), o + vec2(6.2, 12.3)], WHITE, Stroke::new(0.5_f32, WHITE)));
+    if tip(resp, app, "Sequence Play:\nPlay Sampler sequence").clicked() {
+        with_engine(&mut |e| if sv.playing { e.seq_stop() } else { e.seq_play() });
+    }
+
+    // SAVE: the pattern as it is goes into its slot (a paid function in rekordbox; free here).
+    let save = q_at(50.0, 5.0, 46.0, 20.0);
+    let resp = ui.interact(save, ui.id().with("seq_save"), Sense::click());
+    p.rect_filled(save, 2.0, hex(0x0A0A0A));
+    p.text(save.center(), Align2::CENTER_CENTER, "SAVE", caps(10.5), if !sv.dirty { hex(0x303030) } else if resp.hovered() { WHITE } else { hex(0x8C8C8C) });
+    if tip(resp, app, "Sequence Save:\nSave Sampler sequence").clicked() && sv.dirty {
+        let mut saved = None;
+        with_engine(&mut |e| {
+            saved = Some(e.seq.pattern(sv.cur).clone());
+            e.seq.mark_saved(sv.cur);
+        });
+        if let Some(mut pat) = saved {
+            pat.events.iter_mut().for_each(|ev| ev.fresh = false);
+            pat.events.shrink_to_fit();
+            sp.seq.patterns.resize(PATTERNS, None);
+            sp.seq.patterns[sv.cur] = Some(pat);
+            *changed = true;
+        }
+    }
+
+    // The pattern between its arrows (`LengthRoll_ArrowL/R.svg`, 5 x 8, rgb 150).
+    let arrow = hex(0x969696);
+    for (dir, x, id) in [(-1i32, 105.0f32, "seq_prev"), (1, 200.0, "seq_next")] {
+        let ar = q_at(x, 11.0, 5.0, 8.0);
+        let resp = ui.interact(ar.expand2(vec2(4.0, 6.0)), ui.id().with(id), Sense::click());
+        let col = if resp.hovered() { WHITE } else { arrow };
+        let (tipx, backx) = if dir < 0 { (ar.min.x, ar.max.x) } else { (ar.max.x, ar.min.x) };
+        let s = if dir < 0 { 1.0 } else { -1.0 };
+        // The chevron of the SVG: tip at (0, 4.07), arms to the far edge, 1.8 thick.
+        for arm in [-1.0f32, 1.0] {
+            p.add(egui::Shape::convex_polygon(vec![pos2(tipx, ar.center().y), pos2(backx, ar.center().y + 4.0 * arm), pos2(backx, ar.center().y + 2.2 * arm), pos2(tipx + 2.3 * s, ar.center().y)], col, Stroke::NONE));
+        }
+        if tip(resp, app, "Select sequence to Rec/Play").clicked() {
+            let from = sv.reserved.unwrap_or(sv.cur) as i32;
+            let to = (from + dir).rem_euclid(PATTERNS as i32) as usize;
+            // Stopped: at once. Playing: on the next bar.
+            with_engine(&mut |e| e.seq.select(to, 4.0));
+        }
+    }
+    let slot_r = q_at(112.0, 5.0, 86.0, 20.0);
+    let resp = ui.interact(slot_r, ui.id().with("seq_slot"), Sense::hover());
+    let slot_hover = resp.hovered();
+    let saved_slot = sp.seq.patterns.get(sv.cur).is_some_and(|x| x.is_some());
+    // White: saved. Grey: not saved. Grey with a red dot: recorded, not saved yet.
+    let temp = sv.dirty && sv.has_events;
+    let blink = (ui.input(|i| i.time) / 0.3) as i64 % 2 == 0;
+    let (name_no, name_col) = match sv.reserved {
+        // A change waiting for its bar: the pattern to come blinks.
+        Some(n) => (n, if blink { WHITE } else { hex(0x505050) }),
+        None => (sv.cur, if saved_slot && !sv.dirty { WHITE } else { hex(0x505050) }),
+    };
+    p.text(q_at(100.0, 4.5, 110.0, 20.0).center(), Align2::CENTER_CENTER, format!("PATTERN {}", name_no + 1), caps(9.0), name_col);
+    if temp && sv.reserved.is_none() {
+        p.circle_filled(so + vec2(120.0, 15.0), 4.0, RED);
+    }
+    let _ = tip(resp, app, "Sequence Slot:\nIndicates how sequence is saved:\n- Sequence name in white indicates the sequence is saved.\n- Gray out sequence name indicates the sequence is not saved.\n- Gray out sequence name with red circle indicates the sequence is temporarily recorded.\nUp to eight sequences can be saved.");
+    // DELETE (`p13008_delete_1nrm.png`, 12 x 12) shows while the pointer is over the pattern.
+    if slot_hover && (saved_slot || sv.has_events || sv.dirty) && sv.reserved.is_none() {
+        let dr = q_at(185.0, 9.0, 12.0, 12.0);
+        let dresp = ui.interact(dr, ui.id().with("seq_delete"), Sense::click());
+        let col = if dresp.hovered() { WHITE } else { hex(0xA0A0A0) };
+        let c = dr.center();
+        p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], Stroke::new(1.3_f32, col));
+        p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], Stroke::new(1.3_f32, col));
+        if tip(dresp, app, "Delete selected sequence").clicked() {
+            with_engine(&mut |e| e.seq.clear(sv.cur));
+            sp.seq.patterns.resize(PATTERNS, None);
+            sp.seq.patterns[sv.cur] = None;
+            *changed = true;
+        }
+    }
+
+    // Length: 1Bar / 2Bars / 4Bars.
+    let len = q_at(213.0, 6.0, 48.0, 18.0);
+    let resp = ui.interact(len, ui.id().with("seq_len"), Sense::click());
+    let bars_label = |b: u8| if b == 1 { "1Bar".to_string() } else { format!("{b}Bars") };
+    p.text(len.left_center() + vec2(5.5, -0.5), Align2::LEFT_CENTER, bars_label(sv.bars), FontId::proportional(11.0), WHITE);
+    crate::icons_player::chevron_down(&p, len.right_center() + vec2(-4.0, 0.5), 1.0, WHITE);
+    let mut new_bars = None;
+    crate::ui_browser::dropdown(ui, &resp, "seq_len_pop", |ui| {
+        ui.set_min_width(70.0);
+        for b in [1u8, 2, 4] {
+            if ui.selectable_label(sv.bars == b, bars_label(b)).clicked() {
+                new_bars = Some(b);
+                ui.memory_mut(|m| m.close_popup());
+            }
+        }
+    });
+    let _ = tip(resp, app, "Change sequence length");
+    if let Some(b) = new_bars {
+        with_engine(&mut |e| e.seq.set_bars(b));
+    }
+
+    // Beat counter (163 x 12): a black bar with a mark per beat, and the play position.
+    let beat = q_at(270.0, 10.0, 163.0, 12.0);
+    let resp = ui.interact(beat, ui.id().with("seq_beat"), Sense::hover());
+    p.rect_filled(Rect::from_min_size(beat.min + vec2(0.0, 3.0), vec2(163.0, 6.0)), 0.0, Color32::BLACK);
+    let marks = sv.bars.max(1) as usize * 4;
+    for k in 0..=marks {
+        // Every bar line (1 Bar: every second beat) is the brighter mark.
+        let strong = if sv.bars == 1 { k % 2 == 0 } else { k % 4 == 0 };
+        let x = beat.min.x + 1.0 + 160.0 * k as f32 / marks as f32;
+        p.rect_filled(Rect::from_min_size(pos2(x, beat.min.y + 4.0), vec2(1.0, 4.0)), 0.0, if strong { hex(0x808080) } else { hex(0x404040) });
+    }
+    // The marker (`p13019_plyposition`, drawn at twice its size: 8 x 12): white, red while
+    // recording.
+    let frac = (sv.pos / sv.beats.max(1.0)).clamp(0.0, 1.0) as f32;
+    let mk = Rect::from_min_size(pos2(beat.min.x + frac * (163.0 - 8.0), beat.min.y), vec2(8.0, 12.0));
+    p.rect_filled(mk, 1.5, Color32::BLACK);
+    p.rect_filled(mk.shrink2(vec2(2.0, 1.5)), 0.0, if sv.rec && sv.playing { hex(0xFE0000) } else { WHITE });
+    let _ = tip(resp, app, "Beat Counter:\nIndicates sequence length and beats.\nDuring recording or playback of a sequence, a marker that indicates playback position is moving.");
+
+    // MUTE and ERASE: pad modes of the sequencer, one at a time, only while it plays.
+    for (mode, x, label, id, hint) in [
+        (1u8, 445.0f32, "MUTE", "seq_mute", "Sequence Mute mode:\nMute Sampler sequence per Sampler Slot"),
+        (2, 488.0, "ERASE", "seq_erase", "Sequence Erase mode:\nErase Sampler sequence per Sampler Slot"),
+    ] {
+        let on = app.px.sampler.seq_mode == mode;
+        // (Arial 12 in rekordbox: a little larger than Q and BPM SYNC.)
+        let mr = q_at(x, 5.0, 46.0, 20.0);
+        let resp = ui.interact(mr, ui.id().with(id), Sense::click());
+        let col = if !sv.playing { hex(0x484848) } else if on { BLUE } else if resp.hovered() { WHITE } else { hex(0x8C8C8C) };
+        p.text(mr.center(), Align2::CENTER_CENTER, label, caps(10.5), col);
+        if tip(resp, app, hint).clicked() {
+            if sv.playing {
+                app.px.sampler.seq_mode = if on { 0 } else { mode };
+            } else {
+                app.toast_err("Invalid operation. Available during sequencer playback/recording.");
+            }
+        }
+    }
+
+    // Metronome (`metronome_off/on.svg`, 19 x 18) and its volume (`metronome_vol1..3.svg`).
+    let mr = q_at(545.0, 4.0, 19.0, 18.0);
+    let resp = ui.interact(mr, ui.id().with("seq_metro"), Sense::click());
+    p.rect_filled(Rect::from_min_size(mr.min + vec2(0.5, 0.0), vec2(18.0, 18.0)), 2.0, if sp.seq.metronome { BLUE } else { BTN });
+    let m = |x: f32, y: f32| mr.min + vec2(x, y);
+    let poly = |pts: Vec<Pos2>| {
+        p.add(egui::Shape::convex_polygon(pts, WHITE, Stroke::NONE));
+    };
+    poly(vec![m(5.95, 11.0), m(13.05, 11.0), m(13.5, 14.0), m(5.5, 14.0)]);
+    poly(vec![m(7.0, 4.0), m(12.0, 4.0), m(11.14, 5.0), m(7.86, 5.0)]);
+    poly(vec![m(12.0, 4.0), m(13.05, 11.0), m(12.0, 11.0), m(11.14, 5.0)]);
+    poly(vec![m(6.35, 8.4), m(7.17, 9.8), m(7.0, 11.0), m(5.95, 11.0)]);
+    poly(vec![m(5.3, 4.5), m(6.5, 4.5), m(10.3, 11.0), m(9.0, 11.0)]);
+    p.rect_filled(Rect::from_min_size(m(8.5, 6.0), vec2(2.0, 1.0)), 0.0, WHITE);
+    p.rect_filled(Rect::from_min_size(m(8.5, 8.0), vec2(2.0, 1.0)), 0.0, WHITE);
+    if tip(resp, app, "Metronome On/Off").clicked() {
+        sp.seq.metronome = !sp.seq.metronome;
+        *changed = true;
+    }
+    let vr = q_at(570.0, 4.0, 19.0, 18.0);
+    let resp = ui.interact(vr, ui.id().with("seq_metro_vol"), Sense::click());
+    let vol = sp.seq.metronome_vol.min(2);
+    for (k, (x, y0, y1)) in [(3.0f32, 5.0f32, 13.0f32), (8.0, 3.0, 15.0), (13.0, 1.0, 17.0)].into_iter().enumerate() {
+        p.rect_filled(Rect::from_min_max(vr.min + vec2(x, y0), vr.min + vec2(x + 3.0, y1)), 0.0, if k as u8 <= vol { BLUE } else { OFF });
+    }
+    if tip(resp, app, "Metronome Volume").clicked() {
+        sp.seq.metronome_vol = (vol + 1) % 3;
+        *changed = true;
     }
 }
 
@@ -692,5 +980,39 @@ fn edit_panel(app: &mut App, ui: &mut Ui, er: Rect, idx: usize, slot_w: f32) {
     if changed {
         app.prefs.sampler.slots[idx] = Some(s);
         app.sampler_push_slot(idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (Where rekordbox is not installed there is nothing to check: the engine's own click
+    /// is used.)
+    #[test]
+    fn the_metronome_reads_rekordboxs_click_when_it_is_installed() {
+        if !std::path::Path::new(CLICK_FILE).exists() {
+            return;
+        }
+        let d = crate::audio::decode_file(CLICK_FILE).expect("the click file decodes");
+        assert_eq!(d.sr, 44100);
+        assert!(d.frames() > 1000 && d.frames() < 44100, "{}", d.frames());
+        assert!(d.samples.iter().any(|v| v.abs() > 0.1));
+    }
+
+    #[test]
+    fn sequencer_settings_survive_a_round_trip_and_old_settings_still_load() {
+        let mut sp = SamplerPrefs::default();
+        sp.seq.patterns[2] = Some(Pattern { bars: 4, events: vec![crate::sequencer::Event { t: 1.5, pad: 3, bank: 1, on: true, vel: 0.5, fresh: true }] });
+        sp.seq.current = 2;
+        sp.seq.metronome = true;
+        sp.seq.metronome_vol = 2;
+        let back: SamplerPrefs = serde_json::from_str(&serde_json::to_string(&sp).unwrap()).unwrap();
+        let p = back.seq.patterns[2].as_ref().unwrap();
+        assert_eq!((p.bars, p.events.len(), p.events[0].t, p.events[0].pad, p.events[0].bank, p.events[0].fresh), (4, 1, 1.5, 3, 1, false));
+        assert_eq!((back.seq.current, back.seq.metronome, back.seq.metronome_vol), (2, true, 2));
+        // Settings written before the sequencer existed: rekordbox's defaults.
+        let old: SamplerPrefs = serde_json::from_str(r#"{"gain":50.0,"bpm":128.0}"#).unwrap();
+        assert_eq!((old.seq.patterns.len(), old.seq.metronome, old.seq.metronome_vol, old.seq.quantize_on, old.seq.quantize, old.bpm), (PATTERNS, false, 1, true, 4, 128.0));
     }
 }

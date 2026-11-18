@@ -62,6 +62,8 @@ impl App {
         let smp = self.prefs.perf_sampler && !four;
         let steps = if smp {
             let py = by - 1.5 + 43.0;
+            let (sx, sy) = (796.0, py + 88.0);
+            let s10 = 1512.0 - 4.0 - 3.0 * 179.0;
             let p = |x: f32, y: f32| (pos2(x, y), pos2(x, y));
             let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
             vec![
@@ -78,6 +80,41 @@ impl App {
                 ("SMP volume fader down", pos2(775.0, py + 22.0), pos2(775.0, py + 42.0)),
                 st("SMP BANK 2", p(82.0, py + 104.0)),
                 st("SMP BANK 1", p(54.0, py + 104.0)),
+                // The sequencer strip (from x 796, the panel's last 30 pt). Slot 1 is a gate
+                // sample by now, slot 2 a loop, slot 10 a one-shot; Q is on.
+                st("SEQ REC (armed, nothing plays yet)", p(sx + 10.0, sy + 15.0)),
+                st("SEQ pad 1 with REC armed (starts the pattern; gate: on and off)", p(23.0, py + 34.0)),
+                st("SEQ pad 10 (one-shot)", p(s10 + 19.0, py + 34.0)),
+                st("SEQ pad 2 (loop: plays, not recorded)", p(183.0 + 19.0, py + 34.0)),
+                st("SEQ REC off (the pattern keeps playing)", p(sx + 10.0, sy + 15.0)),
+                st("SEQ metronome on", p(sx + 554.0, sy + 13.0)),
+                st("SEQ metronome volume (1 -> 2)", p(sx + 579.0, sy + 13.0)),
+                st("SEQ length pull-down", p(sx + 237.0, sy + 15.0)),
+                st("SEQ length 2Bars", p(sx + 213.0 + 25.0, sy + 24.0 + 36.0)),
+                st("SEQ SAVE", p(sx + 73.0, sy + 15.0)),
+                st("SEQ MUTE mode", p(sx + 468.0, sy + 15.0)),
+                st("SEQ mute button of slot 10 (shown by the mode)", p(s10 + 42.0, py + 34.0)),
+                st("SEQ ERASE mode", p(sx + 511.0, sy + 15.0)),
+                st("SEQ erase button of slot 1", p(4.0 + 179.0 - 32.0, py + 34.0)),
+                st("SEQ next pattern (waits for the bar)", p(sx + 202.5, sy + 15.0)),
+                st("wait 1", p(sx + 300.0, sy - 40.0)),
+                st("wait 2", p(sx + 300.0, sy - 40.0)),
+                st("wait 3", p(sx + 300.0, sy - 40.0)),
+                st("wait 4", p(sx + 300.0, sy - 40.0)),
+                st("wait 5", p(sx + 300.0, sy - 40.0)),
+                st("wait 6: pattern 2 plays (empty)", p(sx + 300.0, sy - 40.0)),
+                st("SEQ PLAY (stop: REC and the modes go off)", p(sx + 35.0, sy + 15.0)),
+                st("SEQ MUTE while stopped (refused)", p(sx + 468.0, sy + 15.0)),
+                st("SEQ previous pattern (stopped: at once)", p(sx + 107.5, sy + 15.0)),
+                st("SEQ PLAY (pattern 1 from its start)", p(sx + 35.0, sy + 15.0)),
+                st("wait 7", p(sx + 300.0, sy - 40.0)),
+                st("wait 8", p(sx + 300.0, sy - 40.0)),
+                st("wait 9", p(sx + 300.0, sy - 40.0)),
+                st("wait 10", p(sx + 300.0, sy - 40.0)),
+                st("wait 11", p(sx + 300.0, sy - 40.0)),
+                st("wait 12", p(sx + 300.0, sy - 40.0)),
+                st("wait 13", p(sx + 300.0, sy - 40.0)),
+                st("wait 14: pattern 1 has been round", p(sx + 300.0, sy - 40.0)),
                 st("SMP eject slot 10", p(1512.0 - 4.0 - 3.0 * 179.0 + 62.0, py + 34.0)),
             ]
         } else if four {
@@ -108,6 +145,24 @@ impl App {
         let i = ((frame - START) / SPAN) as usize;
         let f = (frame - START) % SPAN;
         let Some((name, a, b)) = steps.get(i).copied() else { return };
+        if smp && frame == START {
+            // Nothing is heard during the run (the samples and the metronome still run).
+            if let Some(e) = crate::sampler::SAMPLER.lock().as_mut() {
+                e.silent = true;
+            }
+        }
+        if name.starts_with("wait") {
+            // (The run is not tied to the screen's refresh: a wait step is made to last about
+            // 0.65 s, so that the pattern, which runs in real time, gets somewhere.)
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            if f == 0 {
+                raw.events.push(egui::Event::PointerMoved(a));
+            }
+            if f == 30 {
+                eprintln!("perftest: {name}: {}", self.perf_state_sampler());
+            }
+            return;
+        }
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         match f {
             0 => raw.events.push(egui::Event::PointerMoved(a)),
@@ -146,7 +201,45 @@ impl App {
         };
         let loaded: Vec<usize> = sp.slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| i + 1).collect();
         let s1 = sp.slots[0].as_ref().map(|s| (s.looped, s.gate));
-        format!("loaded {loaded:?} | playing pads {playing:?} | slot 1 (loop, gate) {s1:?} | bank {} Q {} sync {} bpm {:.2} volume {} gain {}", sp.bank + 1, sp.quantize, sp.sync, sp.bpm, sp.volume, sp.gain)
+        // The sequencer: transport, the current pattern's notes as (beat, pad, on), what is
+        // saved, and how much of it has been played since PLAY.
+        let seq = match crate::sampler::SAMPLER.lock().as_ref() {
+            Some(e) => {
+                let q = &e.seq;
+                let pat = q.pattern(q.current());
+                let notes: Vec<String> = pat.events.iter().map(|ev| format!("{:.2}:{}{}", ev.t, ev.pad + 1, if ev.on { "" } else { "off" })).collect();
+                let muted: Vec<usize> = (0..16).filter(|pad| self.px.sampler.is_muted(sp.bank as usize * 16 + pad)).map(|pad| pad + 1).collect();
+                format!(
+                    "playing {} rec {} pos {:.2}/{} pattern {} (reserved {:?}) bars {} notes [{}] dirty {} passes {} fired {} | muted {muted:?} mode {}",
+                    q.playing,
+                    q.rec,
+                    q.pos(),
+                    q.beats(),
+                    q.current() + 1,
+                    q.reserved().map(|n| n + 1),
+                    pat.bars,
+                    notes.join(" "),
+                    q.dirty(q.current()),
+                    q.passes,
+                    q.fired,
+                    self.px.sampler.seq_mode
+                )
+            }
+            None => String::new(),
+        };
+        let saved: Vec<String> = sp.seq.patterns.iter().enumerate().filter_map(|(i, p)| p.as_ref().map(|p| format!("{}: {} bars, {} notes", i + 1, p.bars, p.events.len()))).collect();
+        format!(
+            "loaded {loaded:?} | playing pads {playing:?} | slot 1 (loop, gate) {s1:?} | bank {} Q {} sync {} bpm {:.2} volume {} gain {} | SEQ {seq} | saved {saved:?} current {} metronome {} vol {}",
+            sp.bank + 1,
+            sp.quantize,
+            sp.sync,
+            sp.bpm,
+            sp.volume,
+            sp.gain,
+            sp.seq.current + 1,
+            sp.seq.metronome,
+            sp.seq.metronome_vol
+        )
     }
 
     fn perf_state4(&self) -> String {
