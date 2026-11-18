@@ -46,13 +46,13 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
         6 => &["STEMS"],
-        7 => &["Mixer"],
+        7 => &["Deck", "Mixer"],
         _ => &["Database", "Browse", "Others"],
     }
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 103] = [
+const SETTINGS: [(u8, usize, &str); 105] = [
     (0, 0, "Language"),
     (0, 0, "Show Tooltips"),
     (0, 0, "Font Size"),
@@ -141,9 +141,11 @@ const SETTINGS: [(u8, usize, &str); 103] = [
     (4, 1, "Color comments"),
     (4, 1, "Customize Color Comments"),
     (4, 2, "rekordbox Library"),
-    (7, 0, "EQ"),
-    (7, 0, "EQ/ISOLATOR"),
-    (7, 0, "Channel Fader Curve"),
+    (7, 0, "Eject/Load Lock"),
+    (7, 0, "Instant Doubles"),
+    (7, 1, "EQ"),
+    (7, 1, "EQ/ISOLATOR"),
+    (7, 1, "Channel Fader Curve"),
     (6, 0, "Enable the STEMS Function"),
     (6, 0, "STEMS mode"),
     (6, 0, "STEMS Analysis Process"),
@@ -426,6 +428,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 3 => page_keyboard(app, ui, sub_tab),
                 5 => page_audio(app, ui, sub_tab),
                 6 => page_stems(app, ui),
+                7 if sub_tab == 0 => page_deck(app, ui),
                 7 => page_mixer(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }
@@ -1589,6 +1592,29 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
                 });
             });
         }
+    }
+}
+
+/// Controller > Deck: rekordbox's Eject/Load Lock and the Instant Doubles switch of its Load
+/// card (labels and defaults as in 7.2.19).
+fn page_deck(app: &mut App, ui: &mut Ui) {
+    let mut changed = false;
+    card(ui, "Eject/Load Lock", |ui| {
+        if radio(ui, app.prefs.deck_load_lock, "Lock") {
+            app.prefs.deck_load_lock = true;
+            changed = true;
+        }
+        if radio(ui, !app.prefs.deck_load_lock, "Unlock") {
+            app.prefs.deck_load_lock = false;
+            changed = true;
+        }
+    });
+    card(ui, "Load", |ui| {
+        changed |= toggle(ui, &mut app.prefs.instant_doubles, "Instant Doubles");
+        note(ui, "Loading the track that is already on the other deck takes over its position, tempo and play state.");
+    });
+    if changed {
+        app.save_prefs();
     }
 }
 

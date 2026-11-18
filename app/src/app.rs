@@ -209,6 +209,11 @@ pub struct Prefs {
     pub stem_model: Option<String>,
     /// Download the chosen model in the background at launch.
     pub stems_auto_download: bool,
+    /// Preferences > Controller > Deck (Performance mode). Eject/Load Lock: a playing deck
+    /// refuses a new track. Instant Doubles: loading the track that is on the other deck
+    /// takes over its position, tempo and play state. Both off by default, as in rekordbox.
+    pub deck_load_lock: bool,
+    pub instant_doubles: bool,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
@@ -701,6 +706,8 @@ impl Default for Prefs {
             usb_browse: Default::default(),
             stem_model: None,
             stems_auto_download: true,
+            deck_load_lock: false,
+            instant_doubles: false,
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -3155,6 +3162,11 @@ impl App {
 
     /// Load a track into the active deck.
     pub fn load_track_here(&mut self, id: i64) {
+        // Eject/Load Lock (Performance): not while the deck plays, unless it stands at the end.
+        if self.performance() && self.prefs.deck_load_lock && self.playing() && self.pos() < self.deck.duration - 0.05 {
+            self.toast_err("Load Lock. Not available during playback.");
+            return;
+        }
         let Some(t) = self.track(id).cloned() else { return };
         if t.missing {
             self.toast_err(format!("The file for \"{}\" cannot be found.", t.display_title()));
@@ -3244,6 +3256,7 @@ impl App {
                     self.deck.phrases = None;
                     self.start_deck_phrases(a.clone());
                     self.start_deck_vocal(a.clone());
+                    self.instant_double();
                 }
                 Err(e) => {
                     if let Some((old, pos, gain)) = self.deck_backup.take() {
@@ -3359,6 +3372,15 @@ impl App {
             return;
         }
         if let Some(c) = self.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned() {
+            {
+                // SLIP on a playing deck: the hot cue sounds while the pad is held and the
+                // track carries on underneath.
+                let mut st = self.player.state.lock();
+                if st.slip && st.playing && st.slip_pos.is_none() {
+                    st.slip_pos = Some(st.pos);
+                }
+                st.slip_hold = st.slip && st.playing;
+            }
             self.seek(c.start);
             if let Some(e) = c.end.filter(|e| *e > c.start) {
                 self.player.state.lock().loop_range = Some((c.start, e));
@@ -3384,6 +3406,8 @@ impl App {
         }
     }
     pub fn hot_cue_up(&mut self) {
+        // SLIP: letting go of the pad returns to where the track would have been.
+        self.player.state.lock().slip_hold = false;
         if let Some(start) = self.deck.hot_preview.take() {
             self.set_playing(false);
             self.player.state.lock().loop_range = None;

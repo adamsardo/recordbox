@@ -266,6 +266,17 @@ pub struct PlayState {
     pub ch_fader: f32,
     /// Highest level since the meter last read it, after the EQ and before the fader (L, R).
     pub peak: [f32; 2],
+    /// Fade in and out over a few milliseconds at play and pause, and cross-fade over a jump
+    /// of the position (a cue, a hot cue, a beat jump, a click on the overview), so that none
+    /// of them clicks. The app always sets it; off by default so that tests of the plain
+    /// signal path see every sample.
+    pub smooth: bool,
+    /// SLIP: while a loop runs or a hot cue is held (`slip_hold`), the position the track
+    /// would have reached keeps moving in the background (`slip_pos`, source frames), and
+    /// playback returns to it when the loop ends or the pad is released.
+    pub slip: bool,
+    pub slip_hold: bool,
+    pub slip_pos: Option<f64>,
     /// Beat times of the loaded track (seconds), for BEAT SYNC.
     pub grid: Option<Arc<Vec<f64>>>,
     /// BEAT SYNC: this deck follows the other deck's beat phase while both play.
@@ -306,6 +317,10 @@ impl Default for PlayState {
             trim: 1.0,
             ch_fader: 1.0,
             peak: [0.0; 2],
+            smooth: false,
+            slip: false,
+            slip_hold: false,
+            slip_pos: None,
             grid: None,
             sync_follow: false,
             sync_bend: 0.0,
@@ -816,11 +831,17 @@ struct DeckDsp {
     eq3: crate::mixer::Eq3,
     trim: f32,
     ch_fader: f32,
+    /// Where the position was going to be at the next frame (a difference means a jump).
+    expect: f64,
+    /// A cross-fade away from the old position after a jump: (old position, frames left).
+    xf: Option<(f64, u32)>,
+    /// Play / pause fade in use (0 silent .. 1 playing).
+    gate: f32,
 }
 
 impl DeckDsp {
     fn new() -> DeckDsp {
-        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0], eq3: crate::mixer::Eq3::new(), trim: 1.0, ch_fader: 1.0 }
+        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0], eq3: crate::mixer::Eq3::new(), trim: 1.0, ch_fader: 1.0, expect: 0.0, xf: None, gate: 0.0 }
     }
 }
 
@@ -939,9 +960,16 @@ fn search_grain(rate: u32) -> usize {
 /// Add one deck's audio to `out` (which the caller has cleared) and advance its position.
 pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u32) {
     let searching = s.search != 0.0;
-    if !s.playing && !searching {
+    let smooth = s.smooth;
+    if !s.playing && !searching && (!smooth || s.dsp.gate <= 0.0) {
         s.search_count = 0;
         s.dsp.st.active = false;
+        s.dsp.expect = s.pos;
+        s.dsp.xf = None;
+        s.dsp.gate = 0.0;
+        if !s.slip {
+            s.slip_pos = None;
+        }
         return;
     }
     let Some(audio) = s.audio.clone() else { return };
@@ -991,8 +1019,40 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     if !stretch {
         s.dsp.st.active = false;
     }
+    // SLIP: start the background position when a loop begins or a pad is held, and come back
+    // to it when that ends.
+    if s.slip && s.playing && (s.loop_range.is_some() || s.slip_hold) {
+        if s.slip_pos.is_none() {
+            s.slip_pos = Some(s.pos);
+        }
+    } else if let Some(b) = s.slip_pos.take() {
+        if s.slip && s.playing {
+            s.pos = b.clamp(0.0, frames.saturating_sub(2) as f64);
+        }
+    }
+    // A position that is not where the last buffer left it has been moved: cross-fade from
+    // where it was (4 ms; rekordbox fades out, moves and fades in, over a time not traced).
+    let fade_n = ((0.004 * rate as f32) as u32).max(1);
+    if smooth && s.playing && s.dsp.gate > 0.0 && (s.pos - s.dsp.expect).abs() > 2.0 * step.max(1.0) {
+        s.dsp.xf = Some((s.dsp.expect, fade_n));
+    }
     for f in out.chunks_mut(channels) {
-        if searching {
+        // Fading out after pause: the sound carries on from where it was for the length of
+        // the fade, while the deck's position already stands where it was put.
+        let fading_out = smooth && !s.playing && !searching;
+        if fading_out {
+            s.dsp.gate -= 1.0 / fade_n as f32;
+            if s.dsp.gate <= 0.0 || s.dsp.expect as usize + 2 >= frames {
+                s.dsp.gate = 0.0;
+                s.dsp.expect = s.pos;
+                s.dsp.xf = None;
+                break;
+            }
+        } else if smooth && s.dsp.gate < 1.0 {
+            s.dsp.gate = (s.dsp.gate + 1.0 / fade_n as f32).min(1.0);
+        }
+        if fading_out {
+        } else if searching {
             // After each grain the position skips so that, overall, it moves at `search`
             // times normal speed (backward for negative values).
             s.search_count += 1;
@@ -1006,7 +1066,7 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
                 s.pos = a * audio.sr as f64 + (s.pos - bf);
             }
         }
-        let p = s.pos;
+        let p = if fading_out { s.dsp.expect } else { s.pos };
         if p as usize + 1 >= frames {
             s.playing = false;
             s.pos = frames.saturating_sub(1) as f64;
@@ -1019,6 +1079,20 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             src.g.set(s.dsp.stem_g);
         }
         let (mut l, mut r) = if stretch { s.dsp.st.frame(&src, p, pitch * step, hop) } else { src.at(p) };
+        if let Some((op, left)) = s.dsp.xf {
+            // Raised cosine from the old position's sound to the new one's.
+            let w = 0.5 - 0.5 * (std::f32::consts::PI * (1.0 - left as f32 / fade_n as f32)).cos();
+            let (ol, or) = src.at(op.clamp(0.0, frames.saturating_sub(2) as f64));
+            l = l * w + ol * (1.0 - w);
+            r = r * w + or * (1.0 - w);
+            s.dsp.xf = if left > 1 { Some((op + step * speed, left - 1)) } else { None };
+        }
+        if smooth {
+            // Raised cosine over the play / pause fade.
+            let g = 0.5 - 0.5 * (std::f32::consts::PI * s.dsp.gate).cos();
+            l *= g;
+            r *= g;
+        }
         if eq_on {
             let d = &mut s.dsp;
             for k in 0..3 {
@@ -1071,8 +1145,16 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
         } else {
             f[0] += 0.5 * (l + r) * vol + click;
         }
+        if fading_out {
+            s.dsp.expect += step * speed;
+            continue;
+        }
         s.pos += step * speed;
         s.dsp.st.expect = s.pos;
+        s.dsp.expect = s.pos;
+        if let Some(b) = s.slip_pos.as_mut() {
+            *b += step * speed;
+        }
     }
     s.peak = peak;
 }
@@ -1652,5 +1734,86 @@ mod strip_tests {
         let mut s = PlayState { strip: 1, eq_pos: [0.0, 0.5, 0.5], ..deck() };
         let d = 20.0 * (rms(&mut s) / plain).log10();
         assert!(d < -0.3 && d > -3.0, "{d}");
+    }
+}
+
+#[cfg(test)]
+mod smooth_tests {
+    use super::*;
+
+    fn deck() -> PlayState {
+        let n = 44100 * 4;
+        // A ramp, so that a sample's value tells its position.
+        let x: Vec<f32> = (0..n).flat_map(|i| { let v = 0.2 + 0.6 * i as f32 / n as f32; [v, v] }).collect();
+        PlayState { audio: Some(Arc::new(Decoded { sr: 44100, samples: x, raw_frames: n, damaged: 0, truncated: false })), playing: true, volume: 1.0, gain: 1.0, smooth: true, ..Default::default() }
+    }
+
+    fn run(s: &mut PlayState, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        render_deck(s, &mut out, 2, 44100);
+        out.chunks(2).map(|c| c[0]).collect()
+    }
+
+    fn max_step(x: &[f32]) -> f32 {
+        x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn play_pause_and_jumps_do_not_step() {
+        let mut s = deck();
+        // Play: the level rises over 4 ms instead of starting at 0.2.
+        let a = run(&mut s, 1000);
+        assert!(a[0].abs() < 0.01 && (a[999] - 0.2).abs() < 0.01);
+        assert!(max_step(&a) < 0.01);
+        // A jump of two seconds (0.3 in level): cross-faded, no step.
+        s.pos += 88200.0;
+        let b = run(&mut s, 1000);
+        assert!(max_step(&b) < 0.01, "{}", max_step(&b));
+        assert!((b[999] - 0.5).abs() < 0.02);
+        // Pause: fades out over 4 ms, and the position stays where it was at the pause.
+        s.playing = false;
+        let pos = s.pos;
+        let c = run(&mut s, 1000);
+        assert!(max_step(&c) < 0.01 && c[999] == 0.0 && c[0] > 0.4);
+        assert_eq!(s.pos, pos);
+        // A loop wrap is not faded (it is meant to be sample exact).
+        let mut s = deck();
+        run(&mut s, 1000);
+        s.loop_range = Some((0.0, 1500.0 / 44100.0));
+        let d = run(&mut s, 1000);
+        assert!(max_step(&d) > 0.005);
+    }
+
+    #[test]
+    fn slip_returns_to_where_the_track_would_be() {
+        let mut s = PlayState { slip: true, ..deck() };
+        run(&mut s, 2000);
+        // A loop of 500 frames for 3000 frames, then out of it.
+        s.loop_range = Some((2000.0 / 44100.0, 2500.0 / 44100.0));
+        run(&mut s, 3000);
+        assert!(s.pos < 2501.0 && s.slip_pos.is_some());
+        s.loop_range = None;
+        run(&mut s, 100);
+        assert!((s.pos - 5100.0).abs() < 1.5, "{}", s.pos);
+        assert!(s.slip_pos.is_none());
+        // Without SLIP the loop's end is where playback goes on.
+        let mut s = deck();
+        run(&mut s, 2000);
+        s.loop_range = Some((2000.0 / 44100.0, 2500.0 / 44100.0));
+        run(&mut s, 3000);
+        s.loop_range = None;
+        run(&mut s, 100);
+        assert!(s.pos < 2700.0);
+        // A held hot cue with SLIP: back to the background position on release.
+        let mut s = PlayState { slip: true, ..deck() };
+        run(&mut s, 2000);
+        s.slip_pos = Some(s.pos);
+        s.slip_hold = true;
+        s.pos = 40000.0;
+        run(&mut s, 1000);
+        assert!((s.pos - 41000.0).abs() < 1.5);
+        s.slip_hold = false;
+        run(&mut s, 10);
+        assert!((s.pos - 3010.0).abs() < 1.5, "{}", s.pos);
     }
 }

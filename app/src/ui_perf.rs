@@ -265,7 +265,11 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
 fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
     let p = ui.painter().clone();
     let loaded = app.deck.track.is_some();
-    let mode = if app.prefs.show_stems { app.px.pad_mode[n as usize] } else { 0 };
+    let mode = match app.px.pad_mode[n as usize] {
+        1 if !app.prefs.show_stems => 0,
+        m => m,
+    };
+    let page = app.deck.x.pad_page.min(1);
     let col_w = (r.width() - 3.0) / 2.0;
     let pad = |c: usize, row: usize| Rect::from_min_size(pos2(r.min.x + c as f32 * (col_w + 3.0), r.min.y + row as f32 * 22.7), vec2(col_w, 19.0));
     if mode == 1 {
@@ -297,10 +301,56 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
                 }
             }
         }
+    } else if mode == 2 {
+        // BEAT JUMP: one cell per length, back on its left and forward on its right. Page 1:
+        // 1 to 128 beats (the lengths rekordbox's pads default to); page 2: 1/8 to 1/2.
+        let lens: [f64; 8] = if page == 0 { [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0] } else { [0.125, 0.25, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0] };
+        for (i, b) in lens.iter().enumerate() {
+            let pr = pad(i / 4, i % 4);
+            p.rect_filled(pr, 0.0, hex(0x161616));
+            if *b <= 0.0 {
+                continue;
+            }
+            p.text(pr.center(), Align2::CENTER_CENTER, crate::player_ext::beats_text(*b), bold(10.5), if loaded { WHITE } else { OFF });
+            for (dir, x) in [(-1.0, pr.min.x), (1.0, pr.max.x - 30.0)] {
+                let br = Rect::from_min_size(pos2(x, pr.min.y), vec2(30.0, pr.height()));
+                let resp = ui.interact(br, ui.id().with(("bjpad", i, dir as i32)), Sense::click());
+                p.rect_filled(br, 0.0, if resp.hovered() && loaded { lighten(BTN) } else { BTN });
+                let col = if loaded { WHITE } else { OFF };
+                if dir < 0.0 {
+                    crate::icons_player::chevron_left(&p, br.center(), 1.1, col);
+                } else {
+                    crate::icons_player::chevron_right(&p, br.center(), 1.1, col);
+                }
+                if press_fired(ui, &resp) && loaded {
+                    app.beat_jump(dir * *b);
+                }
+            }
+        }
+    } else if mode == 3 {
+        // BEAT LOOP: the 16 lengths, 1/64 to 2 beats on the first page and 4 to 512 on the
+        // second; the running loop's length is lit, and pressing it again ends the loop.
+        let cur = app.loop_active().map(|(a, b)| (b - a) / app.beat_len().max(1e-9));
+        for i in 0..8usize {
+            let b = crate::player_ext::LOOP_SIZES[i + 8 * page as usize];
+            let pr = pad(i / 4, i % 4);
+            let resp = ui.interact(pr, ui.id().with(("blpad", i)), Sense::click());
+            let lit = cur.map(|c| (c / b - 1.0).abs() < 0.02).unwrap_or(false);
+            p.rect_filled(pr, 0.0, if lit { LOOP } else if resp.hovered() && loaded { hex(0x1E1E1E) } else { hex(0x161616) });
+            p.text(pr.center(), Align2::CENTER_CENTER, crate::player_ext::beats_text(b), bold(10.5), if loaded { WHITE } else { OFF });
+            if press_fired(ui, &resp) && loaded {
+                if lit {
+                    app.loop_exit();
+                } else {
+                    app.prefs.loop_beats = b;
+                    app.auto_loop(b);
+                }
+            }
+        }
     } else {
-        // HOT CUE: A-D on the left, E-H on the right.
-        for slot in 0..8usize {
-            let pr = pad(slot / 4, slot % 4);
+        // HOT CUE: A-D on the left, E-H on the right; the second page has I-P.
+        for slot in (8 * page as usize)..(8 * page as usize + 8) {
+            let pr = pad((slot % 8) / 4, slot % 4);
             let resp = ui.interact(pr, ui.id().with(("hotpad", slot)), Sense::click());
             let cue = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot as i32).cloned();
             let letter = ((b'A' + slot as u8) as char).to_string();
@@ -320,7 +370,8 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
             if press_fired(ui, &resp) && loaded {
                 app.hot_cue_down(slot as i32);
             }
-            if app.deck.hot_preview.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            let held = app.deck.hot_preview.is_some() || app.player.state.lock().slip_hold;
+            if held && !ui.input(|i| i.pointer.any_down()) {
                 app.hot_cue_up();
             }
             if let Some(c) = cue {
@@ -329,8 +380,13 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
         }
     }
     // Pad mode pull-down (deck 1 at the left under the pads, deck 2 at the right).
-    let label = if mode == 1 { "STEMS" } else { "HOT CUE" };
-    let mw = 62.0;
+    let label = match mode {
+        1 => "STEMS",
+        2 => "BEAT JUMP",
+        3 => "BEAT LOOP",
+        _ => "HOT CUE",
+    };
+    let mw = 70.0;
     let mr = Rect::from_min_size(pos2(if n == 0 { r.min.x } else { r.max.x - mw }, r.min.y + 91.5), vec2(mw, 17.0));
     let resp = ui.interact(mr, ui.id().with("padmode"), Sense::click());
     p.rect_filled(mr, 2.0, if resp.hovered() { lighten(BTN) } else { PANEL });
@@ -346,10 +402,33 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
             app.px.pad_mode[n as usize] = 1;
             ui.close_menu();
         }
-        for name in ["PAD FX", "SLICER", "BEAT JUMP", "BEAT LOOP", "KEYBOARD", "KEY SHIFT", "SEQ. CALL", "ACT. CENSR", "MEMORY CUE"] {
+        for (m, name) in [(2u8, "BEAT JUMP"), (3, "BEAT LOOP")] {
+            if ui.selectable_label(mode == m, name).clicked() {
+                app.px.pad_mode[n as usize] = m;
+                ui.close_menu();
+            }
+        }
+        for name in ["PAD FX", "SLICER", "KEYBOARD", "KEY SHIFT", "SEQ. CALL", "ACT. CENSR", "MEMORY CUE"] {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
     });
+    // Page buttons beside the pull-down (HOT CUE: A-H / I-P; BEAT JUMP and BEAT LOOP: their
+    // second page). Where rekordbox puts its page control on screen is not known.
+    if mode != 1 {
+        let px = if n == 0 { mr.max.x + 6.0 } else { mr.min.x - 52.0 };
+        let names = match mode {
+            2 => ["1 - 128", "1/8 - 1/2"],
+            3 => ["1/64 - 2", "4 - 512"],
+            _ => ["A - H", "I - P"],
+        };
+        let pr = Rect::from_min_size(pos2(px, mr.min.y), vec2(46.0, 17.0));
+        let resp = ui.interact(pr, ui.id().with("padpage"), Sense::click());
+        p.rect_filled(pr, 2.0, if resp.hovered() { lighten(BTN) } else { PANEL });
+        p.text(pr.center(), Align2::CENTER_CENTER, names[page as usize], FontId::proportional(9.0), DIM2);
+        if resp.on_hover_text("Page").clicked() {
+            app.deck.x.pad_page = 1 - page;
+        }
+    }
 }
 
 /// Loop size with halve / double, and AU (auto beat loop) or MA (manual: IN, OUT, RELOOP/EXIT).
@@ -502,10 +581,15 @@ fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_active: bool) {
     let _ = playing;
 
     // SLIP (not built), Q, MT.
-    let slip = ui.interact(at(170.0, 10.0, 30.0, 18.0), ui.id().with("slip"), Sense::hover());
-    p.rect_filled(at(170.0, 10.0, 30.0, 18.0), 2.0, PANEL);
-    p.text(at(170.0, 10.0, 30.0, 18.0).center(), Align2::CENTER_CENTER, "SLIP", caps(8.0), OFF);
-    let _ = slip.on_hover_text("SLIP is not built in recordbox yet.");
+    // SLIP: lit when on; blinks (500 ms) while the track runs on in the background.
+    let slip_on = app.deck.x.slip;
+    let blink = slip_on && app.slip_running() && (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+    if app.slip_running() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    if tip(flat(ui, at(170.0, 10.0, 30.0, 18.0), "slip", "SLIP", 8.0, if slip_on && !blink { BLUE } else { PANEL }, WHITE), app, "Slip").clicked() {
+        app.toggle_slip();
+    }
     let q = app.prefs.quantize;
     if tip(flat(ui, at(170.0, 38.0, 30.0, 18.0), "quant", "Q", 8.5, if q { BLUE } else { BTN }, WHITE), app, "Quantize").clicked() {
         app.prefs.quantize = !q;

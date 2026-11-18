@@ -51,6 +51,10 @@ pub struct DeckExt {
     /// and the one being worked out in the background.
     pub stem_wave: Option<([bool; 4], Waveform)>,
     pub stem_wave_rx: Option<(i64, [bool; 4], crossbeam_channel::Receiver<Waveform>)>,
+    /// SLIP is on for this deck (Performance).
+    pub slip: bool,
+    /// Pad pages: HOT CUE shows I-P instead of A-H; BEAT JUMP's and BEAT LOOP's second page.
+    pub pad_page: u8,
     /// Performance: how many steps the platter's tempo range is past its default of ±10
     /// (0 = ±10, 1 = ±16, 2 = WIDE, 3 = ±6).
     pub tempo_range: u8,
@@ -60,7 +64,7 @@ impl DeckExt {
     /// What stays on a deck when another track is loaded or it is emptied: the switches of
     /// the deck itself (MT, BEAT SYNC, KEY SYNC, isolator), not the settings made for a track.
     pub fn carried(&self) -> DeckExt {
-        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, tempo_range: self.tempo_range, ..Default::default() }
+        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, tempo_range: self.tempo_range, slip: self.slip, pad_page: self.pad_page, ..Default::default() }
     }
 }
 
@@ -96,6 +100,9 @@ pub struct PlayerExt {
     pub loop_manual: [bool; 2],
     /// STEM FX switches (VOCAL, INST, BASS, DRUMS), all on at start, as in rekordbox.
     pub stem_fx: [bool; 4],
+    /// Quantize of the deck that is not active (`Prefs::quantize` is the active deck's): each
+    /// deck has its own Q, as in rekordbox.
+    pub other_quantize: bool,
 }
 
 /// One channel strip of the Performance mixer (knob and fader positions, 0..1).
@@ -125,7 +132,7 @@ impl MixStrip {
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 2], loop_manual: [false; 2], stem_fx: [true; 4] }
+        PlayerExt { other: Deck::default(), other_backup: None, active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 2], loop_manual: [false; 2], stem_fx: [true; 4], other_quantize: true }
     }
 }
 
@@ -416,7 +423,45 @@ impl App {
         std::mem::swap(&mut self.deck, &mut self.px.other);
         std::mem::swap(&mut self.deck_backup, &mut self.px.other_backup);
         std::mem::swap(&mut self.player.state, &mut self.player.other);
+        std::mem::swap(&mut self.prefs.quantize, &mut self.px.other_quantize);
         self.px.active ^= 1;
+    }
+
+    /// Instant Doubles (Preferences > Controller > Deck > Load): the track just loaded is also
+    /// on the other deck, so this deck takes over its position, tempo and play state.
+    pub fn instant_double(&mut self) {
+        if !(self.performance() && self.prefs.instant_doubles) || self.deck.track.is_none() || self.deck.track != self.px.other.track {
+            return;
+        }
+        let (pos, playing, rate) = {
+            let o = self.player.other.lock();
+            (o.pos, o.playing, o.audio.as_ref().map(|a| a.sr))
+        };
+        if rate.is_none() {
+            return;
+        }
+        self.deck.x.tempo_adj = self.px.other.x.tempo_adj;
+        self.deck.x.tempo_range = self.px.other.x.tempo_range;
+        self.deck.x.master_tempo = self.px.other.x.master_tempo;
+        {
+            let mut s = self.player.state.lock();
+            if s.audio.as_ref().map(|a| a.sr) == rate {
+                s.pos = pos;
+                s.playing = playing;
+            }
+        }
+        self.push_deck_controls();
+    }
+
+    /// SLIP on / off for the active deck.
+    pub fn toggle_slip(&mut self) {
+        self.deck.x.slip = !self.deck.x.slip;
+        self.push_deck_controls();
+    }
+
+    /// The active deck's SLIP is holding a background position (the button blinks).
+    pub fn slip_running(&self) -> bool {
+        self.player.state.lock().slip_pos.is_some()
     }
 
     /// Run `f` with deck `n` (0 = A, 1 = B) in place as `self.deck` / `self.player.state`.
@@ -573,6 +618,8 @@ impl App {
             s.bend = if two { x.bend as f64 * BEND_AMOUNT } else { 0.0 };
             s.master_tempo = two && x.master_tempo;
             s.key_shift = if keys { x.key_shift as f32 } else { 0.0 };
+            s.smooth = true;
+            s.slip = perf && x.slip;
             let m = self.px.mix[n as usize];
             s.fader = if perf {
                 // Crossfader side as assigned (THRU: not through the crossfader at all).
