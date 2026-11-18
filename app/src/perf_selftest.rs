@@ -55,6 +55,29 @@ impl App {
             ("PLAY/PAUSE deck 1 (pause)", o + egui::vec2(20.0, 102.0), o + egui::vec2(20.0, 102.0)),
         ];
         let _ = d2;
+        // The 4Deck Horizontal layout has its own positions (decks 655 pt wide, mixer from 661,
+        // decks 2 and 4 from 855; the second row of decks 190 pt further down).
+        let four = self.prefs.perf_four;
+        let steps = if four {
+            let y1 = t + 198.0;
+            let y3 = y1 + 190.0 + extra;
+            let ly3 = y3 + 76.0 + extra;
+            let p = |x: f32, y: f32| (pos2(x, y), pos2(x, y));
+            let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
+            vec![
+                st("4D FX panel button", p(205.0, 14.0)),
+                st("4D MASTER deck 3 (lower half)", p(655.0 - 42.0, y3 + 39.0)),
+                st("4D loop size down deck 3", p(382.0 + 16.0, ly3 + 6.0 + 49.0)),
+                st("4D PLAY deck 4", p(855.0 + 10.0 + 20.0, ly3 + 84.0)),
+                st("4D hot cue pad B deck 4", p(855.0 + 285.0 + 40.0, ly3 + 6.0 + 19.6 + 7.0)),
+                ("4D channel fader 4 down", pos2(661.0 + 162.5, y1 + 224.5), pos2(661.0 + 162.5, y1 + 284.0)),
+                st("quick click on CUE of channel 3", p(661.0 + 30.0, y1 + 198.0)),
+                st("4D BEAT SYNC deck 2", p(1512.0 - 76.0 + 20.0, y1 + 14.0)),
+                st("4D PLAY deck 4 (pause)", p(855.0 + 10.0 + 20.0, ly3 + 84.0)),
+            ]
+        } else {
+            steps
+        };
         const START: u32 = 140;
         const SPAN: u32 = 40;
         if frame < START {
@@ -85,9 +108,30 @@ impl App {
                 }
             }
             // The loop is left running for a while before its state is read.
+            30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),
             30 => eprintln!("perftest: {name}: {}", self.perf_state()),
             _ => {}
         }
+    }
+
+    fn perf_state4(&self) -> String {
+        let act = self.px.active as usize;
+        let loops: Vec<f64> = (0..4).map(|n| if n == act { self.prefs.loop_beats } else { self.px.parked_loop[n].unwrap_or(self.prefs.loop_beats) }).collect();
+        let d4 = self.deck_of(3);
+        let hot: Vec<i32> = d4.cues.iter().filter(|c| c.kind == crate::model::CueKind::Hot).map(|c| c.slot).collect();
+        let playing: Vec<bool> = self.player.decks.iter().map(|d| d.lock().playing).collect();
+        format!(
+            "fx panel {} | active deck {} master deck {} | loop sizes {:?} | playing {:?} | deck 4 hot cues {:?} | fader 4 {:.2} | cue 3 {} | deck 2 beat sync {}",
+            self.prefs.perf_fx,
+            act + 1,
+            self.px.master + 1,
+            loops,
+            playing,
+            hot,
+            self.px.mix[3].fader,
+            self.px.mix[2].cue,
+            self.deck_of(1).x.beat_sync
+        )
     }
 
     fn perf_state(&self) -> String {

@@ -126,6 +126,8 @@ pub struct PlayerExt {
     /// Quantize of the parked decks (`Prefs::quantize` is the active deck's): each deck has
     /// its own Q, as in rekordbox.
     pub parked_quantize: [bool; 4],
+    /// Each deck's auto loop size while it is not the active deck.
+    pub parked_loop: [Option<f64>; 4],
 }
 
 /// One channel strip of the Performance mixer (knob and fader positions, 0..1).
@@ -155,7 +157,7 @@ impl MixStrip {
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], parked_quantize: [true; 4] }
+        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], parked_quantize: [true; 4], parked_loop: [None; 4] }
     }
 }
 
@@ -493,6 +495,11 @@ impl App {
         std::mem::swap(&mut self.deck_backup, &mut self.px.parked_backup[a]);
         std::mem::swap(&mut self.deck_backup, &mut self.px.parked_backup[n]);
         self.px.parked_quantize[a] = self.prefs.quantize;
+        // The loop size belongs to the deck too (a deck not used yet starts from the one showing).
+        self.px.parked_loop[a] = Some(self.prefs.loop_beats);
+        if let Some(b) = self.px.parked_loop[n] {
+            self.prefs.loop_beats = b;
+        }
         self.prefs.quantize = self.px.parked_quantize[n];
         self.player.state = self.player.decks[n].clone();
         self.px.active = n as u8;
@@ -557,7 +564,8 @@ impl App {
 
     /// Load a track into deck 0 (A) or 1 (B); B exists only in the 2 Players layout.
     pub fn load_track_to(&mut self, deck: u8, id: i64) {
-        let d = if self.two_players() { deck.min(self.deck_count() - 1) } else { self.px.active };
+        // Performance: the deck that was last clicked (its number is lit) takes the track.
+        let d = if self.performance() { self.px.active } else if self.two_players() { deck.min(self.deck_count() - 1) } else { self.px.active };
         self.with_deck(d, |a| a.load_track_here(id));
     }
 

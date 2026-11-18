@@ -164,6 +164,17 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     let (title_f, sub_f, time_f, tx0) = if c4 { (13.5, 10.5, 12.0, 60.0) } else { (15.5, 12.0, 13.5, 64.0) };
     // ---- track information
     p.rect_filled(at(0.0, 0.0, w, hdr), 0.0, PANEL);
+    // ---- overview (the whole track). It is laid out before the header's buttons: in the
+    // 4-deck layout its top (the hot cue letters) reaches under MASTER, and the buttons must
+    // win the click there.
+    // (The waveform stands on a base 88.5 pt down; the progress frame, the minute marks and,
+    // when shown, the phrase bar follow under it, the phrase bar in a row of its own.)
+    let phrase_h = if app.prefs.show_phrase_bar { PHRASE_ROW } else { 0.0 };
+    // (In the 4-deck layout the base is 68 pt down and the lower part starts 76 pt down.)
+    let lower = if c4 { 76.0 } else { 99.5 };
+    p.rect_filled(at(0.0, hdr, w, lower - hdr + phrase_h + stems_row), 0.0, BG);
+    draw_overview(app, ui, at(4.0, if c4 { 37.0 } else { 58.5 }, w - 8.0, 44.0), pos);
+
     p.text(pos2(x0 + 13.6, y0 + if c4 { 14.0 } else { 13.5 }), Align2::CENTER_CENTER, format!("{}", n + 1), bold(9.5), if is_active { WHITE } else { DIM });
     crate::ui_player2::artwork(app, ui, art, &track);
     let (title, artist) = match &track {
@@ -195,7 +206,7 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     if tip(flat(ui, Rect::from_min_size(pos2(rx - 161.0, y0 + if c4 { 7.5 } else { 11.0 }), vec2(66.0, if c4 { 11.5 } else { 12.5 })), "keysync", "KEY SYNC", 8.5, if ks { hex(0x007DE1) } else { BTN }, if loaded || ks { WHITE } else { OFF }), app, "KEY SYNC").clicked() {
         app.toggle_key_sync();
     }
-    let ky = y0 + if c4 { 35.0 } else { 38.0 };
+    let ky = y0 + if c4 { 33.5 } else { 38.0 };
     let kl = ui.interact(Rect::from_center_size(pos2(rx - 158.0, ky), vec2(12.0, 14.0)), ui.id().with("keydn"), Sense::click());
     crate::icons_player::chevron_left(&p, pos2(rx - 158.0, ky), 0.9, if loaded { WHITE } else { dim });
     if tip(kl, app, "Key Shift Down").clicked() {
@@ -234,15 +245,6 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     if tip(mresp, app, "MASTER").clicked() {
         app.set_master();
     }
-
-    // ---- overview (the whole track)
-    // (The waveform stands on a base 88.5 pt down; the progress frame, the minute marks and,
-    // when shown, the phrase bar follow under it, the phrase bar in a row of its own.)
-    let phrase_h = if app.prefs.show_phrase_bar { PHRASE_ROW } else { 0.0 };
-    // (In the 4-deck layout the base is 68 pt down and the lower part starts 76 pt down.)
-    let lower = if c4 { 76.0 } else { 99.5 };
-    p.rect_filled(at(0.0, hdr, w, lower - hdr + phrase_h + stems_row), 0.0, BG);
-    draw_overview(app, ui, at(4.0, if c4 { 38.0 } else { 58.5 }, w - 8.0, 44.0), pos);
 
     // ---- stem part buttons (MUTE / SOLO), right-aligned under the overview
     if stems_row > 0.0 {
@@ -288,7 +290,7 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     for (dx, dy) in [(-3.5, -3.5), (3.5, -3.5), (-3.5, 3.5), (3.5, 3.5)] {
         p.rect_filled(Rect::from_center_size(tc + vec2(dx, dy), vec2(5.0, 5.0)), 0.0, WHITE);
     }
-    let top = if c4 { 8.0 } else { 6.5 };
+    let top = if c4 { 6.0 } else { 6.5 };
     pads(app, ui, Rect::from_min_size(pos2(x0 + pads_x, ly + top), vec2(pads_w, 110.0)), n, c4);
     loop_box(app, ui, pos2(x0 + loop_x, ly + top), n, c4);
     platter_panel(app, ui, pos2(x0 + panel_x, ly + if c4 { 0.0 } else { -3.0 }), n, is_active, c4);

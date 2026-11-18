@@ -1738,7 +1738,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
         let pa = Rect::from_min_max(pos2(gx, bar.min.y + 5.0), pos2(gx + 80.0, bar.min.y + 21.0));
         p.rect_filled(Rect::from_min_max(pa.min, pos2(pa.max.x - 16.5, pa.max.y)), egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, BTN);
         p.rect_filled(Rect::from_min_max(pos2(pa.max.x - 16.0, pa.min.y), pa.max), egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, BTN);
-        p.text(pos2(pa.min.x + 7.0, pa.center().y), Align2::LEFT_CENTER, if two && app.load_target == 1 { "PLAYER B" } else { "PLAYER A" }, rb_bold(9.75), WHITE);
+        p.text(pos2(pa.min.x + 7.0, pa.center().y), Align2::LEFT_CENTER, if app.performance() { format!("DECK {}", app.px.active + 1) } else if two && app.load_target == 1 { "PLAYER B".to_string() } else { "PLAYER A".to_string() }, rb_bold(9.75), WHITE);
         {
             let c = pos2(pa.max.x - 8.0, pa.center().y + 0.5);
             p.add(egui::Shape::line(vec![c + vec2(-3.6, -1.8), c + vec2(0.0, 1.8), c + vec2(3.6, -1.8)], Stroke::new(1.0, WHITE)));
@@ -1746,6 +1746,16 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
         let par = ui.interact(pa.intersect(bar), ui.id().with("playera"), Sense::click());
         let par = if app.prefs.tooltips { par.on_hover_text("Player that double-click or Return loads tracks into.") } else { par };
         dropdown(ui, &par, "playera_menu", |ui| {
+            // Performance: the decks of the layout; the one chosen becomes the active deck.
+            if app.performance() {
+                for n in 0..app.deck_count() {
+                    if ui.selectable_label(app.px.active == n, format!("DECK {}", n + 1)).clicked() {
+                        app.activate_deck(n);
+                        ui.memory_mut(|m| m.close_popup());
+                    }
+                }
+                return;
+            }
             // Load target: deck B exists in the 2 Players layout.
             if ui.selectable_label(app.load_target == 0 || !two, "PLAYER A").clicked() {
                 app.load_target = 0;
