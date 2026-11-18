@@ -1477,6 +1477,11 @@ impl App {
                     "confirmdelete" => app.dialogs.confirm_delete_node = Some((0, "Warm Up".into(), false)),
                     "about" => app.dialogs.about = true,
                     "performance" => app.prefs.app_mode = 1,
+                    // Performance with BEAT JUMP pads on deck 1 and BEAT LOOP pads on deck 2.
+                    "perfpads" => {
+                        app.prefs.app_mode = 1;
+                        app.px.pad_mode = [2, 3];
+                    }
                     other => crate::library_ext::shot_view(&mut app, other),
                 }
             }

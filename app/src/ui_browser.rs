@@ -124,7 +124,7 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
     let vr = Rect::from_min_max(pos2(rx - 105.0, ty + 6.0), pos2(rx - 70.0, ty + 22.0));
     let vresp = ui.interact(vr, ui.id().with("perfvol"), Sense::click_and_drag());
     let mut vol = app.player.state.lock().volume;
-    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on()) {
+    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on() || vresp.clicked()) {
         vol = ((pp.x - vr.min.x) / vr.width()).clamp(0.0, 1.0);
         app.player.state.lock().volume = vol;
     }
@@ -153,7 +153,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         for (i, name) in ["EXPORT", "PERFORMANCE"].iter().enumerate() {
             if ui.selectable_label(perf == (i == 1), *name).clicked() {
                 app.set_app_mode(i as u8);
-                ui.close_menu();
+                ui.memory_mut(|m| m.close_popup());
             }
         }
         for name in ["LIGHTING", "EDIT"] {
@@ -181,6 +181,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
             crate::icons_player::layout_mark(ui.painter(), pos2(resp.rect.min.x + 15.0, resp.rect.center().y), i as u8, WHITE);
             if resp.clicked() {
                 app.set_player_layout(i as u8);
+                ui.memory_mut(|m| m.close_popup());
             }
         }
     });

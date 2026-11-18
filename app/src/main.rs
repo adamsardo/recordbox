@@ -21,6 +21,7 @@ mod key;
 mod library_ext;
 mod menus;
 mod mixer;
+mod perf_selftest;
 mod model;
 mod manual;
 mod phrase;
@@ -73,6 +74,7 @@ impl eframe::App for Gui {
         }
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
+        self.app.shot_perf_events(frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }

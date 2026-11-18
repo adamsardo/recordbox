@@ -396,16 +396,16 @@ fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8) {
     crate::ui_browser::dropdown(ui, &resp, "padmodepop", |ui| {
         if ui.selectable_label(mode == 0, "HOT CUE").clicked() {
             app.px.pad_mode[n as usize] = 0;
-            ui.close_menu();
+            ui.memory_mut(|m| m.close_popup());
         }
         if ui.add_enabled(stems_on, egui::SelectableLabel::new(mode == 1, "STEMS")).on_disabled_hover_text("Enable the STEMS Function in Preferences > Extensions > STEMS.").clicked() {
             app.px.pad_mode[n as usize] = 1;
-            ui.close_menu();
+            ui.memory_mut(|m| m.close_popup());
         }
         for (m, name) in [(2u8, "BEAT JUMP"), (3, "BEAT LOOP")] {
             if ui.selectable_label(mode == m, name).clicked() {
                 app.px.pad_mode[n as usize] = m;
-                ui.close_menu();
+                ui.memory_mut(|m| m.close_popup());
             }
         }
         for name in ["PAD FX", "SLICER", "KEYBOARD", "KEY SHIFT", "SEQ. CALL", "ACT. CENSR", "MEMORY CUE"] {
@@ -701,7 +701,8 @@ fn mixer(app: &mut App, ui: &mut Ui, r: Rect) {
         let (ft, fb) = (y0 + 169.5, y0 + 219.5);
         let fr = Rect::from_min_max(pos2(cx - 12.0, ft - 4.0), pos2(cx + 12.0, fb + 4.0));
         let fresp = ui.interact(fr, ui.id().with(("fader", n)), Sense::click_and_drag());
-        if let Some(pp) = fresp.interact_pointer_pos().filter(|_| fresp.dragged() || fresp.is_pointer_button_down_on()) {
+        // (Also on `clicked`: a quick click's press and release can fall into one frame.)
+        if let Some(pp) = fresp.interact_pointer_pos().filter(|_| fresp.dragged() || fresp.is_pointer_button_down_on() || fresp.clicked()) {
             m.fader = ((fb - pp.y) / (fb - ft)).clamp(0.0, 1.0);
             changed = true;
         }
@@ -828,7 +829,7 @@ fn bottom_row(app: &mut App, ui: &mut Ui, r: Rect, cx: f32) {
     if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.any())) {
         xf = 0.5;
         changed = true;
-    } else if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged()) {
+    } else if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.is_pointer_button_down_on() || resp.clicked()) {
         xf = ((pp.x - fl) / (fr - fl)).clamp(0.0, 1.0);
         changed = true;
     }
