@@ -700,6 +700,16 @@ impl App {
         self.deck.x.stem_wave.as_ref().map(|w| w.0 == on).unwrap_or(false) && !on.iter().all(|x| *x)
     }
 
+    /// The enlarged waveform is being worked out again for the parts that now sound. rekordbox
+    /// shows it empty meanwhile (grid, cues and playhead stay), then draws the new one.
+    pub fn stem_wave_preparing(&self) -> bool {
+        if !self.prefs.stem_waveform {
+            return false;
+        }
+        let s = self.player.state.lock();
+        s.stems.is_some() && !s.stem_on.iter().all(|x| *x) && !self.deck.x.stem_wave.as_ref().map(|w| w.0 == s.stem_on).unwrap_or(false)
+    }
+
     /// Keep the active deck's stem waveform in step with its part switches: worked out on a
     /// background thread from the audible stems whenever the set of parts changes.
     pub fn poll_stem_wave(&mut self) {
@@ -724,14 +734,34 @@ impl App {
         if !have && !running {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let ctx = self.ctx.clone();
+            // The instruments are the mix less the other parts (as in playback), which needs
+            // the decoded original at the stems' rate; otherwise the model's own part is used.
+            let orig = self.deck.audio.clone().filter(|a| a.sr == crate::stems::htdemucs::SAMPLE_RATE as u32);
             std::thread::spawn(move || {
                 let n = stems.len;
                 let mut mono = vec![0.0f32; n];
-                for (src, on) in on.iter().enumerate() {
-                    if *on {
-                        let (l, r) = (&stems.data[src * 2 * n..(src * 2 + 1) * n], &stems.data[(src * 2 + 1) * n..(src * 2 + 2) * n]);
-                        for i in 0..n {
-                            mono[i] += 0.5 * (l[i] + r[i]);
+                let mut add = |src: usize, k: f32| {
+                    let (l, r) = (&stems.data[src * 2 * n..(src * 2 + 1) * n], &stems.data[(src * 2 + 1) * n..(src * 2 + 2) * n]);
+                    for i in 0..n {
+                        mono[i] += k * 0.5 * (l[i] + r[i]);
+                    }
+                };
+                match orig.as_deref().filter(|_| on[2]) {
+                    Some(a) => {
+                        for src in [0, 1, 3] {
+                            if !on[src] {
+                                add(src, -1.0);
+                            }
+                        }
+                        for (i, m) in mono.iter_mut().enumerate().take(a.frames()) {
+                            *m += 0.5 * (a.samples[i * 2] + a.samples[i * 2 + 1]);
+                        }
+                    }
+                    None => {
+                        for (src, on) in on.iter().enumerate() {
+                            if *on {
+                                add(src, 1.0);
+                            }
                         }
                     }
                 }

@@ -468,14 +468,16 @@ pub fn slider_to_buffer(t: f32, range: Option<(u32, u32)>) -> u32 {
 
 /// What a click on a stem part button does to the four sources' on/off states
 /// (source index: 0 drums, 1 bass, 2 other, 3 vocals; `srcs` are the part's sources).
-/// MUTE mode: the part is switched off, or back on. SOLO mode: the part plays alone; a click
-/// on the part that already plays alone brings every part back.
+/// MUTE mode: the part is switched off, or back on. SOLO mode, as rekordbox 7.2.19 derives it
+/// from the same on/off states (`PartMuteSoloComp::getNextStatesOnSoloMode`, 0x102075b08):
+/// the part plays alone, unless it is sounding while some other part is off, in which case
+/// every part comes back.
 pub fn stem_click(on: [bool; 4], srcs: &[usize], solo: bool) -> [bool; 4] {
     let mut next = on;
     if solo {
-        let alone = (0..4).all(|i| on[i] == srcs.contains(&i));
+        let restore = on.iter().any(|x| !*x) && srcs.iter().all(|s| on[*s]);
         for (i, n) in next.iter_mut().enumerate() {
-            *n = alone || srcs.contains(&i);
+            *n = restore || srcs.contains(&i);
         }
     } else {
         let target = !srcs.iter().all(|s| on[*s]);
@@ -495,11 +497,38 @@ pub fn stem_part_click(app: &mut App, srcs: &[usize]) {
         (s.stems.is_some(), s.stem_on)
     };
     if !have {
-        app.separate_loaded();
+        // rekordbox's status line for a part pressed before its data exists. recordbox also
+        // starts the separation if it is not running yet (it is, when tracks are separated
+        // on load).
+        if app.stem.separating.is_some() || app.stem.loading.is_some() {
+            app.toast("There is no analysis data for the STEMS function.");
+        } else {
+            app.separate_loaded();
+        }
         return;
     }
     let next = stem_click(on, srcs, app.prefs.stem_solo);
     app.player.state.lock().stem_on = next;
+}
+
+/// Preferences > ACTIVE STEM Setting. Going from MUTE to SOLO brings every part back unless
+/// exactly one part is sounding (`PartMuteSoloComp::selectPartMuteMode`, 0x102075628); going
+/// back to MUTE keeps the parts as they are.
+pub fn set_stem_solo(app: &mut App, solo: bool) {
+    if solo && !app.prefs.stem_solo {
+        for st in [&app.player.state, &app.player.other] {
+            let mut s = st.lock();
+            s.stem_on = stems_entering_solo(s.stem_on, app.prefs.stem_parts == 3);
+        }
+    }
+    app.prefs.stem_solo = solo;
+}
+
+/// The on/off states after switching to SOLO mode (`three`: bass belongs to the instruments).
+pub fn stems_entering_solo(on: [bool; 4], three: bool) -> [bool; 4] {
+    let parts: &[&[usize]] = if three { &[&[3], &[2, 1], &[0]] } else { &[&[3], &[2], &[1], &[0]] };
+    let sounding = parts.iter().filter(|p| p.iter().all(|s| on[*s])).count();
+    if sounding == 1 { on } else { [true; 4] }
 }
 
 /// The stream configuration for a device: its default, with the chosen sample rate and
@@ -801,6 +830,15 @@ mod tests {
         assert_eq!(stem_click([true, false, false, false], &[0], true), all);
         assert_eq!(stem_click(all, &[2, 1], true), [false, true, true, false]);
         assert_eq!(stem_click([false, true, true, false], &[2, 1], true), all);
+        // As rekordbox: a sounding part pressed while another is off restores all, also when
+        // it is not alone; a silent part pressed takes over.
+        assert_eq!(stem_click([true, false, true, true], &[3], true), all);
+        assert_eq!(stem_click([true, false, true, false], &[3], true), [false, false, false, true]);
+        // Switching to SOLO: all parts back unless exactly one sounds.
+        assert_eq!(stems_entering_solo([true, true, true, false], false), all);
+        assert_eq!(stems_entering_solo([false, false, false, true], false), [false, false, false, true]);
+        assert_eq!(stems_entering_solo([false, true, true, false], true), [false, true, true, false], "INST of three parts is one part");
+        assert_eq!(stems_entering_solo(all, false), all);
     }
 
     #[test]

@@ -539,6 +539,31 @@ pub fn cache_size() -> u64 {
     std::fs::read_dir(stems_dir()).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
 }
 
+/// Keep the cache within `limit` bytes by removing the stems used longest ago (never `keep`,
+/// the file just written). Separating on every load would otherwise fill the disk: a track's
+/// stems take about 250 MB.
+pub fn trim_cache(limit: u64, keep: &Path) {
+    let Ok(rd) = std::fs::read_dir(stems_dir()) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "stems").unwrap_or(false))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.accessed().or_else(|_| m.modified()).ok()?, m.len(), e.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.sort();
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        if path != keep && std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
+}
+
 pub fn clear_cache() {
     if let Ok(rd) = std::fs::read_dir(stems_dir()) {
         for e in rd.flatten() {

@@ -331,8 +331,10 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     // white minute ticks from 8 to 10 pt under it.
     let base = r.min.y + 30.0;
     let full_h = 24.0;
-    let stem_view = app.stem_wave_shown();
-    if let Some(w) = app.deck.x.stem_wave.as_ref().filter(|_| stem_view).map(|s| &s.1).or(app.deck.wave.as_ref()) {
+    // The overview always shows the whole mix, as in rekordbox: only the enlarged waveform
+    // follows the parts that sound.
+    let stem_view = false;
+    if let Some(w) = app.deck.wave.as_ref() {
         let n = r.width().max(1.0) as usize;
         let cols = w.columns(n);
         // the overview fills its height at the track's loudest column
@@ -369,6 +371,13 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
         bars.paint(&p);
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
+    }
+    // Separation progress: rekordbox's thin blue line under the overview, from the start of
+    // the track to where the parts are ready.
+    if let (Some((sid, pr)), Some(tid)) = (app.stem.separating, app.deck.track) {
+        if sid == tid && pr > 0.0 {
+            p.rect_filled(Rect::from_min_max(pos2(r.min.x, base + 1.5), pos2(r.min.x + r.width() * pr.clamp(0.0, 1.0), base + 2.5)), 0.0, hex(0x077DE1));
+        }
     }
     // Vocal positions (rekordbox's vocal detection): a band along the top, brighter where the
     // vocal level is higher.
@@ -537,7 +546,10 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         }
     }
     let stem_view = app.stem_wave_shown();
-    if let Some(w) = app.deck.x.stem_wave.as_ref().filter(|_| stem_view).map(|s| &s.1).or(app.deck.wave.as_ref()) {
+    if app.stem_wave_preparing() {
+        // Empty while the waveform of the sounding parts is worked out.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    } else if let Some(w) = app.deck.x.stem_wave.as_ref().filter(|_| stem_view).map(|s| &s.1).or(app.deck.wave.as_ref()) {
         let fps = WAVE_FPS;
         let n = w.frames.len();
         let mut x = r.min.x;
@@ -1052,20 +1064,31 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let have = app.player.state.lock().stems.is_some();
     let on = app.player.state.lock().stem_on;
     let loaded = app.deck.track.is_some();
-    // (label, source indices, colour). Three parts put bass with the instruments.
+    // (label, source indices, colour). Three parts put bass with the instruments. Colours as
+    // measured from rekordbox 7.2.19 (reference set, stems/13).
+    const VOCAL: Color32 = Color32::from_rgb(0x02, 0xDA, 0x0C);
+    const INST: Color32 = Color32::from_rgb(0xDA, 0x1B, 0x02);
+    const BASS: Color32 = Color32::from_rgb(0xD2, 0x00, 0x90);
+    const DRUMS: Color32 = Color32::from_rgb(0x46, 0x55, 0xFF);
     let parts: Vec<(&str, Vec<usize>, Color32)> = if app.prefs.stem_parts == 3 {
-        vec![("VOCAL", vec![3], hex(0x3CC85A)), ("INST", vec![2, 1], hex(0xA05AE6)), ("DRUMS", vec![0], hex(0x2E7DF0))]
+        vec![("VOCAL", vec![3], VOCAL), ("INST", vec![2, 1], INST), ("DRUMS", vec![0], DRUMS)]
     } else {
-        vec![("VOCAL", vec![3], hex(0x3CC85A)), ("INST", vec![2], hex(0xA05AE6)), ("BASS", vec![1], hex(0xF08C28)), ("DRUMS", vec![0], hex(0x2E7DF0))]
+        vec![("VOCAL", vec![3], VOCAL), ("INST", vec![2], INST), ("BASS", vec![1], BASS), ("DRUMS", vec![0], DRUMS)]
     };
+    // As rekordbox's deck strip (reference set, stems/14 and 30): the mode ("MUTE" or "SOLO")
+    // in grey, then one 44 x 17 pt button per part on a 50 pt pitch. A sounding part has its
+    // name and a 1 pt outline in its colour; a muted one is grey with no outline.
+    p.text(pos2(sx(main, 438.0), y), Align2::RIGHT_CENTER, if app.prefs.stem_solo { "SOLO" } else { "MUTE" }, FontId::proportional(10.0), hex(0x8C8C8C));
     for (i, (label, srcs, col)) in parts.iter().enumerate() {
-        let r = at(452.0 + i as f32 * 78.0, 70.0);
+        let r = at(474.0 + i as f32 * 50.0, 44.0).shrink2(vec2(0.0, 4.5));
         let resp = ui.interact(r, ui.id().with(("stem", i)), Sense::click());
-        let lit = have && srcs.iter().all(|s| on[*s]);
-        p.rect_filled(r, 3.0, if lit { col.gamma_multiply(0.85) } else if resp.hovered() { hex(0x2A2A2A) } else { hex(0x161616) });
-        p.rect_stroke(r, 3.0, Stroke::new(1.0_f32, if have { *col } else { hex(0x3C3C3C) }), egui::StrokeKind::Inside);
-        p.text(r.center(), Align2::CENTER_CENTER, *label, bold(10.5), if have { WHITE } else { DIM });
-        let resp = resp.on_hover_text(if have { "Switch this part on or off" } else { "Separate this track into parts first" });
+        let lit = srcs.iter().all(|s| on[*s]);
+        p.rect_filled(r, 1.0, if resp.hovered() { hex(0x1E1E1E) } else { hex(0x0F0F0F) });
+        if lit {
+            p.rect_stroke(r, 1.0, Stroke::new(1.0_f32, *col), egui::StrokeKind::Inside);
+        }
+        p.text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(10.0), if lit { *col } else { hex(0x8C8C8C) });
+        let resp = resp.on_hover_text(format!("STEM MUTE ({label}):\nThe {label} Stem is output when set to on. The {label} Stem is muted when set to off."));
         if resp.clicked() && loaded {
             // MUTE or SOLO, as chosen in Preferences > STEMS > ACTIVE STEM Setting.
             crate::prefs_ext::stem_part_click(app, srcs);
@@ -1082,16 +1105,16 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     } else if let Some(e) = &app.stem.error {
         e.clone()
     } else if have {
-        format!("Stems ready ({model}). Click a part to mute it.")
+        String::new()
     } else if !loaded {
         "Load a track to separate it into parts.".to_string()
     } else {
         format!("Not separated yet. Model: {model}.")
     };
-    p.text(pos2(sx(main, 770.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
+    p.text(pos2(sx(main, 700.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
     // Where the model comes from and its licence, on hover over the status line.
     if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
-        let sr = Rect::from_min_size(pos2(sx(main, 770.0), y - 9.0), vec2(360.0, 18.0));
+        let sr = Rect::from_min_size(pos2(sx(main, 700.0), y - 9.0), vec2(360.0, 18.0));
         ui.interact(sr, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
     let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();

@@ -209,6 +209,10 @@ pub struct Prefs {
     pub stem_model: Option<String>,
     /// Download the chosen model in the background at launch.
     pub stems_auto_download: bool,
+    /// Separate a track when it is loaded, as rekordbox does while its STEMS function is on.
+    pub stems_auto_separate: bool,
+    /// Most disk space the kept stems may use, in GB (the least recently used go first).
+    pub stem_cache_gb: u32,
     /// Import play histories from connected devices automatically.
     pub import_device_history: bool,
     /// Keyboard shortcuts changed from their defaults: action id -> key name.
@@ -691,6 +695,8 @@ impl Default for Prefs {
             usb_browse: Default::default(),
             stem_model: None,
             stems_auto_download: true,
+            stems_auto_separate: true,
+            stem_cache_gb: 20,
             import_device_history: true,
             keymap: Default::default(),
             column_browser: false,
@@ -2391,11 +2397,33 @@ impl App {
         });
     }
 
-    fn load_cached_stems(&mut self, id: i64) {
-        let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return };
+    /// Stems for a track that has just been loaded: the kept ones if this track was separated
+    /// before, else (as rekordbox does on every load while STEMS is on) a fresh separation in
+    /// the background, during which the original plays. A separation still running for a
+    /// track that is no longer on a deck is stopped.
+    fn stems_for_loaded(&mut self, id: i64) {
+        if let Some((sid, _)) = self.stem.separating {
+            if sid != id && self.px.other.track != Some(sid) {
+                self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.stem.separating = None;
+            }
+        }
+        if self.load_cached_stems(id) {
+            return;
+        }
+        let quiet = self.screenshot.is_some() && std::env::var("PREPDECK_SHOT_STEMS").is_err();
+        let ready = self.stem.model.as_deref().and_then(crate::stems::spec).map(crate::stems::model_ready).unwrap_or(false);
+        if self.prefs.show_stems && self.prefs.stems_auto_separate && ready && !quiet && self.deck.track == Some(id) {
+            self.separate_loaded();
+        }
+    }
+
+    /// Start reading a track's kept stems, if it has any (false: it has none).
+    fn load_cached_stems(&mut self, id: i64) -> bool {
+        let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return false };
         let path = crate::stems::cache_path(&t.path, &model);
         if !path.exists() {
-            return;
+            return false;
         }
         self.stem.loading = Some(id);
         let tx = self.stem.tx.clone();
@@ -2405,6 +2433,7 @@ impl App {
             let _ = tx.send(StemMsg::Done(id, r));
             ctx.request_repaint();
         });
+        true
     }
 
     /// Separate the loaded track (downloading the model first if it is missing).
@@ -2427,8 +2456,11 @@ impl App {
         self.stem.error = None;
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
-        let cancel = self.stem.cancel.clone();
-        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Each separation has its own stop flag, so stopping one (its track left the deck)
+        // cannot stop the next.
+        let cancel: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+        self.stem.cancel = cancel.clone();
+        let cache_limit = self.prefs.stem_cache_gb as u64 * 1_000_000_000;
         std::thread::spawn(move || {
             let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
                 let dec = crate::audio::decode_file(&t.path)?;
@@ -2439,7 +2471,9 @@ impl App {
                     ctx2.request_repaint();
                     !cancel.load(std::sync::atomic::Ordering::Relaxed)
                 })?;
-                let _ = crate::stems::save(&crate::stems::cache_path(&t.path, m.id), &st);
+                let kept = crate::stems::cache_path(&t.path, m.id);
+                let _ = crate::stems::save(&kept, &st);
+                crate::stems::trim_cache(cache_limit, &kept);
                 Ok(std::sync::Arc::new(st))
             };
             let _ = tx.send(StemMsg::Done(id, run().map_err(|e| e.to_string())));
@@ -2477,7 +2511,7 @@ impl App {
                         self.stem.downloading = Some((0, 0));
                     }
                     if let Some(id) = self.deck.track {
-                        self.load_cached_stems(id);
+                        self.stems_for_loaded(id);
                     }
                 }
                 StemMsg::Download(d, t) => self.stem.downloading = Some((d, t)),
@@ -2502,7 +2536,12 @@ impl App {
                         }
                     }
                 }
-                StemMsg::Progress(id, p) => self.stem.separating = Some((id, p)),
+                StemMsg::Progress(id, p) => {
+                    // (Not for a separation that was stopped because its track left the deck.)
+                    if self.stem.separating.map(|s| s.0) == Some(id) {
+                        self.stem.separating = Some((id, p));
+                    }
+                }
                 StemMsg::Done(id, r) => {
                     if self.stem.separating.map(|s| s.0) == Some(id) {
                         self.stem.separating = None;
@@ -3162,7 +3201,7 @@ impl App {
                 st.stem_on = [true; 4];
             }
         }
-        self.load_cached_stems(id);
+        self.stems_for_loaded(id);
         if t.analyzed == 0 {
             self.analyze(&[id], false);
         }

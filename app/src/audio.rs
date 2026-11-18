@@ -234,6 +234,9 @@ pub struct PlayState {
     /// drums, bass, other, vocals. With all on (or no stems) the original mix plays.
     pub stems: Option<Arc<crate::stems::Stems>>,
     pub stem_on: [bool; 4],
+    /// STEM ISO gain of each source (same order): 0 kills it, 1 leaves it, up to +6 dB
+    /// (`stem_iso_gain` turns a knob position into this).
+    pub stem_iso: [f32; 4],
     /// Search (scan): 0 = off; otherwise the speed and direction (e.g. 8.0 forward, -8.0
     /// backward). Short grains are played at normal pitch and the position skips between
     /// them, as a CDJ's SEARCH buttons do; it sounds whether or not the deck is playing.
@@ -279,6 +282,7 @@ impl Default for PlayState {
             metronome_vol: 0.5,
             stems: None,
             stem_on: [true; 4],
+            stem_iso: [1.0; 4],
             search: 0.0,
             muted: false,
             tempo: 1.0,
@@ -587,12 +591,19 @@ impl Iso3 {
     }
 }
 
-/// The loaded audio as the callback reads it: the original mix, or the audible stems summed.
+/// The loaded audio as the callback reads it: the original mix and, once the track is
+/// separated, its parts, each with the gain in force for the frame being rendered.
+///
+/// As rekordbox 7.2.19 mixes them (`StretchableAudioSource::read`, 0x10287fa18): while no
+/// part is muted or moved off unity, only the original file plays (bit for bit); otherwise
+/// the original fades out and the audible parts fade in. The instruments part is what is
+/// left of the mix after the other parts, so all parts together are always the mix.
 struct Src<'a> {
     audio: &'a Decoded,
     frames: usize,
     stems: Option<&'a crate::stems::Stems>,
-    stem_on: [bool; 4],
+    /// Gains for this frame: the original, then drums, bass, other, vocals.
+    g: std::cell::Cell<[f32; 5]>,
     stem_ratio: f64,
 }
 
@@ -601,38 +612,35 @@ impl Src<'_> {
     #[inline]
     fn at(&self, p: f64) -> (f32, f32) {
         let p = p.max(0.0);
-        match self.stems {
-            // Some stems muted: sum the audible ones at the same position.
-            Some(st) if st.len > 1 => {
-                let sp = p * self.stem_ratio;
-                let si = (sp as usize).min(st.len - 2);
-                let sf = (sp - si as f64) as f32;
-                let (mut l, mut r) = (0.0f32, 0.0f32);
-                let n = st.len as isize;
-                for (src, on) in self.stem_on.iter().enumerate() {
-                    if *on {
-                        let lb = src * 2 * st.len;
-                        let rb = lb + st.len;
-                        let at = |base: usize, k: isize| st.data[base + k.clamp(0, n - 1) as usize];
-                        let k = si as isize;
-                        l += cubic(at(lb, k - 1), at(lb, k), at(lb, k + 1), at(lb, k + 2), sf);
-                        r += cubic(at(rb, k - 1), at(rb, k), at(rb, k + 1), at(rb, k + 2), sf);
-                    }
-                }
-                (l, r)
-            }
-            // 4-point cubic (Catmull-Rom) between frames: exact at whole positions, far less
-            // high-frequency loss than linear interpolation when the file's rate differs from
-            // the device's (e.g. 44.1 kHz files on a 48 kHz output).
-            _ => {
-                let i = p as usize;
-                let fr = (p - i as f64) as f32;
-                let frames = self.frames as isize;
-                let at = |k: isize, c: usize| self.audio.samples[(k.clamp(0, frames - 1) as usize) * 2 + c];
-                let ii = i as isize;
-                (cubic(at(ii - 1, 0), at(ii, 0), at(ii + 1, 0), at(ii + 2, 0), fr), cubic(at(ii - 1, 1), at(ii, 1), at(ii + 1, 1), at(ii + 2, 1), fr))
-            }
-        }
+        // 4-point cubic (Catmull-Rom) between frames: exact at whole positions, far less
+        // high-frequency loss than linear interpolation when the file's rate differs from
+        // the device's (e.g. 44.1 kHz files on a 48 kHz output).
+        let i = p as usize;
+        let fr = (p - i as f64) as f32;
+        let frames = self.frames as isize;
+        let at = |k: isize, c: usize| self.audio.samples[(k.clamp(0, frames - 1) as usize) * 2 + c];
+        let ii = i as isize;
+        let (ol, or) = (cubic(at(ii - 1, 0), at(ii, 0), at(ii + 1, 0), at(ii + 2, 0), fr), cubic(at(ii - 1, 1), at(ii, 1), at(ii + 1, 1), at(ii + 2, 1), fr));
+        let g = self.g.get();
+        let st = match self.stems {
+            Some(st) if st.len > 1 && (g[1] != 0.0 || g[2] != 0.0 || g[3] != 0.0 || g[4] != 0.0) => st,
+            _ => return (ol * g[0], or * g[0]),
+        };
+        let sp = p * self.stem_ratio;
+        let si = (sp as usize).min(st.len - 2);
+        let sf = (sp - si as f64) as f32;
+        let n = st.len as isize;
+        let k = si as isize;
+        let part = |src: usize| -> (f32, f32) {
+            let lb = src * 2 * st.len;
+            let rb = lb + st.len;
+            let at = |base: usize, k: isize| st.data[base + k.clamp(0, n - 1) as usize];
+            (cubic(at(lb, k - 1), at(lb, k), at(lb, k + 1), at(lb, k + 2), sf), cubic(at(rb, k - 1), at(rb, k), at(rb, k + 1), at(rb, k + 2), sf))
+        };
+        let (d, b, v) = (part(0), part(1), part(3));
+        // Instruments: the mix less drums, bass and vocals.
+        let o = (ol - d.0 - b.0 - v.0, or - d.1 - b.1 - v.1);
+        (g[0] * ol + g[1] * d.0 + g[2] * b.0 + g[3] * o.0 + g[4] * v.0, g[0] * or + g[1] * d.1 + g[2] * b.1 + g[3] * o.1 + g[4] * v.1)
     }
     /// Left + right of whole source frame `i` (for aligning grains).
     #[inline]
@@ -788,11 +796,13 @@ struct DeckDsp {
     eq: Iso3,
     /// Crossfader gain in use (moving toward the deck's `fader`).
     fader: f32,
+    /// Gains in use for the original and the four parts (moving toward their targets).
+    stem_g: [f32; 5],
 }
 
 impl DeckDsp {
     fn new() -> DeckDsp {
-        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0 }
+        DeckDsp { st: Stretch::new(), eq: Iso3::new(), fader: 1.0, stem_g: [1.0, 0.0, 0.0, 0.0, 0.0] }
     }
 }
 
@@ -856,6 +866,29 @@ fn render(states: &[Arc<Mutex<PlayState>>; 2], out: &mut [f32], channels: usize,
     }
 }
 
+/// Time a part takes to fade fully in or out when it is muted or unmuted.
+pub const STEM_RAMP_SECS: f32 = 0.0033;
+
+/// STEM ISO: the gain for a knob position (0 = fully left, 0.5 = centre, 1 = fully right), as
+/// rekordbox 7.2.19's 256-step curve (`partIsoCurve`, read at `round(value * 255)`): kill at
+/// the left end with a soft toe, a straight line up to unity, a flat zone around the centre
+/// (steps 124 to 131, so a centred knob leaves the original playing), then a straight line
+/// up to +6 dB.
+pub fn stem_iso_gain(value: f32) -> f32 {
+    let i = (value.clamp(0.0, 1.0) * 255.0).round() as i32;
+    match i {
+        0..=9 => 0.0006 * (i * i) as f32,
+        10 => 0.0591,
+        11 => 0.0691,
+        12 => 0.0791,
+        13 => 0.0895,
+        14..=123 => 1.0 - (124 - i) as f32 / 122.0,
+        124..=131 => 1.0,
+        132..=252 => 1.0 + (i - 131) as f32 * (0.9952623 / 122.0),
+        _ => 1.9952623,
+    }
+}
+
 /// Frames per search grain at the device rate (60 ms).
 fn search_grain(rate: u32) -> usize {
     (rate as usize * 60 / 1000).max(1)
@@ -874,8 +907,23 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
     let frames = audio.frames();
     let vol = if s.muted { 0.0 } else { s.volume * s.gain * if searching { 0.7 } else { 1.0 } };
     let click_len = (rate as f64 * 0.03) as usize;
-    let stems = if s.stem_on.iter().all(|x| *x) { None } else { s.stems.clone() };
-    let src = Src { audio: &audio, frames, stems: stems.as_deref(), stem_on: s.stem_on, stem_ratio: crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64 };
+    let stems = s.stems.clone();
+    // Where the gains of the original and the parts are heading. The parts are used only
+    // while one of them is muted or off unity; until then the original plays untouched.
+    let use_parts = stems.is_some() && (0..4).any(|i| !s.stem_on[i] || s.stem_iso[i] != 1.0);
+    let mut stem_target = [if use_parts { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0, 0.0];
+    if use_parts {
+        for i in 0..4 {
+            stem_target[1 + i] = if s.stem_on[i] { s.stem_iso[i].clamp(0.0, 10.0) } else { 0.0 };
+        }
+    }
+    if stems.is_none() {
+        s.dsp.stem_g = [1.0, 0.0, 0.0, 0.0, 0.0];
+    }
+    // A full on/off change takes 3.3 ms (rekordbox's `udsp::GainController`: 145.53 frames
+    // at 44.1 kHz), at a constant slope, so smaller moves are proportionally quicker.
+    let stem_k = 1.0 / (STEM_RAMP_SECS * rate as f32);
+    let src = Src { audio: &audio, frames, stems: stems.as_deref(), g: std::cell::Cell::new(s.dsp.stem_g), stem_ratio: crate::stems::htdemucs::SAMPLE_RATE as f64 / audio.sr.max(1) as f64 };
     let metro = if searching { None } else { s.metronome.clone() };
     let grain = search_grain(rate);
     // Speed and pitch for this buffer. The pitch follows the speed unless Master Tempo holds
@@ -912,6 +960,12 @@ pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u3
             s.playing = false;
             s.pos = frames.saturating_sub(1) as f64;
             break;
+        }
+        if s.dsp.stem_g != stem_target {
+            for (g, t) in s.dsp.stem_g.iter_mut().zip(stem_target) {
+                *g += (t - *g).clamp(-stem_k, stem_k);
+            }
+            src.g.set(s.dsp.stem_g);
         }
         let (mut l, mut r) = if stretch { s.dsp.st.frame(&src, p, pitch * step, hop) } else { src.at(p) };
         if eq_on {
@@ -1393,5 +1447,94 @@ mod dsp_tests {
         let (pm, pf) = (m.lock().pos / 44100.0, f.lock().pos / 44100.0);
         let e = phase_error(f.lock().grid.as_ref().unwrap(), pf, m.lock().grid.as_ref().unwrap(), pm).unwrap();
         assert!(e.abs() > 0.15, "{e}");
+    }
+}
+
+#[cfg(test)]
+mod stem_mix_tests {
+    use super::*;
+
+    /// A track whose parts are known: original = drums + bass + other + vocals, where the
+    /// stored "other" is deliberately wrong (the instruments are taken as the residual).
+    fn deck() -> (PlayState, Vec<f32>, [Vec<f32>; 4]) {
+        let n = 44100;
+        let tone = |f: f32, a: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * f * std::f32::consts::TAU / 44100.0).sin() * a).collect() };
+        let parts = [tone(60.0, 0.2), tone(110.0, 0.15), tone(440.0, 0.1), tone(880.0, 0.12)];
+        let mix: Vec<f32> = (0..n).map(|i| parts.iter().map(|p| p[i]).sum()).collect();
+        let mut data = Vec::new();
+        for (k, p) in parts.iter().enumerate() {
+            let stored: Vec<f32> = if k == 2 { p.iter().map(|x| x * 0.5).collect() } else { p.clone() };
+            data.extend_from_slice(&stored);
+            data.extend_from_slice(&stored);
+        }
+        let audio = Decoded { sr: 44100, samples: mix.iter().flat_map(|x| [*x, *x]).collect(), raw_frames: n, damaged: 0, truncated: false };
+        let s = PlayState { audio: Some(Arc::new(audio)), stems: Some(Arc::new(crate::stems::Stems { len: n, data })), playing: true, volume: 1.0, gain: 1.0, ..Default::default() };
+        (s, mix, parts)
+    }
+
+    fn run(s: &mut PlayState, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        render_deck(s, &mut out, 2, 44100);
+        out.chunks(2).map(|c| c[0]).collect()
+    }
+
+    #[test]
+    fn all_parts_on_is_the_original_bit_for_bit() {
+        let (mut s, mix, _) = deck();
+        let out = run(&mut s, 4000);
+        assert!(out.iter().zip(&mix).all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn a_muted_part_fades_out_over_3_3_ms_and_the_rest_is_the_mix_without_it() {
+        let (mut s, mix, parts) = deck();
+        run(&mut s, 1000);
+        s.stem_on[3] = false; // vocals
+        let out = run(&mut s, 1000);
+        // No jump at the switch: the first frame is still (almost) the whole mix.
+        assert!((out[0] - mix[1000]).abs() < 0.01, "{} vs {}", out[0], mix[1000]);
+        // Half way through the fade about half of the vocal is left.
+        let half = 1000 + 73;
+        let left = (out[73] - (mix[half] - parts[3][half])) / parts[3][half];
+        assert!((left - 0.5).abs() < 0.08, "{left}");
+        // After 146 frames (3.3 ms) it is the mix less the vocals, exactly as rekordbox sums it.
+        for i in 150..1000 {
+            let want = mix[1000 + i] - parts[3][1000 + i];
+            assert!((out[i] - want).abs() < 1e-4, "frame {i}: {} vs {want}", out[i]);
+        }
+        // Back on: the original returns, bit for bit once the fade is over.
+        s.stem_on[3] = true;
+        let out = run(&mut s, 1000);
+        assert!(out[200..].iter().zip(&mix[2200..]).all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn instruments_are_what_is_left_of_the_mix() {
+        let (mut s, mix, parts) = deck();
+        s.stem_on = [false, false, true, false];
+        let out = run(&mut s, 2000);
+        // The stored "other" is half level; the residual is the true instruments part.
+        for i in 300..2000 {
+            assert!((out[i] - parts[2][i]).abs() < 1e-4, "frame {i}");
+        }
+        let _ = mix;
+    }
+
+    #[test]
+    fn stem_iso_curve_and_gain() {
+        assert_eq!(stem_iso_gain(0.0), 0.0);
+        assert_eq!(stem_iso_gain(0.5), 1.0);
+        assert!((stem_iso_gain(1.0) - 1.9952623).abs() < 1e-6);
+        assert!((stem_iso_gain(64.0 / 255.0) - 0.5082).abs() < 1e-4);
+        assert!((stem_iso_gain(16.0 / 255.0) - 0.1148).abs() < 1e-4);
+        assert!((stem_iso_gain(132.0 / 255.0) - 1.0081578).abs() < 1e-5);
+        assert!((stem_iso_gain(9.0 / 255.0) - 0.0486).abs() < 1e-6);
+        // Drums at +6 dB: the mix plus one more helping of drums.
+        let (mut s, mix, parts) = deck();
+        s.stem_iso[0] = stem_iso_gain(1.0);
+        let out = run(&mut s, 2000);
+        for i in 300..2000 {
+            assert!((out[i] - (mix[i] + 0.9952623 * parts[0][i])).abs() < 1e-4);
+        }
     }
 }

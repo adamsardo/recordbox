@@ -101,7 +101,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 "#),
     ("stems", "Stems", r#"
-<p>recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Advanced &gt; STEMS). Separated stems are kept so each track is only split once. The stem pads mute and unmute parts; Preferences &gt; Advanced &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
+<p>recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Extensions &gt; STEMS). Separated stems are kept so each track is only split once. A track is separated when it is loaded, and the original plays until its parts are ready. The part buttons mute and unmute parts (or solo them); Preferences &gt; Extensions &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
 "#),
     ("export", "Exporting to USB", r#"
 <ol>

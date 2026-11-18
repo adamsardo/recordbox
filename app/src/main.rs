@@ -186,6 +186,11 @@ impl eframe::App for Gui {
         if bench > 0 {
             if let Some((_, frames)) = app.screenshot.clone() {
                 static TIMES: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+                // PREPDECK_BENCH_MUTE=<frame>: mute the vocals at that frame (the stem waveform).
+                if std::env::var("PREPDECK_BENCH_MUTE").ok().and_then(|v| v.parse::<u32>().ok()) == Some(frames) {
+                    eprintln!("bench: stems ready at the mute {}", app.player.state.lock().stems.is_some());
+                    app.player.state.lock().stem_on[3] = false;
+                }
                 if frames == 60 {
                     if !app.px.muted {
                         app.toggle_mute();
@@ -204,6 +209,7 @@ impl eframe::App for Gui {
                     let avg = v.iter().sum::<f32>() / v.len() as f32;
                     eprintln!("bench: {} frames, update avg {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}", v.len(), avg, v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1]);
                     use std::sync::atomic::Ordering::Relaxed;
+                    eprintln!("bench: stems ready {}, separating {:?}, stem error {:?}", app.player.state.lock().stems.is_some(), app.stem.separating, app.stem.error);
                     eprintln!("bench: audio callback found a deck held {} times, gave a buffer up {} times", audio::AUDIO_CONTENDED.load(Relaxed), audio::AUDIO_DROPPED.load(Relaxed));
                 }
             }

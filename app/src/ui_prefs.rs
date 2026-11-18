@@ -34,7 +34,8 @@ const STEM_WAVEFORM_WIRED: bool = true;
 /// Categories the original has and Recordbox does not (no subscription, no cloud): shown
 /// dimmed at their places so the list reads the same.
 const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "recordbox has no subscription plans."), (101, "CLOUD", "recordbox has no cloud service.")];
-const PAGES: [(u8, &str); 6] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced")];
+// Extensions is where rekordbox keeps its STEMS page (in Performance mode).
+const PAGES: [(u8, &str); 7] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced"), (6, "Extensions")];
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
     match page {
@@ -43,7 +44,8 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         2 => &["General", "Category", "Sort", "Column", "My Settings", "Device", "Others"],
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
-        _ => &["Database", "Browse", "Others", "STEMS"],
+        6 => &["STEMS"],
+        _ => &["Database", "Browse", "Others"],
     }
 }
 
@@ -137,16 +139,16 @@ const SETTINGS: [(u8, usize, &str); 100] = [
     (4, 1, "Color comments"),
     (4, 1, "Customize Color Comments"),
     (4, 2, "rekordbox Library"),
-    (4, 3, "Enable the STEMS Function"),
-    (4, 3, "STEMS mode"),
-    (4, 3, "STEMS Analysis Process"),
-    (4, 3, "Prioritize sound quality"),
-    (4, 3, "Prioritize speed"),
-    (4, 3, "STEM Waveform Display"),
-    (4, 3, "ACTIVE STEM Setting"),
-    (4, 3, "MUTE / SOLO"),
-    (4, 3, "Reset the MUTE/SOLO state while loading"),
-    (4, 3, "Stem separation model"),
+    (6, 0, "Enable the STEMS Function"),
+    (6, 0, "STEMS mode"),
+    (6, 0, "STEMS Analysis Process"),
+    (6, 0, "Prioritize sound quality"),
+    (6, 0, "Prioritize speed"),
+    (6, 0, "STEM Waveform Display"),
+    (6, 0, "ACTIVE STEM Setting"),
+    (6, 0, "MUTE / SOLO"),
+    (6, 0, "Reset the MUTE/SOLO state while loading"),
+    (6, 0, "Stem separation model"),
     (2, 6, "Supported devices"),
     (0, 0, "Tooltips"),
 ];
@@ -254,6 +256,20 @@ fn side_icon(p: &egui::Painter, o: egui::Pos2, page: u8, c: Color32, bg: Color32
             p.add(egui::Shape::line(arc(0.0), egui::Stroke::new(0.86, bg)));
             p.add(egui::Shape::line(vec![at(18.43, 12.11), at(18.43, 14.68), at(15.86, 14.68)], egui::Stroke::new(0.86, bg)));
             p.add(egui::Shape::line(vec![at(11.57, 19.83), at(11.57, 17.26), at(14.15, 17.26)], egui::Stroke::new(0.86, bg)));
+        }
+        // Extensions: two gears (skins/preferece_extensions_off.svg: 9 pt across, eight teeth,
+        // a 3.86 pt hole; centres 19.51, 11.79 and 10.50, 18.22).
+        6 => {
+            for (cx, cy) in [(19.508, 11.789), (10.504, 18.221)] {
+                let c0 = at(cx, cy);
+                p.circle_filled(c0, 3.5, c);
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let (dir, side) = (vec2(a.sin(), -a.cos()), vec2(a.cos(), a.sin()));
+                    p.add(egui::Shape::convex_polygon(vec![c0 + dir * 2.8 - side * 1.04, c0 + dir * 4.5 - side * 0.9, c0 + dir * 4.5 + side * 0.9, c0 + dir * 2.8 + side * 1.04], c, egui::Stroke::NONE));
+                }
+                p.circle_filled(c0, 1.93, bg);
+            }
         }
         // Advanced: three lines.
         _ => {
@@ -396,6 +412,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 2 => page_dj_system(app, ui, sub_tab),
                 3 => page_keyboard(app, ui, sub_tab),
                 5 => page_audio(app, ui, sub_tab),
+                6 => page_stems(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }
         }
@@ -1547,7 +1564,6 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
                 });
             });
         }
-        3 => page_stems(app, ui),
         _ => {
             card(ui, "rekordbox Library", |ui| {
                 toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when recordbox starts");
@@ -1620,11 +1636,11 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
     });
     card(ui, "ACTIVE STEM Setting", |ui| {
         if radio(ui, !app.prefs.stem_solo, "MUTE") {
-            app.prefs.stem_solo = false;
+            crate::prefs_ext::set_stem_solo(app, false);
         }
         if STEM_SOLO_WIRED {
             if radio(ui, app.prefs.stem_solo, "SOLO") {
-                app.prefs.stem_solo = true;
+                crate::prefs_ext::set_stem_solo(app, true);
             }
         } else {
             kit::radio_off(ui, false, "SOLO", "The part buttons mute their part, so far.");
@@ -1658,7 +1674,9 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         if let Some((d, t)) = app.stem.downloading {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
-        note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} GB in use.", crate::stems::cache_size() as f64 / 1e9));
+        toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
+        note(ui, "As rekordbox does while its STEMS function is on. The original plays until the parts are ready. Off: a track is separated when you first press one of its part buttons.");
+        note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {
                 crate::stems::clear_cache();
