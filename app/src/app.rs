@@ -3698,7 +3698,7 @@ impl App {
         } else {
             self.pos()
         };
-        let end = start + beats * self.beat_len();
+        let end = loop_end_on_grid(&self.deck.beats, start, beats).unwrap_or(start + beats * self.beat_len());
         self.player.state.lock().loop_range = Some((start, end));
         self.deck.last_loop = Some((start, end));
     }
@@ -4706,6 +4706,22 @@ pub fn media_stamp(m: &std::fs::Metadata) -> (i64, i64) {
 /// Jump a whole number of beats along the grid's own beats (so tempo changes are followed),
 /// keeping the position within the beat. None for fractional jumps or an empty grid; beyond
 /// the grid's ends the nearest beat interval is extended.
+/// Where a loop of `n` beats starting at `start` ends, walking the grid's own beats so the
+/// loop stays on the grid through a tempo change (AUD-006). Whole numbers of beats use
+/// [`grid_jump`]; a fraction is that part of the beat interval the loop starts in.
+pub fn loop_end_on_grid(beats: &[Beat], start: f64, n: f64) -> Option<f64> {
+    if n <= 0.0 {
+        return None;
+    }
+    if n.fract() == 0.0 {
+        return grid_jump(beats, start, n).filter(|e| *e > start);
+    }
+    let whole = n.floor();
+    let from = if whole > 0.0 { grid_jump(beats, start, whole)? } else { start };
+    let next = grid_jump(beats, from, 1.0)?;
+    Some(from + (next - from) * (n - whole)).filter(|e| *e > start)
+}
+
 pub fn grid_jump(beats: &[Beat], p: f64, n: f64) -> Option<f64> {
     if beats.len() < 2 || n.fract() != 0.0 {
         return None;

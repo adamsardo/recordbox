@@ -520,6 +520,20 @@ mod tests {
         g.beats(d).iter().map(|b| ((b.time * 1e6).round() as i64, b.beat)).collect()
     }
     #[test]
+    fn loops_follow_the_grid_through_a_tempo_change() {
+        // 120 BPM until 2.0 s, then 100 BPM.
+        let g = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.0, bpm: 100.0, beat: 1 }] };
+        let b = g.beats(10.0);
+        let end = |s: f64, n: f64| (crate::app::loop_end_on_grid(&b, s, n).unwrap() * 1e6).round() as i64;
+        // Four beats from 1.0 s: two at 0.5 s and two at 0.6 s, not 4 x 0.5.
+        assert_eq!(end(1.0, 4.0), 3_200_000);
+        assert_eq!(end(0.0, 1.0), 500_000);
+        // Half a beat uses the interval the loop starts in.
+        assert_eq!(end(2.0, 0.5), 2_300_000);
+        assert_eq!(end(1.5, 1.5), 2_300_000);
+        assert!(crate::app::loop_end_on_grid(&[], 1.0, 4.0).is_none());
+    }
+    #[test]
     fn double_and_half_grid_follow_rekordbox() {
         // Constant grid: first beat at 0.1 s numbered 2.
         let g = BeatGrid::constant(0.1, 120.0, 2);
