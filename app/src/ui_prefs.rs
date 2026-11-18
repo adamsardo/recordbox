@@ -35,7 +35,8 @@ const STEM_WAVEFORM_WIRED: bool = true;
 /// dimmed at their places so the list reads the same.
 const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "recordbox has no subscription plans."), (101, "CLOUD", "recordbox has no cloud service.")];
 // Extensions is where rekordbox keeps its STEMS page (in Performance mode).
-const PAGES: [(u8, &str); 7] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced"), (6, "Extensions")];
+// Controller holds the Performance mixer's settings, as in rekordbox.
+const PAGES: [(u8, &str); 8] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (7, "Controller"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced"), (6, "Extensions")];
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
     match page {
@@ -45,12 +46,13 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
         6 => &["STEMS"],
+        7 => &["Mixer"],
         _ => &["Database", "Browse", "Others"],
     }
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 100] = [
+const SETTINGS: [(u8, usize, &str); 103] = [
     (0, 0, "Language"),
     (0, 0, "Show Tooltips"),
     (0, 0, "Font Size"),
@@ -139,6 +141,9 @@ const SETTINGS: [(u8, usize, &str); 100] = [
     (4, 1, "Color comments"),
     (4, 1, "Customize Color Comments"),
     (4, 2, "rekordbox Library"),
+    (7, 0, "EQ"),
+    (7, 0, "EQ/ISOLATOR"),
+    (7, 0, "Channel Fader Curve"),
     (6, 0, "Enable the STEMS Function"),
     (6, 0, "STEMS mode"),
     (6, 0, "STEMS Analysis Process"),
@@ -256,6 +261,14 @@ fn side_icon(p: &egui::Painter, o: egui::Pos2, page: u8, c: Color32, bg: Color32
             p.add(egui::Shape::line(arc(0.0), egui::Stroke::new(0.86, bg)));
             p.add(egui::Shape::line(vec![at(18.43, 12.11), at(18.43, 14.68), at(15.86, 14.68)], egui::Stroke::new(0.86, bg)));
             p.add(egui::Shape::line(vec![at(11.57, 19.83), at(11.57, 17.26), at(14.15, 17.26)], egui::Stroke::new(0.86, bg)));
+        }
+        // Controller: a box with two rings (skins/preferece_controller_off.svg).
+        7 => {
+            p.rect_filled(Rect::from_min_max(at(6.0, 8.57), at(24.01, 21.44)), 0.0, c);
+            for cx in [11.145, 18.864] {
+                p.circle_filled(at(cx, 15.005), 2.573, bg);
+                p.circle_filled(at(cx, 15.005), 1.286, c);
+            }
         }
         // Extensions: two gears (skins/preferece_extensions_off.svg: 9 pt across, eight teeth,
         // a 3.86 pt hole; centres 19.51, 11.79 and 10.50, 18.22).
@@ -413,6 +426,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 3 => page_keyboard(app, ui, sub_tab),
                 5 => page_audio(app, ui, sub_tab),
                 6 => page_stems(app, ui),
+                7 => page_mixer(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }
         }
@@ -1575,6 +1589,36 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
                 });
             });
         }
+    }
+}
+
+/// Controller > Mixer, as far as the Performance mixer goes: rekordbox's EQ / ISOLATOR choice
+/// and its three channel fader curves (labels and defaults as in 7.2.19).
+fn page_mixer(app: &mut App, ui: &mut Ui) {
+    let mut changed = false;
+    card(ui, "EQ", |ui| {
+        sub(ui, "EQ/ISOLATOR");
+        if radio(ui, !app.prefs.eq_isolator, "EQ") {
+            app.prefs.eq_isolator = false;
+            changed = true;
+        }
+        if radio(ui, app.prefs.eq_isolator, "ISOLATOR") {
+            app.prefs.eq_isolator = true;
+            changed = true;
+        }
+        note(ui, "EQ: HIGH, MID and LOW cut to -26 dB and boost to +6 dB (the DJM-900NXS2 type). ISOLATOR: each band can be removed completely.");
+    });
+    card(ui, "Channel Fader Curve", |ui| {
+        for (i, name) in ["Exponential Curve", "Linear Curve", "Logarithmic Curve"].iter().enumerate() {
+            if radio(ui, app.prefs.ch_fader_curve == i as u8, name) {
+                app.prefs.ch_fader_curve = i as u8;
+                changed = true;
+            }
+        }
+    });
+    if changed {
+        app.poll_decks();
+        app.save_prefs();
     }
 }
 

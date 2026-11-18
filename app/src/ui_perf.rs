@@ -221,7 +221,8 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     // ---- stem part buttons (MUTE / SOLO), right-aligned under the overview
     if stems_row > 0.0 {
         let sy = y0 + 97.0 + phrase_h;
-        p.rect_filled(Rect::from_min_size(pos2(x0, sy), vec2(w, 19.0)), 0.0, PANEL);
+        // (Only as wide as its buttons, so the phrase bar beside it stays visible.)
+        p.rect_filled(Rect::from_min_max(pos2(rx - 262.0, sy), pos2(rx, sy + 19.0)), 0.0, BG);
         let on = app.player.state.lock().stem_on;
         let three = app.prefs.stem_parts == 3;
         let parts: Vec<(&str, Vec<usize>, Color32)> = PART.iter().filter(|x| !(three && x.0 == "BASS")).map(|x| (x.0, if three && x.0 == "INST" { vec![2, 1] } else { vec![x.1] }, x.2)).collect();

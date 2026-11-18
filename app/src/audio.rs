@@ -1603,3 +1603,54 @@ mod stem_mix_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    fn deck() -> PlayState {
+        let n = 44100;
+        let x: Vec<f32> = (0..n).flat_map(|i| { let v = (i as f32 * 440.0 * std::f32::consts::TAU / 44100.0).sin() * 0.5; [v, v] }).collect();
+        PlayState { audio: Some(Arc::new(Decoded { sr: 44100, samples: x, raw_frames: n, damaged: 0, truncated: false })), playing: true, volume: 1.0, gain: 1.0, ..Default::default() }
+    }
+
+    fn rms(s: &mut PlayState) -> f32 {
+        let mut out = vec![0.0f32; 8192];
+        render_deck(s, &mut out, 2, 44100);
+        let mut out = vec![0.0f32; 8192];
+        render_deck(s, &mut out, 2, 44100);
+        (out.iter().map(|v| v * v).sum::<f32>() / out.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn performance_strip_applies_trim_fader_and_feeds_the_meter_before_the_fader() {
+        // No strip (Export): the track as it is, and no meter reading.
+        let mut s = deck();
+        let plain = rms(&mut s);
+        assert_eq!(s.peak, [0.0; 2]);
+        // Strip with everything at unity and a flat EQ: the same level; the meter reads the peak.
+        let mut s = PlayState { strip: 1, ..deck() };
+        assert!((rms(&mut s) / plain - 1.0).abs() < 1e-3);
+        assert!((s.peak[0] - 0.5).abs() < 0.01);
+        // Fader at -12 dB: the output falls, the meter (before the fader) does not.
+        let mut s = PlayState { strip: 1, ch_fader: crate::mixer::channel_fader_gain(0.5, 1), ..deck() };
+        let half = rms(&mut s);
+        assert!((20.0 * (half / plain).log10() + 12.0).abs() < 0.3, "{}", 20.0 * (half / plain).log10());
+        assert!((s.peak[0] - 0.5).abs() < 0.01);
+        // Trim fully right: +8.8 dB on both.
+        let mut s = PlayState { strip: 1, trim: crate::mixer::trim_gain(1.0), ..deck() };
+        assert!((20.0 * (rms(&mut s) / plain).log10() - 8.79).abs() < 0.1);
+        // Isolator with MID at the left end: a 440 Hz tone (between the crossovers) falls to
+        // what the LOW band still passes of it (about -16 dB, 0.6 octave above 284 Hz).
+        let mut s = PlayState { strip: 2, eq_pos: [0.5, 0.0, 0.5], ..deck() };
+        assert!(20.0 * (rms(&mut s) / plain).log10() < -12.0);
+        // ...and with LOW at the left end too it is gone.
+        let mut s = PlayState { strip: 2, eq_pos: [0.0, 0.0, 0.5], ..deck() };
+        assert!(20.0 * (rms(&mut s) / plain).log10() < -45.0);
+        // Equalizer with LOW at the left end: 440 Hz is barely touched (the cut shelf lies
+        // below 250 Hz), where the isolator's LOW takes 16 dB off it.
+        let mut s = PlayState { strip: 1, eq_pos: [0.0, 0.5, 0.5], ..deck() };
+        let d = 20.0 * (rms(&mut s) / plain).log10();
+        assert!(d < -0.3 && d > -3.0, "{d}");
+    }
+}
