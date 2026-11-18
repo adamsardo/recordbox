@@ -222,6 +222,9 @@ pub struct Prefs {
     pub perf_sampler: bool,
     /// The sampler deck: its slots and settings.
     pub sampler: crate::ui_sampler::SamplerPrefs,
+    /// The FX panel's choices (rekordbox's FxUnitSettings): modes, effects, beat values,
+    /// single-mode snapshots, RELEASE FX and the CFX row.
+    pub fx: crate::ui_fx::FxSaved,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
@@ -720,6 +723,7 @@ impl Default for Prefs {
             deck_load_lock: false,
             instant_doubles: false,
             perf_fx: false,
+            fx: Default::default(),
             perf_four: false,
             perf_sampler: false,
             sampler: Default::default(),

@@ -6,11 +6,17 @@
 //! FILTER follows rekordbox's traced rules exactly in its blend zones, cutoff curves and
 //! resonance law (the filters themselves are ordinary second-order sections; rekordbox's own
 //! filter shape was not traced). NOISE, CRUSH and DUB ECHO follow the traced outlines; JET,
-//! SPACE and SWEEP are recordbox's own takes on the effects of those names. PITCH and GATE
-//! COMP are not built.
+//! SPACE, SWEEP, PITCH and GATE COMP are recordbox's own takes on the effects of those names
+//! (GATE COMP with the thresholds and time constants of rekordbox's `GateCore` / `CompCore`
+//! parameter lists).
 
 /// The USER menu's nine types in rekordbox's order (the effect if recordbox has it).
-pub const LIST: [(&str, Option<u8>); 9] = [("FILTER", Some(0)), ("JET", Some(1)), ("CRUSH", Some(2)), ("NOISE", Some(3)), ("PITCH", None), ("SPACE", Some(5)), ("DUB ECHO", Some(6)), ("SWEEP", Some(7)), ("GATE COMP", None)];
+pub const LIST: [(&str, Option<u8>); 9] = [("FILTER", Some(0)), ("JET", Some(1)), ("CRUSH", Some(2)), ("NOISE", Some(3)), ("PITCH", Some(4)), ("SPACE", Some(5)), ("DUB ECHO", Some(6)), ("SWEEP", Some(7)), ("GATE COMP", Some(8))];
+
+/// The effects DEFAULT offers for a mixer, in the order of its buttons. Without hardware
+/// rekordbox shows FILTER alone; the lists of its supported mixers were not traced, so this is
+/// the one list there is.
+pub const DEFAULT_LIST: [u8; 1] = [0];
 
 pub fn name(kind: u8) -> &'static str {
     LIST.iter().find(|x| x.1 == Some(kind)).map(|x| x.0).unwrap_or("FILTER")
@@ -104,7 +110,17 @@ pub struct Cfx {
     comb_pos: [usize; 8],
     comb_lp: [f32; 8],
     made: (f32, f32, u32),
+    /// PITCH: the shifter's line, write position and window phase.
+    ps: Vec<f32>,
+    ps_w: usize,
+    ps_ph: f32,
+    /// GATE COMP: the level follower and the gain in use.
+    env: f32,
+    gain: f32,
 }
+
+const PS_LEN: usize = 4096;
+const PS_WIN: f32 = 2048.0;
 
 impl Cfx {
     pub fn new() -> Cfx {
@@ -115,7 +131,7 @@ impl Cfx {
                 combs.push(vec![0.0; l + ch * 31]);
             }
         }
-        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], combs, comb_pos: [0; 8], comb_lp: [0.0; 8], made: (-1.0, -1.0, 0) }
+        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], combs, comb_pos: [0; 8], comb_lp: [0.0; 8], made: (-1.0, -1.0, 0), ps: vec![0.0; PS_LEN * 2], ps_w: 0, ps_ph: 0.0, env: 0.0, gain: 1.0 }
     }
 
     fn reset(&mut self) {
@@ -128,6 +144,9 @@ impl Cfx {
         self.fb_lp = [0.0; 2];
         self.hold = [0.0; 2];
         self.made = (-1.0, -1.0, 0);
+        self.ps.iter_mut().for_each(|v| *v = 0.0);
+        self.env = 0.0;
+        self.gain = 1.0;
     }
 
     #[inline]
@@ -281,6 +300,65 @@ impl Cfx {
                             *v += coloured * depth.min(1.0);
                         }
                         self.w = (self.w + 1) % ECHO_LEN;
+                    }
+                }
+                4 => {
+                    // PITCH: left lowers the pitch, right raises it, an octave at the ends;
+                    // PARAM mixes the shifted sound in (all of it from the centre up).
+                    let ratio = 2f32.powf(if right { depth } else { -depth });
+                    let wet = (p * 2.0).min(1.0) * (depth * 8.0).min(1.0);
+                    for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
+                        self.ps[self.ps_w * 2] = f[0];
+                        self.ps[self.ps_w * 2 + 1] = f[1];
+                        self.ps_ph += (1.0 - ratio) / PS_WIN;
+                        self.ps_ph -= self.ps_ph.floor();
+                        let mut o = [0.0f32; 2];
+                        for k in 0..2 {
+                            let ph = (self.ps_ph + k as f32 * 0.5).fract();
+                            let d = 1.0 + ph * PS_WIN;
+                            let i = d as usize;
+                            let t = d - i as f32;
+                            let g = 0.5 - 0.5 * (std::f32::consts::TAU * ph).cos();
+                            let (a, b) = ((self.ps_w + PS_LEN - i) % PS_LEN, (self.ps_w + PS_LEN - i - 1) % PS_LEN);
+                            for ch in 0..2 {
+                                o[ch] += (self.ps[a * 2 + ch] + (self.ps[b * 2 + ch] - self.ps[a * 2 + ch]) * t) * g;
+                            }
+                        }
+                        self.ps_w = (self.ps_w + 1) % PS_LEN;
+                        f[0] += (o[0] - f[0]) * wet;
+                        f[1] += (o[1] - f[1]) * wet;
+                    }
+                }
+                8 => {
+                    // GATE COMP: left a gate whose threshold rises with the knob, right a
+                    // compressor that squeezes harder with it and makes the level up. The
+                    // follower's release (0.99964 / 0.99919 a sample at 44.1 kHz), the gate's
+                    // opening and closing (0.0026571, 0.99982), the compressor's threshold
+                    // (0.24) and its make-up limit (3.6) are rekordbox's defaults; PARAM is
+                    // the gate's closing time or the compressor's make-up.
+                    let per = 44100.0 / r;
+                    let rel = if right { 0.99919f32 } else { 0.99964f32 }.powf(per);
+                    for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
+                        let a = f[0].abs().max(f[1].abs());
+                        self.env = if a > self.env { a } else { self.env * rel };
+                        let want = if right {
+                            let th = 0.24 * (1.0 - 0.75 * depth);
+                            let ratio = 1.0 - 0.85 * depth;
+                            let g = if self.env > th { (th + (self.env - th) * ratio) / self.env } else { 1.0 };
+                            g * (1.0 + (3.6 - 1.0) * depth * p).min(1.0 / g.max(0.05)).min(3.6)
+                        } else if self.env >= 0.5 * depth * depth {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        if want > self.gain {
+                            self.gain += (want - self.gain) * (0.0026571 * per * 4.0).min(1.0);
+                        } else {
+                            let close = 0.99982f32.powf(per * (0.25 + 3.0 * (1.0 - p)));
+                            self.gain = want + (self.gain - want) * close;
+                        }
+                        f[0] *= self.gain;
+                        f[1] *= self.gain;
                     }
                 }
                 _ => {

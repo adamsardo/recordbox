@@ -404,7 +404,8 @@ impl App {
         // CFX on the sampler (Preferences > Controller > Effect), only with the FX panel shown.
         let cfx = if self.prefs.sampler.cfx_on_sampler && self.prefs.perf_fx { self.px.sampler.cfx_color } else { 0.5 };
         if let Some(r) = crate::fx::RACK.lock().as_mut() {
-            r.sampler_cfx_set = (if self.px.cfx_user { self.px.cfx_kind } else { 0 }, cfx, self.px.cfx_param);
+            let (ck, cc, cp) = crate::ui_fx::cfx_for(self, crate::fx::SAMPLER);
+            r.sampler_cfx_set = (ck, if cfx == 0.5 { 0.5 } else { cc }, cp);
         }
         let sp = &self.prefs.sampler;
         let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);

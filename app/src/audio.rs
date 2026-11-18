@@ -535,6 +535,14 @@ pub fn beat_phase(beats: &[f64], t: f64) -> Option<f64> {
     Some(((t - a) / len).rem_euclid(1.0))
 }
 
+/// Where `t` is on the beat grid, in beats from its first beat (whole part = the beat's
+/// number, fraction = `beat_phase`). For Beat FX quantize.
+pub fn beat_pos(beats: &[f64], t: f64) -> Option<f64> {
+    let phase = beat_phase(beats, t)?;
+    let i = beats.partition_point(|b| *b <= t);
+    Some(if i == 0 { ((t - beats[0]) / (beats[1] - beats[0])).floor() + phase } else { (i - 1) as f64 + if i >= beats.len() { ((t - beats[i - 1]) / (beats[i - 1] - beats[i - 2])).floor() } else { 0.0 } + phase })
+}
+
 /// Beat phase of the follower minus the master's, wrapped to -0.5..0.5 beats (positive: the
 /// follower is ahead).
 pub fn phase_error(follower: &[f64], t_f: f64, master: &[f64], t_m: f64) -> Option<f64> {
@@ -1069,6 +1077,14 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
                     buf.resize(out.len(), 0.0);
                 }
                 buf[..out.len()].iter_mut().for_each(|v| *v = 0.0);
+                // Beat FX quantize: where the deck is on its grid as this buffer starts.
+                rack.beat[i] = match (s.playing && s.search == 0.0, &s.grid, &s.audio) {
+                    (true, Some(g), Some(a)) => beat_pos(g, s.pos / a.sr as f64),
+                    _ => None,
+                };
+                if i == MASTER_DECK.load(std::sync::atomic::Ordering::Relaxed) as usize {
+                    rack.beat[crate::fx::MASTER] = rack.beat[i];
+                }
                 render_deck_cue(s, &mut buf[..out.len()], cue, channels, rate);
                 rack.process(i, &mut buf[..out.len()], rate);
                 for (o, v) in out.iter_mut().zip(&buf) {

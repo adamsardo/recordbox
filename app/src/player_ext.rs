@@ -123,6 +123,8 @@ pub struct PlayerExt {
     pub cfx_user: bool,
     pub cfx_param: f32,
     pub cfx_color: [f32; 5],
+    /// The rest of the FX panel's state: CFX multi mode, PARAM per effect, what was last saved.
+    pub fxx: crate::ui_fx::FxExtra,
     /// Quantize of the parked decks (`Prefs::quantize` is the active deck's): each deck has
     /// its own Q, as in rekordbox.
     pub parked_quantize: [bool; 4],
@@ -159,7 +161,7 @@ impl MixStrip {
 
 impl Default for PlayerExt {
     fn default() -> Self {
-        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], parked_quantize: [true; 4], parked_loop: [None; 4], sampler: crate::ui_sampler::SamplerUi::new() }
+        PlayerExt { parked: std::array::from_fn(|_| Deck::default()), parked_backup: [None, None, None, None], active: 0, muted: false, master: 0, crossfader: 0.5, dual_control: false, wave_link: false, mix: [MixStrip::new(1), MixStrip::new(2), MixStrip::new(1), MixStrip::new(2)], hp_mix: 0.5, hp_level: 0.5, master_db: [-120.0; 2], pad_mode: [0; 4], loop_manual: [false; 4], stem_fx: [true; 4], fx: [crate::ui_fx::FxUi::new(), crate::ui_fx::FxUi::new()], cfx_kind: 0, cfx_user: false, cfx_param: 0.5, cfx_color: [0.5; 5], fxx: Default::default(), parked_quantize: [true; 4], parked_loop: [None; 4], sampler: crate::ui_sampler::SamplerUi::new() }
     }
 }
 
@@ -721,9 +723,10 @@ impl App {
             s.key_shift = if keys { x.key_shift as f32 } else { 0.0 };
             s.smooth = true;
             // Sound Color FX (only with the FX panel shown; DEFAULT is always FILTER).
-            s.cfx_kind = if self.px.cfx_user { self.px.cfx_kind } else { 0 };
-            s.cfx_color = if perf && self.prefs.perf_fx { self.px.cfx_color[n as usize] } else { 0.5 };
-            s.cfx_param = self.px.cfx_param;
+            let (ck, cc, cp) = crate::ui_fx::cfx_for(self, n as usize);
+            s.cfx_kind = ck;
+            s.cfx_color = if perf && self.prefs.perf_fx { cc } else { 0.5 };
+            s.cfx_param = cp;
             // Headphones CUE: the deck's share, by the MIX and LEVEL knobs (rekordbox's law).
             s.cue_gain = if perf && hp_on && self.px.mix[n as usize].cue { crate::mixer::cue_master_balance(1.0 - hp_mix) * hp_level } else { 0.0 };
             s.deck_no = n;
