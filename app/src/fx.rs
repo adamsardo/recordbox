@@ -1789,6 +1789,38 @@ mod tests {
         }
     }
 
+    /// `cargo test --release fx_cost -- --ignored --nocapture`: what the effects cost on the
+    /// audio thread, as a share of real time (512-frame buffers at 48 kHz, one channel).
+    #[test]
+    #[ignore]
+    fn fx_cost() {
+        let run = |label: &str, set: &dyn Fn(&mut UnitParams)| {
+            let mut rack = Rack::new();
+            rack.enabled = true;
+            let mut p = unit(Kind::Delay, 1.0, 0.7);
+            p.slots[0].on = false;
+            set(&mut p);
+            rack.units[0].params = p;
+            rack.units[0].prepare(&p.assign);
+            let mut x = tone(48000 * 20, 330.0);
+            let t = std::time::Instant::now();
+            for chunk in x.chunks_mut(512 * 2) {
+                rack.process(0, chunk, 48000);
+            }
+            let secs = t.elapsed().as_secs_f64();
+            println!("fx cost: {label:<34} {:6.2} % of real time ({:.1} us per 512-frame buffer)", secs / 20.0 * 100.0, secs / (48000.0 * 20.0 / 512.0) * 1e6);
+        };
+        run("assigned, nothing on", &|_| {});
+        run("DELAY + ECHO + SPIRAL", &|p| p.slots.iter_mut().for_each(|s| s.on = true));
+        for info in INFO.iter() {
+            let label = format!("{} alone", info.name);
+            run(&label, &|p| p.slots[0] = SlotParams { on: true, level: 0.7, ..SlotParams::new(info.kind) });
+        }
+        run("REVERB + PHASER + PITCH ECHO-like", &|p| {
+            p.slots = [SlotParams { on: true, ..SlotParams::new(Kind::Reverb) }, SlotParams { on: true, ..SlotParams::new(Kind::Phaser) }, SlotParams { on: true, ..SlotParams::new(Kind::UpEcho) }];
+        });
+    }
+
     #[test]
     fn tap_tempo_and_beat_text() {
         let mut t = Tap::new();
