@@ -345,7 +345,7 @@ impl Cfx {
                             let th = 0.24 * (1.0 - 0.75 * depth);
                             let ratio = 1.0 - 0.85 * depth;
                             let g = if self.env > th { (th + (self.env - th) * ratio) / self.env } else { 1.0 };
-                            g * (1.0 + (3.6 - 1.0) * depth * p).min(1.0 / g.max(0.05)).min(3.6)
+                            g * (1.0 + (3.6 - 1.0) * depth * p)
                         } else if self.env >= 0.5 * depth * depth {
                             1.0
                         } else {
@@ -432,7 +432,9 @@ mod tests {
             let Some(kind) = kind else { continue };
             for color in [0.05, 0.95] {
                 let mut fx = Cfx::new();
-                let x: Vec<f32> = (0..48000).flat_map(|i| { let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 0.5; [v, v] }).collect();
+                // (GATE COMP's gate is tried with a quiet sound: a loud one passes it untouched.)
+                let amp = if kind == 8 && color < 0.5 { 0.1 } else { 0.5 };
+                let x: Vec<f32> = (0..48000).flat_map(|i| { let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * amp; [v, v] }).collect();
                 let mut y = x.clone();
                 fx.process(kind, color, 0.5, &mut y, 48000);
                 let peak = y.iter().fold(0.0f32, |a, b| a.max(b.abs()));
@@ -441,5 +443,40 @@ mod tests {
                 assert!(diff > 0.003, "{name} at {color} changes the sound ({diff})");
             }
         }
+    }
+
+    #[test]
+    fn pitch_and_gate_comp() {
+        let tone = |amp: f32| -> Vec<f32> { (0..96000).flat_map(|i| { let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * amp; [v, v] }).collect() };
+        let hz = |x: &[f32]| x.chunks_exact(2).zip(x.chunks_exact(2).skip(1)).filter(|(a, b)| a[0] <= 0.0 && b[0] > 0.0).count() as f32;
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        // PITCH: an octave up at the right end, an octave down at the left.
+        for (color, want) in [(1.0, 880.0), (0.0, 220.0)] {
+            let mut fx = Cfx::new();
+            let mut x = tone(0.5);
+            fx.process(4, color, 0.5, &mut x, 48000);
+            let got = hz(&x[96000..]);
+            assert!((got - want).abs() < want * 0.06, "{color}: {got}");
+        }
+        // GATE: fully left the threshold is 0.5, so a 0.1 sound is shut out and a 0.7 one passes.
+        let mut fx = Cfx::new();
+        let mut x = tone(0.1);
+        fx.process(8, 0.0, 0.5, &mut x, 48000);
+        assert!(rms(&x[96000..]) < 0.001);
+        let mut fx = Cfx::new();
+        let mut x = tone(0.7);
+        fx.process(8, 0.0, 0.5, &mut x, 48000);
+        assert!((rms(&x[96000..]) - 0.7 * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
+        // COMP: fully right a loud sound comes down and a quiet one comes up (make-up), so
+        // the two end up closer than the 20 dB they started apart.
+        let level = |amp: f32| {
+            let mut fx = Cfx::new();
+            let mut x = tone(amp);
+            fx.process(8, 1.0, 0.5, &mut x, 48000);
+            rms(&x[96000..])
+        };
+        let (loud, quiet) = (level(0.8), level(0.08));
+        assert!(loud < 0.8 * std::f32::consts::FRAC_1_SQRT_2 && quiet > 0.08 * std::f32::consts::FRAC_1_SQRT_2, "{loud} {quiet}");
+        assert!(20.0 * (loud / quiet).log10() < 12.0, "{}", 20.0 * (loud / quiet).log10());
     }
 }

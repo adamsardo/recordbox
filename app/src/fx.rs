@@ -308,6 +308,13 @@ fn svf(s: &mut [f32; 2], x: f32, g: f32, k: f32) -> (f32, f32, f32) {
     (v2, v1, x - k * v1 - v2)
 }
 
+/// Through up to 1.5, then rounded off toward 2.5.
+#[inline]
+fn sat(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= 1.5 { x } else { x.signum() * (1.5 + (a - 1.5) / (1.0 + (a - 1.5))) }
+}
+
 #[inline]
 fn svf_g(fc: f32, rate: f32) -> f32 {
     (PI * (fc / rate).clamp(0.0002, 0.45)).tan()
@@ -441,9 +448,9 @@ impl Slot {
 
     #[inline]
     fn push(&mut self, l: f32, r: f32) {
-        // (Kept inside +-8 so a feedback of 1 cannot run away.)
-        self.delay[self.w * 2] = l.clamp(-8.0, 8.0);
-        self.delay[self.w * 2 + 1] = r.clamp(-8.0, 8.0);
+        // (Rounded off above 1.5, never past 2.5, so a feedback of 1 cannot run away.)
+        self.delay[self.w * 2] = sat(l);
+        self.delay[self.w * 2 + 1] = sat(r);
         self.w = (self.w + 1) % DELAY_LEN;
     }
 
@@ -745,6 +752,10 @@ impl Slot {
             let target = if p.on { 1.0 } else { 0.0 };
             self.gate += (target - self.gate).clamp(-gate_k, gate_k);
             let g = self.gate;
+            if g <= 0.0 && !p.on {
+                // Off and faded out: the rest of the buffer is the dry sound, untouched.
+                break;
+            }
             let (xl, xr) = (buf[n * 2], buf[n * 2 + 1]);
             // Split off the bands the effect leaves alone.
             let (mut dl, mut dr, mut tl, mut tr) = (xl, xr, 0.0, 0.0);
@@ -842,7 +853,7 @@ impl Slot {
                     let span = (k2 * 2.0).min(1.0);
                     let fc = 14000.0 * (120.0f32 / 14000.0).powf(span * (1.0 - t));
                     let gf = svf_g(fc, r);
-                    let k = 1.0 / (0.7 * 16f32.powf(k1));
+                    let k = 1.0 / (0.7 * 12f32.powf(k1));
                     let a = svf(&mut self.f2[0], dl, gf, k);
                     let b = svf(&mut self.f2[1], dr, gf, k);
                     let (fl, fr) = if b1 { (a.2, b.2) } else { (a.0, b.0) };
@@ -875,7 +886,8 @@ impl Slot {
                             self.ap[c][k] = y - a * out;
                             y = out;
                         }
-                        self.fb[c] = y.clamp(-8.0, 8.0);
+                        let y = sat(y);
+                        self.fb[c] = y;
                         o[c] = y;
                     }
                     (dl + o[0] * m, dr + o[1] * m)
@@ -1489,20 +1501,249 @@ mod tests {
 
     #[test]
     fn modulation_effects_and_reverb_stay_bounded_and_change_the_sound() {
-        for kind in [Kind::Filter, Kind::Flanger, Kind::Phaser, Kind::Pan, Kind::Reverb, Kind::Spiral, Kind::LowCutEcho, Kind::PingPong, Kind::SlipRoll, Kind::RevRoll] {
+        // Every effect, in multi mode (knobs centred) and in single mode with its knobs and
+        // buttons at each extreme: bounded, audible, and after OFF the dry sound exactly.
+        for info in INFO.iter() {
+            let kind = info.kind;
+            for (single, knob, btn) in [(false, [0.5, 0.5], [false, false]), (true, [0.0, 0.0], [true, false]), (true, [1.0, 1.0], [false, true]), (true, [1.0, 0.0], [true, true])] {
+                if single && info.single_id < 0 {
+                    continue;
+                }
+                let mut rack = Rack::new();
+                rack.enabled = true;
+                let mut p = unit(kind, default_value(kind), 0.8);
+                if single {
+                    p.single = true;
+                    p.one = SlotParams { knob, btn, ..p.slots[0] };
+                    p.slots[0].on = false;
+                }
+                rack.units[0].params = p;
+                rack.units[0].prepare(&p.assign);
+                // (A second of history first, as a playing deck would have.)
+                rack.units[0].params.slots[0].on = false;
+                rack.units[0].params.one.on = false;
+                let mut pre = tone(48000, 330.0);
+                rack.process(0, &mut pre, 48000);
+                assert_eq!(pre, tone(48000, 330.0), "{kind:?} off is the dry sound");
+                rack.units[0].params = p;
+                let x = tone(48000 * 3, 330.0);
+                let mut y = x.clone();
+                for (i, chunk) in y.chunks_mut(512 * 2).enumerate() {
+                    let _ = i;
+                    rack.process(0, chunk, 48000);
+                }
+                let peak = y.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                assert!(y.iter().all(|v| v.is_finite()) && peak < 4.0, "{kind:?} {knob:?} {btn:?} peak {peak}");
+                let diff = rms(&x.iter().zip(&y).map(|(a, b)| a - b).collect::<Vec<f32>>());
+                // (HELIX's low cut + high cut leave it only a band of the 330 Hz tone; the
+                // echoes with FEEDBACK at zero are quiet. All must still be heard.)
+                // (PAN with LFO AMP at zero does not move the sound.)
+                assert!(diff > 0.002 || (kind == Kind::Pan && knob[0] == 0.0), "{kind:?} {knob:?} {btn:?} does something ({diff})");
+                rack.units[0].params.slots[0].on = false;
+                rack.units[0].params.one.on = false;
+                let dry = tone(4800, 330.0);
+                let mut z = dry.clone();
+                rack.process(0, &mut z, 48000);
+                assert!(z[2000..] == dry[2000..], "{kind:?} {knob:?} {btn:?}: the dry sound is back after OFF");
+            }
+        }
+    }
+
+    #[test]
+    fn lists_ids_tables_and_laws_match_rekordbox() {
+        // 35 effects in multi mode, 34 in single; engine ids are a permutation of 0..n.
+        for (single, n) in [(false, 35usize), (true, 34)] {
+            assert_eq!(list(single).count(), n);
+            let mut ids: Vec<i8> = list(single).map(|i| if single { i.single_id } else { i.multi_id }).collect();
+            ids.sort();
+            assert_eq!(ids, (0..n as i8).collect::<Vec<i8>>());
+            for id in 0..n as i64 {
+                assert!(from_id(id, single).is_some());
+            }
+        }
+        assert_eq!(list(false).map(|i| i.name).take(9).collect::<Vec<_>>(), ["DELAY", "ECHO", "SPIRAL", "REVERB", "REV DELAY", "MT DELAY", "UP ECHO", "DOWN ECHO", "TRANS"]);
+        assert_eq!(list(true).nth(6).unwrap().name, "PITCH ECHO");
+        assert_eq!(list(true).nth(24).unwrap().name, "STRETCH");
+        assert_eq!(list(false).nth(26).unwrap().name, "BPF ECHO");
+        assert_eq!((from_id(3, true), from_id(2, false), from_id(12, false), from_id(11, false), from_id(34, false)), (Some(Kind::Spiral), Some(Kind::RevDelay), Some(Kind::RevRoll), Some(Kind::Robot), Some(Kind::Stretch)));
+        // Defaults: VINYL BRAKE 4 beats, STRETCH 2, the signed table +4, ROBOT 0 %, REVERB 50 %.
+        assert_eq!(default_value(Kind::VinylBrake), 4.0);
+        assert_eq!(default_value(Kind::Stretch), 2.0);
+        assert_eq!((default_value(Kind::EnigmaJet), beat_table(Kind::MobiusSaw).0.len()), (4.0, 22));
+        assert_eq!((default_value(Kind::Robot), default_value(Kind::Pitch), default_value(Kind::Reverb)), (0.0, -50.0, 50.0));
+        assert!(beat_table(Kind::BpfEcho).0.is_empty());
+        assert_eq!(value_text(Kind::EnigmaJet, 4.0), "+4");
+        assert_eq!(value_text(Kind::EnigmaJet, -0.0625), "-1/16");
+        assert_eq!(value_text(Kind::Robot, -37.0), "-37%");
+        assert_eq!(value_text(Kind::Noise, 0.0), "-");
+        assert_eq!(info_of(Kind::VinylBrake).labels, ["REPEAT", "ECHO", "ON", "BPF"]);
+        // Laws: the echo's feedback (0 .. 0.7 .. 1), MT DELAY's mix, STRETCH's speed.
+        assert!((fb_law(0.0, 0.7), fb_law(0.5, 0.7), fb_law(1.0, 0.7)) == (0.0, 0.7, 1.0));
+        assert!((fb_law(0.25, 0.7) - 0.35).abs() < 1e-6 && (fb_law(0.75, 0.7) - 0.85).abs() < 1e-6);
+        assert_eq!(mt_mix(0.0), (1.0, 0.0));
+        assert!((mt_mix(0.25).1 - 0.35).abs() < 1e-6 && (mt_mix(0.5).0 - 1.0).abs() < 1e-6 && (mt_mix(1.0).0 - 0.7).abs() < 1e-6 && mt_mix(1.0).1 == 0.7);
+        assert_eq!((stretch_speed(0.0), stretch_speed(0.5), stretch_speed(1.0)), (1.0, 0.5, 0.25));
+        assert_eq!((echo_mix(0.75), echo_mix(1.0)), ((1.0, 1.0), (0.0, 1.0)));
+    }
+
+    /// Cycles of the strongest tone, counted from zero crossings of the left channel.
+    fn crossings(x: &[f32]) -> usize {
+        x.chunks_exact(2).zip(x.chunks_exact(2).skip(1)).filter(|(a, b)| a[0] <= 0.0 && b[0] > 0.0).count()
+    }
+
+    #[test]
+    fn pitch_shifts_by_its_percent_value() {
+        // 440 Hz at +100 % is 880 Hz, at -50 % 220 Hz (LEVEL/DEPTH fully up: the shifted sound only).
+        for (pct, want) in [(100.0, 880.0), (-50.0, 220.0), (26.0, 554.4)] {
             let mut rack = Rack::new();
             rack.enabled = true;
-            rack.units[0].params = unit(kind, default_value(kind), 0.8);
+            rack.units[0].params = unit(Kind::Pitch, pct, 1.0);
             let a = rack.units[0].params.assign;
             rack.units[0].prepare(&a);
-            let x = tone(48000 * 3, 330.0);
-            let mut y = x.clone();
-            rack.process(0, &mut y, 48000);
-            let peak = y.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-            assert!(peak.is_finite() && peak < 4.0, "{kind:?} peak {peak}");
-            let diff = rms(&x.iter().zip(&y).map(|(a, b)| a - b).collect::<Vec<f32>>());
-            assert!(diff > 0.005, "{kind:?} does something ({diff})");
+            let mut x = tone(48000 * 2, 440.0);
+            rack.process(0, &mut x, 48000);
+            let hz = crossings(&x[48000 * 2..]) as f32;
+            assert!((hz - want).abs() < want * 0.06, "{pct}%: {hz} Hz, wanted {want}");
         }
+    }
+
+    #[test]
+    fn single_mode_runs_its_one_effect_and_its_knobs_act() {
+        let burst = |n: usize| -> Vec<f32> { (0..n).flat_map(|i| { let v = if i < 480 { 0.5 } else { 0.0 }; [v, v] }).collect() };
+        let run = |knob: [f32; 2], btn: [bool; 2], kind: Kind| -> Vec<f32> {
+            let mut rack = Rack::new();
+            rack.enabled = true;
+            let mut p = unit(Kind::Trans, 1.0, 1.0);
+            // (The multi slot is on too: in single mode it must not act.)
+            p.single = true;
+            p.one = SlotParams { on: true, level: 0.75, value: 1.0, knob, btn, ..SlotParams::new(kind) };
+            rack.units[0].params = p;
+            rack.units[0].prepare(&p.assign);
+            let mut x = burst(48000 * 2);
+            rack.process(0, &mut x, 48000);
+            x
+        };
+        let at = |x: &[f32], f: usize| rms(&x[f * 2..(f + 480) * 2]);
+        // ECHO, FEEDBACK at the centre: repeats at 0.7; at the left end one repeat only; at
+        // the right end they do not fade.
+        let x = run([0.5, 0.5], [false, false], Kind::Echo);
+        assert!(at(&x, 24000) > 0.4 && (at(&x, 48000) / at(&x, 24000) - 0.7).abs() < 0.05);
+        let x = run([0.0, 0.5], [false, false], Kind::Echo);
+        assert!(at(&x, 24000) > 0.4 && at(&x, 48000) < 0.01);
+        let x = run([1.0, 0.5], [false, false], Kind::Echo);
+        assert!((at(&x, 72000) / at(&x, 24000) - 1.0).abs() < 0.05);
+        // FREEZE: nothing new enters the echo.
+        let x = run([0.5, 0.5], [false, true], Kind::Echo);
+        assert!(at(&x, 24000) < 0.01);
+        // FILTER to the left: the repeat is duller (a 10 ms step keeps less of its edge).
+        let dull = run([0.5, 0.0], [false, false], Kind::Echo);
+        let bright = run([0.5, 0.5], [false, false], Kind::Echo);
+        let edge = |x: &[f32]| (x[24001 * 2] - x[23999 * 2]).abs();
+        assert!(edge(&dull) < edge(&bright) * 0.5, "{} vs {}", edge(&dull), edge(&bright));
+        // DELAY, LR RATIO to the left end: the left repeat comes at half the time.
+        let x = run([0.5, 0.0], [false, false], Kind::Delay);
+        assert!(x[12100 * 2] > 0.3 && x[12100 * 2 + 1].abs() < 0.01 && x[24100 * 2 + 1] > 0.3);
+        // MT DELAY at the centre: seven repeats an eighth of a beat apart (3,000 frames).
+        let x = run([0.5, 0.5], [false, false], Kind::MtDelay);
+        for k in 1..=7 {
+            assert!(at(&x, k * 3000) > 0.05, "tap {k}");
+        }
+        assert!(at(&x, 8 * 3000 + 600) < 0.001);
+        // TRANS in single mode with DUTY at a quarter: open for a quarter of the beat.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        let mut p = unit(Kind::Echo, 1.0, 1.0);
+        p.slots[0].on = false;
+        p.single = true;
+        p.one = SlotParams { on: true, level: 1.0, value: 1.0, knob: [0.25, 0.5], ..SlotParams::new(Kind::Trans) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        let mut x = tone(48000, 440.0);
+        rack.process(0, &mut x, 48000);
+        assert!(rms(&x[1000 * 2..5000 * 2]) > 0.3 && rms(&x[7000 * 2..23000 * 2]) < 0.01 && rms(&x[25000 * 2..29000 * 2]) > 0.3);
+    }
+
+    #[test]
+    fn quantize_puts_the_gate_and_the_roll_on_the_beat_grid() {
+        // TRANS, 1 beat, switched on half a beat into a beat: with quantize the gate is in
+        // its closed half and opens at the next beat (12,000 frames on at 120 BPM); without,
+        // it opens at once.
+        for (quantize, open_first) in [(true, false), (false, true)] {
+            let mut rack = Rack::new();
+            rack.enabled = true;
+            let mut p = unit(Kind::Trans, 1.0, 1.0);
+            p.quantize = [quantize; CHANNELS];
+            rack.units[0].params = p;
+            rack.units[0].prepare(&p.assign);
+            let mut x = tone(36000, 440.0);
+            let mut beat = 8.5f64;
+            for chunk in x.chunks_mut(480 * 2) {
+                rack.beat[0] = Some(beat);
+                rack.process(0, chunk, 48000);
+                beat += 480.0 / 24000.0;
+            }
+            let (a, b) = (rms(&x[2000 * 2..10000 * 2]), rms(&x[14000 * 2..22000 * 2]));
+            assert_eq!(a > 0.3, open_first, "quantize {quantize}: {a}");
+            assert_eq!(b > 0.3, !open_first, "quantize {quantize}: {b}");
+        }
+        // ROLL, 1/2 beat, switched on a quarter beat after a beat: the loop is the half beat
+        // that ended on that beat, joined a quarter beat in.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        rack.units[0].params.assign = [true, false, false, false, false, false];
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
+        let mut hist: Vec<f32> = (0..48000).flat_map(|i| { let v = i as f32 / 48000.0; [v, v] }).collect();
+        rack.process(0, &mut hist, 48000);
+        rack.units[0].params = unit(Kind::Roll, 0.5, 1.0);
+        rack.beat[0] = Some(4.25);
+        let mut x = vec![0.0f32; 480 * 2];
+        rack.process(0, &mut x, 48000);
+        // Beat 4.0 was 6,000 frames before this buffer: the loop is history 30,000..42,000,
+        // and the first frame out is 6,000 into it.
+        assert!((x[400 * 2] - (36000.0 + 400.0) / 48000.0).abs() < 0.001, "{}", x[400 * 2]);
+    }
+
+    #[test]
+    fn stretch_plays_slower_and_vinyl_brake_stops() {
+        // STRETCH at LEVEL/DEPTH 0.5 with REPITCH: half speed, so 440 Hz is heard as 220 Hz.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        let mut p = unit(Kind::Trans, 4.0, 0.5);
+        p.slots[0].on = false;
+        p.single = true;
+        p.one = SlotParams { on: true, level: 0.5, value: 4.0, btn: [true, false], ..SlotParams::new(Kind::Stretch) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        let mut x = tone(48000, 440.0);
+        for chunk in x.chunks_mut(512 * 2) {
+            rack.process(0, chunk, 48000);
+        }
+        let hz = crossings(&x[24000 * 2..]) as f32 * 2.0;
+        assert!((hz - 220.0).abs() < 8.0, "{hz}");
+        // Without REPITCH the pitch is put back.
+        rack = Rack::new();
+        rack.enabled = true;
+        p.one.btn = [false, false];
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        let mut x = tone(48000, 440.0);
+        for chunk in x.chunks_mut(512 * 2) {
+            rack.process(0, chunk, 48000);
+        }
+        let hz = crossings(&x[24000 * 2..]) as f32 * 2.0;
+        assert!((hz - 440.0).abs() < 20.0, "{hz}");
+        // VINYL BRAKE, 1 beat, LEVEL/DEPTH fully up, ECHO at zero: silent once the beat is over.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        p.one = SlotParams { on: true, level: 1.0, value: 1.0, knob: [0.5, 0.0], ..SlotParams::new(Kind::VinylBrake) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        let mut x = tone(48000, 440.0);
+        for chunk in x.chunks_mut(512 * 2) {
+            rack.process(0, chunk, 48000);
+        }
+        assert!(rms(&x[2000 * 2..8000 * 2]) > 0.2 && rms(&x[30000 * 2..]) < 0.01);
     }
 
     #[test]

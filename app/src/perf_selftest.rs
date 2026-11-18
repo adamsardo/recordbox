@@ -176,6 +176,36 @@ impl App {
         } else {
             steps
         };
+        // The FX panel's own run (PREPDECK_SHOT_VIEW=perffx2): single mode, its knobs, buttons
+        // and snapshot, back to multi mode, CFX multi mode.
+        let fxt = std::env::var("PREPDECK_SHOT_VIEW").map(|v| v.split(',').any(|x| x.trim() == "perffx2")).unwrap_or(false);
+        let steps = if fxt {
+            let (y1, y2, cy) = (28.0 + 14.0, 28.0 + 37.5, 28.0 + 66.0);
+            let p = |x: f32, y: f32| (pos2(x, y), pos2(x, y));
+            let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
+            vec![
+                st("FX1 assign deck 1", p(85.0, y1)),
+                st("FX1 single mode", p(169.0, y2)),
+                st("FX1 single effect on (DELAY)", p(233.0, y1)),
+                ("FX1 single knob 1 up", pos2(318.0, y2), pos2(318.0, y2 - 30.0)),
+                st("FX1 single button 1 (LOW CUT)", p(471.0, y1)),
+                st("FX1 single beat up", p(285.0, y2)),
+                st("FX1 snapshot", p(516.0, y1)),
+                st("FX1 multi mode", p(169.0, y1 + 4.0)),
+                st("FX1 slot 3 (SPIRAL) on", p(193.0 + 222.0 + 40.0, y1)),
+                st("FX1 slot 3 beat down", p(454.0, y2)),
+                st("FX2 single mode", p(756.0 + 169.0, y2)),
+                st("CFX multi mode", p(92.0, cy)),
+                st("CFX multi: deck 1's effect off", p(660.0, cy)),
+                st("CFX multi: deck 1's effect on", p(660.0, cy)),
+                ("CFX multi: deck 1's COLOR to the right", pos2(748.0, cy), pos2(748.0, cy - 40.0)),
+                st("CFX single mode", p(116.0, cy)),
+                st("CFX multi mode again (deck 1 keeps its COLOR)", p(92.0, cy)),
+                st("FX1 single mode again (snapshot kept)", p(169.0, y2)),
+            ]
+        } else {
+            steps
+        };
         const START: u32 = 140;
         const SPAN: u32 = 40;
         if frame < START {
@@ -295,6 +325,7 @@ impl App {
                     raw.events.push(button(b, false));
                 }
             }
+            30 if fxt => eprintln!("perftest: {name}: {}", self.perf_state_fx()),
             // The loop is left running for a while before its state is read.
             30 if smp => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
             30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),
@@ -356,6 +387,48 @@ impl App {
             sp.seq.current + 1,
             sp.seq.metronome,
             sp.seq.metronome_vol
+        )
+    }
+
+    fn perf_state_fx(&self) -> String {
+        let f = &self.px.fx[0];
+        let one = f.params.one;
+        let x = &self.px.fxx;
+        let (ck, cc, cp, grid) = {
+            let s = self.player.decks[0].lock();
+            (s.cfx_kind, s.cfx_color, s.cfx_param, format!("deck 1 playing {} grid beats {:?} search {}", s.playing, s.grid.as_ref().map(|g| g.len()), s.search))
+        };
+        // What the audio thread holds for FX1.
+        let audio = match crate::fx::RACK.lock().as_ref() {
+            Some(r) => {
+                let p = &r.units[0].params;
+                format!("single {} one on {} knob {:.2} btn {:?} quantize {:?} beat {:?} ({grid})", p.single, p.one.on, p.one.knob[0], p.one.btn, &p.quantize[..2], r.beat[0].map(|b| (b * 100.0).round() / 100.0))
+            }
+            None => "no rack".into(),
+        };
+        format!(
+            "FX1 assign {:?} single {} | one {} on {} value {} knobs [{:.2}, {:.2}] btns {:?} snapshots {} | slot 3 {} on {} value {} | FX2 single {} | CFX multi {} on {:?} colours {:?} deck 1 (audio) kind {} colour {:.2} param {:.2} | audio: {} | kept = shown {}",
+            &f.params.assign[..2],
+            f.params.single,
+            crate::fx::name(one.kind),
+            one.on,
+            crate::fx::value_text(one.kind, one.value),
+            one.knob[0],
+            one.knob[1],
+            one.btn,
+            f.snaps.iter().filter(|s| s.is_some()).count(),
+            crate::fx::name(f.params.slots[2].kind),
+            f.params.slots[2].on,
+            crate::fx::value_text(f.params.slots[2].kind, f.params.slots[2].value),
+            self.px.fx[1].params.single,
+            x.cfx_multi,
+            &x.cfx_multi_on[..2],
+            self.px.cfx_color,
+            ck,
+            cc,
+            cp,
+            audio,
+            crate::ui_fx::snapshot(self) == self.prefs.fx
         )
     }
 

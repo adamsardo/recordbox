@@ -124,14 +124,11 @@ impl FxUi {
                 self.snaps[pos(k)] = snap.map(|(a, b, c, d)| (a.clamp(0.0, 1.0), b.clamp(0.0, 1.0), c, d));
             }
         }
+        // (An id that is no effect leaves the slot's effect as it is.)
         for slot in 0..3 {
-            if let Some(k) = fx::from_id(s.multi_fx[slot] as i64, false) {
-                self.set_kind(slot, k);
-            }
+            self.set_kind(slot, fx::from_id(s.multi_fx[slot] as i64, false).unwrap_or(self.params.slots[slot].kind));
         }
-        if let Some(k) = fx::from_id(s.single_fx as i64, true) {
-            self.set_kind(3, k);
-        }
+        self.set_kind(3, fx::from_id(s.single_fx as i64, true).unwrap_or(self.params.one.kind));
         self.params.single = s.single_shown;
         self.release_kind = s.release_fx.min(2);
         for i in 0..3 {
@@ -254,11 +251,12 @@ pub fn sync(app: &mut App) {
         let s = app.prefs.fx.clone();
         restore(app, &s);
     }
-    // Keep the choices: written half a second after the last change.
+    // Keep the choices: written within half a second of a change.
     let now = snapshot(app);
     if now != app.prefs.fx {
         app.prefs.fx = now;
-        app.px.fxx.pending = Some(std::time::Instant::now());
+        // (Timed from the first change, so a run of changes cannot put the write off.)
+        app.px.fxx.pending.get_or_insert_with(std::time::Instant::now);
     }
     if app.px.fxx.pending.map(|t| t.elapsed().as_millis() > 500).unwrap_or(false) {
         app.px.fxx.pending = None;
@@ -305,9 +303,38 @@ pub fn sync(app: &mut App) {
 fn small(ui: &mut Ui, r: Rect, id: impl std::hash::Hash, label: &str, lit: bool, enabled: bool) -> egui::Response {
     let resp = ui.interact(r, ui.id().with(id), Sense::click());
     let p = ui.painter();
-    p.rect_filled(r, 2.0, if lit { BLUE } else if resp.hovered() && enabled { lighten(BTN) } else { hex(0x141414) });
-    p.text(r.center(), Align2::CENTER_CENTER, label, caps(8.0), if enabled { WHITE } else { OFF });
+    p.rect_filled(r, 2.0, if lit { BLUE } else if resp.hovered() && enabled { lighten(BTN) } else { hex(0x282828) });
+    p.text(r.center(), Align2::CENTER_CENTER, label, caps(9.0), if enabled { WHITE } else { OFF });
     resp
+}
+
+/// The FX panel's knob, as rekordbox draws it (measured on reference performance/06): a ring
+/// 17.5 pt across, open at the bottom, blue from its start to the value (`bipolar`: from the
+/// centre to the value), and a white mark at the value. Drag up or down to turn (a full sweep
+/// over 150 pt), double click for `reset`. Returns the new value when it changed.
+fn fx_knob(ui: &mut Ui, c: egui::Pos2, id: impl std::hash::Hash, value: f32, reset: f32, bipolar: bool) -> Option<f32> {
+    let p = ui.painter().clone();
+    let resp = ui.interact(Rect::from_center_size(c, vec2(22.0, 22.0)), ui.id().with(id), Sense::click_and_drag());
+    let mut out = None;
+    if resp.double_clicked() {
+        out = Some(reset);
+    } else if resp.dragged() {
+        let dy = resp.drag_delta().y;
+        if dy != 0.0 {
+            out = Some((value - dy / 150.0).clamp(0.0, 1.0));
+        }
+    }
+    let v = out.unwrap_or(value);
+    let ang = |x: f32| (-225.0 + 270.0 * x).to_radians();
+    let arc = |a: f32, b: f32| -> Vec<egui::Pos2> { (0..=32).map(|i| { let t = ang(a + (b - a) * i as f32 / 32.0); c + vec2(t.cos(), t.sin()) * 7.6 }).collect() };
+    p.add(egui::Shape::line(arc(0.0, 1.0), Stroke::new(2.4_f32, if resp.hovered() || resp.dragged() { hex(0x464646) } else { hex(0x323232) })));
+    let from = if bipolar { 0.5 } else { 0.0 };
+    if (v - from).abs() > 0.012 {
+        p.add(egui::Shape::line(arc(from, v), Stroke::new(2.4_f32, BLUE)));
+    }
+    let a = ang(v);
+    p.line_segment([c + vec2(a.cos(), a.sin()) * 5.2, c + vec2(a.cos(), a.sin()) * 9.6], Stroke::new(2.0_f32, WHITE));
+    out
 }
 
 /// A mode button: three dots (multi) or one (single), lit for the mode in use.
@@ -317,12 +344,11 @@ fn mode_button(ui: &mut Ui, r: Rect, id: impl std::hash::Hash, dots: i32, lit: b
     if lit {
         p.rect_filled(r, 2.0, BLUE);
     } else {
-        p.rect_filled(r, 2.0, if resp.hovered() { lighten(BTN) } else { hex(0x1E1E1E) });
+        p.rect_filled(r, 2.0, if resp.hovered() { lighten(BTN) } else { hex(0x181818) });
         p.rect_stroke(r, 2.0, Stroke::new(1.0_f32, hex(0x646464)), egui::StrokeKind::Inside);
     }
-    let c = if lit { WHITE } else { hex(0x8C8C8C) };
     for k in 0..dots {
-        p.circle_filled(r.center() + vec2((k as f32 - (dots - 1) as f32 / 2.0) * 5.0, 0.0), 1.5, c);
+        p.circle_filled(r.center() + vec2((k as f32 - (dots - 1) as f32 / 2.0) * 5.3, 0.0), 1.8, WHITE);
     }
     let clicked = resp.clicked();
     let _ = resp.on_hover_text(tooltip);
@@ -349,15 +375,15 @@ fn slot(app: &mut App, ui: &mut Ui, u: usize, s: usize, o: egui::Pos2, sx: f32) 
     let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(o.x + x, o.y + y), vec2(w, h));
     let single = s == 3;
     let sp = if single { app.px.fx[u].params.one } else { app.px.fx[u].params.slots[s] };
-    let name_r = at(sx, 10.0, 80.0, 15.0);
+    let name_r = at(sx, 5.0, 81.5, 18.0);
     let nresp = ui.interact(name_r, ui.id().with(("fxname", u, s)), Sense::click());
     p.rect_filled(name_r, 2.0, if sp.on { BLUE } else if nresp.hovered() { lighten(BTN) } else { BTN });
-    p.text(name_r.center(), Align2::CENTER_CENTER, fx::name(sp.kind), caps(8.5), WHITE);
+    p.text(name_r.center(), Align2::CENTER_CENTER, fx::name(sp.kind), caps(9.5), WHITE);
     if tip(nresp, app, "Turns the effect on/off.").clicked() {
         let f = &mut app.px.fx[u].params;
         if single { f.one.on = !sp.on } else { f.slots[s].on = !sp.on }
     }
-    let list_r = at(sx + 83.0, 10.0, 17.0, 15.0);
+    let list_r = at(sx + 82.0, 5.0, 20.0, 18.0);
     let lresp = ui.interact(list_r, ui.id().with(("fxlist", u, s)), Sense::click());
     p.rect_filled(list_r, 2.0, if lresp.hovered() { lighten(BTN) } else { BTN });
     crate::icons_player::chevron_down(&p, list_r.center() + vec2(0.0, 0.5), 1.0, WHITE);
@@ -377,8 +403,8 @@ fn slot(app: &mut App, ui: &mut Ui, u: usize, s: usize, o: egui::Pos2, sx: f32) 
         });
     });
     // LEVEL/DEPTH, then `<` value `>`.
-    let kc = pos2(o.x + sx + 13.0, o.y + 36.5);
-    if let Some(v) = crate::ui_perf::knob(ui, kc, ("fxlevel", u, s), sp.level, 0.5, BLUE) {
+    let kc = pos2(o.x + sx + 15.5, o.y + 37.5);
+    if let Some(v) = fx_knob(ui, kc, ("fxlevel", u, s), sp.level, 0.5, false) {
         let f = &mut app.px.fx[u].params;
         if single { f.one.level = v } else { f.slots[s].level = v }
     }
@@ -408,31 +434,33 @@ fn single_controls(app: &mut App, ui: &mut Ui, u: usize, o: egui::Pos2) {
         let x = o.x + 193.0 + 112.0 + k as f32 * 68.0;
         let label = labels[k];
         if label.is_empty() {
-            p.circle_stroke(pos2(x + 13.0, o.y + 36.5), 9.5, Stroke::new(2.5_f32, hex(0x282828)));
+            p.circle_stroke(pos2(x + 13.0, o.y + 37.5), 7.6, Stroke::new(2.4_f32, hex(0x282828)));
             continue;
         }
-        p.text(pos2(x + 30.0, o.y + 17.5), Align2::CENTER_CENTER, label, caps(7.5), WHITE);
-        if let Some(v) = crate::ui_perf::knob(ui, pos2(x + 13.0, o.y + 36.5), ("fxknob", u, k), sp.knob[k], 0.5, BLUE) {
+        p.text(pos2(x + 30.0, o.y + 14.0), Align2::CENTER_CENTER, label, caps(8.0), WHITE);
+        // (PITCH, FILTER and the like rest at their centre: the blue runs from there.)
+        let bipolar = matches!(label, "PITCH" | "FILTER" | "SWING" | "LR RATIO" | "LOW / HI CUT" | "SPEED" | "TIME");
+        if let Some(v) = fx_knob(ui, pos2(x + 13.0, o.y + 37.5), ("fxknob", u, k), sp.knob[k], 0.5, bipolar) {
             app.px.fx[u].params.one.knob[k] = v;
         }
-        p.text(pos2(x + 44.0, o.y + 36.5), Align2::CENTER_CENTER, knob_text(label, sp.knob[k]), bold(9.0), WHITE);
+        p.text(pos2(x + 44.0, o.y + 37.5), Align2::CENTER_CENTER, knob_text(label, sp.knob[k]), bold(9.0), WHITE);
     }
     for k in 0..2usize {
-        let r = Rect::from_min_size(pos2(o.x + 193.0 + 250.0, o.y + 10.0 + k as f32 * 19.0), vec2(56.0, 15.0));
+        let r = Rect::from_min_size(pos2(o.x + 193.0 + 250.0, o.y + 5.0 + k as f32 * 21.0), vec2(56.0, 18.0));
         let label = labels[2 + k];
         if label.is_empty() {
             continue;
         }
         let resp = ui.interact(r, ui.id().with(("fxbtn", u, k)), Sense::click());
         p.rect_filled(r, 2.0, if sp.btn[k] { BLUE } else if resp.hovered() { lighten(BTN) } else { BTN });
-        p.text(r.center(), Align2::CENTER_CENTER, label, caps(7.5), WHITE);
+        p.text(r.center(), Align2::CENTER_CENTER, label, caps(8.0), WHITE);
         if resp.clicked() {
             app.px.fx[u].params.one.btn[k] = !sp.btn[k];
         }
     }
     // Snapshot: keeps the two knobs and the two buttons for this effect (LEVEL/DEPTH is not
     // kept, as in rekordbox). Lit while the controls are as saved.
-    let r = Rect::from_min_size(pos2(o.x + 193.0 + 311.0, o.y + 10.0), vec2(24.0, 15.0));
+    let r = Rect::from_min_size(pos2(o.x + 193.0 + 311.0, o.y + 5.0), vec2(24.0, 18.0));
     let now: Snap = (sp.knob[0], sp.knob[1], sp.btn[0], sp.btn[1]);
     let saved = app.px.fx[u].snaps[pos(sp.kind)] == Some(now);
     let resp = ui.interact(r, ui.id().with(("fxsnap", u)), Sense::click());
@@ -452,9 +480,12 @@ fn single_controls(app: &mut App, ui: &mut Ui, u: usize, o: egui::Pos2) {
 pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
     let full = r;
-    let r = Rect::from_min_size(r.min, vec2(r.width(), BEAT_H - 1.0));
-    cfx_row(app, ui, Rect::from_min_max(pos2(full.min.x, full.min.y + BEAT_H), full.max));
+    // (rekordbox: 3 pt of black above the Beat FX row and between it and the CFX row.)
+    p.rect_filled(Rect::from_min_size(r.min, vec2(r.width(), BEAT_H + 3.0)), 0.0, egui::Color32::BLACK);
+    let r = Rect::from_min_max(pos2(r.min.x, r.min.y + 3.0), pos2(r.max.x, r.min.y + BEAT_H));
+    cfx_row(app, ui, Rect::from_min_max(pos2(full.min.x, full.min.y + BEAT_H + 3.0), full.max));
     p.rect_filled(r, 0.0, hex(0x1E1E1E));
+    let r = Rect::from_min_size(full.min, vec2(full.width(), BEAT_H));
     p.rect_filled(Rect::from_min_max(pos2(r.center().x - 0.5, r.min.y), pos2(r.center().x + 0.5, r.max.y)), 0.0, BG);
     for u in 0..2usize {
         let x0 = if u == 0 { r.min.x } else { r.center().x };
@@ -468,7 +499,7 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         let four = app.deck_count() == 4;
         let labels = [("1", Some(0usize)), ("2", Some(1)), ("S", Some(fx::SAMPLER)), ("3", if four { Some(2) } else { None }), ("4", if four { Some(3) } else { None }), ("M", Some(fx::MASTER))];
         for (i, (label, ch)) in labels.iter().enumerate() {
-            let br = at(76.0 + (i % 3) as f32 * 21.5, 10.0 + (i / 3) as f32 * 18.0, 18.0, 15.0);
+            let br = at(76.0 + (i % 3) as f32 * 21.0, 10.5 + (i / 3) as f32 * 18.5, 20.0, 17.5);
             let lit = ch.map(|c| app.px.fx[u].params.assign[c]).unwrap_or(false);
             let resp = small(ui, br, ("fxassign", u, i), label, lit, ch.is_some());
             if let Some(c) = ch {
@@ -493,36 +524,36 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         }
         // Mode: multi (three effects) or single (one effect with five parameters).
         let single = app.px.fx[u].params.single;
-        if mode_button(ui, at(158.0, 8.0, 22.0, 17.0), ("fxmulti", u), 3, !single, "Beat FX multi-mode:\nThis mode allows to use up to three effects simultaneously.") {
+        if mode_button(ui, at(158.0, 8.0, 24.0, 20.0), ("fxmulti", u), 3, !single, "Beat FX multi-mode:\nThis mode allows to use up to three effects simultaneously.") {
             app.px.fx[u].params.single = false;
         }
-        if mode_button(ui, at(158.0, 29.0, 22.0, 17.0), ("fxsingle", u), 1, single, "Beat FX single-mode:\nThis mode allows to use one effect with five parameters.") {
+        if mode_button(ui, at(158.0, 28.7, 24.0, 19.0), ("fxsingle", u), 1, single, "Beat FX single-mode:\nThis mode allows to use one effect with five parameters.") {
             app.px.fx[u].params.single = true;
         }
         if single {
-            slot(app, ui, u, 3, o, 193.0);
+            slot(app, ui, u, 3, o, 192.5);
             single_controls(app, ui, u, o);
         } else {
             for s in 0..3usize {
-                slot(app, ui, u, s, o, 193.0 + s as f32 * 111.0);
+                slot(app, ui, u, s, o, 192.5 + s as f32 * 111.0);
             }
         }
 
         // RELEASE FX: held while the name is pressed.
         let rk = app.px.fx[u].release_kind.min(2) as usize;
-        let rel_r = at(538.0, 10.0, 76.0, 15.0);
+        let rel_r = at(538.0, 7.0, 78.0, 18.0);
         let rresp = ui.interact(rel_r, ui.id().with(("fxrel", u)), Sense::click_and_drag());
         let held = rresp.is_pointer_button_down_on();
-        p.rect_filled(rel_r, 2.0, hex(0x141414));
+        p.rect_filled(rel_r, 2.0, hex(0x1E1E1E));
         p.rect_stroke(rel_r, 2.0, Stroke::new(1.0_f32, if held { BLUE } else { hex(0x8C8C8C) }), egui::StrokeKind::Inside);
-        p.text(rel_r.center(), Align2::CENTER_CENTER, fx::RELEASE[rk].0, caps(8.0), if held { hex(0x3C8CFF) } else { WHITE });
+        p.text(rel_r.center(), Align2::CENTER_CENTER, fx::RELEASE[rk].0, caps(9.0), if held { hex(0x3C8CFF) } else { WHITE });
         let ridx = app.px.fx[u].release_idx[rk].min(fx::RELEASE_BEATS.len() - 1);
         app.px.fx[u].params.release = if held { Some((rk as u8, fx::RELEASE_BEATS[ridx])) } else { None };
         if held {
             ui.ctx().request_repaint();
         }
         let _ = rresp.on_hover_text("RELEASE FX: on while the button is held.");
-        let rl = at(617.0, 10.0, 17.0, 15.0);
+        let rl = at(617.0, 7.0, 20.0, 18.0);
         let rlresp = ui.interact(rl, ui.id().with(("fxrellist", u)), Sense::click());
         p.rect_filled(rl, 2.0, if rlresp.hovered() { lighten(BTN) } else { BTN });
         crate::icons_player::chevron_down(&p, rl.center() + vec2(0.0, 0.5), 1.0, WHITE);
@@ -548,24 +579,24 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
 
         // FX tempo: AUTO (each channel's own tempo) or TAP.
         let auto = app.px.fx[u].auto;
-        let ar = at(645.0, 7.0, 104.0, 17.0);
+        let ar = at(644.5, 6.5, 105.5, 18.5);
         let aresp = ui.interact(ar, ui.id().with(("fxauto", u)), Sense::click());
-        p.rect_filled(ar, 2.0, if auto { BLUE } else if aresp.hovered() { lighten(BTN) } else { hex(0x141414) });
+        p.rect_filled(ar, 2.0, if auto { BLUE } else if aresp.hovered() { lighten(BTN) } else { hex(0x1E1E1E) });
         if !auto {
             p.rect_stroke(ar, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
         }
-        p.text(ar.center(), Align2::CENTER_CENTER, "AUTO", caps(8.0), WHITE);
+        p.text(ar.center(), Align2::CENTER_CENTER, "AUTO", caps(9.0), WHITE);
         if aresp.clicked() {
             app.px.fx[u].auto = true;
         }
-        let tr = at(645.0, 28.0, 104.0, 17.0);
+        let tr = at(645.0, 28.0, 105.0, 18.0);
         let tresp = ui.interact(tr, ui.id().with(("fxtap", u)), Sense::click());
-        p.rect_filled(tr, 2.0, if !auto { BLUE } else if tresp.hovered() { lighten(BTN) } else { hex(0x141414) });
+        p.rect_filled(tr, 2.0, if !auto { BLUE } else if tresp.hovered() { lighten(BTN) } else { hex(0x1E1E1E) });
         if auto {
             p.rect_stroke(tr, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
         }
         let label = if auto { "TAP".to_string() } else { format!("TAP  {:.1}", app.px.fx[u].tap_bpm) };
-        p.text(tr.center(), Align2::CENTER_CENTER, label, caps(8.0), WHITE);
+        p.text(tr.center(), Align2::CENTER_CENTER, label, caps(9.0), WHITE);
         if crate::ui_player::press_fired(ui, &tresp) {
             let now = ui.input(|i| i.time);
             let f = &mut app.px.fx[u];
@@ -582,7 +613,7 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
 /// A COLOR knob (centre = off, with a small catch so it comes to rest there).
 fn color_knob(app: &mut App, ui: &mut Ui, kc: egui::Pos2, c: usize) {
     let v = if c == fx::SAMPLER { app.px.sampler.cfx_color } else { app.px.cfx_color[c] };
-    if let Some(nv) = crate::ui_perf::knob(ui, kc, ("cfxcolor", c), v, 0.5, if (v - 0.5).abs() > 0.012 { BLUE } else { WHITE }) {
+    if let Some(nv) = fx_knob(ui, kc, ("cfxcolor", c), v, 0.5, true) {
         let nv = if (nv - 0.5).abs() < 0.015 { 0.5 } else { nv };
         if c == fx::SAMPLER {
             app.px.sampler.cfx_color = nv;
@@ -603,10 +634,10 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
     let at = |x: f32, w: f32, h: f32| Rect::from_center_size(pos2(x0 + x * k, cy), vec2(w, h));
     p.text(pos2(x0 + 11.0, cy), Align2::LEFT_CENTER, "CFX", bold(11.5), hex(0x8C8C8C));
     let multi = app.px.fxx.cfx_multi;
-    if mode_button(ui, at(92.0, 22.0, 15.0), "cfxmulti", 3, multi, "CFX multi-mode: an effect for each channel.") {
+    if mode_button(ui, at(93.0, 22.0, 18.5), "cfxmulti", 3, multi, "CFX multi-mode: an effect for each channel.") {
         app.px.fxx.cfx_multi = true;
     }
-    if mode_button(ui, at(116.0, 22.0, 15.0), "cfxsingle", 1, !multi, "CFX single-mode: one effect for all channels.") {
+    if mode_button(ui, at(116.75, 22.5, 18.5), "cfxsingle", 1, !multi, "CFX single-mode: one effect for all channels.") {
         app.px.fxx.cfx_multi = false;
     }
     // S (the sampler deck) is live when "Apply CFX to Sampler" is ticked in Preferences >
@@ -618,23 +649,23 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
         // Six cells across the row (laid out without a reference picture).
         for (i, (label, _, ch)) in channels.into_iter().enumerate() {
             let cx = 150.0 + i as f32 * 224.0;
-            p.text(pos2(x0 + (cx + 8.0) * k, cy), Align2::CENTER_CENTER, label, caps(8.5), if ch.is_some() { WHITE } else { OFF });
+            p.text(pos2(x0 + (cx + 8.0) * k, cy), Align2::CENTER_CENTER, label, caps(10.0), if ch.is_some() { WHITE } else { OFF });
             let kc = pos2(x0 + (cx + 150.0) * k, cy);
             let Some(c) = ch else {
-                p.circle_stroke(kc, 9.5, Stroke::new(2.5_f32, hex(0x282828)));
+                p.circle_stroke(kc, 7.6, Stroke::new(2.4_f32, hex(0x282828)));
                 continue;
             };
             let kind = app.px.fxx.cfx_multi_kind[c];
             let on = app.px.fxx.cfx_multi_on[c];
-            let er = at(cx + 62.0, 80.0, 15.0);
+            let er = at(cx + 62.0, 80.0, 18.0);
             let eresp = ui.interact(er, ui.id().with(("cfxmname", c)), Sense::click());
             p.rect_filled(er, 2.0, if on { BLUE } else if eresp.hovered() { lighten(BTN) } else { BTN });
-            p.text(er.center(), Align2::CENTER_CENTER, crate::cfx::name(kind), caps(8.0), WHITE);
+            p.text(er.center(), Align2::CENTER_CENTER, crate::cfx::name(kind), caps(9.0), WHITE);
             if eresp.clicked() {
                 app.px.fxx.cfx_multi_on[c] = !on;
             }
             let _ = eresp.on_hover_text("Turns the effect on/off.");
-            let lr = at(cx + 113.0, 17.0, 15.0);
+            let lr = at(cx + 114.0, 20.0, 18.0);
             let lresp = ui.interact(lr, ui.id().with(("cfxmlist", c)), Sense::click());
             p.rect_filled(lr, 2.0, if lresp.hovered() { lighten(BTN) } else { BTN });
             crate::icons_player::chevron_down(&p, lr.center() + vec2(0.0, 0.5), 1.0, WHITE);
@@ -653,35 +684,35 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
     }
     // DEFAULT (the mixer's effects: FILTER without hardware) / USER (the chosen effect).
     let user = app.px.cfx_user;
-    let dr = at(218.5, 78.0, 15.0);
+    let dr = at(218.25, 79.5, 18.5);
     let dresp = ui.interact(dr, ui.id().with("cfxdefault"), Sense::click());
-    p.rect_filled(dr, 2.0, if !user { BLUE } else { hex(0x141414) });
+    p.rect_filled(dr, 2.0, if !user { BLUE } else { hex(0x1E1E1E) });
     if user {
         p.rect_stroke(dr, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
     }
-    p.text(dr.center(), Align2::CENTER_CENTER, "DEFAULT", caps(8.0), WHITE);
+    p.text(dr.center(), Align2::CENTER_CENTER, "DEFAULT", caps(9.0), WHITE);
     if dresp.clicked() {
         app.px.cfx_user = false;
         app.px.cfx_param = app.px.fxx.cfx_params[crate::cfx::DEFAULT_LIST[0] as usize];
     }
-    let ur = at(298.0, 78.0, 15.0);
+    let ur = at(298.5, 79.0, 18.5);
     let uresp = ui.interact(ur, ui.id().with("cfxuser"), Sense::click());
-    p.rect_filled(ur, 2.0, if user { BLUE } else { hex(0x141414) });
+    p.rect_filled(ur, 2.0, if user { BLUE } else { hex(0x1E1E1E) });
     if !user {
         p.rect_stroke(ur, 2.0, Stroke::new(1.0_f32, hex(0x8C8C8C)), egui::StrokeKind::Inside);
     }
-    p.text(ur.center(), Align2::CENTER_CENTER, "USER", caps(8.0), WHITE);
+    p.text(ur.center(), Align2::CENTER_CENTER, "USER", caps(9.0), WHITE);
     if uresp.clicked() {
         app.px.cfx_user = true;
         app.px.cfx_param = app.px.fxx.cfx_params[app.px.cfx_kind as usize % 9];
     }
     // The effect: FILTER in DEFAULT; in USER a click lists the nine types.
     let kind = if user { app.px.cfx_kind } else { crate::cfx::DEFAULT_LIST[0] };
-    let er = at(414.0, 68.0, 15.0);
+    let er = at(414.25, 67.5, 18.0);
     let eresp = ui.interact(er, ui.id().with("cfxeffect"), Sense::click());
-    p.rect_filled(er, 2.0, hex(0x141414));
+    p.rect_filled(er, 2.0, hex(0x1E1E1E));
     p.rect_stroke(er, 2.0, Stroke::new(1.0_f32, BLUE), egui::StrokeKind::Inside);
-    p.text(er.center(), Align2::CENTER_CENTER, crate::cfx::name(kind), caps(8.0), WHITE);
+    p.text(er.center(), Align2::CENTER_CENTER, crate::cfx::name(kind), caps(9.0), WHITE);
     if user {
         crate::ui_browser::dropdown(ui, &eresp, "cfxpop", |ui| {
             for (name, kd) in crate::cfx::LIST {
@@ -695,18 +726,18 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
             }
         });
     }
-    p.text(pos2(x0 + 543.0 * k, cy), Align2::CENTER_CENTER, "PARAM", caps(8.0), WHITE);
-    if let Some(v) = crate::ui_perf::knob(ui, pos2(x0 + 580.0 * k, cy), "cfxparam", app.px.cfx_param, 0.5, BLUE) {
+    p.text(pos2(x0 + 543.0 * k, cy), Align2::CENTER_CENTER, "PARAM", caps(9.0), WHITE);
+    if let Some(v) = fx_knob(ui, pos2(x0 + 581.0 * k, cy), "cfxparam", app.px.cfx_param, 0.5, false) {
         app.px.cfx_param = v;
         app.px.fxx.cfx_params[kind as usize % 9] = v;
     }
     for (label, x, ch) in channels {
-        p.text(pos2(x0 + x * k, cy), Align2::CENTER_CENTER, label, caps(8.5), if ch.is_some() { WHITE } else { OFF });
+        p.text(pos2(x0 + x * k, cy), Align2::CENTER_CENTER, label, caps(10.0), if ch.is_some() { WHITE } else { OFF });
         let kc = pos2(x0 + (x + 27.0) * k, cy);
         match ch {
             Some(c) => color_knob(app, ui, kc, c),
             None => {
-                p.circle_stroke(kc, 9.5, Stroke::new(2.5_f32, hex(0x282828)));
+                p.circle_stroke(kc, 7.6, Stroke::new(2.4_f32, hex(0x282828)));
             }
         }
     }

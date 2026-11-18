@@ -1070,6 +1070,7 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     let mut rack = lock_for_audio(&crate::fx::RACK);
     match rack.as_deref_mut().and_then(|r| r.as_deref_mut()).filter(|r| r.active() && channels == 2) {
         Some(rack) => {
+            rack.beat = [None; crate::fx::CHANNELS];
             for s in guards.iter_mut().filter_map(|g| g.as_deref_mut()) {
                 let i = (s.deck_no as usize).min(3);
                 let mut buf = std::mem::take(&mut rack.scratch[i]);
@@ -1078,12 +1079,12 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
                 }
                 buf[..out.len()].iter_mut().for_each(|v| *v = 0.0);
                 // Beat FX quantize: where the deck is on its grid as this buffer starts.
-                rack.beat[i] = match (s.playing && s.search == 0.0, &s.grid, &s.audio) {
-                    (true, Some(g), Some(a)) => beat_pos(g, s.pos / a.sr as f64),
-                    _ => None,
-                };
-                if i == MASTER_DECK.load(std::sync::atomic::Ordering::Relaxed) as usize {
-                    rack.beat[crate::fx::MASTER] = rack.beat[i];
+                // (More than one state can carry a deck number; only a playing one sets it.)
+                if let (true, Some(g), Some(a)) = (s.playing && s.search == 0.0, &s.grid, &s.audio) {
+                    rack.beat[i] = beat_pos(g, s.pos / a.sr as f64);
+                    if i == MASTER_DECK.load(std::sync::atomic::Ordering::Relaxed) as usize {
+                        rack.beat[crate::fx::MASTER] = rack.beat[i];
+                    }
                 }
                 render_deck_cue(s, &mut buf[..out.len()], cue, channels, rate);
                 rack.process(i, &mut buf[..out.len()], rate);
@@ -2071,5 +2072,19 @@ mod cue_tests {
         let mut cue = vec![0.0f32; 2048];
         render_deck_cue(&mut s, &mut vec![0.0f32; 2048], &mut cue, 2, 44100);
         assert!(cue.iter().all(|v| *v == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod beat_pos_tests {
+    #[test]
+    fn beat_pos_counts_beats_from_the_grids_first_beat() {
+        let grid: Vec<f64> = (0..8).map(|i| 1.0 + i as f64 * 0.5).collect();
+        let at = |t: f64| super::beat_pos(&grid, t).unwrap();
+        assert!((at(1.0) - 0.0).abs() < 1e-9 && (at(1.25) - 0.5).abs() < 1e-9 && (at(3.125) - 4.25).abs() < 1e-9);
+        // Before the first beat and after the last the grid carries on at its end spacing.
+        assert!((at(0.75) + 0.5).abs() < 1e-9, "{}", at(0.75));
+        assert!((at(5.25) - 8.5).abs() < 1e-9, "{}", at(5.25));
+        assert!(super::beat_pos(&[1.0], 2.0).is_none());
     }
 }

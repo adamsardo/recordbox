@@ -1533,7 +1533,7 @@ impl App {
                         app.px.pad_mode = [crate::ui_perf::PAD_SAMPLER, crate::ui_perf::PAD_SEQ_CALL, crate::ui_perf::PAD_SAMPLER, crate::ui_perf::PAD_SEQ_CALL];
                     }
                     // Performance with the FX panel open.
-                    "perffx" => {
+                    "perffx" | "perffx2" => {
                         app.prefs.app_mode = 1;
                         app.prefs.perf_fx = true;
                     }
