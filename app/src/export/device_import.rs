@@ -5,7 +5,8 @@ use super::anlz;
 use super::settings::{crc16_xmodem, UsbSettings};
 use super::usb::{self, DevTrack, DeviceLibrary};
 use crate::model::*;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// A device track copied into the collection's folders, ready to be added to the library.
@@ -25,23 +26,100 @@ pub struct ImportedTrack {
 
 /// Where an imported device file goes: `<music_dir>/<artist>/<album>/<file name>`, the same
 /// folder rule the export uses on the drive. A different file already at that name gets
-/// " (2)", " (3)" …; the same file (same size) is reused.
-pub fn import_destination(music_dir: &Path, dt: &DevTrack, size: u64) -> (PathBuf, bool) {
-    let dir = music_dir.join(usb::media_dir(&dt.artist, &dt.album).trim_start_matches("/Contents/"));
-    let name = Path::new(&dt.file_path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "track".into());
+/// " (2)", " (3)" …; an existing regular file is reused only when its size and
+/// contents match. Hashes are read in bounded chunks, only for same-size collisions.
+pub fn import_destination(
+    music_dir: &Path,
+    dt: &DevTrack,
+    source: &Path,
+) -> Result<(PathBuf, bool)> {
+    let metadata = std::fs::metadata(source)
+        .with_context(|| format!("could not inspect the device file {}", source.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "the device file is not a regular file: {}",
+            source.display()
+        );
+    }
+    let size = metadata.len();
+    let mut source_hash = None;
+    let dir =
+        music_dir.join(usb::media_dir(&dt.artist, &dt.album).trim_start_matches("/Contents/"));
+    let name = Path::new(&dt.file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "track".into());
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (name.clone(), String::new()),
     };
     let mut n = 1;
     loop {
-        let cand = dir.join(if n == 1 { name.clone() } else { format!("{stem} ({n}){ext}") });
-        match std::fs::metadata(&cand) {
-            Ok(m) if m.len() == size => return (cand, true),
+        let cand = dir.join(if n == 1 {
+            name.clone()
+        } else {
+            format!("{stem} ({n}){ext}")
+        });
+        match std::fs::symlink_metadata(&cand) {
+            Ok(m) if m.is_file() && m.len() == size => {
+                let hash = match source_hash {
+                    Some(hash) => hash,
+                    None => {
+                        let hash = usb::sha256_file(source)
+                            .context("could not read the device file for comparison")?;
+                        source_hash = Some(hash);
+                        hash
+                    }
+                };
+                if usb::sha256_file(&cand).with_context(|| {
+                    format!("could not compare the existing file {}", cand.display())
+                })? == hash
+                {
+                    return Ok((cand, true));
+                }
+                n += 1;
+            }
             Ok(_) => n += 1,
-            Err(_) => return (cand, false),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok((cand, false)),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("could not inspect the destination {}", cand.display())
+                })
+            }
         }
     }
+}
+
+/// Copy to a unique sibling temporary file, then publish its complete contents
+/// without replacing a destination created after it was chosen.
+fn copy_audio_no_replace(source: &Path, destination: &Path, expected_size: u64) -> Result<()> {
+    let mut input = std::fs::File::open(source).context("could not open the device file")?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("the imported file has no parent directory"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .context("could not create an import temporary file")?;
+    let copied = std::io::copy(&mut input, temporary.as_file_mut())
+        .context("could not copy the device file")?;
+    if copied != expected_size {
+        anyhow::bail!("the copy is incomplete ({copied} of {expected_size} bytes)");
+    }
+    temporary.as_file_mut().flush()?;
+    let permissions = input.metadata()?.permissions();
+    temporary.as_file().set_permissions(permissions.clone())?;
+    temporary.as_file().sync_all()?;
+    let imported = temporary
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "could not publish the imported file {}",
+                destination.display()
+            )
+        })?;
+    // Windows persistence clears temporary attributes, including the read-only bit.
+    imported.set_permissions(permissions)?;
+    Ok(())
 }
 
 /// Copy one device track into `music_dir` and read everything the device knows about it.
@@ -50,17 +128,17 @@ pub fn import_destination(music_dir: &Path, dt: &DevTrack, size: u64) -> (PathBu
 pub fn import_track(root: &Path, lib: &DeviceLibrary, id: u32, music_dir: &Path, data_dir: &Path, artwork_dir: &Path) -> Result<ImportedTrack> {
     let dt = lib.tracks.get(&id).ok_or_else(|| anyhow!("the track is no longer on the device"))?;
     let src = root.join(dt.file_path.trim_start_matches('/'));
-    let size = std::fs::metadata(&src).map(|m| m.len()).map_err(|_| anyhow!("file not found on the device"))?;
-    let (dest, reused_file) = import_destination(music_dir, dt, size);
+    let size = match std::fs::metadata(&src) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(anyhow!("file not found on the device"))
+        }
+        Err(e) => return Err(e).context("could not inspect the device file"),
+    };
+    let (dest, reused_file) = import_destination(music_dir, dt, &src)?;
     if !reused_file {
         std::fs::create_dir_all(dest.parent().unwrap())?;
-        let part = dest.with_file_name(format!("{}.part", dest.file_name().unwrap_or_default().to_string_lossy()));
-        let copied = std::fs::copy(&src, &part).map_err(|e| anyhow!("could not copy the file: {e}"))?;
-        if copied != size {
-            let _ = std::fs::remove_file(&part);
-            return Err(anyhow!("the copy is incomplete ({copied} of {size} bytes)"));
-        }
-        std::fs::rename(&part, &dest)?;
+        copy_audio_no_replace(&src, &dest, size)?;
     }
     // The file's own tags first, then what the device library says (which is what the DJ saw
     // and edited in rekordbox), field by field where the device has a value.
@@ -272,4 +350,205 @@ pub fn read_sync(root: &Path) -> Option<SyncConfig> {
 pub fn write_sync(root: &Path, c: &SyncConfig) -> Result<()> {
     std::fs::create_dir_all(root.join(".Recordbox"))?;
     usb::write_atomic(&root.join(".Recordbox").join("sync.json"), &serde_json::to_vec_pretty(c)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "recordbox-device-import-{}-{time}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn device_track() -> DevTrack {
+        DevTrack {
+            id: 1,
+            artist: "Artist".into(),
+            album: "Album".into(),
+            file_path: "/song.mp3".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn import_keeps_different_same_size_audio_and_reuses_only_matching_content() {
+        let dir = TestDirectory::new();
+        let device = dir.0.join("device");
+        std::fs::create_dir(&device).unwrap();
+        // A difference beyond the hash reader's first chunk must still be detected.
+        let original = vec![37; (2 << 20) + 17];
+        std::fs::write(device.join("song.mp3"), &original).unwrap();
+        let track = device_track();
+        let mut library = DeviceLibrary::default();
+        library.tracks.insert(track.id, track);
+        let music = dir.0.join("Music");
+        let data = dir.0.join("data");
+        let artwork = dir.0.join("artwork");
+
+        let first = import_track(&device, &library, 1, &music, &data, &artwork).unwrap();
+        assert!(!first.reused_file);
+        let first_path = Path::new(&first.track.path);
+        let mut different = original.clone();
+        *different.last_mut().unwrap() ^= 1;
+        std::fs::write(first_path, &different).unwrap();
+
+        let second = import_track(&device, &library, 1, &music, &data, &artwork).unwrap();
+        assert!(!second.reused_file);
+        assert!(second.track.path.ends_with("song (2).mp3"));
+        assert_eq!(std::fs::read(&second.track.path).unwrap(), original);
+        assert_eq!(std::fs::read(first_path).unwrap(), different);
+
+        let again = import_track(&device, &library, 1, &music, &data, &artwork).unwrap();
+        assert!(again.reused_file);
+        assert_eq!(again.track.path, second.track.path);
+        assert_eq!(std::fs::read(device.join("song.mp3")).unwrap(), original);
+        assert!(!music.join("Artist/Album/song (3).mp3").exists());
+    }
+
+    #[test]
+    fn destination_directories_are_not_reused_or_replaced() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        std::fs::write(&source, b"audio").unwrap();
+        let music = dir.0.join("Music");
+        let occupied = music.join("Artist/Album/song.mp3");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let (destination, reused) = import_destination(&music, &device_track(), &source).unwrap();
+        assert!(!reused);
+        assert_eq!(destination, music.join("Artist/Album/song (2).mp3"));
+        assert!(occupied.is_dir());
+    }
+
+    #[test]
+    fn missing_or_non_file_device_sources_are_reported() {
+        let dir = TestDirectory::new();
+        assert!(import_destination(
+            &dir.0.join("Music"),
+            &device_track(),
+            &dir.0.join("missing")
+        )
+        .is_err());
+        assert!(import_destination(&dir.0.join("Music"), &device_track(), &dir.0).is_err());
+        assert!(!dir.0.join("Music").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_inspection_errors_are_not_treated_as_available_paths() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        let music = dir.0.join("not-a-directory");
+        std::fs::write(&source, b"audio").unwrap();
+        std::fs::write(&music, b"keep me").unwrap();
+        let error = import_destination(&music, &device_track(), &source).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("could not inspect the destination"));
+        assert_eq!(std::fs::read(&music).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_symlinks_are_kept_and_not_reused() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        std::fs::write(&source, b"audio").unwrap();
+        let music = dir.0.join("Music");
+        let occupied = music.join("Artist/Album/song.mp3");
+        std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&source, &occupied).unwrap();
+        let (destination, reused) = import_destination(&music, &device_track(), &source).unwrap();
+        assert!(!reused);
+        assert_eq!(destination, music.join("Artist/Album/song (2).mp3"));
+        assert_eq!(std::fs::read_link(&occupied).unwrap(), source);
+    }
+
+    #[test]
+    fn copy_refuses_a_file_created_after_the_destination_was_selected() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        std::fs::write(&source, b"new audio").unwrap();
+        let (destination, reused) =
+            import_destination(&dir.0.join("Music"), &device_track(), &source).unwrap();
+        assert!(!reused);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"another import").unwrap();
+        assert!(copy_audio_no_replace(&source, &destination, 9).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"another import");
+        assert_eq!(std::fs::read(&source).unwrap(), b"new audio");
+        assert_eq!(
+            std::fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn incomplete_copy_removes_only_its_own_partial_destination() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        let destination = dir.0.join("destination");
+        let unrelated = dir.0.join("destination.part");
+        std::fs::write(&source, b"audio").unwrap();
+        std::fs::write(&unrelated, b"keep me").unwrap();
+        let error = copy_audio_no_replace(&source, &destination, 99).unwrap_err();
+        assert!(error.to_string().contains("copy is incomplete"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&source).unwrap(), b"audio");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn complete_copy_preserves_read_only_source_permissions() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("source");
+        let destination = dir.0.join("destination");
+        std::fs::write(&source, b"audio").unwrap();
+        let writable = std::fs::metadata(&source).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&source, readonly).unwrap();
+        let result = copy_audio_no_replace(&source, &destination, 5);
+        let copied_readonly = std::fs::metadata(&destination).map(|m| m.permissions().readonly());
+        // Restore original permissions before assertions so Windows can remove the fixture.
+        std::fs::set_permissions(&source, writable.clone()).unwrap();
+        if destination.exists() {
+            std::fs::set_permissions(&destination, writable).unwrap();
+        }
+        result.unwrap();
+        assert!(copied_readonly.unwrap());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"audio");
+    }
+
+    #[test]
+    fn missing_copy_source_does_not_create_a_destination() {
+        let dir = TestDirectory::new();
+        let destination = dir.0.join("destination");
+        assert!(copy_audio_no_replace(&dir.0.join("missing"), &destination, 5).is_err());
+        assert!(!destination.exists());
+    }
 }
