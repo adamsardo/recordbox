@@ -17,6 +17,13 @@ The playback changes retain the existing animation cadence and audio controls:
 - Gate Comp reuses coefficients while its side, PARAM and device rate stay
   unchanged. This helps that optional effect; it is not an explanation for
   default playback with effects bypassed.
+- Expanded Collection categories reuse their grouped counts until library
+  metadata changes. Rows outside the scroll viewport skip painting and text
+  layout while retaining their widget IDs and keyboard-focus registration.
+- Smoothed channel/crossfader, trim and isolator gains targeting zero clear a
+  subnormal tail at the end of the buffer. Normal gain values and the audible
+  fade remain unchanged. This avoids repeatedly processing a tiny, silent gain
+  on older Intel processors without changing the floating-point mode.
 
 RustFFT and Candle's matrix backend already select supported SIMD at runtime.
 Public builds retain their existing CPU compatibility, dependencies and
@@ -29,6 +36,8 @@ From the source checkout, after installing the normal native build dependencies:
 ```sh
 cargo test --manifest-path app/Cargo.toml --release --locked cpu_playback_cost -- --ignored --nocapture --test-threads=1
 cargo test --manifest-path app/Cargo.toml --release --locked cpu_overview_cost -- --ignored --nocapture --test-threads=1
+cargo test --manifest-path app/Cargo.toml --release --locked cpu_zero_gain_cost -- --ignored --nocapture --test-threads=1
+cargo test --manifest-path app/Cargo.toml --release --locked cpu_collection_categories_cost -- --ignored --nocapture --test-threads=1
 ```
 
 These opt-in reports have no timing pass/fail threshold. Ordinary CI exercises
@@ -76,3 +85,57 @@ settle, then compare again immediately after loading an unprepared track.
 Keep explicit thread settings and CPU power mode unchanged between runs.
 Containers, hybrid Intel CPUs and laptops under thermal limits can behave
 differently from the cloud Xeon. Model inference was not measured here.
+
+The follow-up reports use the same portable release toolchain on that Xeon,
+pinned to one logical CPU. The category report generates 100,000 tracks and
+compares the former row painter/count grouping with the cached implementation,
+including actual egui widgets and tessellation. Three runs of five warm frames
+follow the separately measured cold frame. Every row still participates in
+keyboard focus; this is painting culling rather than widget virtualization.
+
+| Measured component | Before | After |
+| --- | --- | --- |
+| Expanded Artist category, warm frame | 275.934 ms | 74.730 ms |
+| All Collection categories expanded, warm frame | 570.498 ms | 114.116 ms |
+| Zero channel fader, four-state callback, 20 simulated seconds, 44.1 → 48 kHz | 0.292 s | 0.031 s |
+
+The category component was 3.7–5 times faster. The muted callback case used
+about nine times less elapsed time after two seconds of warmup; ordinary unity
+controls produced identical output checksums. Its absolute compute cost was
+about 1.46% of one core before and 0.16% after, excluding the device and window.
+This silent-gain case does not establish a cause for high CPU with untouched
+controls. Category savings depend on the expanded groups and library contents;
+100,000 distinct artists is a scaling stress case.
+
+## Check sustained Linux process CPU
+
+In the usual Linux `top` display, 100% means one logical CPU. On a four-core
+machine, a process at 80% uses roughly 0.8 of one core; monitors using a
+whole-machine percentage have a different scale.
+
+Let loading and initial analysis settle, then compare the same track and audio
+settings with a smaller window, the Simple Player, and expanded versus collapsed
+Collection categories. These comparisons distinguish display and library work
+from the audio callback. Keep screen refresh and CPU power settings fixed.
+
+`glxinfo -B` identifies the renderer. `llvmpipe` or `softpipe` indicates software
+graphics; an `NVE4` renderer identifies the Nouveau NVIDIA hardware path. Graphics
+driver CPU time belongs to Recordbox's process too, so high process CPU alone
+does not identify which part of the application is busy.
+
+Inspect threads during playback with:
+
+```sh
+top -H -p $(pgrep -n -x recordbox)
+```
+
+The main thread has the same thread ID as the process ID. Compare it with
+`cpal_alsa_out` and any `llvmpipe-*` workers. A busy main thread points toward
+interface or driver work; a busy ALSA output thread needs device/callback
+investigation. This is a diagnostic distinction, not an automatic diagnosis.
+
+The screenshot benchmark requests continuous repaint itself. Its update timings
+exclude GPU/driver work and cannot establish idle CPU usage. Whole-process tests
+on a virtual display with software graphics also do not reproduce an older
+physical GPU or its driver. Collection and zero-gain reports measure specific
+components, not a promised reduction in total process CPU.
