@@ -14,8 +14,8 @@ const GROUP_BYTES: usize = 36;
 /// longer string has been seen in a rekordbox-made export, so everything is cut there.
 pub const MAX_STRING_CHARS: usize = 255;
 
-/// Largest row a page can hold (heap minus one row group).
-pub const MAX_ROW_BYTES: usize = PAGE - HEAP_START - 6;
+/// Largest row a page can hold after four-byte alignment, leaving its row directory intact.
+pub const MAX_ROW_BYTES: usize = (PAGE - HEAP_START - 6) & !3;
 
 /// `s` cut to at most `max` characters (never inside a character).
 pub fn clip_chars(s: &str, max: usize) -> &str {
@@ -215,6 +215,7 @@ fn paginate(rows: &[Vec<u8>]) -> Vec<Vec<usize>> {
     let mut cur: Vec<usize> = vec![];
     let mut used = 0usize;
     for (i, r) in rows.iter().enumerate() {
+        // write_database bounds every row by MAX_ROW_BYTES before pagination.
         let len = (r.len() + 3) & !3;
         if !cur.is_empty() && HEAP_START + used + len + groups_bytes(cur.len() + 1) > PAGE {
             pages.push(std::mem::take(&mut cur));
@@ -326,6 +327,8 @@ pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) 
             let base = pi as usize * PAGE;
             let pg = &mut out[base..base + PAGE];
             let n = rows_idx.len();
+            let available = (PAGE - HEAP_START).checked_sub(groups_bytes(n))
+                .ok_or_else(|| anyhow::anyhow!("row directory of table {} exceeds a database page", t.page_type))?;
             put_u32(pg, 4, pi);
             put_u32(pg, 8, t.page_type);
             let nextp = if k + 1 < p.data.len() { p.data[k + 1] } else { p.empty };
@@ -343,11 +346,13 @@ pub fn write_database(tables: &[TableSpec], header_unknown: u32, sequence: u32) 
                 let mut row = tables_row(t, r, ri);
                 let len = (row.len() + 3) & !3;
                 row.resize(len, 0);
-                pg[HEAP_START + used..HEAP_START + used + len].copy_from_slice(&row);
+                let end = used.checked_add(len).filter(|&end| end <= available)
+                    .ok_or_else(|| anyhow::anyhow!("rows of table {} exceed a database page", t.page_type))?;
+                pg[HEAP_START + used..HEAP_START + end].copy_from_slice(&row);
                 offsets.push(used as u16);
-                used += len;
+                used = end;
             }
-            let free = PAGE - HEAP_START - used - groups_bytes(n);
+            let free = available - used;
             put_u16(pg, 28, free as u16);
             put_u16(pg, 30, used as u16);
             put_u16(pg, 32, n as u16);
