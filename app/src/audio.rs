@@ -1165,6 +1165,16 @@ fn search_grain(rate: u32) -> usize {
     (rate as usize * 60 / 1000).max(1)
 }
 
+/// A zero-target one-pole gain can get stuck at a subnormal value indefinitely. Clear
+/// only that tail, keeping all normal values and nonzero targets unchanged. Doing this
+/// once per buffer adds no checks to the sample loop and bounds the tail to one buffer.
+#[inline]
+fn clear_zero_gain_tail(gain: &mut f32, target: f32) {
+    if target == 0.0 && gain.is_subnormal() {
+        *gain = target;
+    }
+}
+
 /// Add one deck's audio to `out` (which the caller has cleared) and advance its position.
 pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u32) {
     render_deck_cue(s, out, &mut [], channels, rate)
@@ -1386,6 +1396,16 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
         }
     }
     s.peak = peak;
+    clear_zero_gain_tail(&mut s.dsp.ch_fader, s.ch_fader);
+    clear_zero_gain_tail(&mut s.dsp.fader, s.fader);
+    if strip != 0 {
+        clear_zero_gain_tail(&mut s.dsp.trim, s.trim);
+    }
+    if eq_on {
+        for (gain, target) in s.dsp.eq.g.iter_mut().zip(iso_gain) {
+            clear_zero_gain_tail(gain, target);
+        }
+    }
 }
 
 /// Metronome click level for the three volume steps of the GRID panel (1 = quiet … 3 = loud).
@@ -2007,6 +2027,100 @@ mod smooth_tests {
         }
     }
 
+    #[test]
+    fn gain_cleanup_preserves_normal_values_and_nonzero_targets() {
+        for target in [0.0f32, -0.0] {
+            for bits in [1u32, 0x007f_ffff, 0x8000_0001, 0x807f_ffff] {
+                let mut gain = f32::from_bits(bits);
+                clear_zero_gain_tail(&mut gain, target);
+                assert_eq!(gain.to_bits(), target.to_bits());
+            }
+            for bits in [0u32, 0x8000_0000, f32::MIN_POSITIVE.to_bits(), (-f32::MIN_POSITIVE).to_bits(),
+                1.0f32.to_bits(), f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0x7fc0_0123] {
+                let mut gain = f32::from_bits(bits);
+                clear_zero_gain_tail(&mut gain, target);
+                assert_eq!(gain.to_bits(), bits);
+            }
+        }
+        for target in [f32::from_bits(1), -f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::INFINITY, f32::NAN] {
+            let mut gain = f32::from_bits(0x007f_ffff);
+            clear_zero_gain_tail(&mut gain, target);
+            assert_eq!(gain.to_bits(), 0x007f_ffff);
+        }
+    }
+
+    #[test]
+    fn normal_fader_response_matches_the_original_envelope() {
+        // Keep the pre-cleanup one-pole envelope as an independent output expectation.
+        // This includes a zero target, but remains far above underflow for this interval.
+        for channel in [false, true] {
+            for target in [0.0, -0.0, 0.1, 0.7, 1.0] {
+                let mut s = deck();
+                s.dsp.gate = 1.0;
+                if channel { s.ch_fader = target; } else { s.fader = target; }
+                let audio = s.audio.clone().unwrap();
+                let (mut gain, mut frame) = (1.0f32, 0usize);
+                let k = 1.0 / (0.005 * 44100.0f32);
+                for frames in [1, 7, 64, 512] {
+                    let mut out = vec![0.0f32; frames * 2];
+                    render_deck(&mut s, &mut out, 2, 44100);
+                    for stereo in out.chunks_exact(2) {
+                        gain += (target - gain) * k;
+                        for ch in 0..2 {
+                            assert_eq!(stereo[ch].to_bits(), (audio.samples[frame * 2 + ch] * gain).to_bits());
+                        }
+                        frame += 1;
+                    }
+                    let rendered = if channel { s.dsp.ch_fader } else { s.dsp.fader };
+                    assert_eq!(rendered.to_bits(), gain.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_gain_tails_settle_silently_and_controls_recover() {
+        for rate in [44100u32, 48000, 96000] {
+            for control in 0..5 {
+                let mut s = deck();
+                match control {
+                    0 => s.ch_fader = 0.0,
+                    1 => s.fader = 0.0,
+                    2 => { s.strip = 1; s.trim = 0.0; }
+                    3 => { s.eq_on = true; s.eq_gain = [0.0; 3]; }
+                    _ => { s.strip = 2; s.eq_pos = [0.0; 3]; }
+                }
+                let mut out = [0.0f32; 1024];
+                for _ in 0..(rate as usize * 2).div_ceil(512) {
+                    out.fill(0.0);
+                    render_deck(&mut s, &mut out, 2, rate);
+                }
+                let gains: &[f32] = match control {
+                    0 => std::slice::from_ref(&s.dsp.ch_fader),
+                    1 => std::slice::from_ref(&s.dsp.fader),
+                    2 => std::slice::from_ref(&s.dsp.trim),
+                    _ => &s.dsp.eq.g,
+                };
+                assert!(gains.iter().all(|g| g.to_bits() == 0), "rate {rate}, control {control}, {gains:?}");
+                let pos = s.pos;
+                out.fill(0.0);
+                render_deck(&mut s, &mut out, 2, rate);
+                assert!(s.playing && s.pos > pos);
+                assert!(out.iter().all(|v| *v == 0.0));
+                match control {
+                    0 => s.ch_fader = 1.0,
+                    1 => s.fader = 1.0,
+                    2 => s.trim = 1.0,
+                    3 => s.eq_gain = [1.0; 3],
+                    _ => s.eq_pos = [0.5; 3],
+                }
+                out.fill(0.0);
+                render_deck(&mut s, &mut out, 2, rate);
+                assert!(out.iter().all(|v| v.is_finite()) && out.iter().any(|v| v.abs() > 0.01));
+            }
+        }
+    }
+
     /// Opt-in CPU report using the actual callback, synthetic audio and no device.
     /// `cargo test --release cpu_playback_cost -- --ignored --nocapture --test-threads=1`
     #[test]
@@ -2050,6 +2164,63 @@ mod smooth_tests {
             }
             elapsed.sort_by(f64::total_cmp);
             println!("cpu playback: {label}, source_rate {source_rate}, rate {rate}, decks {decks}, frames 512, median_seconds {:.9}, checksum {:.12}", elapsed[2], checksum);
+        }
+    }
+
+    /// Actual callback cost after a zero fader has had time to decay below normal f32.
+    /// The same benchmark runs before and after gain cleanup; the gain bits show whether
+    /// the old subnormal plateau or an exact zero was timed.
+    /// `cargo test --release cpu_zero_gain_cost -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn cpu_zero_gain_cost() {
+        use std::hint::black_box;
+        let source_rate = 44100u32;
+        let n = source_rate as usize * 23;
+        let samples = (0..n).flat_map(|i| {
+            let v = (i as f32 * 330.0 * std::f32::consts::TAU / source_rate as f32).sin() * 0.3;
+            [v, v * 0.8]
+        }).collect();
+        let audio = Arc::new(Decoded { sr: source_rate, samples, raw_frames: n, damaged: 0, truncated: false });
+        for rate in [44100u32, 48000] {
+            for (label, ch_fader, fader) in [("unity", 1.0, 1.0), ("channel-zero", 0.0, 1.0), ("cross-zero", 1.0, 0.0)] {
+                let mut elapsed = Vec::new();
+                let mut checksum = 0.0f64;
+                let mut gain_bits = (0, 0);
+                for _ in 0..5 {
+                    let states: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|deck_no| Arc::new(Mutex::new(if deck_no == 0 {
+                        PlayState { audio: Some(audio.clone()), playing: true, volume: 1.0, gain: 1.0,
+                            smooth: true, ch_fader, fader, ..Default::default() }
+                    } else {
+                        PlayState { deck_no: deck_no as u8, ..Default::default() }
+                    })));
+                    let mut out = [0.0f32; 1024];
+                    // Two seconds settle even the old one-pole subnormal plateau. The source
+                    // lasts 23 seconds so it keeps playing throughout the 20 timed seconds.
+                    for _ in 0..(rate as usize * 2).div_ceil(512) {
+                        render(black_box(&states), black_box(&mut out), 2, rate);
+                    }
+                    let start_pos = {
+                        let s = states[0].lock();
+                        gain_bits = (s.dsp.ch_fader.to_bits(), s.dsp.fader.to_bits());
+                        if ch_fader == 0.0 { assert!(s.dsp.ch_fader.abs() < f32::MIN_POSITIVE); }
+                        if fader == 0.0 { assert!(s.dsp.fader.abs() < f32::MIN_POSITIVE); }
+                        s.pos
+                    };
+                    let blocks = rate as usize * 20 / 512;
+                    let start = std::time::Instant::now();
+                    for _ in 0..blocks {
+                        render(black_box(&states), black_box(&mut out), 2, rate);
+                    }
+                    elapsed.push(start.elapsed().as_secs_f64());
+                    black_box(&out);
+                    checksum += out.iter().map(|v| *v as f64).sum::<f64>();
+                    let s = states[0].lock();
+                    assert!(s.playing && s.pos > start_pos + source_rate as f64 * 19.0);
+                }
+                elapsed.sort_by(f64::total_cmp);
+                println!("cpu zero gain: {label}, source_rate {source_rate}, rate {rate}, frames 512, median_seconds {:.9}, gain_bits {gain_bits:?}, checksum {:.12}", elapsed[2], checksum);
+            }
         }
     }
 

@@ -1039,10 +1039,91 @@ pub struct DeviceInfo {
     pub free: Option<u64>,
 }
 
+/// Immutable Collection rows, prepared only for the categories the user opens.
+/// These values depend on library metadata, never on the currently loaded deck.
+#[derive(Default)]
+pub(crate) struct CollectionCategories {
+    rows: [Option<Arc<[(String, usize)]>>; 4],
+}
+
+impl CollectionCategories {
+    fn clear(&mut self) {
+        self.rows.fill(None);
+    }
+
+    pub(crate) fn rows(&mut self, tracks: &[Track], field: usize) -> Arc<[(String, usize)]> {
+        self.rows[field].get_or_insert_with(|| {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for t in tracks {
+                *counts.entry(App::category_value(t, field as u8)).or_default() += 1;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            if field == 0 {
+                rows.reverse(); // Date Added: newest day first, as before.
+            }
+            rows.into()
+        }).clone()
+    }
+}
+
+#[cfg(test)]
+mod collection_category_tests {
+    use super::*;
+
+    #[test]
+    fn collection_categories_match_existing_grouping_and_order() {
+        let tracks = vec![
+            Track { date_added: "2025-02-03T09:00".into(), genre: " House ".into(), artist: "B".into(), album: " a ".into(), ..Default::default() },
+            Track { date_added: "2025-02-03T10:00".into(), genre: "House".into(), artist: "b".into(), album: "A".into(), ..Default::default() },
+            Track { date_added: "2026-01-01".into(), genre: "\t".into(), artist: "é".into(), album: "".into(), ..Default::default() },
+            Track::default(),
+        ];
+        let expected = [
+            vec![("2026-01-01", 1), ("2025-02-03", 2), ("", 1)],
+            vec![("", 2), ("House", 2)],
+            vec![("", 1), ("B", 1), ("b", 1), ("é", 1)],
+            vec![("", 2), ("A", 1), ("a", 1)],
+        ];
+        let mut cache = CollectionCategories::default();
+        for (field, want) in expected.into_iter().enumerate() {
+            let rows = cache.rows(&tracks, field);
+            assert_eq!(&*rows, want.iter().map(|(s, n)| (s.to_string(), *n)).collect::<Vec<_>>());
+            assert!(Arc::ptr_eq(&rows, &cache.rows(&tracks, field)), "unchanged frames share immutable rows");
+        }
+    }
+
+    #[test]
+    fn collection_categories_rebuild_after_metadata_and_library_changes() {
+        let mut tracks = vec![Track { artist: "old".into(), album: "old".into(), genre: "old".into(), date_added: "2024-01-01".into(), ..Default::default() }];
+        let mut cache = CollectionCategories::default();
+        let old: Vec<_> = (0..4).map(|field| cache.rows(&tracks, field)).collect();
+        // The same invalidation used by track_mut covers metadata edits and Undo/Redo.
+        cache.clear();
+        tracks[0].artist = "new artist".into();
+        tracks[0].album = "new album".into();
+        tracks[0].genre = "new genre".into();
+        tracks[0].date_added = "2026-02-03T12:00".into();
+        for field in 0..4 {
+            let rows = cache.rows(&tracks, field);
+            assert!(!Arc::ptr_eq(&rows, &old[field]));
+            assert_eq!(&*rows, &[(App::category_value(&tracks[0], field as u8), 1)]);
+        }
+        // Reloads can add or remove tracks while old row snapshots remain alive.
+        cache.clear();
+        tracks.push(tracks[0].clone());
+        assert_eq!(cache.rows(&tracks, 2)[0].1, 2);
+        cache.clear();
+        tracks.clear();
+        assert!(cache.rows(&tracks, 2).is_empty());
+        assert_eq!(&*old[2], &[("old".into(), 1)]);
+    }
+}
+
 pub struct App {
     pub db: Db,
     pub prefs: Prefs,
     pub tracks: Vec<Track>,
+    pub(crate) collection_categories: CollectionCategories,
     pub index: HashMap<i64, usize>,
     pub previews: HashMap<i64, Vec<u8>>,
     pub cue_counts: HashMap<i64, (usize, usize)>,
@@ -1184,6 +1265,7 @@ impl App {
             db,
             prefs,
             tracks: vec![],
+            collection_categories: CollectionCategories::default(),
             index: HashMap::new(),
             previews: HashMap::new(),
             cue_counts: HashMap::new(),
@@ -1656,6 +1738,7 @@ impl App {
         self.reload_tags();
     }
     pub fn reload_tracks(&mut self) {
+        self.collection_categories.clear();
         let queued: HashSet<i64> = self.tracks.iter().filter(|t| t.analyzed == 3).map(|t| t.id).collect();
         self.tracks = self.db.all_tracks().unwrap_or_default();
         let mut replaced: Vec<i64> = vec![];
@@ -1738,6 +1821,9 @@ impl App {
     }
     pub fn track_mut(&mut self, id: i64) -> Option<&mut Track> {
         let i = *self.index.get(&id)?;
+        // Metadata dialogs, inline edits, tag reloads and Undo/Redo can update a track
+        // without reloading the library. Invalidate before handing out mutable access.
+        self.collection_categories.clear();
         Some(&mut self.tracks[i])
     }
     /// Save a track without recording an undo step (analysis, sync and other system updates).

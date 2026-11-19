@@ -880,6 +880,15 @@ pub const TREE_FONT: f32 = 10.5;
 /// the pane's edge, the triangle is centred 9 pt in and the text starts 20 pt in (+`indent`).
 fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool, pitch: f32) -> egui::Response {
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
+    // Register every row, including its keyboard focus target. Only the painting and
+    // text layout can be omitted for rows outside the ScrollArea's clip rectangle.
+    if ui.is_rect_visible(rr) {
+        paint_collection_row(ui, rr, &resp, text, arrow, indent, count, selected);
+    }
+    resp
+}
+
+fn paint_collection_row(ui: &Ui, rr: Rect, resp: &egui::Response, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool) {
     let p = ui.painter();
     let bar = Rect::from_min_max(pos2(rr.min.x + 1.0, rr.min.y), pos2(rr.max.x - 1.0, rr.max.y));
     if selected {
@@ -896,7 +905,36 @@ fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, cou
     if let Some(c) = count {
         p.text(pos2(rr.max.x - 10.0, rr.center().y), Align2::RIGHT_CENTER, c.to_string(), rb(TREE_FONT), WHITE);
     }
-    resp
+}
+
+fn collection_leaves(ui: &mut Ui, field: u8, rows: &[(String, usize)], view: &View) -> Option<View> {
+    let mut pick = None;
+    for (value, count) in rows {
+        let selected = matches!(view, View::Category { field: f, value: v } if *f == field && v == value);
+        let label = if value.is_empty() { "(none)" } else { value.as_str() };
+        if collection_row(ui, label, None, 14.0, Some(*count), selected, 16.0).clicked() {
+            pick = Some(View::Category { field, value: value.clone() });
+        }
+    }
+    pick
+}
+
+fn collection_category_groups(ui: &mut Ui, categories: &mut CollectionCategories, tracks: &[Track], view: &View) -> Option<View> {
+    let mut pick = None;
+    for (field, label) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
+        let key = egui::Id::new(("cat_open", field));
+        let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+        if collection_row(ui, label, Some(open), 0.0, None, false, 18.0).clicked() {
+            ui.ctx().data_mut(|d| d.insert_temp(key, !open));
+        }
+        if open {
+            let rows = categories.rows(tracks, field);
+            if let Some(view) = collection_leaves(ui, field as u8, &rows, view) {
+                pick = Some(view);
+            }
+        }
+    }
+    pick
 }
 
 pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
@@ -916,30 +954,8 @@ pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>)
                     app.set_view(View::Collection);
                 }
                 all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
-                for (fi, f) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
-                    let key = egui::Id::new(("cat_open", fi));
-                    let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
-                    let r = collection_row(ui, f, Some(open), 0.0, None, false, 18.0);
-                    if r.clicked() {
-                        ui.ctx().data_mut(|d| d.insert_temp(key, !open));
-                    }
-                    if open {
-                        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-                        for t in &app.tracks {
-                            *counts.entry(App::category_value(t, fi as u8)).or_default() += 1;
-                        }
-                        let mut items: Vec<(String, usize)> = counts.into_iter().collect();
-                        if fi == 0 {
-                            items.reverse(); // newest first
-                        }
-                        for (v, n) in items {
-                            let sel = app.view == View::Category { field: fi as u8, value: v.clone() };
-                            let label = if v.is_empty() { "(none)".to_string() } else { v.clone() };
-                            if collection_row(ui, &label, None, 14.0, Some(n), sel, 16.0).clicked() {
-                                app.set_view(View::Category { field: fi as u8, value: v });
-                            }
-                        }
-                    }
+                if let Some(view) = collection_category_groups(ui, &mut app.collection_categories, &app.tracks, &app.view) {
+                    app.set_view(view);
                 }
             });
         }
@@ -2579,4 +2595,203 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
 
 pub fn track_menu_items(app: &mut App, ui: &mut Ui, sel: &[i64]) {
     crate::ui_library_ext::track_menu(app, ui, sel);
+}
+
+#[cfg(test)]
+mod collection_render_tests {
+    use super::*;
+
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx
+    }
+
+    fn input() -> egui::RawInput {
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 240.0))), ..Default::default() }
+    }
+
+    /// The former row path, including offscreen painting/text layout. Keep this
+    /// independent of collection_row's visibility shortcut for parity and CPU reports.
+    fn original_collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool, pitch: f32) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
+        paint_collection_row(ui, rect, &response, text, arrow, indent, count, selected);
+        response
+    }
+
+    #[test]
+    fn collection_leaf_culling_preserves_visible_shapes_layout_and_ids() {
+        let rows: Vec<_> = (0..200).map(|i| (if i == 0 { String::new() } else { format!("Artist {i:03}") }, i + 1)).collect();
+        for offset in [0.0, 19.0, 400.0, 3000.0] {
+            let ctx = context();
+            let render = |culled: bool| {
+                let mut tail = None;
+                let output = ctx.run(input(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().vertical_scroll_offset(offset).auto_shrink([false, false]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            collection_row(ui, "All", None, 0.0, None, false, 17.0);
+                            collection_row(ui, "Artist", Some(true), 0.0, None, false, 18.0);
+                            let view = View::Category { field: 2, value: "Artist 025".into() };
+                            if culled {
+                                collection_leaves(ui, 2, &rows, &view);
+                            } else {
+                                for (value, count) in &rows {
+                                    let selected = matches!(&view, View::Category { value: v, .. } if v == value);
+                                    original_collection_row(ui, if value.is_empty() { "(none)" } else { value }, None, 14.0, Some(*count), selected, 16.0);
+                                }
+                            }
+                            let response = collection_row(ui, "Album", Some(false), 0.0, None, false, 18.0);
+                            tail = Some((response.id, response.rect, ui.min_rect()));
+                        });
+                    });
+                });
+                let visible: Vec<_> = output.shapes.into_iter().filter(|s| s.shape.visual_bounding_rect().intersects(s.clip_rect)).collect();
+                (tail.unwrap(), visible)
+            };
+            // Settle the ScrollArea geometry and warm the font atlas before comparing.
+            render(false);
+            render(false);
+            let original = render(false);
+            let optimized = render(true);
+            assert_eq!(original.0, optimized.0, "layout and the following header's ID at scroll offset {offset}");
+            assert_eq!(original.1, optimized.1, "visible labels, counts, selection and clipping at offset {offset}");
+        }
+    }
+
+    #[test]
+    fn collection_offscreen_rows_keep_tab_order_and_keyboard_focus() {
+        let ctx = context();
+        let rows: Vec<_> = (0..200).map(|i| (format!("Artist {i:03}"), 1)).collect();
+        let frame = |optimized: bool, raw: egui::RawInput| {
+            let mut leaves = vec![];
+            let mut tail = None;
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        collection_row(ui, "All", None, 0.0, None, false, 17.0);
+                        collection_row(ui, "Artist", Some(true), 0.0, None, false, 18.0);
+                        if optimized {
+                            collection_leaves(ui, 2, &rows, &View::Collection);
+                        } else {
+                            for (value, count) in &rows {
+                                let response = original_collection_row(ui, value, None, 14.0, Some(*count), false, 16.0);
+                                leaves.push((response.id, ui.is_rect_visible(response.rect)));
+                            }
+                        }
+                        tail = Some(collection_row(ui, "Album", Some(false), 0.0, None, false, 18.0).id);
+                    });
+                });
+            });
+            std::hint::black_box(output);
+            (leaves, tail.unwrap())
+        };
+        let tab = |shift| {
+            let mut raw = input();
+            let modifiers = egui::Modifiers { shift, ..Default::default() };
+            raw.modifiers = modifiers;
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed, repeat: false, modifiers });
+            }
+            raw
+        };
+        frame(false, input());
+        let (leaves, tail) = frame(false, input());
+        let last_visible = leaves.iter().rposition(|(_, visible)| *visible).unwrap();
+        assert!(last_visible + 1 < leaves.len() && !leaves[last_visible + 1].1);
+
+        // Tab must enter the next leaf even when it lies just outside the clip.
+        ctx.memory_mut(|m| m.request_focus(leaves[last_visible].0));
+        frame(true, input());
+        frame(true, tab(false));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[last_visible + 1].0));
+
+        // Keep an already-focused hidden row alive over multiple ordinary frames.
+        ctx.memory_mut(|m| m.request_focus(leaves[149].0));
+        for _ in 0..3 { frame(true, input()); }
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[149].0));
+        frame(true, tab(true));
+        frame(true, input()); // egui applies Shift+Tab's previous target next frame.
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[148].0));
+
+        // The following category header remains adjacent to the final hidden leaf.
+        ctx.memory_mut(|m| m.request_focus(leaves[199].0));
+        frame(true, input());
+        frame(true, tab(false));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(tail));
+        frame(true, tab(true));
+        frame(true, input());
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[199].0));
+    }
+
+    fn original_groups(ui: &mut Ui, tracks: &[Track], view: &View) {
+        for (field, label) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
+            let open = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new(("cat_open", field)))).unwrap_or(false);
+            original_collection_row(ui, label, Some(open), 0.0, None, false, 18.0);
+            if open {
+                let mut counts = std::collections::BTreeMap::<String, usize>::new();
+                for t in tracks {
+                    *counts.entry(App::category_value(t, field as u8)).or_default() += 1;
+                }
+                let mut rows: Vec<_> = counts.into_iter().collect();
+                if field == 0 { rows.reverse(); }
+                for (value, count) in rows {
+                    let selected = *view == View::Category { field: field as u8, value: value.clone() };
+                    let label = if value.is_empty() { "(none)".to_string() } else { value.clone() };
+                    original_collection_row(ui, &label, None, 14.0, Some(count), selected, 16.0);
+                }
+            }
+        }
+    }
+
+    /// Real egui groups under a normal ScrollArea clip, including tessellation. No GPU,
+    /// audio or timing pass/fail limit. `cargo test --release cpu_collection_categories_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cpu_collection_categories_cost() {
+        let tracks: Vec<_> = (0..100_000).map(|i| Track {
+            id: i,
+            artist: format!("Artist {i:06}"), album: format!("Album {:05}", i % 5000),
+            genre: format!("Genre {:03}", i % 200), date_added: format!("2025-{:02}-{:02}", i % 12 + 1, i % 28 + 1),
+            ..Default::default()
+        }).collect();
+        for (name, open) in [("collapsed", [false; 4]), ("artist", [false, false, true, false]), ("all", [true; 4])] {
+            for legacy in [true, false] {
+                let ctx = context();
+                for (field, value) in open.into_iter().enumerate() {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("cat_open", field)), value));
+                }
+                let mut cache = CollectionCategories::default();
+                let mut frame = || {
+                    let mut output = ctx.run(input(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                if legacy { original_collection_row(ui, "All", None, 0.0, None, true, 17.0); }
+                                else { collection_row(ui, "All", None, 0.0, None, true, 17.0); }
+                                if legacy { original_groups(ui, &tracks, &View::Collection); }
+                                else { collection_category_groups(ui, &mut cache, &tracks, &View::Collection); }
+                            });
+                        });
+                    });
+                    let shapes = std::mem::take(&mut output.shapes);
+                    std::hint::black_box(ctx.tessellate(shapes, output.pixels_per_point));
+                    std::hint::black_box(output);
+                };
+                let cold = std::time::Instant::now();
+                frame();
+                let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+                frame();
+                let mut times = vec![];
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    for _ in 0..5 { frame(); }
+                    times.push(start.elapsed().as_secs_f64() * 1000.0 / 5.0);
+                }
+                times.sort_by(f64::total_cmp);
+                eprintln!("cpu_collection_categories_cost tracks={} groups={name} legacy={legacy} cold_ms={cold_ms:.3} warm_median_ms={:.3} frames_per_run=5 runs=3 includes=egui_widgets_and_tessellation", tracks.len(), times[1]);
+            }
+        }
+    }
 }
