@@ -651,6 +651,9 @@ struct TrashEntry {
 }
 
 #[cfg(test)]
+mod sqlcipher_tests;
+
+#[cfg(test)]
 mod schema_tests {
     use super::*;
 

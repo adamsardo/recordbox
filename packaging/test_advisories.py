@@ -38,10 +38,10 @@ class AdvisoryGateTests(unittest.TestCase):
 
     def test_exact_baseline_passes_and_reports_unresolved_findings(self):
         result = gate.assess(self.audit, self.baseline, 1)
-        self.assertEqual(len(result["known"]), 3)
+        self.assertEqual(len(result["known"]), len(self.baseline["findings"]))
         self.assertFalse(result["new"] or result["stale"])
         rendered = gate.render(result)
-        self.assertIn("3 existing blocking findings remain unresolved", rendered)
+        self.assertIn(f"{len(self.baseline['findings'])} existing blocking findings remain unresolved", rendered)
         for finding in self.baseline["findings"]:
             self.assertIn(finding["advisory_id"], rendered)
 
@@ -64,7 +64,7 @@ class AdvisoryGateTests(unittest.TestCase):
                 self.assertEqual(len(result["stale"]), 1)
 
     def test_removed_findings_make_baseline_stale(self):
-        for i in range(3):
+        for i in range(len(self.baseline["findings"])):
             result = gate.assess(report(self.rows[:i] + self.rows[i + 1:]), self.baseline, 1)
             self.assertEqual([v["advisory_id"] for v in result["stale"]],
                              [self.baseline["findings"][i]["advisory_id"]])
