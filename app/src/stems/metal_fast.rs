@@ -13,7 +13,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::{CpuStorage, CustomOp1, CustomOp2, DType, Layout, MetalDevice, MetalStorage, Result, Shape, Storage, Tensor};
 use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
-use objc2_metal::{MTLResourceOptions, MTLResourceUsage, MTLSize};
+use objc2_metal::{MTLResourceOptions, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -341,22 +341,22 @@ impl CustomOp1 for Kernel {
         // Hold the extra tensors' storage for the duration of the encoding.
         let extra: Vec<_> = self.extra.iter().map(|t| t.storage_and_layout()).collect();
         let enc = dev.command_encoder()?;
-        enc.set_label(self.name);
-        enc.set_compute_pipeline_state(&pipe);
-        enc.set_buffer(0, Some(storage.buffer()), layout.start_offset() * 4);
-        enc.use_resource(storage.buffer(), MTLResourceUsage::Read);
+        let encoder = enc.as_ref();
+        encoder.set_label(self.name);
+        encoder.set_compute_pipeline_state(&pipe);
+        // Candle tracks buffer reads and writes to order dispatches using
+        // untracked buffers. Keep the command guard alive through dispatch.
+        encoder.set_input_buffer(0, Some(storage.buffer()), layout.start_offset() * 4);
         for (i, (s, l)) in extra.iter().enumerate() {
             let Storage::Metal(s) = &**s else { candle_core::bail!("{}: inputs must be on Metal", self.name) };
             if !l.is_contiguous() || s.dtype() != DType::F32 {
                 candle_core::bail!("{}: input {} must be contiguous f32", self.name, i + 1)
             }
-            enc.set_buffer(i + 1, Some(s.buffer()), l.start_offset() * 4);
-            enc.use_resource(s.buffer(), MTLResourceUsage::Read);
+            encoder.set_input_buffer(i + 1, Some(s.buffer()), l.start_offset() * 4);
         }
         let k = extra.len() + 1;
-        enc.set_buffer(k, Some(&out), 0);
-        enc.use_resource(&*out, MTLResourceUsage::Write);
-        enc.set_bytes_directly(k + 1, self.params.len() * 4, self.params.as_ptr() as *const std::ffi::c_void);
+        encoder.set_output_buffer(k, Some(&out), 0);
+        encoder.set_bytes_directly(k + 1, self.params.len() * 4, self.params.as_ptr() as *const std::ffi::c_void);
         // Thread group: powers of two per axis, within the pipeline's limit.
         let limit = pipe.max_total_threads_per_threadgroup().max(1);
         let mut group = candle_metal_kernels::utils::get_block_dims(self.grid.0, self.grid.1, self.grid.2);
@@ -369,7 +369,7 @@ impl CustomOp1 for Kernel {
                 group.width /= 2
             }
         }
-        enc.dispatch_threads(MTLSize { width: self.grid.0, height: self.grid.1, depth: self.grid.2 }, group);
+        encoder.dispatch_threads(MTLSize { width: self.grid.0, height: self.grid.1, depth: self.grid.2 }, group);
         drop(enc);
         Ok((MetalStorage::new(out, dev, count, DType::F32), Shape::from(self.out.clone())))
     }
