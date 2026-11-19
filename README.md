@@ -1,8 +1,35 @@
 # Recordbox
 
+<!-- project-badges:start -->
+<p align="center">
+  <a href="https://github.com/fantuz/recordbox/actions/workflows/build.yml?query=branch%3Amain"><img src="https://github.com/fantuz/recordbox/actions/workflows/build.yml/badge.svg?branch=main" alt="Build and package on main" height="20"></a>
+  <a href="https://github.com/fantuz/recordbox/actions/workflows/github-code-scanning/codeql?query=branch%3Amain"><img src="https://github.com/fantuz/recordbox/actions/workflows/github-code-scanning/codeql/badge.svg?branch=main" alt="CodeQL analysis on main" height="20"></a>
+  <a href="https://github.com/fantuz/recordbox/releases/latest"><img src="https://img.shields.io/github/v/release/fantuz/recordbox?label=release" alt="Latest stable release" height="20"></a>
+  <a href="https://github.com/fantuz/recordbox/releases"><img src="https://img.shields.io/github/downloads/fantuz/recordbox/total?label=downloads" alt="GitHub release downloads" height="20"></a>
+  <br>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/fantuz/recordbox" alt="MIT license" height="20"></a>
+  <a href="app/Cargo.toml"><img src="https://img.shields.io/badge/built%20with-Rust-555555?logo=rust" alt="Built with Rust" height="20"></a>
+  <a href="#running-it"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-507269" alt="macOS; experimental Windows and Linux packages" height="20"></a>
+</p>
+<!-- project-badges:end -->
+
 An unofficial, open-source macOS app for getting ready for a DJ set: organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
 
 > **Not affiliated with AlphaTheta or Pioneer DJ.** rekordbox is a trademark of AlphaTheta Corporation. This is an independent project that uses rekordbox's preparation workflow as the reference for how things should behave.
+
+This is the [fantuz/recordbox](https://github.com/fantuz/recordbox) fork of
+[adamsardo/recordbox](https://github.com/adamsardo/recordbox), with the original
+authors and MIT licence preserved.
+
+<p align="center">
+  <a href="https://github.com/fantuz/recordbox/releases/latest"><img src="https://img.shields.io/badge/Download-latest%20release-2e7d32?style=for-the-badge&logo=github" alt="Download the latest Recordbox release" height="32"></a>
+  <br>
+  <a href="#running-it">Installation details</a> · <a href="https://github.com/fantuz/recordbox/releases">All releases</a>
+</p>
+
+Choose your operating system and processor from the release's **Downloads**
+table. Packages are unsigned; macOS builds are not notarized. Windows and Linux
+packages are experimental.
 
 ## Status
 
@@ -10,7 +37,7 @@ An unofficial, open-source macOS app for getting ready for a DJ set: organise yo
 
 So far: 70 source files, 57,441 lines of Rust.
 
-This is being built in the open. An AI coding agent (Claude Code, run through Craft Anything) is writing the code, and this repo syncs from its build folder about every 15 minutes, so you're watching it come together in real time. Expect gaps and the occasional broken build until a first release. Star or watch the repo to follow along.
+The upstream project is being built in the open with an AI coding agent (Claude Code, run through Craft Anything), and its repository syncs from the build folder about every 15 minutes. This fork adds validated native packages and release automation. Expect gaps and the occasional broken development build. Star or watch the repo to follow along.
 
 ## What it's aiming for
 
@@ -38,14 +65,16 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 ## Running it
 
 Downloads for the `fantuz/recordbox` fork are available from
-[GitHub Releases](https://github.com/fantuz/recordbox/releases). Version 0.5.0
-introduces unsigned macOS app bundles and experimental Windows/Linux packages.
-See the [0.5.0 release notes](docs/releases/0.5.0.md) for changes and known limits.
+[the latest release](https://github.com/fantuz/recordbox/releases/latest).
+Choose the macOS app ZIP matching your processor, or an experimental Windows x64
+ZIP or Linux x64 archive. Prebuilt packages do not require Rust; see the release
+notes and [installation guide](docs/BUILD-AND-PACKAGING.md) for requirements,
+checksums and known limits.
 
-You need [Rust](https://rustup.rs). Then:
+To build from source, install [Rust](https://rustup.rs). Then:
 
 ```bash
-git clone https://github.com/adamsardo/recordbox
+git clone https://github.com/fantuz/recordbox.git
 cd recordbox/app
 cargo run --release
 ```
