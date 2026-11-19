@@ -54,14 +54,34 @@ release notes distinguish delivered changes from the application's existing
 feature baseline and disclose the tracked test/security findings below.
 
 After the release pull request passes its checks, merge it to the fork's `main`
-and verify the intended merged revision. A maintainer then creates and pushes
+and wait for **Build and package** to finish successfully on that exact merged
+revision. A maintainer then creates and pushes
 the immutable `v<version>` tag at that validated commit. Merging to `main` does not
 automatically create a tag or publish a release.
 
 The tag starts the same **Build and package** workflow for that exact revision.
 Before heavy builds, its version gate requires the tag, `VERSION`, Cargo manifest
-and lockfile to agree. Publication then requires the complete application-test
-gate, dependency-advisory gate, and all four native package/smoke jobs to pass.
+and lockfile to agree. It can reuse all four native packages and matching smoke
+artifacts from **one completed, successful `main` push** of this workflow in the
+same repository, for the exact tag SHA and embedded `VERSION`. PR/fork runs,
+other branches/revisions, incomplete or expired sets, and mixed runs are refused.
+Immutable artifact IDs select the original archives and smoke reports; the old
+release bundle is not used as a substitute for verifying them again.
+
+The complete application suite and a **fresh dependency-advisory audit** still
+run on the tag.
+Publication requires those gates plus fresh verification of all four native
+archives and their matching smoke evidence. Only the native compilation/smoke
+jobs are skipped when that complete trusted set was explicitly selected.
+If discovery finds no complete set or the API is unavailable, every native build
+and smoke job runs as before. Artifact expiry/deletion after selection fails
+publication closed: use **Re-run all jobs** to run selection again and fall back
+to native builds. A failed-jobs-only retry retains the previous selection.
+Artifacts normally expire after 14 days. Waiting for the exact merged `main` run
+to turn green before tagging avoids a second Apple Silicon build request; free
+hosted runner availability remains best effort. Existing tags are never moved,
+and this workflow improvement only applies to tags containing it.
+
 `packaging/prepare_release.py` validates the notes, complete archive/checksum set,
 and each archive's manifest, source revision, runtime/file hashes and target,
 together with the native smoke evidence.
