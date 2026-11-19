@@ -1303,8 +1303,9 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
             r = r * w + or * (1.0 - w);
             s.dsp.xf = if left > 1 { Some((op + step * speed, left - 1)) } else { None };
         }
-        if smooth {
-            // Raised cosine over the play / pause fade.
+        if smooth && s.dsp.gate != 1.0 {
+            // Raised cosine only while the play / pause fade is moving. A settled
+            // gate is exactly unity; avoid a cosine for every audible sample.
             let g = 0.5 - 0.5 * (std::f32::consts::PI * s.dsp.gate).cos();
             l *= g;
             r *= g;
@@ -1984,6 +1985,72 @@ mod smooth_tests {
 
     fn max_step(x: &[f32]) -> f32 {
         x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn settled_play_fade_preserves_every_output_sample() {
+        for rate in [22050, 44100, 48000, 96000] {
+            for channels in [1, 2, 4] {
+                let (mut smooth, mut plain) = (deck(), deck());
+                smooth.dsp.gate = 1.0;
+                plain.smooth = false;
+                for frames in [1, 33, 512, 1025] {
+                    let (mut a, mut b) = (vec![0.0; frames * channels], vec![0.0; frames * channels]);
+                    render_deck(&mut smooth, &mut a, channels, rate);
+                    render_deck(&mut plain, &mut b, channels, rate);
+                    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "rate {rate}, channels {channels}, frames {frames}");
+                    assert_eq!(smooth.pos, plain.pos);
+                    assert_eq!(smooth.dsp.gate, 1.0);
+                }
+            }
+        }
+    }
+
+    /// Opt-in CPU report using the actual callback, synthetic audio and no device.
+    /// `cargo test --release cpu_playback_cost -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn cpu_playback_cost() {
+        use std::hint::black_box;
+        // The first three cases reproduce one deck with default playback controls,
+        // including a common 44.1 kHz file on a 48 kHz Linux output.
+        for (label, source_rate, rate, decks, smooth, strip, kind, color) in [
+            ("default-44k", 44100u32, 44100u32, 1, true, 0, 0, 0.5),
+            ("default-44k-to-48k", 44100, 48000, 1, true, 0, 0, 0.5),
+            ("default-48k", 48000, 48000, 1, true, 0, 0, 0.5),
+            ("plain-control", 48000, 48000, 1, false, 0, 0, 0.5),
+            ("two-decks", 44100, 48000, 2, true, 0, 0, 0.5),
+            ("four-decks", 44100, 48000, 4, true, 0, 0, 0.5),
+            ("filter", 48000, 48000, 1, true, 1, 0, 0.17),
+            ("gate-left", 48000, 48000, 1, true, 1, 8, 0.17),
+            ("gate-right", 48000, 48000, 1, true, 1, 8, 0.83),
+        ] {
+            let n = source_rate as usize * 21;
+            let samples = (0..n).flat_map(|i| {
+                let v = (i as f32 * 330.0 * std::f32::consts::TAU / source_rate as f32).sin() * 0.3;
+                [v, v * 0.8]
+            }).collect();
+            let audio = Arc::new(Decoded { sr: source_rate, samples, raw_frames: n, damaged: 0, truncated: false });
+            let mut elapsed = Vec::new();
+            let mut checksum = 0.0f64;
+            for _ in 0..5 {
+                let states: Vec<_> = (0..decks).map(|deck_no| Arc::new(Mutex::new(PlayState {
+                    audio: Some(audio.clone()), playing: true, volume: 1.0, gain: 1.0,
+                    smooth, strip, cfx_kind: kind, cfx_color: color, cfx_param: 0.63,
+                    deck_no, ..Default::default() }))).collect();
+                let mut out = [0.0f32; 1024];
+                // Settle the play fade, knob glide and filter coefficients before timing.
+                for _ in 0..16 { render(black_box(&states), black_box(&mut out), 2, rate); }
+                let start = std::time::Instant::now();
+                let blocks = rate as usize * 20 / 512;
+                for _ in 0..blocks { render(black_box(&states), black_box(&mut out), 2, rate); }
+                elapsed.push(start.elapsed().as_secs_f64());
+                checksum += out.iter().map(|v| *v as f64).sum::<f64>();
+            }
+            elapsed.sort_by(f64::total_cmp);
+            println!("cpu playback: {label}, source_rate {source_rate}, rate {rate}, decks {decks}, frames 512, median_seconds {:.9}, checksum {:.12}", elapsed[2], checksum);
+        }
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub struct DeckExt {
     pub phrases_edited: bool,
     /// The beats last handed to the audio thread for BEAT SYNC (count, first and last time).
     pub grid_sig: (usize, u64, u64),
+    /// Prepared static overview columns for this loaded track (not carried to another track).
+    pub overview_cache: crate::ui_player::OverviewCache,
     /// A-GAIN knob drag: pointer y and the gain (dB) when it began.
     pub gain_drag: Option<(f32, f32)>,
     /// Seconds the enlarged waveform was scrubbed or scrolled this frame (for the waveform link).
