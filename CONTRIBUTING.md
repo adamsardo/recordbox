@@ -48,7 +48,8 @@ blocking. Do not suppress findings just to make a check green.
 
 The full serial application suite and Clippy run on Linux. All four native
 package jobs (macOS ARM64/Intel, Windows x64 and Linux x64) compile in release
-mode, run backup security regressions and smoke the extracted application.
+mode, run backup, SQLCipher/WAL, audio-import and PDB-boundary regressions, and
+smoke the extracted application.
 Smoke proves startup/rendering, not physical audio playback or USB-player
 compatibility. Broader portable tests can be added to the native matrix as
 their platform requirements are made explicit.

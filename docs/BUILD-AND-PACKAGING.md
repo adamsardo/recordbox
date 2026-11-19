@@ -110,7 +110,8 @@ cleaned up, make rustfmt and `cargo clippy --all-targets -- -D warnings` strict.
 Native GUI smoke is a rendering/startup check, not a substitute for exercising
 real library imports, audio playback, USB devices or signed installers.
 The full serial application suite and Clippy run on Linux; every native package
-job runs the backup regressions and GUI smoke. The optional USB real-export
+job runs backup, SQLCipher/WAL, audio-import and PDB-boundary regressions plus
+GUI smoke. The optional USB real-export
 oracle group is explicitly ignored and requires `RECORDBOX_TEST_ORACLES` fixtures. See
 [Contributing](../CONTRIBUTING.md#optional-format-oracles) for the targeted command
 and explicit fixture requirements.
