@@ -46,15 +46,15 @@ repository protection settings.
 
 ## Fork release process
 
-The first packaged release of `fantuz/recordbox` is **0.5.0**. Release changes go
+The first packaged release of `fantuz/recordbox` is **0.5.0**. Each release goes
 through a pull request: update root `VERSION`, `app/Cargo.toml`, the matching
-package entry in `app/Cargo.lock`, and `docs/releases/0.5.0.md` together. The
+package entry in `app/Cargo.lock`, and `docs/releases/<version>.md` together. The
 release notes distinguish delivered changes from the application's existing
 feature baseline and disclose the tracked test/security findings below.
 
 After the release pull request passes its checks, merge it to the fork's `main`
 and verify the intended merged revision. A maintainer then creates and pushes
-the immutable `v0.5.0` tag at that validated commit. Merging to `main` does not
+the immutable `v<version>` tag at that validated commit. Merging to `main` does not
 automatically create a tag or publish a release.
 
 The tag starts the same **Build and package** workflow for that exact revision.
@@ -78,7 +78,7 @@ stable version can replace the latest release. Existing tags/releases must
 agree with the intended source/assets; publication must not move a tag or
 replace mismatched assets. Pull-request runs and ordinary branch pushes do not
 publish. A tag workflow publishes only to the repository where that tag was
-pushed: this fork's `v0.5.0` does not create an upstream tag or release. If upstream
+pushed: a tag in this fork does not create an upstream tag or release. If upstream
 adopts the workflow, its maintainer enables Actions and pushes a matching version
 tag there to start that repository's own release.
 
@@ -214,7 +214,7 @@ models, credentials, screenshots, or caches. It refuses to overwrite prior outpu
 
 ```sh
 python packaging/smoke_app.py \
-  --archive dist/macos-arm64/Recordbox-0.5.0-macos-arm64.zip \
+  --archive "dist/macos-arm64/Recordbox-$(cat VERSION)-macos-arm64.zip" \
   --output smoke/macos-arm64 --timeout 240
 ```
 
