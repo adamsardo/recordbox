@@ -95,6 +95,11 @@ for installation, system requirements, current platform limitations and the
 checks maintainers can enable. Version tags publish validated packages to GitHub
 Releases; the application packages remain unsigned.
 
+For Linux/Intel playback CPU measurements, see the
+[playback performance guide](docs/PLAYBACK-PERFORMANCE.md). Its synthetic
+benchmarks exercise one-deck rendering and waveform drawing without personal
+music or audio hardware.
+
 ## The brief
 
 This is the request the agent is building from, word for word:

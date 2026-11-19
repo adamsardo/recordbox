@@ -3171,6 +3171,7 @@ impl App {
                     }
                 }
                 if self.deck.track == Some(id) {
+                    self.deck.x.overview_cache.clear();
                     self.deck.wave = Some(res.wave);
                     if self.deck.audio.is_none() {
                         self.deck.duration = res.duration;
