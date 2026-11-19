@@ -46,6 +46,11 @@ The upstream project is being built in the open with an AI coding agent (Claude 
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
 - **USB export:** drives that CDJ/XDJ players can read, the same way rekordbox does
 
+Import integrity checks include signed PQTZ beatgrid shifts and known PSSI
+phrase versions, with generated parser regressions. See
+[ANLZ import integrity](docs/ANLZ-IMPORT-INTEGRITY.md) for the exact scope and
+remaining compatibility limits.
+
 ## Scope
 
 The first version is deliberately limited to preparation: everything you do *before* the set. Performance features such as live mixing, effects, lighting and video aren't part of it.

@@ -235,8 +235,6 @@ pub fn beat_number(beats: &[Beat], t: f64) -> u16 {
 
 const KEY: [u8; 19] = [0xCB, 0xE1, 0xEE, 0xFA, 0xE5, 0xEE, 0xAD, 0xEE, 0xE9, 0xD2, 0xE9, 0xEB, 0xE1, 0xE9, 0xF3, 0xE8, 0xE9, 0xF4, 0xE1];
 
-/// XOR the data part of a PSSI section (everything after the entry count) with rekordbox 6's
-/// mask. Applying it twice restores the original.
 /// Name of a phrase kind (high-mood labels).
 pub fn kind_name(kind: u16) -> &'static str {
     match kind {
@@ -259,19 +257,34 @@ pub fn cue_proposals(s: &Structure, beats: &[Beat]) -> Vec<(f64, &'static str)> 
         .collect()
 }
 
-pub fn mask_section(section: &mut [u8]) {
-    if section.len() < 18 || &section[..4] != b"PSSI" {
-        return;
+/// Supported PSSI framing. Opaque header and entry fields are left uninterpreted.
+fn pssi_layout(section: &[u8]) -> Option<(usize, usize)> {
+    if section.len() < 32 || &section[..4] != b"PSSI" {
+        return None;
     }
-    let n = u16::from_be_bytes([section[16], section[17]]);
+    let header = u32::from_be_bytes(section[4..8].try_into().ok()?) as usize;
+    let total = u32::from_be_bytes(section[8..12].try_into().ok()?) as usize;
+    let version = u16::from_be_bytes([section[12], section[13]]) as usize;
+    let entry_size = u16::from_be_bytes([section[14], section[15]]) as usize;
+    let n = u16::from_be_bytes([section[16], section[17]]) as usize;
+    if header != 32 || total != section.len() || version > 1 || entry_size != 24 || header.checked_add(n.checked_mul(entry_size)?)? != total {
+        return None;
+    }
+    Some((version, n))
+}
+
+/// XOR the PSSI bytes after the entry count. Version 1 rotates the same mask by one
+/// byte; applying this twice restores the original. Unsupported sections stay untouched.
+pub fn mask_section(section: &mut [u8]) {
+    let Some((version, n)) = pssi_layout(section) else { return };
     for (i, b) in section[18..].iter_mut().enumerate() {
-        *b ^= KEY[i % KEY.len()].wrapping_add(n as u8);
+        *b ^= KEY[(i + version) % KEY.len()].wrapping_add(n as u8);
     }
 }
 
 /// The mood field of an unmasked section is 1..=3; a masked one decodes to that range.
 pub fn is_masked(section: &[u8]) -> bool {
-    if section.len() < 20 {
+    if pssi_layout(section).is_none() {
         return false;
     }
     let mood = u16::from_be_bytes([section[18], section[19]]);
@@ -310,15 +323,15 @@ pub fn pssi(s: &Structure) -> Vec<u8> {
 
 /// Parse an (unmasked or masked) PSSI section.
 pub fn parse(section: &[u8]) -> Option<Structure> {
+    let (_, n) = pssi_layout(section)?;
     let mut s = section.to_vec();
     if is_masked(&s) {
         mask_section(&mut s);
     }
-    if s.len() < 32 || &s[..4] != b"PSSI" {
+    let mood = u16::from_be_bytes([s[18], s[19]]);
+    if !(1..=3).contains(&mood) {
         return None;
     }
-    let n = u16::from_be_bytes([s[16], s[17]]) as usize;
-    let mood = u16::from_be_bytes([s[18], s[19]]);
     let end_beat = u16::from_be_bytes([s[26], s[27]]);
     let mut phrases = vec![];
     for k in 0..n {
@@ -382,6 +395,89 @@ mod tests {
         mask_section(&mut b);
         assert!(is_masked(&b));
         assert_eq!(parse(&b), Some(s));
+    }
+
+    fn pssi_fixture(version: u16, mood: u16, masked: bool) -> Vec<u8> {
+        let mut b = b"PSSI".to_vec();
+        b.extend_from_slice(&32u32.to_be_bytes());
+        b.extend_from_slice(&80u32.to_be_bytes());
+        b.extend_from_slice(&version.to_be_bytes());
+        b.extend_from_slice(&24u16.to_be_bytes());
+        b.extend_from_slice(&2u16.to_be_bytes());
+        b.extend_from_slice(&mood.to_be_bytes());
+        b.extend_from_slice(&[11, 22, 33, 44, 55, 66]);
+        b.extend_from_slice(&128u16.to_be_bytes());
+        b.extend_from_slice(&[77, 88, 254, 99]); // Unnamed bank and opaque header fields.
+        for (index, beat, kind) in [(1u16, 16u16, 2u16), (2, 64, 5)] {
+            b.extend_from_slice(&index.to_be_bytes());
+            b.extend_from_slice(&beat.to_be_bytes());
+            b.extend_from_slice(&kind.to_be_bytes());
+            b.extend_from_slice(&[0x5a; 18]);
+        }
+        if masked {
+            // Independent fixture encoder from the documented ASCII seed, rather than
+            // production KEY or mask_section. Version selects the starting seed byte.
+            for (byte, seed) in b[18..].iter_mut().zip(b"Kanzen-niRikaishita".iter().cycle().skip(version as usize)) {
+                *byte ^= seed.wrapping_add(0x80).wrapping_add(2);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn pssi_accepts_masked_and_plain_versions_zero_and_one() {
+        let expected = Structure { mood: 3, phrases: vec![Phrase { beat: 16, kind: 2 }, Phrase { beat: 64, kind: 5 }], end_beat: 128 };
+        for version in [0, 1] {
+            let plain = pssi_fixture(version, 3, false);
+            let masked = pssi_fixture(version, 3, true);
+            for (bytes, is_ciphertext) in [(&plain, false), (&masked, true)] {
+                let before = bytes.clone();
+                assert_eq!(is_masked(bytes), is_ciphertext);
+                assert_eq!(parse(bytes), Some(expected.clone()));
+                assert_eq!(*bytes, before, "parsing must not change source bytes");
+            }
+            let mut transformed = plain.clone();
+            mask_section(&mut transformed);
+            assert_eq!(transformed, masked);
+            mask_section(&mut transformed);
+            assert_eq!(transformed, plain, "opaque fields survive mask roundtrip");
+        }
+        assert_eq!(&pssi_fixture(1, 3, true)[18..20], &[0xe3, 0xf3]);
+    }
+
+    #[test]
+    fn pssi_rejects_unsupported_or_inconsistent_framing() {
+        let plain = pssi_fixture(1, 3, false);
+        for end in 0..plain.len() {
+            assert!(parse(&plain[..end]).is_none(), "prefix {end}");
+        }
+        for (offset, value) in [(12, 2u16), (14, 23), (16, 1), (16, 3), (16, u16::MAX)] {
+            let mut bad = plain.clone();
+            bad[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            let before = bad.clone();
+            assert!(parse(&bad).is_none());
+            mask_section(&mut bad);
+            assert_eq!(bad, before, "unsupported framing must stay untouched");
+        }
+        for (offset, value) in [(4, 30u32), (8, 79), (8, 81)] {
+            let mut bad = plain.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            assert!(parse(&bad).is_none());
+        }
+        let mut trailing = plain;
+        trailing.push(0);
+        assert!(parse(&trailing).is_none());
+    }
+
+    #[test]
+    fn pssi_rejects_invalid_moods_after_decoding() {
+        for version in [0, 1] {
+            for mood in [0, 4, u16::MAX] {
+                for masked in [false, true] {
+                    assert!(parse(&pssi_fixture(version, mood, masked)).is_none());
+                }
+            }
+        }
     }
 
     /// Compare Recordbox's phrases with rekordbox's for the user's library, on rekordbox's own

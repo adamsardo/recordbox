@@ -2140,8 +2140,9 @@ impl App {
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let from_rb = base.and_then(|b| {
-                let same = crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| grids_match(&r, &grid)).unwrap_or(false);
-                if !same {
+                let dat = b.with_extension("DAT");
+                let same = crate::rbimport::read_pqtz_grid(&dat).map(|r| grids_match(&r, &grid)).unwrap_or(false);
+                if !same || !crate::rbimport::pqtz_beat_indices_match(&dat, &beats) {
                     return None;
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
