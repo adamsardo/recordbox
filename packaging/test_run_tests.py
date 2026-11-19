@@ -16,6 +16,13 @@ test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
 
 """
 
+NATIVE_OUTPUT = """test db::sqlcipher_tests::encrypted_wal_reads_backup_reopen_and_wrong_key ... 2026-11-19 16:09:23.828: ERROR CORE sqlcipher_page_cipher: hmac check failed for pgno=1
+2026-11-19 16:09:23.828: ERROR CORE sqlite3Codec: error decrypting page 1 data: 1
+2026-11-19 16:09:23.828: ERROR CORE sqlcipher_codec_ctx_set_error: 1 lock=0
+ok"""
+
+NATIVE_LOG = LOG.replace("test backup::tests::backup_restore_round_trip ... ok", NATIVE_OUTPUT)
+
 
 class ApplicationSuiteTests(unittest.TestCase):
     def test_complete_passing_suite_and_explicit_ignored_tests_are_accepted(self):
@@ -29,6 +36,31 @@ class ApplicationSuiteTests(unittest.TestCase):
         self.assertTrue(accepts_suite(LOG.replace(
             "backup::tests::backup_restore_round_trip ... ok",
             "backup::tests::rejects_invalid_input - should panic ... ok"), 0))
+
+    def test_native_diagnostics_can_interleave_a_serial_test_completion(self):
+        self.assertTrue(accepts_suite(NATIVE_LOG, 0))
+        self.assertTrue(accepts_suite(NATIVE_LOG.replace("... 2026-11-19", "... \n2026-11-19"), 0))
+        self.assertTrue(accepts_suite(NATIVE_LOG.replace("lock=0\nok", "lock=0\nerror: expected wrong key\nok"), 0))
+
+    def test_native_test_still_requires_its_own_completion_before_next_test_or_summary(self):
+        missing_completion = NATIVE_LOG.replace("lock=0\nok", "lock=0")
+        self.assertFalse(accepts_suite(missing_completion, 0))
+        # A later test's completion cannot finish the earlier incomplete native test.
+        self.assertFalse(accepts_suite(missing_completion.replace(
+            "export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic ... ok",
+            "export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic ... \nok"), 0))
+        truncated = NATIVE_LOG[:NATIVE_LOG.index("\nok\n")]
+        self.assertFalse(accepts_suite(truncated, 0))
+        self.assertFalse(accepts_suite(truncated + "\n" + NATIVE_LOG[NATIVE_LOG.index("test result:"):] + "\nok\n", 0))
+
+    def test_failed_or_duplicate_native_completion_is_not_accepted(self):
+        failed = NATIVE_LOG.replace("lock=0\nok", "lock=0\nFAILED")
+        self.assertFalse(accepts_suite(failed, 0))
+        self.assertFalse(accepts_suite(NATIVE_LOG, 101))
+        duplicate = NATIVE_LOG.replace(
+            "export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic",
+            "db::sqlcipher_tests::encrypted_wal_reads_backup_reopen_and_wrong_key")
+        self.assertFalse(accepts_suite(duplicate, 0))
 
     def test_no_failures_are_accepted_including_former_pdb_exception(self):
         for name in ("backup::tests::backup_restore_round_trip",

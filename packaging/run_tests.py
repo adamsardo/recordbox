@@ -9,7 +9,29 @@ import sys
 def accepts_suite(log, returncode):
     """Do not mistake an empty, filtered, truncated or failed run for a clean suite."""
     runs = re.findall(r"^running (\d+) tests?$", log, re.MULTILINE)
-    results = re.findall(r"^test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored(?:, [^\r\n]*)?)$", log, re.MULTILINE)
+    results = []
+    pending = None
+    result_pattern = re.compile(r"ok|FAILED|ignored(?:, [^\r\n]*)?")
+    for line in log.splitlines():
+        test = re.fullmatch(r"test (\S+)(?: - should panic)? \.\.\. (.*)", line)
+        if test:
+            if pending is not None:
+                return False
+            name, tail = test.groups()
+            if result_pattern.fullmatch(tail):
+                results.append((name, tail))
+            else:
+                # Native libraries bypass Rust's output capture and can print between
+                # libtest's serial test prefix and its standalone completion status.
+                pending = name
+        elif pending is not None:
+            if result_pattern.fullmatch(line):
+                results.append((pending, line))
+                pending = None
+            elif re.match(r"test result:|running \d+ tests?$|failures:", line):
+                return False
+    if pending is not None:
+        return False
     summaries = re.findall(
         r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
         r"(\d+) measured; (\d+) filtered out; finished in [^\r\n]+$", log, re.MULTILINE,
