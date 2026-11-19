@@ -325,36 +325,237 @@ fn names(c: &rusqlite::Connection, table: &str) -> Result<HashMap<String, String
 /// anchor at the first beat and one wherever the tempo changes.
 pub fn read_pqtz_grid(dat: &Path) -> Option<BeatGrid> {
     let b = std::fs::read(dat).ok()?;
+    parse_pqtz_grid(&b)
+}
+
+fn parse_pqtz_grid(b: &[u8]) -> Option<BeatGrid> {
+    let mut anchors = vec![];
+    let mut last_tempo = None;
+    for beat in pqtz_beats(b)? {
+        let beat = beat?;
+        if Some(beat.bpm) != last_tempo {
+            anchors.push(GridAnchor { time: beat.time, bpm: beat.bpm, beat: beat.beat });
+            last_tempo = Some(beat.bpm);
+        }
+    }
+    (!anchors.is_empty()).then_some(BeatGrid { anchors })
+}
+
+/// Native phrase beat numbers are positions in PQTZ, so reuse them only when the
+/// audible grid has the same source records at the same positions.
+pub fn pqtz_beat_indices_match(dat: &Path, beats: &[Beat]) -> bool {
+    std::fs::read(dat).ok().map(|b| pqtz_indices_match(&b, beats)).unwrap_or(false)
+}
+
+fn pqtz_indices_match(b: &[u8], beats: &[Beat]) -> bool {
+    let Some(mut source) = pqtz_beats(b) else { return false };
+    let mut count = 0;
+    let same = source.all(|source| {
+        let Some(source) = source else { return false };
+        count += 1;
+        beats.get(source.index).map(|beat| {
+            beat.index == source.index && beat.beat == source.beat && (beat.time - source.time).abs() <= 0.0011 && (beat.bpm - source.bpm).abs() < 0.01
+        }).unwrap_or(false)
+    });
+    same && count > 0
+}
+
+fn pqtz_beats(b: &[u8]) -> Option<impl Iterator<Item = Option<Beat>> + '_> {
     if b.get(0..4)? != b"PMAI" {
         return None;
     }
     let be32 = |o: usize| -> Option<u32> { Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
-    let be16 = |o: usize| -> Option<u16> { Some(u16::from_be_bytes(b.get(o..o + 2)?.try_into().ok()?)) };
     let mut i = be32(4)? as usize;
-    while i + 12 <= b.len() {
+    if i < 12 || i > b.len() || be32(8)? as usize != b.len() {
+        return None;
+    }
+    while i < b.len() {
+        let header = be32(i.checked_add(4)?)? as usize;
         let total = be32(i + 8)? as usize;
-        if total < 12 {
+        if header < 12 || total < header {
             return None;
         }
-        if &b[i..i + 4] == b"PQTZ" {
-            let n = be32(i + 20)? as usize;
-            let mut anchors: Vec<GridAnchor> = vec![];
-            let mut last_tempo = u16::MAX;
-            for k in 0..n {
-                let o = i + 24 + k * 8;
-                let beat = be16(o)? as u8;
-                let tempo = be16(o + 2)?;
-                let ms = be32(o + 4)?;
-                if tempo != last_tempo {
-                    anchors.push(GridAnchor { time: ms as f64 / 1000.0, bpm: tempo as f64 / 100.0, beat: beat.clamp(1, 4) });
-                    last_tempo = tempo;
-                }
+        let section = b.get(i..i.checked_add(total)?)?;
+        if section.get(..4)? == b"PQTZ" {
+            if header != 24 {
+                return None;
             }
-            return (!anchors.is_empty()).then_some(BeatGrid { anchors });
+            let n = be32(i + 20)? as usize;
+            if n.checked_mul(8)?.checked_add(header)? != section.len() {
+                return None;
+            }
+            // Deck grid edits keep the original entries and store a signed millisecond
+            // adjustment in the header. Negative effective times are unsupported: the
+            // grid model drops preroll beats, which would change native phrase indices.
+            let shift = i16::from_be_bytes([section[18], section[19]]) as i64;
+            let mut previous = None;
+            return Some(section[header..].chunks_exact(8).enumerate().map(move |(index, entry)| {
+                let beat = u16::from_be_bytes([entry[0], entry[1]]);
+                let tempo = u16::from_be_bytes([entry[2], entry[3]]);
+                let ms = i64::from(u32::from_be_bytes(entry[4..8].try_into().ok()?)) + shift;
+                if ms < 0 || tempo == 0 || !(1..=4).contains(&beat) || previous.map(|last| ms <= last).unwrap_or(false) {
+                    return None;
+                }
+                previous = Some(ms);
+                Some(Beat { time: ms as f64 / 1000.0, bpm: tempo as f64 / 100.0, beat: beat as u8, index })
+            }));
         }
         i += total;
     }
     None
+}
+
+#[cfg(test)]
+mod pqtz_tests {
+    use super::*;
+
+    fn fixture(shift: i16, entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let total = 28 + 24 + entries.len() * 8;
+        let mut b = b"PMAI".to_vec();
+        b.extend_from_slice(&28u32.to_be_bytes());
+        b.extend_from_slice(&(total as u32).to_be_bytes());
+        b.resize(28, 0);
+        b.extend_from_slice(b"PQTZ");
+        b.extend_from_slice(&24u32.to_be_bytes());
+        b.extend_from_slice(&((24 + entries.len() * 8) as u32).to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&8u16.to_be_bytes());
+        b.extend_from_slice(&shift.to_be_bytes());
+        b.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (beat, tempo, ms) in entries {
+            b.extend_from_slice(&beat.to_be_bytes());
+            b.extend_from_slice(&tempo.to_be_bytes());
+            b.extend_from_slice(&ms.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn pqtz_import_applies_signed_shift_to_each_tempo_anchor() {
+        for (shift, raw, first, next) in [
+            (0, 29, 0.029, 1.029),
+            (414, 29, 0.443, 1.443),
+            (-166, 178, 0.012, 1.012),
+            (-230, 236, 0.006, 1.006),
+            (i16::MIN, 32768, 0.0, 1.0),
+            (i16::MAX, 1, 32.768, 33.768),
+        ] {
+            let b = fixture(shift, &[(1, 12000, raw), (2, 12000, raw + 500), (3, 12500, raw + 1000)]);
+            let g = parse_pqtz_grid(&b).unwrap();
+            assert_eq!(g.anchors.len(), 2);
+            assert_eq!(g.anchors[0].time, first);
+            assert_eq!(g.anchors[1].time, next);
+            assert_eq!((g.anchors[0].bpm, g.anchors[1].bpm), (120.0, 125.0));
+            assert_eq!((g.anchors[0].beat, g.anchors[1].beat), (1, 3));
+            assert_eq!(parse_pqtz_grid(&b).unwrap().anchors[0].time, g.anchors[0].time);
+        }
+    }
+
+    #[test]
+    fn pqtz_rejects_negative_preroll_without_reindexing_native_phrases() {
+        // Dropping source beat 1 would make a native phrase at beat 2 refer to beat 3.
+        let b = fixture(-200, &[(1, 12000, 100), (2, 12000, 600)]);
+        assert!(parse_pqtz_grid(&b).is_none());
+        assert!(!pqtz_indices_match(&b, &BeatGrid::constant(0.4, 120.0, 2).beats(1.0)));
+        // Check every record, including one that would not create a new tempo anchor.
+        assert!(parse_pqtz_grid(&fixture(-200, &[(1, 12000, 400), (2, 12000, 100)])).is_none());
+        assert_eq!(parse_pqtz_grid(&fixture(-100, &[(1, 12000, 100)])).unwrap().anchors[0].time, 0.0);
+    }
+
+    #[test]
+    fn pqtz_phrase_indices_match_only_the_same_audible_records() {
+        let b = fixture(-166, &[(1, 12000, 178), (2, 12000, 678)]);
+        let beats = parse_pqtz_grid(&b).unwrap().beats(1.1);
+        assert!(pqtz_indices_match(&b, &beats));
+        let phrase = crate::phrase::Structure { mood: 1, phrases: vec![crate::phrase::Phrase { beat: 2, kind: crate::phrase::UP }], end_beat: 2 };
+        assert_eq!(crate::phrase::cue_proposals(&phrase, &beats), vec![(0.512, "Up")]);
+        assert!(!pqtz_indices_match(&b, &beats[..1]), "missing source records cannot be reused");
+        for field in 0..4 {
+            let mut changed = beats.clone();
+            match field {
+                0 => changed[1].time += 0.002,
+                1 => changed[1].bpm += 1.0,
+                2 => changed[1].beat = 3,
+                _ => changed[1].index = 0,
+            }
+            assert!(!pqtz_indices_match(&b, &changed));
+        }
+        let rounded = fixture(-166, &[(1, 12000, 178), (2, 12000, 677)]);
+        assert!(pqtz_indices_match(&rounded, &beats), "whole-millisecond quantization is allowed");
+    }
+
+    #[test]
+    fn pqtz_positive_shift_imports_without_reusing_reindexed_phrases() {
+        // The documented deck edit moves 29 ms to 443 ms at 137 BPM. That is more
+        // than one period, so the model extrapolates an earlier audible beat.
+        let b = fixture(414, &[(1, 13700, 29), (2, 13700, 467)]);
+        let g = parse_pqtz_grid(&b).unwrap();
+        assert_eq!(g.anchors[0].time, 0.443);
+        let beats = g.beats(2.0);
+        assert!(beats[0].time < 0.006);
+        assert!((beats[1].time - 0.443).abs() < 1e-9);
+        assert!(!pqtz_indices_match(&b, &beats), "native phrases must be analysed on this audible grid");
+    }
+
+    #[test]
+    fn pqtz_rejects_invalid_beat_records() {
+        for entries in [vec![(0, 12000, 100)], vec![(5, 12000, 100)], vec![(1, 0, 100)], vec![(1, 12000, 100), (2, 12000, 100)], vec![(1, 12000, 100), (2, 12000, 50)]] {
+            let b = fixture(0, &entries);
+            assert!(parse_pqtz_grid(&b).is_none());
+            assert!(!pqtz_indices_match(&b, &BeatGrid::constant(0.1, 120.0, 1).beats(1.0)));
+        }
+    }
+
+    #[test]
+    fn pqtz_materialized_export_applies_shift_once() {
+        let original = fixture(200, &[(1, 12000, 100)]);
+        let g = parse_pqtz_grid(&original).unwrap();
+        let wave = crate::model::Waveform { frames: vec![[0; 8]] };
+        let files = crate::export::anlz::build("/Contents/test.wav", &g.beats(1.0), &wave, &[], 0, 0);
+        let imported = parse_pqtz_grid(&files.dat).unwrap();
+        assert_eq!(imported.anchors.len(), 1);
+        assert_eq!(imported.anchors[0].time, 0.3);
+        assert_eq!(imported.anchors[0].beat, 1);
+        let emitted = crate::export::anlz::section_list(&files.dat).into_iter().find(|(tag, _)| tag == "PQTZ").unwrap().1;
+        assert_eq!(&emitted[18..20], &[0, 0]);
+
+        // An unchanged source grid keeps its original section instead of folding the
+        // already-applied adjustment into the raw entries a second time.
+        let raw_pqt2 = crate::export::anlz::pqt2(&[(1, 12000, 100)], &[345]);
+        let overrides = crate::export::anlz::Overrides {
+            sections: HashMap::from([("PQTZ".into(), original[28..].to_vec()), ("PQT2".into(), raw_pqt2.clone())]),
+            grid_same: true,
+            pssi: None,
+            device: Default::default(),
+            pvdi: None,
+        };
+        let preserved = crate::export::anlz::build_with("/Contents/test.wav", &g.beats(1.0), &wave, &[], 0, 0, Some(&overrides));
+        let emitted = crate::export::anlz::section_list(&preserved.dat).into_iter().find(|(tag, _)| tag == "PQTZ").unwrap().1;
+        assert_eq!(emitted, original[28..]);
+        assert_eq!(parse_pqtz_grid(&preserved.dat).unwrap().anchors[0].time, 0.3);
+        let emitted = crate::export::anlz::section_list(&preserved.ext).into_iter().find(|(tag, _)| tag == "PQT2").unwrap().1;
+        assert_eq!(emitted, raw_pqt2, "PQT2 anchors and fractions stay in their original section");
+    }
+
+    #[test]
+    fn pqtz_rejects_incomplete_framing_and_counts() {
+        let b = fixture(0, &[(1, 12000, 100)]);
+        for end in 0..b.len() {
+            assert!(parse_pqtz_grid(&b[..end]).is_none(), "prefix {end}");
+        }
+        for count in [0, 2, u32::MAX] {
+            let mut bad = b.clone();
+            bad[48..52].copy_from_slice(&count.to_be_bytes());
+            assert!(parse_pqtz_grid(&bad).is_none());
+        }
+        // A following opaque section must not supply an entry missing from PQTZ.
+        let mut bad = b;
+        bad[48..52].copy_from_slice(&2u32.to_be_bytes());
+        bad.extend_from_slice(b"PZZZ\0\0\0\x0c\0\0\0\x0c");
+        let len = bad.len() as u32;
+        bad[8..12].copy_from_slice(&len.to_be_bytes());
+        assert!(parse_pqtz_grid(&bad).is_none());
+    }
 }
 
 /// Cue kind in master.db -> (hot cue slot 0-based, or None for a memory cue). Kinds 1–3 are hot
