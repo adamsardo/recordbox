@@ -17,6 +17,61 @@ import build_archive as package
 import prepare_release as release
 
 
+class DownloadNotesTests(unittest.TestCase):
+    def setUp(self):
+        self.notes = (Path(release.__file__).resolve().parents[1] / "docs/releases/0.5.0.md").read_text()
+
+    def test_current_release_links_all_six_assets_and_tagged_guide(self):
+        body = release.render_release_downloads(self.notes, "fantuz/recordbox", "v0.5.0")
+        names = {f"Recordbox-0.5.0-{platform}-{arch}" + (".tar.gz" if platform == "linux" else ".zip")
+                 for platform, arch in release.TARGETS} | {"SHA256SUMS", "COMMIT-LOG.txt"}
+        for name in names:
+            self.assertIn(f"[`{name}`](https://github.com/fantuz/recordbox/releases/download/v0.5.0/{name})", body)
+        self.assertIn("https://github.com/fantuz/recordbox/blob/v0.5.0/docs/BUILD-AND-PACKAGING.md", body)
+
+    def test_copied_download_block_refreshes_future_version_and_repository(self):
+        old = release.render_release_downloads(self.notes, "fantuz/recordbox", "v0.5.0")
+        body = release.render_release_downloads(old, "adamsardo/recordbox", "v0.6.0")
+        block = body.split("<!-- recordbox-downloads:start -->", 1)[1].split("<!-- recordbox-downloads:end -->", 1)[0]
+        self.assertNotIn("0.5.0", block); self.assertNotIn("fantuz/recordbox", block)
+        for platform, arch in release.TARGETS:
+            name = f"Recordbox-0.6.0-{platform}-{arch}" + (".tar.gz" if platform == "linux" else ".zip")
+            self.assertIn(f"https://github.com/adamsardo/recordbox/releases/download/v0.6.0/{name}", block)
+        self.assertIn("https://github.com/adamsardo/recordbox/blob/v0.6.0/docs/BUILD-AND-PACKAGING.md", block)
+
+    def test_semver_build_metadata_is_encoded_in_tag_and_asset_urls(self):
+        body = release.render_release_downloads("# Release\n", "another/recordbox", "v0.6.0-rc.1+build.2")
+        self.assertIn("/download/v0.6.0-rc.1%2Bbuild.2/Recordbox-0.6.0-rc.1%2Bbuild.2-macos-arm64.zip", body)
+        self.assertIn("/blob/v0.6.0-rc.1%2Bbuild.2/docs/BUILD-AND-PACKAGING.md", body)
+        self.assertIn("[`Recordbox-0.6.0-rc.1+build.2-macos-arm64.zip`]", body)
+
+    def test_rendering_is_idempotent_without_duplicate_tables(self):
+        body = release.render_release_downloads(self.notes, "fantuz/recordbox", "v0.5.0")
+        self.assertEqual(release.render_release_downloads(body, "fantuz/recordbox", "v0.5.0"), body)
+        for text in ("## Downloads", "| Platform | Archive |", "<!-- recordbox-downloads:start -->", "<!-- recordbox-downloads:end -->"):
+            self.assertEqual(body.count(text), 1)
+
+    def test_missing_downloads_section_is_appended_and_other_notes_are_unchanged(self):
+        notes = "# Next release\n\n## Changes\n\nKeep these changes.\n<!-- recordbox-release-source: source -->\n"
+        body = release.render_release_downloads(notes, "fantuz/recordbox", "v0.6.0")
+        self.assertTrue(body.startswith(notes + "\n<!-- recordbox-downloads:start -->\n## Downloads"))
+
+    def test_legacy_section_replacement_preserves_surrounding_notes(self):
+        prefix = "# Release\n\n<!-- recordbox-release-source: source -->\n\n"
+        suffix = "## Known limitations\n\nKeep this exact text.\n"
+        notes = prefix + "## Downloads\n\nOld table.\n\n" + suffix
+        body = release.render_release_downloads(notes, "fantuz/recordbox", "v0.6.0")
+        self.assertTrue(body.startswith(prefix)); self.assertTrue(body.endswith(suffix))
+        self.assertNotIn("Old table.", body)
+
+    def test_malformed_or_duplicate_markers_are_rejected(self):
+        start, end = "<!-- recordbox-downloads:start -->", "<!-- recordbox-downloads:end -->"
+        for notes in (start, end, end + start, start + start + end, start + end + end,
+                      "<!-- recordbox-downloads:start-->" + end):
+            with self.subTest(notes=notes), self.assertRaisesRegex(package.PackageError, "marker"):
+                release.render_release_downloads(notes, "fantuz/recordbox", "v0.6.0")
+
+
 def executable(platform, architecture):
     if platform == "macos":
         return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C if architecture == "arm64" else 0x1000007,
@@ -71,7 +126,7 @@ class ReleaseTests(unittest.TestCase):
 
     def stage(self, tag="v0.5.0"):
         with patch.object(release, "get_commit_log", return_value=self.log):
-            return release.prepare_release(self.input, self.output, self.source, self.commit, tag)
+            return release.prepare_release(self.input, self.output, self.source, self.commit, tag, "fixture-owner/recordbox")
 
     def report_path(self, platform="macos", architecture="arm64"):
         return self.smoke / f"smoke-{platform}-{architecture}-{self.commit}" / "smoke.json"
@@ -112,6 +167,7 @@ class ReleaseTests(unittest.TestCase):
         self.change_zip(mutate)
 
     def test_valid_four_platform_release_has_exact_assets_and_source_marker(self):
+        self.log += "\n## Downloads\n<!-- recordbox-downloads:start -->\nCommit text must remain unchanged.\n"
         self.stage()
         assets = self.output / "assets"
         self.assertEqual({p.name for p in assets.iterdir()}, set(self.names.values()) | {"COMMIT-LOG.txt", "SHA256SUMS"})
@@ -121,6 +177,9 @@ class ReleaseTests(unittest.TestCase):
         body = (self.output / "body.md").read_text()
         self.assertIn(f"<!-- recordbox-release-source: {self.commit} -->", body)
         self.assertIn("Author: Example", body); self.assertIn("0.5.0", body)
+        self.assertIn(self.log.rstrip(), body)
+        for name in set(self.names.values()) | {"COMMIT-LOG.txt", "SHA256SUMS"}:
+            self.assertIn(f"[`{name}`](https://github.com/fixture-owner/recordbox/releases/download/v0.5.0/{name})", body)
 
     def test_tag_mismatch_or_existing_output_is_refused(self):
         with self.assertRaisesRegex(package.PackageError, "Tag"): self.stage("v0.5.1")
