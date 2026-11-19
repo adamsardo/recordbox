@@ -64,6 +64,12 @@ gate, dependency-advisory gate, and all four native package/smoke jobs to pass.
 `packaging/prepare_release.py` validates the notes, complete archive/checksum set,
 and each archive's manifest, source revision, runtime/file hashes and target,
 together with the native smoke evidence.
+Its required `--repository owner/repo` argument sets the download destinations;
+CI passes `--repository "$GITHUB_REPOSITORY"`. Before adding the complete commit
+history, it regenerates the notes' `recordbox-downloads:start` / `:end` block
+with links for that repository and version tag. Future release notes can copy
+this block: archive, checksum, history and packaging-guide links are refreshed
+for each release.
 
 `packaging/publish_release.py` creates a draft GitHub Release, uploads the four
 native archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploaded assets through

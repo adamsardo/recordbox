@@ -12,6 +12,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+from urllib.parse import quote
 import zipfile
 
 import build_archive
@@ -177,7 +178,47 @@ def get_commit_log(source, commit):
                           check=True, capture_output=True, text=True, encoding="utf-8").stdout
 
 
-def prepare_release(input_root, output, source, commit, tag):
+def render_release_downloads(notes, repository, tag):
+    """Refresh the complete Downloads section for this repository and version."""
+    require(isinstance(repository, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository),
+            "Require a GitHub repository in owner/repo form")
+    number = r"(?:0|[1-9][0-9]*)"; identifier = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
+    require(isinstance(tag, str) and re.fullmatch(rf"v{number}\.{number}\.{number}(?:-{identifier})?(?:\+{identifier})?", tag),
+            "Require a safe v<version> release tag")
+    version = tag[1:]; prerelease = version.split("+", 1)[0].partition("-")[2]
+    require(not any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")),
+            "Require a safe v<version> release tag")
+    start, end = "<!-- recordbox-downloads:start -->", "<!-- recordbox-downloads:end -->"
+    counts = notes.count(start), notes.count(end)
+    require(notes.count("recordbox-downloads:") == sum(counts) and counts in {(0, 0), (1, 1)},
+            "Malformed or duplicate release download markers")
+    if counts == (1, 1):
+        require(notes.index(start) < notes.index(end), "Malformed release download marker order")
+    base = f"https://github.com/{repository}"; download = f"{base}/releases/download/{quote(tag, safe='')}"
+    def link(name):
+        return f"[`{name}`]({download}/{quote(name, safe='')})"
+    rows = [start, "## Downloads", "", "| Platform | Archive |", "| --- | --- |"]
+    labels = ("macOS Apple Silicon", "macOS Intel", "Windows x64, experimental", "Linux x64, experimental")
+    for label, (platform, architecture) in zip(labels, TARGETS):
+        name = f"Recordbox-{version}-{platform}-{architecture}" + (".tar.gz" if platform == "linux" else ".zip")
+        rows.append(f"| {label} | {link(name)} |")
+    rows.extend(["", f"Download {link('SHA256SUMS')} to verify the four release archives and {link('COMMIT-LOG.txt')}",
+                 "for the complete source history. See the",
+                 f"[build and packaging guide]({base}/blob/{quote(tag, safe='')}/docs/BUILD-AND-PACKAGING.md) for runtime requirements",
+                 "and verification.", end])
+    block = "\n".join(rows)
+    if counts == (1, 1):
+        return notes[:notes.index(start)] + block + notes[notes.index(end) + len(end):]
+    section = re.search(r"(?m)^##[ \t]+Downloads[ \t]*\r?$", notes)
+    if section:
+        following = re.search(r"(?m)^##[ \t]+", notes[section.end():])
+        boundary = section.end() + following.start() if following else len(notes)
+        return notes[:section.start()] + block + ("\n\n" if following else "\n") + notes[boundary:]
+    separator = "" if not notes or notes.endswith("\n\n") else "\n" if notes.endswith("\n") else "\n\n"
+    return notes + separator + block + "\n"
+
+
+def prepare_release(input_root, output, source, commit, tag, repository):
     require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "Require a full lowercase source commit SHA")
     version = build_archive.read_release_version(source)
     require(tag == "v" + version, "Tag, VERSION and Cargo versions must agree")
@@ -199,6 +240,7 @@ def prepare_release(input_root, output, source, commit, tag):
             verified[name] = checksum
     notes = (source / f"docs/releases/{version}.md").read_text(encoding="utf-8").strip()
     require(bool(notes), "Release notes are empty")
+    notes = render_release_downloads(notes, repository, tag)
     log = get_commit_log(source, commit); require(bool(log.strip()), "Commit log is empty")
     fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", log)), default=0))
     body = (f"{notes}\n\n<!-- recordbox-release-source: {commit} -->\n\n"
@@ -227,10 +269,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path); parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-commit", required=True); parser.add_argument("--tag", required=True)
+    parser.add_argument("--repository", required=True, help="GitHub owner/repo used for release download links")
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     try:
-        prepare_release(args.input, args.output, args.source_root, args.source_commit, args.tag)
+        prepare_release(args.input, args.output, args.source_root, args.source_commit, args.tag, args.repository)
     except (OSError, ValueError, KeyError, TypeError, struct.error, zipfile.BadZipFile, tarfile.TarError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Release verification failed: {error}\n")
 
