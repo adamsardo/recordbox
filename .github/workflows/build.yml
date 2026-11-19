@@ -76,7 +76,7 @@ jobs:
           cache-on-failure: true
       - name: Tooling tests
         run: python -m unittest discover -s packaging -p 'test_*.py' -v
-      - name: No new application test failures
+      - name: Application tests
         run: python packaging/run_tests.py --output reports
       - name: Formatting report (existing formatting debt is advisory)
         shell: bash

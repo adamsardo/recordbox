@@ -11,9 +11,11 @@ not change Rust code, install dependencies, import a library, or download models
 | Windows x86_64 portable ZIP | Rust MSVC, Visual Studio tools including `dumpbin`, OpenSSL runtime | Experimental |
 | Linux x86_64 TAR.GZ | Rust, C compiler, `pkg-config`, ALSA/OpenSSL development packages, `readelf`, `ldd` | Experimental |
 
-CI pins Rust **1.100.0**. The project has no independently validated minimum Rust
-version. Build each architecture separately. There is no universal macOS binary or cross-platform compatibility
-claim in an archive's name.
+The root `rust-toolchain.toml` pins Rust **1.100.0**, rustfmt and Clippy, matching
+CI. The project has no independently validated minimum Rust version. Build each
+architecture separately. There is no universal macOS binary or cross-platform
+compatibility claim in an archive's name. See [Contributing](../CONTRIBUTING.md)
+for developer commands, dependency policy and repository settings.
 
 ## Build checks worth keeping
 
@@ -29,9 +31,8 @@ python -m unittest discover -s packaging -p 'test_*.py' -v
 The backup filter exercises round trips, refusal to overwrite existing music, and
 mismatched ZIP header rejection. Dependency auditing belongs in a separate check
 against the committed `app/Cargo.lock`; retain its detailed advisory report.
-Formatting and Clippy can initially report findings without blocking builds while
-the project's existing baseline is reviewed. This avoids coupling an initial
-packaging contribution to unrelated Rust cleanup.
+Formatting and Clippy report existing findings without blocking builds while
+that debt is reviewed. Keep mechanical cleanup separate from behavioral fixes.
 
 The workflow's **Build and security checks** job requires every native package,
 the application tests and the advisory gate to succeed. Require this status on
@@ -59,7 +60,7 @@ automatically create a tag or publish a release.
 
 The tag starts the same **Build and package** workflow for that exact revision.
 Before heavy builds, its version gate requires the tag, `VERSION`, Cargo manifest
-and lockfile to agree. Publication then requires the application/test baseline
+and lockfile to agree. Publication then requires the complete application-test
 gate, dependency-advisory gate, and all four native package/smoke jobs to pass.
 `packaging/prepare_release.py` validates the notes, complete archive/checksum set,
 and each archive's manifest, source revision, runtime/file hashes and target,
@@ -86,21 +87,19 @@ Download the archive for your operating system and architecture and the release'
 `SHA256SUMS` file. Verify the checksum before extraction. These
 remain unsigned packages with the platform limitations documented below.
 
-Two existing baselines are explicit rather than silently ignored:
+`python packaging/run_tests.py --output reports` runs the complete serial
+application suite and requires a complete successful result with no failed
+tests. The former PDB overflow failure allowance has been removed. Compilation
+errors, failed tests, incomplete or filtered runs fail the check. Ignored tests
+remain visible in the retained report; they are not counted as executed
+coverage. Serial execution avoids existing shared test-fixture races.
 
-- `python packaging/run_tests.py --output reports` runs the complete serial
-  application suite. At introduction it reports **235 passed, 1 failed, 25 ignored**.
-  Only the existing subtraction overflow in `export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic`
-  at `src/export/pdb.rs` is accepted. Another failure, compilation error, incomplete
-  run or a now-passing baseline fails the check. Remove the baseline when that bug
-  is fixed. Serial execution avoids an existing shared test-fixture race.
-- **No new dependency advisories** retains the raw cargo-audit JSON, stderr and
-  exit status. `.github/security/advisory-baseline.json` lists three unresolved
-  pre-existing findings: `libsqlite3-sys 0.38.2` (RUSTSEC-2026-0459) and transitive
-  `quick-xml 0.30.0` (RUSTSEC-2026-0194/0195). A new vulnerability/unsoundness,
-  changed package/version/source, stale baseline, filtered report or execution
-  error fails the check. Informational findings remain visible. This is not a
-  clean security audit; these dependencies still need separate remediation.
+**No new dependency advisories** retains the raw cargo-audit JSON, stderr and
+exit status. `.github/security/advisory-baseline.json` records the exact unresolved
+findings. A new vulnerability/unsoundness, changed package/version/source, stale
+baseline, filtered report or execution error fails the check. Informational
+findings remain visible. An accepted advisory baseline does not mean a clean
+security audit; remaining entries still need separate remediation.
 
 **Tests and lint report** includes a rustfmt report and Clippy warnings. Existing
 formatting debt is advisory. Clippy uses `--cap-lints warn` so its existing
@@ -110,6 +109,11 @@ their normal compiler lint policy. After the baseline is
 cleaned up, make rustfmt and `cargo clippy --all-targets -- -D warnings` strict.
 Native GUI smoke is a rendering/startup check, not a substitute for exercising
 real library imports, audio playback, USB devices or signed installers.
+The full serial application suite and Clippy run on Linux; every native package
+job runs the backup regressions and GUI smoke. The optional USB real-export
+oracle group is explicitly ignored and requires `RECORDBOX_TEST_ORACLES` fixtures. See
+[Contributing](../CONTRIBUTING.md#optional-format-oracles) for the targeted command
+and explicit fixture requirements.
 
 On native macOS, also run:
 
