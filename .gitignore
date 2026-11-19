@@ -5,3 +5,5 @@ __pycache__/
 dist/
 smoke/
 reports/
+/release-input/
+/release/

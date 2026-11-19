@@ -22,6 +22,35 @@ class PackageError(ValueError):
     pass
 
 
+def read_release_version(source_root: Path) -> str:
+    """Check the release marker and both Cargo declarations without building."""
+    try:
+        marker = (source_root / "VERSION").read_text(encoding="utf-8").strip()
+        package = tomllib.loads((source_root / "app/Cargo.toml").read_text(encoding="utf-8"))["package"]
+        locked = tomllib.loads((source_root / "app/Cargo.lock").read_text(encoding="utf-8")).get("package", [])
+        version = package["version"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
+        raise PackageError(f"Missing or invalid release version metadata: {error}") from error
+    number = r"(?:0|[1-9][0-9]*)"
+    identifier = r"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
+    pattern = rf"{number}\.{number}\.{number}(?:-{identifier})?(?:\+{identifier})?"
+    if not isinstance(version, str) or not re.fullmatch(pattern, version):
+        raise PackageError("Cargo package version is not a safe release version")
+    prerelease = version.split("+", 1)[0].partition("-")[2]
+    if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
+        raise PackageError("Cargo package version is not a safe release version: numeric prerelease has a leading zero")
+    if package.get("name") != "recordbox":
+        raise PackageError("Expected the Cargo package to be named recordbox")
+    if marker != version:
+        raise PackageError(f"VERSION {marker!r} does not match Cargo.toml version {version!r}")
+    local = [entry for entry in locked if entry.get("name") == "recordbox" and "source" not in entry]
+    if len(local) != 1:
+        raise PackageError("Cargo.lock must contain exactly one local recordbox package")
+    if local[0].get("version") != version:
+        raise PackageError(f"Cargo.lock recordbox version {local[0].get('version')!r} does not match VERSION {version!r}")
+    return version
+
+
 @dataclass
 class BinaryInfo:
     architecture: str
@@ -176,6 +205,13 @@ def write_file(path: Path, data: bytes, mode: int = 0o644) -> None:
     path.write_bytes(data); path.chmod(mode)
 
 
+def distribution_mode(path: Path, platform: str) -> int:
+    """Archive metadata; Windows stat/chmod do not describe POSIX permissions."""
+    if path.is_dir(): return 0o755
+    if platform == "windows": return 0o755 if path.name.lower() == "recordbox.exe" else 0o644
+    return stat.S_IMODE(path.stat().st_mode)
+
+
 def archive_bundle(bundle: Path, archive: Path, platform: str) -> None:
     paths = [bundle, *sorted(bundle.rglob("*"))]
     if any(path.is_symlink() for path in paths):
@@ -185,14 +221,14 @@ def archive_bundle(bundle: Path, archive: Path, platform: str) -> None:
             for path in paths:
                 name = path.relative_to(bundle.parent).as_posix() + ("/" if path.is_dir() else "")
                 entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)); entry.create_system = 3
-                entry.external_attr = ((stat.S_IFDIR | 0o755 if path.is_dir() else stat.S_IFREG | stat.S_IMODE(path.stat().st_mode)) << 16)
+                entry.external_attr = ((stat.S_IFDIR if path.is_dir() else stat.S_IFREG) | distribution_mode(path, platform)) << 16
                 entry.compress_type = zipfile.ZIP_DEFLATED
                 output.writestr(entry, b"" if path.is_dir() else path.read_bytes())
     else:
         with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed, tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as output:
             for path in paths:
                 entry = tarfile.TarInfo(path.relative_to(bundle.parent).as_posix()); entry.mtime = 0
-                entry.mode = 0o755 if path.is_dir() else stat.S_IMODE(path.stat().st_mode)
+                entry.mode = distribution_mode(path, platform)
                 if path.is_dir():
                     entry.type = tarfile.DIRTYPE; output.addfile(entry)
                 else:
@@ -218,9 +254,7 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     if not binary.is_file() or binary.is_symlink():
         raise PackageError("The built executable must be a regular file")
     manifest_path = source_root / "app/Cargo.toml"
-    version = tomllib.loads(manifest_path.read_text(encoding="utf-8"))["package"]["version"]
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?", version):
-        raise PackageError("Cargo package version is not a safe release version")
+    version = read_release_version(source_root)
     candidates = library_candidates(runtime_files or [], runtime_dirs or [], platform)
     info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates)
     label = f"Recordbox-{version}-{platform}-{architecture}"
@@ -259,7 +293,7 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
         files = []
         for path in sorted(bundle.rglob("*")):
             if path.is_dir(): path.chmod(0o755)
-            else: files.append({"path": path.relative_to(bundle).as_posix(), "sha256": sha256(path), "size": path.stat().st_size, "mode": f"{stat.S_IMODE(path.stat().st_mode):04o}"})
+            else: files.append({"path": path.relative_to(bundle).as_posix(), "sha256": sha256(path), "size": path.stat().st_size, "mode": f"{distribution_mode(path, platform):04o}"})
         bundle.chmod(0o755)
         metadata = {"schema": 1, "product": "Recordbox", "version": version,
                     "source": {"commit": source_commit.lower(), "cargo_manifest_sha256": sha256(manifest_path), "cargo_lock_sha256": sha256(source_root / "app/Cargo.lock")},
@@ -277,13 +311,27 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", required=True, type=Path); parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--output", required=True, type=Path); parser.add_argument("--platform", choices=["macos", "windows", "linux"], required=True)
-    parser.add_argument("--arch", choices=["arm64", "x86_64"], required=True); parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--binary", type=Path); parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--output", type=Path); parser.add_argument("--platform", choices=["macos", "windows", "linux"])
+    parser.add_argument("--arch", choices=["arm64", "x86_64"]); parser.add_argument("--source-commit")
+    parser.add_argument("--check-version", action="store_true", help="Validate VERSION and Cargo versions without packaging")
+    parser.add_argument("--tag", help="With --check-version, require the exact v<VERSION> release tag")
     parser.add_argument("--runtime-library", action="append", default=[], type=Path); parser.add_argument("--runtime-dir", action="append", default=[], type=Path)
     parser.add_argument("--runtime-notice", action="append", default=[], type=Path, help="License/notice accompanying a bundled runtime or embedded asset")
     args = parser.parse_args()
+    packaging = (args.binary, args.output, args.platform, args.arch, args.source_commit)
+    if args.tag is not None and not args.check_version: parser.error("--tag requires --check-version")
+    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice):
+        parser.error("--check-version cannot be combined with packaging arguments")
+    if not args.check_version and any(value is None for value in packaging):
+        parser.error("packaging requires --binary, --output, --platform, --arch and --source-commit")
     try:
+        if args.check_version:
+            version = read_release_version(args.source_root.resolve())
+            if args.tag is not None and not re.fullmatch("v" + re.escape(version), args.tag):
+                raise PackageError(f"Release tag must be v{version}, received {args.tag!r}")
+            print(json.dumps({"status": "passed", "version": version, "tag": args.tag}))
+            return
         result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice)
     except (PackageError, OSError, KeyError, tomllib.TOMLDecodeError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")
