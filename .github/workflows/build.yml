@@ -24,6 +24,13 @@ jobs:
     name: Version and release metadata
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse_run_id: ${{ steps.reuse.outputs.reuse_run_id }}
+      package_ids: ${{ steps.reuse.outputs.package_ids }}
+      smoke_ids: ${{ steps.reuse.outputs.smoke_ids }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,6 +57,12 @@ jobs:
           if [ -n "$RELEASE_TAG" ]; then
             git merge-base --is-ancestor "$GITHUB_SHA" "origin/$RELEASE_DEFAULT_BRANCH"
           fi
+
+      - name: Select an exact-source validated main build for tags
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python packaging/select_release_build.py
 
   tests:
     name: Tests and lint report
@@ -156,6 +169,7 @@ jobs:
   packages:
     name: Package (${{ matrix.platform }}-${{ matrix.arch }})
     needs: version
+    if: needs.version.outputs.reuse_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -339,8 +353,17 @@ jobs:
   release_assets:
     name: Verify release assets
     needs: [version, tests, audit, packages]
+    if: >-
+      ${{ !cancelled() && needs.version.result == 'success' &&
+          needs.tests.result == 'success' && needs.audit.result == 'success' &&
+          ((needs.version.outputs.reuse_run_id == '' && needs.packages.result == 'success') ||
+           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+            needs.version.outputs.reuse_run_id != '' && needs.packages.result == 'skipped')) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -350,15 +373,36 @@ jobs:
         with:
           python-version: '3.12'
       - name: Download this run's native archives
+        if: needs.version.outputs.reuse_run_id == ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: recordbox-*-${{ github.sha }}
           merge-multiple: true
           path: release-input/packages
       - name: Download this run's native smoke evidence
+        if: needs.version.outputs.reuse_run_id == ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: smoke-*-${{ github.sha }}
+          path: release-input/smoke
+      # Immutable IDs prevent a replacement artifact or another run entering this set.
+      # Expiry/deletion fails closed. Rerun ALL jobs to select native fallback.
+      - name: Download the selected main build's native archives
+        if: needs.version.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.version.outputs.reuse_run_id }}
+          artifact-ids: ${{ needs.version.outputs.package_ids }}
+          merge-multiple: true
+          path: release-input/packages
+      - name: Download the same main build's native smoke evidence
+        if: needs.version.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.version.outputs.reuse_run_id }}
+          artifact-ids: ${{ needs.version.outputs.smoke_ids }}
           path: release-input/smoke
       - name: Verify every archive and smoke before staging publication
         shell: bash
@@ -388,11 +432,21 @@ jobs:
           AUDIT: ${{ needs.audit.result }}
           PACKAGES: ${{ needs.packages.result }}
           RELEASE_ASSETS: ${{ needs.release_assets.result }}
-        run: test "$VERSION_CHECK" = success && test "$TESTS" = success && test "$AUDIT" = success && test "$PACKAGES" = success && test "$RELEASE_ASSETS" = success
+          REUSE_RUN_ID: ${{ needs.version.outputs.reuse_run_id }}
+        run: |
+          test "$VERSION_CHECK" = success && test "$TESTS" = success && test "$AUDIT" = success && test "$RELEASE_ASSETS" = success || exit 1
+          if [ -n "$REUSE_RUN_ID" ]; then
+            test "$GITHUB_EVENT_NAME" = push && [[ "$GITHUB_REF" == refs/tags/v* ]] &&
+              [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]] && test "$PACKAGES" = skipped
+          else
+            test "$PACKAGES" = success
+          fi
 
   publish:
     name: Publish the validated version tag
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+          needs.required.result == 'success' && needs.release_assets.result == 'success' }}
     needs: [required, release_assets]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
