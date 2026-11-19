@@ -27,8 +27,8 @@ numerical backends. The changes keep the existing floating-point mode.
 From the source checkout, after installing the normal native build dependencies:
 
 ```sh
-cargo test --manifest-path app/Cargo.toml --release cpu_playback_cost -- --ignored --nocapture --test-threads=1
-cargo test --manifest-path app/Cargo.toml --release cpu_overview_cost -- --ignored --nocapture --test-threads=1
+cargo test --manifest-path app/Cargo.toml --release --locked cpu_playback_cost -- --ignored --nocapture --test-threads=1
+cargo test --manifest-path app/Cargo.toml --release --locked cpu_overview_cost -- --ignored --nocapture --test-threads=1
 ```
 
 These opt-in reports have no timing pass/fail threshold. Ordinary CI exercises

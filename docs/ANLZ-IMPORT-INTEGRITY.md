@@ -33,8 +33,8 @@ positive and negative grid shifts, zero-time boundaries, unsupported preroll,
 unchanged zero-shift behavior, phrase-index mismatches after extrapolation,
 masked and unmasked phrase versions, and malformed or unsupported headers.
 They exercise the application parsers, not just a second copy of the masking
-arithmetic. Existing broader application-test and advisory baselines are
-described in [build checks](BUILD-AND-PACKAGING.md).
+arithmetic. The complete application-test policy and remaining dependency
+advisory baseline are described in [build checks](BUILD-AND-PACKAGING.md).
 
 Public sources inspected on 19 November 2026:
 

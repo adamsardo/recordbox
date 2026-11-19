@@ -301,7 +301,7 @@ fn int(v: &Value) -> i64 {
 /// Run `sql` and return each row as a name -> value map.
 fn rows(c: &rusqlite::Connection, sql: &str) -> Result<Vec<HashMap<String, Value>>> {
     let mut st = c.prepare(sql)?;
-    let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = st.column_names().map(|s| s.to_string()).collect();
     let out = st
         .query_map([], |r| {
             let mut m = HashMap::new();

@@ -76,7 +76,7 @@ jobs:
           cache-on-failure: true
       - name: Tooling tests
         run: python -m unittest discover -s packaging -p 'test_*.py' -v
-      - name: No new application test failures
+      - name: Application tests
         run: python packaging/run_tests.py --output reports
       - name: Formatting report (existing formatting debt is advisory)
         shell: bash
@@ -247,8 +247,14 @@ jobs:
           cache-on-failure: true
       - name: Compile the release executable
         run: cargo build --manifest-path app/Cargo.toml --release --locked
-      - name: Backup security regression tests
-        run: cargo test --manifest-path app/Cargo.toml --release --locked backup::tests -- --test-threads=1
+      - name: Database, backup and import integrity regressions
+        shell: bash
+        run: |
+          for test_filter in backup::tests db::sqlcipher_tests:: export::device_import::tests:: \
+            export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic \
+            export::usb_fix_test::a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap; do
+            cargo test --manifest-path app/Cargo.toml --release --locked "$test_filter" -- --test-threads=1
+          done
       - name: Create macOS app bundle
         if: runner.os == 'macOS'
         run: python packaging/build_archive.py --binary app/target/release/recordbox --platform macos --arch ${{ matrix.arch }} --source-commit ${{ github.sha }} --output dist

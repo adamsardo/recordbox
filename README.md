@@ -76,13 +76,18 @@ ZIP or Linux x64 archive. Prebuilt packages do not require Rust; see the release
 notes and [installation guide](docs/BUILD-AND-PACKAGING.md) for requirements,
 checksums and known limits.
 
-To build from source, install [Rust](https://rustup.rs). Then:
+To build from source, install [Rust through rustup](https://rustup.rs). The
+repository selects the same toolchain as CI. Install your platform's native
+prerequisites from the [build guide](docs/BUILD-AND-PACKAGING.md), then:
 
 ```bash
 git clone https://github.com/fantuz/recordbox.git
 cd recordbox/app
-cargo run --release
+cargo run --release --locked
 ```
+
+See [Contributing](CONTRIBUTING.md) for the pinned toolchain, checks, dependency
+policy and the limits of CI coverage.
 
 This is a work in progress: it may not build at every moment while the agent is mid-change.
 
