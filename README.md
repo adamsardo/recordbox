@@ -37,6 +37,11 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 
 ## Running it
 
+Downloads for the `fantuz/recordbox` fork are available from
+[GitHub Releases](https://github.com/fantuz/recordbox/releases). Version 0.5.0
+introduces unsigned macOS app bundles and experimental Windows/Linux packages.
+See the [0.5.0 release notes](docs/releases/0.5.0.md) for changes and known limits.
+
 You need [Rust](https://rustup.rs). Then:
 
 ```bash
@@ -50,10 +55,11 @@ This is a work in progress: it may not build at every moment while the agent is 
 The **Build and package** GitHub Actions workflow also produces unsigned macOS
 app ZIPs (Apple Silicon and Intel), an experimental Windows x64 portable ZIP and
 an experimental Linux x64 archive. Download the artifact for your platform from
-a successful workflow run; each archive includes a source revision, runtime
-manifest and checksum. See [build checks and packaging](docs/BUILD-AND-PACKAGING.md)
+a successful workflow run; artifacts include source/runtime manifests and
+checksum sidecars. See [build checks and packaging](docs/BUILD-AND-PACKAGING.md)
 for installation, system requirements, current platform limitations and the
-checks maintainers can enable. These are development artifacts, not signed releases.
+checks maintainers can enable. Version tags publish validated packages to GitHub
+Releases; the application packages remain unsigned.
 
 ## The brief
 

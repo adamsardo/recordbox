@@ -38,9 +38,47 @@ the application tests and the advisory gate to succeed. Require this status on
 `main` in a branch ruleset, alongside the existing CodeQL Rust analysis. In
 repository settings, keep Dependabot alerts/security updates and CodeQL enabled;
 the committed Dependabot configuration schedules weekly Cargo and Actions updates.
-Workflow tokens have read-only contents access, Actions use immutable commits,
-builds use `--locked`, and reports/artifacts expire after 14 days. No job publishes
-a release or changes repository protection settings.
+Build jobs have read-only contents access, Actions use immutable commits, and
+builds use `--locked`. Reports/development artifacts expire after 14 days;
+published release assets are retained separately. Only the fork's gated release
+publication job receives contents-write access. Automation does not change
+repository protection settings.
+
+## Fork release process
+
+The first packaged release of `fantuz/recordbox` is **0.5.0**. Release changes go
+through a pull request: update root `VERSION`, `app/Cargo.toml`, the matching
+package entry in `app/Cargo.lock`, and `docs/releases/0.5.0.md` together. The
+release notes distinguish delivered changes from the application's existing
+feature baseline and disclose the tracked test/security findings below.
+
+After the release pull request passes its checks, merge it to the fork's `main`
+and verify the intended merged revision. A maintainer then creates and pushes
+the immutable `v0.5.0` tag at that validated commit. Merging to `main` does not
+automatically create a tag or publish a release.
+
+The tag starts the same **Build and package** workflow for that exact revision.
+Before heavy builds, its version gate requires the tag, `VERSION`, Cargo manifest
+and lockfile to agree. Publication then requires the application/test baseline
+gate, dependency-advisory gate, and all four native package/smoke jobs to pass.
+`packaging/prepare_release.py` validates the notes, complete archive/checksum set,
+and each archive's manifest, source revision, runtime/file hashes and target,
+together with the native smoke evidence.
+
+`packaging/publish_release.py` creates a draft GitHub Release, uploads the four
+native archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploaded assets through
+the API before publishing it. Publication jobs are serialized; only a newer
+stable version can replace the latest release. Existing tags/releases must
+agree with the intended source/assets; publication must not move a tag or
+replace mismatched assets. Pull-request runs and ordinary branch pushes do not
+publish. A tag workflow publishes only to the repository where that tag was
+pushed: this fork's `v0.5.0` does not create an upstream tag or release. If upstream
+adopts the workflow, its maintainer enables Actions and pushes a matching version
+tag there to start that repository's own release.
+
+Download the archive for your operating system and architecture and the release's
+`SHA256SUMS` file. Verify the checksum before extraction. These
+remain unsigned packages with the platform limitations documented below.
 
 Two existing baselines are explicit rather than silently ignored:
 
@@ -170,7 +208,7 @@ models, credentials, screenshots, or caches. It refuses to overwrite prior outpu
 
 ```sh
 python packaging/smoke_app.py \
-  --archive dist/macos-arm64/Recordbox-0.1.0-macos-arm64.zip \
+  --archive dist/macos-arm64/Recordbox-0.5.0-macos-arm64.zip \
   --output smoke/macos-arm64 --timeout 240
 ```
 
