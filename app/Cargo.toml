@@ -1,6 +1,6 @@
 [package]
 name = "recordbox"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "Local DJ library, track analysis, set preparation and Pioneer-compatible USB export"
 
@@ -11,7 +11,8 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.31.1"
 winit = "0.30"
-muda = "0.21"
+# AppKit remains enabled; this macOS app does not attach a GTK3 menu backend.
+muda = { version = "0.21", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher", "backup"] }
 symphonia = { version = "0.5.5", features = ["all"] }
 lofty = "0.22"
@@ -31,23 +32,23 @@ dirs = "5"
 unicode-normalization = "0.1"
 rand = "0.8"
 # Stem separation (open HTDemucs models, pure-Rust inference).
-candle-core = "0.9"
-candle-nn = "0.9"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
 sha2 = "0.10"
 ureq = "2"
 # Clipboard text for Edit > Paste (already in the tree through egui).
 arboard = { version = "3", default-features = false }
 # Library backup archives (stored entries only: the database is small and audio/artwork
 # are compressed already).
-zip = { version = "7", default-features = false }
+zip = { version = "9.7.1", default-features = false }
 egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9", features = ["metal"] }
-candle-nn = { version = "0.9", features = ["metal"] }
+candle-core = { version = "0.11.1", features = ["metal"] }
+candle-nn = { version = "0.11.1", features = ["metal"] }
 # The stem model's own Metal kernels (src/stems/metal_fast.rs) are built with the same Metal
 # wrappers Candle uses; both crates are already in the tree through candle-core.
-candle-metal-kernels = "0.9"
+candle-metal-kernels = "0.11.1"
 objc2-metal = "0.3"
 
 [profile.dev]
