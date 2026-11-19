@@ -160,7 +160,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-15, platform: macos, arch: arm64, binary: recordbox}
+          - {os: macos-26, platform: macos, arch: arm64, binary: recordbox}
           - {os: macos-15-intel, platform: macos, arch: x86_64, binary: recordbox}
           - {os: windows-2022, platform: windows, arch: x86_64, binary: recordbox.exe}
           - {os: ubuntu-22.04, platform: linux, arch: x86_64, binary: recordbox}
