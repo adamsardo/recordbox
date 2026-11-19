@@ -30,8 +30,9 @@ class Archives(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup); self.root = Path(self.temporary.name)
         self.source = self.root / "source with spaces 日本"; self.source.mkdir()
         (self.source / "app/assets/fonts").mkdir(parents=True)
+        (self.source / "VERSION").write_text("0.1.0\n")
         (self.source / "app/Cargo.toml").write_text('[package]\nname="recordbox"\nversion="0.1.0"\n', encoding="utf-8")
-        (self.source / "app/Cargo.lock").write_text("# fixture lock\n")
+        (self.source / "app/Cargo.lock").write_text('version = 4\n[[package]]\nname="recordbox"\nversion="0.1.0"\n')
         (self.source / "LICENSE").write_text("MIT fixture license\n")
         (self.source / "app/assets/fonts/README.txt").write_text("Inter fixture font notice\n")
         (self.source / "packaging").mkdir(); (self.source / "packaging/Inter-OFL.txt").write_text("SIL Open Font License fixture\n")
@@ -88,6 +89,32 @@ class Archives(unittest.TestCase):
         with self.assertRaisesRegex(package.PackageError, "libcrypto"):
             self.build("windows", "x86_64", lambda *_: package.BinaryInfo("x86_64", {"libcrypto-3-x64.dll": None}))
 
+    def test_windows_reported_modes_are_normalized_in_zip_and_manifest(self):
+        library = self.root / "libcrypto-3-x64.dll"; library.write_bytes(b"native DLL fixture")
+        original_stat = Path.stat
+        def windows_stat(path, *, follow_symlinks=True):
+            result = original_stat(path, follow_symlinks=follow_symlinks); fields = list(result)
+            kind = stat.S_IFMT(result.st_mode)
+            reported = 0o777 if stat.S_ISDIR(result.st_mode) or path.name.lower() in {"recordbox", "recordbox.exe"} else 0o666
+            fields[stat.ST_MODE] = kind | reported
+            return os.stat_result(fields)
+        def inspect(path, _):
+            return package.BinaryInfo("x86_64", {library.name: None} if path == self.binary else {"kernel32.dll": None})
+        with patch.object(Path, "stat", windows_stat):
+            result = self.build("windows", "x86_64", inspect, runtime_files=[library])
+        for entry in result["manifest"]["files"]:
+            self.assertEqual(entry["mode"], "0755" if entry["path"] == "recordbox.exe" else "0644")
+        with zipfile.ZipFile(result["archive"]) as archive:
+            for entry in archive.infolist():
+                expected = 0o755 if entry.is_dir() or Path(entry.filename).name == "recordbox.exe" else 0o644
+                self.assertEqual(stat.S_IMODE(entry.external_attr >> 16), expected, entry.filename)
+
+    @unittest.skipIf(os.name == "nt", "POSIX filesystem permission semantics")
+    def test_non_windows_distribution_mode_preserves_file_permissions(self):
+        self.binary.chmod(0o640)
+        self.assertEqual(package.distribution_mode(self.binary, "macos"), 0o640)
+        self.assertEqual(package.distribution_mode(self.binary, "linux"), 0o640)
+
     def test_runtime_library_architecture_must_match(self):
         library = self.root / "custom.dll"; library.write_bytes(b"fixture")
         def inspect(path, _):
@@ -126,6 +153,55 @@ class Archives(unittest.TestCase):
         with self.assertRaisesRegex(package.PackageError, "safe release version"): self.build()
         self.commit = "abc123"
         with self.assertRaisesRegex(package.PackageError, "full Git source commit"): self.build()
+        self.assertFalse(self.output.exists())
+
+    def test_version_mismatch_fails_before_inspection_or_output_creation(self):
+        (self.source / "VERSION").write_text("0.5.0\n")
+        with patch.object(package, "inspect_binary") as inspect, self.assertRaisesRegex(package.PackageError, "does not match Cargo.toml"):
+            package.build_archive(self.binary, self.source, self.output, "macos", "arm64", self.commit)
+        inspect.assert_not_called(); self.assertFalse(self.output.exists())
+        (self.source / "VERSION").write_text("0.1.0\n")
+        (self.source / "app/Cargo.lock").write_text('[[package]]\nname="recordbox"\nversion="0.5.0"\n')
+        with self.assertRaisesRegex(package.PackageError, "Cargo.lock recordbox version"):
+            package.read_release_version(self.source)
+
+    def test_version_reader_requires_one_local_lock_entry_and_marker(self):
+        lock = self.source / "app/Cargo.lock"
+        entry = '[[package]]\nname="recordbox"\nversion="0.1.0"\n'
+        for contents in ("", entry + entry, entry + 'source="registry+https://example.invalid"\n'):
+            lock.write_text(contents)
+            with self.subTest(contents=contents), self.assertRaisesRegex(package.PackageError, "exactly one local recordbox"):
+                package.read_release_version(self.source)
+        lock.write_text(entry); (self.source / "VERSION").unlink()
+        with self.assertRaisesRegex(package.PackageError, "Missing or invalid release version metadata"):
+            package.read_release_version(self.source)
+
+    def test_semver_rejects_unsafe_names_empty_identifiers_and_leading_zeros(self):
+        for version in ("../0.5.0", "01.5.0", "0.5.0-", "0.5.0-rc..1", "0.5.0-01", "0.5.0+build..x"):
+            (self.source / "app/Cargo.toml").write_text(f'[package]\nname="recordbox"\nversion="{version}"\n')
+            with self.subTest(version=version), self.assertRaisesRegex(package.PackageError, "safe release version"):
+                package.read_release_version(self.source)
+
+    def test_release_050_archive_plist_and_manifest_use_checked_version(self):
+        (self.source / "VERSION").write_text("0.5.0\n")
+        (self.source / "app/Cargo.toml").write_text('[package]\nname="recordbox"\nversion="0.5.0"\n')
+        (self.source / "app/Cargo.lock").write_text('[[package]]\nname="recordbox"\nversion="0.5.0"\n')
+        result = self.build()
+        self.assertEqual(Path(result["archive"]).name, "Recordbox-0.5.0-macos-arm64.zip")
+        self.assertEqual(result["manifest"]["version"], "0.5.0")
+        plist = plistlib.loads((Path(result["bundle"]) / "Contents/Info.plist").read_bytes())
+        self.assertEqual(plist["CFBundleShortVersionString"], "0.5.0")
+        self.assertEqual(plist["CFBundleVersion"], "0.5.0")
+
+    def test_check_version_cli_runs_without_native_tools_and_rejects_wrong_tag(self):
+        command = [sys.executable, str(Path(package.__file__)), "--source-root", str(self.source), "--check-version"]
+        result = subprocess.run([*command, "--tag", "v0.1.0"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["version"], "0.1.0")
+        for tag in ("v0.5.0", "0.1.0", "refs/tags/v0.1.0", "v0.1.0\n"):
+            result = subprocess.run([*command, "--tag", tag], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Release tag must be v0.1.0", result.stderr)
         self.assertFalse(self.output.exists())
 
     def test_existing_output_is_preserved(self):
