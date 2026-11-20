@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 struct Backend {
     #[cfg(all(windows, feature = "directml"))]
-    directml: Option<i32>,
+    directml: Option<super::directml::Binding>,
     device: Device,
     label: String,
 }
@@ -24,21 +24,26 @@ pub fn device() -> Device {
     BACKEND.get_or_init(select).device.clone()
 }
 
-pub fn directml_adapter() -> Option<i32> {
+#[cfg(all(windows, feature = "directml"))]
+pub(super) fn directml_device() -> Option<&'static super::directml::Binding> {
+    BACKEND.get_or_init(select).directml.as_ref()
+}
+
+pub fn uses_directml() -> bool {
     #[cfg(all(windows, feature = "directml"))]
-    { BACKEND.get_or_init(select).directml }
+    { directml_device().is_some() }
     #[cfg(not(all(windows, feature = "directml")))]
-    { None }
+    { false }
 }
 
 pub fn gpu_active() -> bool {
-    directml_adapter().is_some() || !device().is_cpu()
+    uses_directml() || !device().is_cpu()
 }
 
 #[cfg(all(windows, feature = "directml"))]
 fn select() -> Backend {
     match super::directml::select() {
-        Ok((index, label)) => Backend { device: Device::Cpu, label, directml: Some(index) },
+        Ok((binding, label)) => Backend { device: Device::Cpu, label, directml: Some(binding) },
         Err(error) => Backend::cpu(&format!("{error:#}")),
     }
 }

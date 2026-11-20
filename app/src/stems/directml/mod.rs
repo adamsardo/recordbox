@@ -1,5 +1,11 @@
 //! ONNX Runtime DirectML execution, restricted to physical Radeon adapters.
+#[cfg(windows)]
+mod device;
 mod network;
+#[cfg(windows)]
+pub(super) use device::{select, Binding};
+#[cfg(not(windows))]
+pub(super) enum Binding {}
 use super::htdemucs::{Stft, TRAINING_FRAMES};
 use anyhow::{ensure, Context, Result};
 use ort::{
@@ -8,19 +14,19 @@ use ort::{
 };
 use std::sync::Mutex;
 
-fn session(model: &[u8], adapter: Option<i32>) -> ort::Result<Session> {
+fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
     let mut builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level1)?
         .with_parallel_execution(false)?
         .with_memory_pattern(false)?;
-    if let Some(index) = adapter {
-        let ep = ort::ep::DirectML::default()
-            .with_device_id(index)
-            .build()
-            .error_on_failure();
-        builder = builder
-            .with_execution_providers([ep])?
-            .with_disable_cpu_fallback()?;
+    if let Some(binding) = adapter {
+        #[cfg(windows)]
+        {
+            binding.attach(&mut builder)?;
+            builder = builder.with_disable_cpu_fallback()?;
+        }
+        #[cfg(not(windows))]
+        match *binding {}
     } else {
         // Only the numerical regression test uses the ONNX CPU execution provider.
         builder = builder.with_intra_threads(2)?;
@@ -28,7 +34,7 @@ fn session(model: &[u8], adapter: Option<i32>) -> ort::Result<Session> {
     builder.commit_from_memory(model)
 }
 
-fn probe(adapter: Option<i32>) -> Result<()> {
+fn probe(adapter: Option<&Binding>) -> Result<()> {
     let mut session = session(&network::probe_model(), adapter)?;
     let input = TensorRef::from_array_view(([1, 1, 3], &[1f32, 2., 3.][..]))?;
     let outputs = session.run(ort::inputs![input])?;
@@ -37,58 +43,12 @@ fn probe(adapter: Option<i32>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-pub(super) fn select() -> Result<(i32, String)> {
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
-    };
-    let exe = std::env::current_exe()?;
-    let dll = exe.with_file_name("onnxruntime.dll");
-    ensure!(
-        dll.is_file(),
-        "Extract the complete DirectML ZIP with onnxruntime.dll beside recordbox.exe"
-    );
-    ort::init_from(&dll)
-        .context("Loading the packaged ONNX Runtime")?
-        .commit();
-    // The legacy DirectML device ID is the DXGI enumeration index, including non-AMD entries.
-    // The factory owns the returned COM references throughout each query.
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-    let mut failures = Vec::new();
-    for index in 0.. {
-        let adapter = match unsafe { factory.EnumAdapters1(index) } {
-            Ok(a) => a,
-            Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-            Err(e) => return Err(e.into()),
-        };
-        let desc = unsafe { adapter.GetDesc1()? };
-        if desc.VendorId != 0x1002 || desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-            continue;
-        }
-        let end = desc
-            .Description
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(desc.Description.len());
-        let name = String::from_utf16_lossy(&desc.Description[..end]);
-        match probe(Some(index as i32)) {
-            Ok(()) => return Ok((index as i32, format!("DirectML · {name} · DXGI adapter {index}"))),
-            Err(error) => failures.push(format!("{name}: {error:#}")),
-        }
-    }
-    ensure!(
-        !failures.is_empty(),
-        "DirectML found no hardware AMD Radeon adapter"
-    );
-    anyhow::bail!("DirectML device check failed: {}", failures.join(", "))
-}
-
 pub(super) struct Engine(Mutex<Session>);
 
 impl Engine {
     pub(super) fn new(
         weights: std::collections::HashMap<String, candle_core::Tensor>,
-        adapter: Option<i32>,
+        adapter: Option<&Binding>,
     ) -> Result<Self> {
         let model = network::model(weights)?;
         Ok(Self(Mutex::new(
@@ -136,39 +96,16 @@ mod tests {
     fn runtime_executes_probe() {
         probe(None).unwrap();
     }
-    // Hosted Windows has a software D3D12 adapter. Exercise DirectML dispatch there
-    // without making it eligible for automatic selection in the application.
-    #[cfg(windows)]
-    fn test_adapter() -> Result<i32> {
-        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
-        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-        let mut errors = Vec::new();
-        for index in 0.. {
-            let adapter = match unsafe { factory.EnumAdapters1(index) } {
-                Ok(adapter) => adapter,
-                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                Err(e) => return Err(e.into()),
-            };
-            let desc = unsafe { adapter.GetDesc1()? };
-            match probe(Some(index as i32)) {
-                Ok(()) => {
-                    println!(
-                        "DirectML FP32 probe passed on DXGI adapter {index} (vendor {:#06x})",
-                        desc.VendorId
-                    );
-                    return Ok(index as i32);
-                }
-                Err(e) => errors.push(format!("adapter {index}: {e:#}")),
-            }
-        }
-        anyhow::bail!("No working DirectML test adapter: {errors:?}")
-    }
-
+    // WARP executes DirectML operators in software on a hosted Windows runner.
+    // The application only enumerates physical Radeon adapters.
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires the Windows DirectML runtime and a DXGI adapter"]
-    fn runtime_executes_directml() {
-        test_adapter().unwrap();
+    #[ignore = "requires the Windows DirectML runtime and D3D12 WARP"]
+    fn runtime_executes_directml() -> Result<()> {
+        let binding = Binding::Warp;
+        probe(Some(&binding))?;
+        println!("DirectML convolution and matrix multiplication passed on D3D12 WARP");
+        Ok(())
     }
 
     #[test]
@@ -199,7 +136,9 @@ mod tests {
         };
         let expected = run(htdemucs::Graph::load(&path, &Device::Cpu).unwrap());
         #[cfg(windows)]
-        let adapter = Some(test_adapter().unwrap());
+        let binding = Binding::Warp;
+        #[cfg(windows)]
+        let adapter = Some(&binding);
         #[cfg(not(windows))]
         let adapter = None;
         let actual = run(htdemucs::Graph::load_onnx(&path, adapter).unwrap());

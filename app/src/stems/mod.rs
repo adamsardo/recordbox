@@ -81,7 +81,7 @@ fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
         loaded.push(entry);
     } else {
         // A compiled DirectML session also holds intermediate buffers in shared GPU memory.
-        let capacity = if backend::directml_adapter().is_some() { 1 } else { 4 };
+        let capacity = if backend::uses_directml() { 1 } else { 4 };
         while loaded.len() >= capacity {
             loaded.remove(0);
         }

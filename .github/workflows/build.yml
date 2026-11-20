@@ -346,7 +346,12 @@ jobs:
             Invoke-WebRequest 'https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th' -OutFile $env:RECORDBOX_TEST_CHECKPOINT
           }
           if ((Get-FileHash $env:RECORDBOX_TEST_CHECKPOINT).Hash.ToLowerInvariant() -ne '8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4') { throw 'HTDemucs checkpoint checksum mismatch' }
-          cargo test --manifest-path app/Cargo.toml --release --locked --features directml stems::directml::tests -- --include-ignored --test-threads=1 --nocapture
+          $messages = cargo test --manifest-path app/Cargo.toml --release --locked --features directml --no-run --message-format=json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $testExe = @($messages | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'recordbox' -and $_.profile.test -and $_.executable } | ForEach-Object { $_.executable })
+          if ($testExe.Count -ne 1) { throw 'Expected one native Recordbox test executable' }
+          Copy-Item (Join-Path $runtime '*.dll') -Destination (Split-Path $testExe[0]) -Force
+          & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --manifest-path app/Cargo.toml --release --locked --features directml
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

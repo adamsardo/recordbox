@@ -236,14 +236,14 @@ impl Graph {
 
     pub fn load_selected(path: &Path) -> Result<Self> {
         #[cfg(all(windows, feature = "directml"))]
-        if let Some(adapter) = super::backend::directml_adapter() {
+        if let Some(adapter) = super::backend::directml_device() {
             return Self::load_onnx(path, Some(adapter));
         }
         Self::load(path, &super::device())
     }
 
     #[cfg(feature = "directml")]
-    pub(super) fn load_onnx(path: &Path, adapter: Option<i32>) -> Result<Self> {
+    pub(super) fn load_onnx(path: &Path, adapter: Option<&super::directml::Binding>) -> Result<Self> {
         let _gpu = GPU.lock();
         let weights = Self::read_weights(path, &Device::Cpu)?;
         let engine = super::directml::Engine::new(weights, adapter).map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
