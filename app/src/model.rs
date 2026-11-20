@@ -234,12 +234,29 @@ impl Track {
         self.key_text.clear();
     }
 
+    fn recorded_file_name(&self) -> Option<&str> {
+        // A library can retain Windows paths even when opened on macOS or Linux.
+        let tail = if matches!(self.path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()) {
+            &self.path[3..]
+        } else if let Some(unc) = self.path.strip_prefix(r"\\") {
+            unc.splitn(3, ['\\', '/']).nth(2)?
+        } else {
+            return std::path::Path::new(&self.path).file_name()?.to_str();
+        };
+        tail.rsplit(['\\', '/'])
+            .next()
+            .filter(|name| !matches!(*name, "" | "." | ".."))
+    }
+
     pub fn file_name(&self) -> String {
-        std::path::Path::new(&self.path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        self.recorded_file_name().unwrap_or_default().to_owned()
     }
     pub fn display_title(&self) -> String {
         if self.title.trim().is_empty() {
-            std::path::Path::new(&self.path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            self.recorded_file_name()
+                .and_then(|name| std::path::Path::new(name).file_stem()?.to_str())
+                .unwrap_or_default()
+                .to_owned()
         } else {
             self.title.clone()
         }
@@ -516,6 +533,27 @@ pub struct MyTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_filenames_survive_a_change_of_computer() {
+        for path in [
+            r"C:\Users\old\Dropbox\contents_42\Café Mix.wav",
+            "D:/DJ/contents_42/Café Mix.wav",
+            r"\\nas\sets\Café Mix.wav",
+            "/Volumes/DJ/contents_42/Café Mix.wav",
+        ] {
+            let track = Track { path: path.into(), ..Default::default() };
+            assert_eq!(track.file_name(), "Café Mix.wav");
+            assert_eq!(track.display_title(), "Café Mix");
+            assert_eq!(track.path, path);
+        }
+        for root in [r"C:\", r"\\nas\sets"] {
+            assert_eq!(Track { path: root.into(), ..Default::default() }.file_name(), "");
+        }
+        #[cfg(unix)]
+        assert_eq!(Track { path: r"/music/Intro\Outro.wav".into(), ..Default::default() }.file_name(), r"Intro\Outro.wav");
+    }
+
     fn times(g: &BeatGrid, d: f64) -> Vec<(i64, u8)> {
         g.beats(d).iter().map(|b| ((b.time * 1e6).round() as i64, b.beat)).collect()
     }

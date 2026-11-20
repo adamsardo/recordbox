@@ -306,8 +306,6 @@ pub struct LibExt {
     pub matches: HashMap<i64, Vec<i64>>,
     pub missing_open: bool,
     pub missing_sel: HashSet<i64>,
-    /// Auto Relocate scan: file names (folded) to paths, and which tracks it is for (None: all).
-    pub reloc_rx: Option<(Receiver<HashMap<String, Vec<PathBuf>>>, Option<Vec<i64>>)>,
     /// Folder of a file just relocated by hand: offer to look there for the other missing files.
     pub reloc_offer: Option<PathBuf>,
     pub clipboard: Vec<i64>,
@@ -363,7 +361,6 @@ impl Default for LibExt {
             matches: HashMap::new(),
             missing_open: false,
             missing_sel: HashSet::new(),
-            reloc_rx: None,
             reloc_offer: None,
             clipboard: vec![],
             dup_confirm: None,
@@ -525,7 +522,6 @@ impl App {
         if let Some(e) = err {
             self.toast_err(format!("This file cannot be played: {e}"));
         }
-        self.poll_auto_relocate();
         self.poll_sources();
     }
 
@@ -1039,64 +1035,49 @@ impl App {
     /// "Auto Relocate": look for the missing files (all, or only `ids`) by name under the
     /// Auto Relocate Search Folders. Runs in the background.
     pub fn auto_relocate(&mut self, ids: Option<Vec<i64>>) {
-        if self.ext.reloc_rx.is_some() {
-            return self.toast_err("Already searching for missing files.");
-        }
         let folders: Vec<PathBuf> = self.prefs.relocate_folders.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect();
         if folders.is_empty() {
             self.ext.missing_open = true;
             return self.toast_err("Add a folder to the Auto Relocate Search Folders first.");
         }
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(scan_file_names(&folders));
-            ctx.request_repaint();
-        });
-        self.ext.reloc_rx = Some((rx, ids));
-        self.toast("Searching the folders for the missing files…");
+        self.start_relocation_scan(folders, ids);
     }
 
-    fn poll_auto_relocate(&mut self) {
-        let Some((rx, _)) = &self.ext.reloc_rx else { return };
-        let Ok(by_name) = rx.try_recv() else { return };
-        let (_, only) = self.ext.reloc_rx.take().unwrap();
-        let (moved, ambiguous, not_found) = self.apply_relocation(&by_name, only.as_deref());
-        let msg = match moved {
-            0 => "rekordbox was not able to locate any files.".replace("rekordbox", "recordbox"),
-            1 => "recordbox found one file.".to_string(),
-            n => format!("recordbox found {n} files."),
-        };
-        let mut msg = msg;
-        if ambiguous > 0 {
-            msg.push_str(&format!(" {ambiguous} had several files with the same name; relocate those one by one."));
-        }
-        if not_found > 0 && moved > 0 {
-            msg.push_str(&format!(" {not_found} could not be found."));
-        }
-        self.toast(msg);
-    }
-
-    /// Point missing tracks at same-named files from a scan (see `pick_relocation`).
-    pub fn apply_relocation(&mut self, by_name: &HashMap<String, Vec<PathBuf>>, only: Option<&[i64]>) -> (usize, usize, usize) {
-        let missing: Vec<(i64, String, u64)> = self.tracks.iter().filter(|t| t.missing && only.map(|o| o.contains(&t.id)).unwrap_or(true)).map(|t| (t.id, t.file_name(), t.file_size)).collect();
-        let (mut moved, mut ambiguous, mut not_found) = (0, 0, 0);
-        for (id, name, size) in missing {
-            let cands: Vec<PathBuf> = by_name.get(&crate::smart::fold(&name)).cloned().unwrap_or_default().into_iter().filter(|p| self.db.track_by_path(&p.to_string_lossy()).is_none()).collect();
-            let any = !cands.is_empty();
-            let sized: Vec<(PathBuf, u64)> = cands.into_iter().map(|p| { let l = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX); (p, l) }).collect();
-            match pick_relocation(&sized, size) {
-                Some(p) => {
-                    if self.relocate_track(id, &p.to_string_lossy()) {
+    /// Apply the same filename, ownership and size checks for both folder searches.
+    pub(crate) fn apply_relocation(&mut self, by_name: &HashMap<String, Vec<PathBuf>>, only: Option<&[i64]>) {
+        let selected = only.map(|ids| ids.iter().copied().collect::<HashSet<_>>());
+        let missing = self.tracks.iter()
+            .filter(|t| t.missing && selected.as_ref().is_none_or(|ids| ids.contains(&t.id)));
+        let matches = relocation_matches(&self.db, by_name, missing);
+        let total = matches.len();
+        let mut moved = 0;
+        let mut reasons = std::collections::BTreeMap::new();
+        for (id, candidate) in matches {
+            let reason = match candidate {
+                RelocationMatch::Found(path, length) if regular_file_size(path) != Some(length) => "File changed during search",
+                RelocationMatch::Found(path, _) => {
+                    if self.relocate_track(id, &path.to_string_lossy()) {
                         moved += 1;
+                        continue;
                     }
+                    "Could not save the new path"
                 }
-                None if any => ambiguous += 1,
-                None => not_found += 1,
-            }
+                RelocationMatch::NoMatch => "No filename match in the searched folders",
+                RelocationMatch::InUse => "Already used by another track",
+                RelocationMatch::Shared => "Same candidate for multiple missing tracks",
+                RelocationMatch::Multiple => "Multiple possible files",
+                RelocationMatch::SizeMismatch => "Different file size",
+                RelocationMatch::Unverified => "Unverified file attributes",
+            };
+            *reasons.entry(reason).or_insert(0usize) += 1;
         }
         self.list_dirty = true;
-        (moved, ambiguous, not_found)
+        let noun = if total == 1 { "track" } else { "tracks" };
+        let mut message = format!("Relocated {moved} of {total} missing {noun}.");
+        for (label, count) in reasons {
+            message.push_str(&format!(" {label} ({count})."));
+        }
+        self.toast(message);
     }
 
     /// "Relocate": point one track at a file chosen by the user, then offer to look for the
@@ -1505,6 +1486,54 @@ pub fn scan_file_names(folders: &[PathBuf]) -> HashMap<String, Vec<PathBuf>> {
         }
     }
     by_name
+}
+
+/// Decide the whole selection before changing the collection. Two missing
+/// records that point to one new path must not be assigned by iteration order.
+fn relocation_matches<'a, 't>(
+    db: &Db,
+    by_name: &'a HashMap<String, Vec<PathBuf>>,
+    tracks: impl Iterator<Item = &'t Track>,
+) -> Vec<(i64, RelocationMatch<'a>)> {
+    let mut claims = HashMap::new();
+    let mut matches = Vec::new();
+    for track in tracks {
+        let paths = by_name
+            .get(&crate::smart::fold(&track.file_name()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let candidate = match_scanned_files(db, paths, track.id, track.file_size);
+        if let RelocationMatch::Found(path, _) = candidate {
+            *claims.entry(path).or_insert(0usize) += 1;
+        }
+        matches.push((track.id, candidate));
+    }
+    for (_, candidate) in &mut matches {
+        if matches!(*candidate, RelocationMatch::Found(path, _) if claims[&path] > 1) {
+            *candidate = RelocationMatch::Shared;
+        }
+    }
+    matches
+}
+
+fn regular_file_size(path: &Path) -> Option<u64> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+}
+
+fn match_scanned_files<'a>(db: &Db, paths: &'a [PathBuf], id: i64, size: u64) -> RelocationMatch<'a> {
+    let candidates: Vec<_> = paths
+        .iter()
+        .filter(|path| db.track_by_path(&path.to_string_lossy()).is_none_or(|owner| owner == id))
+        .map(|path| (path.as_path(), regular_file_size(path)))
+        .collect();
+    if !paths.is_empty() && candidates.is_empty() {
+        RelocationMatch::InUse
+    } else {
+        pick_relocation(&candidates, size)
+    }
 }
 
 /// Year → month → histories, newest first, for the Histories tree.
@@ -2025,7 +2054,61 @@ mod tests {
         let m = scan_file_names(&[dir.clone(), dir.join("a")]);
         let hits = &m[&crate::smart::fold("song one.mp3")];
         assert_eq!(hits.len(), 1);
-        assert_eq!(pick_relocation(&[(hits[0].clone(), 5)], 5), Some(hits[0].clone()));
+        assert_eq!(pick_relocation(&[(hits[0].as_path(), Some(5))], 5), RelocationMatch::Found(&hits[0], 5));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relocation_uses_file_evidence_and_preserves_track_ownership() {
+        use RelocationMatch::*;
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("Café Mix.wav");
+        std::fs::write(&audio, b"abcde").unwrap();
+        let original = Track { path: r"C:\old\contents_42\Café Mix.wav".into(), title: "My edit".into(),
+                               file_size: 5, rating: 4, ..Default::default() };
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let id = db.insert_track(&original).unwrap();
+        let other_path = "/Volumes/USB/Café Mix.wav";
+        let other = db.insert_track(&Track { path: other_path.into(), ..original.clone() }).unwrap();
+        let index = scan_file_names(&[dir.path().to_path_buf()]);
+        let paths = &index[&crate::smart::fold(&original.file_name())];
+        assert_eq!(match_scanned_files(&db, paths, id, 6), SizeMismatch);
+        assert_eq!(match_scanned_files(&db, &[], id, 5), NoMatch);
+        assert_eq!(match_scanned_files(&db, paths, id, 5), Found(&audio, 5));
+
+        let first = Track { id, ..original.clone() };
+        let second = Track { id: other, path: other_path.into(), ..original };
+        for order in [[&first, &second], [&second, &first]] {
+            let results = relocation_matches(&db, &index, order.into_iter());
+            assert_eq!(results, [(order[0].id, Shared), (order[1].id, Shared)]);
+        }
+        assert_eq!(relocation_matches(&db, &index, [&first].into_iter()), [(id, Found(&audio, 5))]);
+        let different = Track { file_size: 9, ..second };
+        assert_eq!(relocation_matches(&db, &index, [&first, &different].into_iter()),
+                   [(id, Found(&audio, 5)), (other, SizeMismatch)]);
+
+        db.set_track_path(id, audio.to_str().unwrap()).unwrap();
+        let stored = db.track(id).unwrap();
+        assert_eq!((stored.path.as_str(), stored.title.as_str(), stored.rating), (audio.to_str().unwrap(), "My edit", 4));
+        assert_eq!(match_scanned_files(&db, paths, id, 5), Found(&audio, 5));
+        assert_eq!(match_scanned_files(&db, paths, other, 5), InUse);
+        assert!(db.set_track_path(other, audio.to_str().unwrap()).is_err());
+        assert_eq!(db.track(other).unwrap().path, other_path);
+        assert!(db.set_track_path(-1, "/absent.wav").is_err());
+        assert_eq!(std::fs::read(&audio).unwrap(), b"abcde");
+
+        // The index can outlive a mounted file or directory entry.
+        std::fs::remove_file(&audio).unwrap();
+        assert_eq!(match_scanned_files(&db, paths, id, 0), Unverified);
+        std::fs::create_dir(&audio).unwrap();
+        assert_eq!(match_scanned_files(&db, paths, id, 5), Unverified);
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&audio).unwrap();
+            let target = dir.path().join("other.wav");
+            std::fs::write(&target, b"abcde").unwrap();
+            std::os::unix::fs::symlink(target, &audio).unwrap();
+            assert_eq!(match_scanned_files(&db, paths, id, 5), Unverified);
+        }
     }
 }

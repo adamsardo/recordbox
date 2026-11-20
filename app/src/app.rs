@@ -497,16 +497,21 @@ mod prefs_tests {
 
 #[cfg(test)]
 mod relocation_tests {
-    use std::path::PathBuf;
     #[test]
     fn picks_only_unambiguous_files() {
-        let p = |s: &str| PathBuf::from(s);
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100)], 100), Some(p("/a/x.mp3")));
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 100), None, "lone file of another size");
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 0), Some(p("/a/x.mp3")), "size unknown");
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99), (p("/b/x.mp3"), 100)], 100), Some(p("/b/x.mp3")));
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100), (p("/b/x.mp3"), 100)], 100), None, "two with the same size");
-        assert_eq!(super::pick_relocation(&[], 100), None);
+        use super::RelocationMatch::*;
+        use std::path::Path;
+        let a = Path::new("/a/x.mp3");
+        let b = Path::new("/b/x.mp3");
+        assert_eq!(super::pick_relocation(&[(a, Some(100))], 100), Found(a, 100));
+        assert_eq!(super::pick_relocation(&[(a, Some(99))], 100), SizeMismatch);
+        assert_eq!(super::pick_relocation(&[(a, Some(99))], 0), Found(a, 99));
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(100))], 100), Found(b, 100));
+        assert_eq!(super::pick_relocation(&[(a, Some(100)), (b, Some(100))], 100), Multiple);
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(98))], 100), SizeMismatch);
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(98))], 0), Multiple);
+        assert_eq!(super::pick_relocation(&[(a, None)], 0), Unverified);
+        assert_eq!(super::pick_relocation(&[(a, None), (b, Some(100))], 100), Unverified);
     }
 }
 
@@ -1203,7 +1208,7 @@ pub struct App {
     /// Last attempt to reopen a lost audio device, and whether the loss was reported.
     pub audio_retry: Option<(Instant, bool)>,
     /// Folder scan for Relocate Missing Files: file names (folded) to paths.
-    pub relocate_rx: Option<Receiver<HashMap<String, Vec<std::path::PathBuf>>>>,
+    pub relocate_rx: Option<RelocationSearch>,
     /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
     pub key_requested: HashSet<i64>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
@@ -4504,11 +4509,22 @@ impl App {
             self.toast_err(format!("That file already belongs to \"{name}\" in your collection."));
             return false;
         }
+        let Some(before) = self.db.track(id) else {
+            self.toast_err("The original track could not be read.");
+            return false;
+        };
+        if let Err(error) = self.db.set_track_path(id, path) {
+            self.toast_err(format!("Could not save the new location ({error})."));
+            return false;
+        }
+        if before.path != path {
+            self.record(Edit::Track { before });
+        }
         if let Some(t) = self.track_mut(id) {
             t.path = path.to_string();
             t.missing = false;
         }
-        self.save_track(id);
+        self.list_dirty = true;
         true
     }
 
@@ -4519,59 +4535,35 @@ impl App {
         if !self.tracks.iter().any(|t| t.missing) {
             return self.toast("No tracks are missing.");
         }
+        self.start_relocation_scan(vec![folder.to_path_buf()], None);
+    }
+
+    pub(crate) fn start_relocation_scan(&mut self, folders: Vec<std::path::PathBuf>, selected: Option<Vec<i64>>) {
         if self.relocate_rx.is_some() {
             return self.toast_err("Already searching for missing files.");
         }
-        // The folder is scanned off the window's thread (it can be large or on a network).
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let folder = folder.to_path_buf();
+        let (tx, result) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let mut by_name: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
-            for e in walkdir::WalkDir::new(&folder).into_iter().flatten() {
-                if e.file_type().is_file() {
-                    if let Some(n) = e.file_name().to_str() {
-                        by_name.entry(crate::smart::fold(n)).or_default().push(e.path().to_path_buf());
-                    }
-                }
-            }
-            let _ = tx.send(by_name);
+            let _ = tx.send(crate::library_ext::scan_file_names(&folders));
             ctx.request_repaint();
         });
-        self.relocate_rx = Some(rx);
-        self.toast("Searching the folder for the missing files…");
+        self.relocate_rx = Some(RelocationSearch { result, selected });
+        self.toast("Searching for missing files…");
     }
 
     pub fn poll_relocate(&mut self) {
-        let Some(rx) = &self.relocate_rx else { return };
-        let Ok(by_name) = rx.try_recv() else { return };
-        self.relocate_rx = None;
-        let missing: Vec<(i64, String, u64)> = self.tracks.iter().filter(|t| t.missing).map(|t| (t.id, t.file_name(), t.file_size)).collect();
-        let (mut moved, mut ambiguous, mut not_found) = (0, 0, 0);
-        for (id, name, size) in missing {
-            let cands = by_name.get(&crate::smart::fold(&name)).cloned().unwrap_or_default();
-            let cands: Vec<std::path::PathBuf> = cands.into_iter().filter(|p| self.db.track_by_path(&p.to_string_lossy()).is_none()).collect();
-            let sized: Vec<(std::path::PathBuf, u64)> = cands.into_iter().map(|p| { let l = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX); (p, l) }).collect();
-            let pick = pick_relocation(&sized, size);
-            match pick {
-                Some(p) => {
-                    if self.relocate_track(id, &p.to_string_lossy()) {
-                        moved += 1;
-                    }
-                }
-                None if by_name.contains_key(&crate::smart::fold(&name)) => ambiguous += 1,
-                None => not_found += 1,
+        let Some(search) = &self.relocate_rx else { return };
+        let by_name = match search.result.try_recv() {
+            Ok(index) => index,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.relocate_rx = None;
+                return self.toast_err("The folder search stopped. Run it again to retry.");
             }
-        }
-        self.list_dirty = true;
-        let mut msg = format!("Relocated {moved} track(s).");
-        if ambiguous > 0 {
-            msg.push_str(&format!(" {ambiguous} had several files with the same name; relocate those one by one."));
-        }
-        if not_found > 0 {
-            msg.push_str(&format!(" {not_found} were not found in that folder."));
-        }
-        self.toast(msg);
+        };
+        let search = self.relocate_rx.take().unwrap();
+        self.apply_relocation(&by_name, search.selected.as_deref());
     }
 
     pub fn start_export(&mut self, root: &str, playlist_ids: &[i64], extra_tracks: &[i64]) {
@@ -4722,16 +4714,36 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     }
 }
 
-/// Which same-named file a missing track moves to: a lone candidate only if its size matches
-/// (when the track's size is known), several only if exactly one has the track's size.
-pub fn pick_relocation(cands: &[(std::path::PathBuf, u64)], size: u64) -> Option<std::path::PathBuf> {
-    match cands {
-        [] => None,
-        [(p, l)] => (size == 0 || *l == size).then(|| p.clone()),
-        _ => {
-            let same: Vec<_> = cands.iter().filter(|(_, l)| size > 0 && *l == size).collect();
-            if same.len() == 1 { Some(same[0].0.clone()) } else { None }
-        }
+pub struct RelocationSearch {
+    result: Receiver<HashMap<String, Vec<std::path::PathBuf>>>,
+    selected: Option<Vec<i64>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RelocationMatch<'a> {
+    Found(&'a std::path::Path, u64),
+    Shared,
+    NoMatch,
+    InUse,
+    Multiple,
+    SizeMismatch,
+    Unverified,
+}
+
+/// Classify the available same-named candidates. An unreadable candidate could
+/// still share the saved size, so the user must resolve that case manually.
+pub fn pick_relocation<'a>(candidates: &[(&'a std::path::Path, Option<u64>)], size: u64) -> RelocationMatch<'a> {
+    if candidates.is_empty() {
+        return RelocationMatch::NoMatch;
+    }
+    if candidates.iter().any(|(_, length)| length.is_none()) {
+        return RelocationMatch::Unverified;
+    }
+    let mut matching = candidates.iter().filter(|(_, length)| size == 0 || *length == Some(size));
+    match (matching.next(), matching.next()) {
+        (Some((path, Some(length))), None) => RelocationMatch::Found(path, *length),
+        (None, _) => RelocationMatch::SizeMismatch,
+        _ => RelocationMatch::Multiple,
     }
 }
 
