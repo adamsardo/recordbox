@@ -1945,12 +1945,18 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         if let Some((d, t)) = app.stem.downloading {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
-        toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
-        ui.add_enabled_ui(app.prefs.stems_auto_separate && crate::stems::radeon_hold().is_none(), |ui| {
-            toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+        let automatic_available = crate::stems::radeon_hold().is_none();
+        ui.add_enabled_ui(automatic_available, |ui| {
+            toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
+            ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
+                toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+            });
         });
-        if let Some(reason) = crate::stems::radeon_hold() { note(ui, reason); }
-        note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
+        if automatic_available {
+            note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
+        } else {
+            note(ui, "Automatic separation is paused. Cached parts still load. Choose Separate or Retry CPU to process one track.");
+        }
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {

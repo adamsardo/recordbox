@@ -171,8 +171,8 @@ impl Col {
 }
 
 impl Prefs {
-    fn auto_stems_on_load(&self, gpu: bool) -> bool {
-        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu)
+    pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
+        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::radeon_hold().is_none()
     }
 }
 
@@ -2756,7 +2756,7 @@ impl App {
         }
         let quiet = self.screenshot.is_some() && std::env::var("PREPDECK_SHOT_STEMS").is_err();
         let ready = self.stem.model.as_deref().and_then(crate::stems::spec).map(crate::stems::model_ready).unwrap_or(false);
-        if self.prefs.auto_stems_on_load(self.stem.gpu_available()) && crate::stems::radeon_hold().is_none() && ready && !quiet && self.deck.track == Some(id) {
+        if self.prefs.auto_stems_on_load(self.stem.gpu_available()) && ready && !quiet && self.deck.track == Some(id) {
             let execution = if self.prefs.stems_auto_cpu { crate::stems::SeparationDevice::Selected } else { crate::stems::SeparationDevice::GpuOnly };
             self.separate_loaded_on(execution);
         }

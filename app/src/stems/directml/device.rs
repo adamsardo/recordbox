@@ -297,6 +297,14 @@ mod tests {
         let detail = binding.failure_detail();
         assert!(detail.contains("D3D12 device removal reason"));
         assert!(!backend::status().0);
+        let preferences = crate::app::Prefs {
+            show_stems: true,
+            stems_auto_separate: true,
+            stems_auto_cpu: true,
+            ..Default::default()
+        };
+        assert!(!preferences.auto_stems_on_load(true));
+        assert!(!preferences.auto_stems_on_load(false));
         for execution in [SeparationDevice::Selected, SeparationDevice::GpuOnly] {
             assert!(execution
                 .device()
