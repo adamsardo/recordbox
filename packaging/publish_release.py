@@ -1,4 +1,4 @@
-"""Publish a verified native release; a failed run leaves its resumable draft."""
+"""Publish a verified native release or verify an existing publication."""
 
 import argparse
 import hashlib
@@ -150,14 +150,14 @@ def publish_release(repository, tag, source, directory, github):
             obj = github.api("GET", f"{base}/git/tags/{obj['sha']}")["object"]
         raise ReleaseError("Tag does not resolve to the expected source commit")
 
-    def owned_draft(release):
-        if release.get("draft") is not True:
-            raise ReleaseError("Release is already published; refusing to alter it")
+    def checked_release(release, *, draft):
+        if release.get("draft") is not draft:
+            raise ReleaseError("Release publication state changed during verification")
         if (release.get("tag_name") != tag or release.get("target_commitish") != source or
                 release.get("body") != body or release.get("name") != tag or
                 release.get("prerelease") is not False or type(release.get("id")) is not int or
                 release["id"] <= 0):
-            raise ReleaseError("Existing draft does not belong to this prepared source release")
+            raise ReleaseError("Existing release does not belong to this prepared source release")
         return release
 
     def remote_assets(release_id, complete=False):
@@ -201,11 +201,19 @@ def publish_release(repository, tag, source, directory, github):
         release = matches[0] if matches else github.api("POST", f"{base}/releases", {
             "tag_name": tag, "target_commitish": source, "name": tag, "body": body,
             "draft": True, "prerelease": False, "make_latest": "false"})
-    release = owned_draft(release)
+    if release.get("draft") is False:
+        checked_release(release, draft=False)
+        release_id = release["id"]
+        remote_assets(release_id, complete=True)
+        release = checked_release(github.api("GET", f"{base}/releases/{release_id}"), draft=False)
+        check_tag()
+        return release
+
+    checked_release(release, draft=True)
     release_id = release["id"]
     existing = remote_assets(release_id)
     for name in sorted(files.keys() - existing):
-        release = owned_draft(github.api("GET", f"{base}/releases/{release_id}"))
+        release = checked_release(github.api("GET", f"{base}/releases/{release_id}"), draft=True)
         upload_url = release.get("upload_url", "").removesuffix("{?name,label}")
         if upload_url != f"https://uploads.github.com{base}/releases/{release_id}/assets":
             raise ReleaseError("Unsafe GitHub asset upload URL")
@@ -226,7 +234,7 @@ def publish_release(repository, tag, source, directory, github):
         if requested_version == latest_version:
             raise ReleaseError("Release version is already published as latest")
         make_latest = "true" if requested_version > latest_version else "false"
-    owned_draft(github.api("GET", f"{base}/releases/{release_id}"))
+    checked_release(github.api("GET", f"{base}/releases/{release_id}"), draft=True)
     check_tag()
     result = github.api("PATCH", f"{base}/releases/{release_id}",
                         {"draft": False, "make_latest": make_latest})
