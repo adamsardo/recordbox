@@ -356,6 +356,12 @@ jobs:
           --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin"
           --runtime-dir "$env:RECORDBOX_VC_CRT"
           --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
+      - name: Cache the public HTDemucs validation checkpoint
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/recordbox-model/955717e8-8726e21a.th
+          key: recordbox-htdemucs-8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4
       - name: Build and test the Windows Radeon DirectML preview
         if: runner.os == 'Windows'
         shell: pwsh
@@ -365,7 +371,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:ORT_DYLIB_PATH = Join-Path $runtime 'onnxruntime.dll'
           $env:PATH = "$runtime;$env:PATH"
-          cargo test --manifest-path app/Cargo.toml --release --locked --features directml stems::directml::tests::runtime_executes -- --ignored --test-threads=1 --nocapture
+          $modelDir = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'recordbox-model')
+          $env:RECORDBOX_TEST_CHECKPOINT = Join-Path $modelDir '955717e8-8726e21a.th'
+          if (-not (Test-Path $env:RECORDBOX_TEST_CHECKPOINT)) {
+            Invoke-WebRequest 'https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th' -OutFile $env:RECORDBOX_TEST_CHECKPOINT
+          }
+          if ((Get-FileHash $env:RECORDBOX_TEST_CHECKPOINT).Hash.ToLowerInvariant() -ne '8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4') { throw 'HTDemucs checkpoint checksum mismatch' }
+          cargo test --manifest-path app/Cargo.toml --release --locked --features directml stems::directml::tests -- --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --manifest-path app/Cargo.toml --release --locked --features directml
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

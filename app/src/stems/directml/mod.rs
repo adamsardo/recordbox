@@ -139,9 +139,7 @@ mod tests {
     // Hosted Windows has a software D3D12 adapter. Exercise DirectML dispatch there
     // without making it eligible for automatic selection in the application.
     #[cfg(windows)]
-    #[test]
-    #[ignore = "requires the Windows DirectML runtime and a DXGI adapter"]
-    fn runtime_executes_directml() -> Result<()> {
+    fn test_adapter() -> Result<i32> {
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
         let mut errors = Vec::new();
@@ -158,7 +156,7 @@ mod tests {
                         "DirectML FP32 probe passed on DXGI adapter {index} (vendor {:#06x})",
                         desc.VendorId
                     );
-                    return Ok(());
+                    return Ok(index as i32);
                 }
                 Err(e) => errors.push(format!("adapter {index}: {e:#}")),
             }
@@ -166,8 +164,15 @@ mod tests {
         anyhow::bail!("No working DirectML test adapter: {errors:?}")
     }
 
+    #[cfg(windows)]
     #[test]
-    #[ignore = "requires RECORDBOX_TEST_CHECKPOINT and the ONNX Runtime CPU library"]
+    #[ignore = "requires the Windows DirectML runtime and a DXGI adapter"]
+    fn runtime_executes_directml() {
+        test_adapter().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires RECORDBOX_TEST_CHECKPOINT and ONNX Runtime"]
     fn onnx_four_stems_match_candle() {
         use crate::stems::{compare::relative_error, htdemucs};
         use candle_core::Device;
@@ -193,7 +198,11 @@ mod tests {
             .unwrap()
         };
         let expected = run(htdemucs::Graph::load(&path, &Device::Cpu).unwrap());
-        let actual = run(htdemucs::Graph::load_onnx(&path, None).unwrap());
+        #[cfg(windows)]
+        let adapter = Some(test_adapter().unwrap());
+        #[cfg(not(windows))]
+        let adapter = None;
+        let actual = run(htdemucs::Graph::load_onnx(&path, adapter).unwrap());
         for (name, (a, b)) in htdemucs::SOURCES
             .iter()
             .zip(expected.chunks_exact(2 * len).zip(actual.chunks_exact(2 * len)))
