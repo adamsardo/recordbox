@@ -350,7 +350,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $testExe = @($messages | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'recordbox' -and $_.profile.test -and $_.executable } | ForEach-Object { $_.executable })
           if ($testExe.Count -ne 1) { throw 'Expected one native Recordbox test executable' }
-          Copy-Item (Join-Path $runtime '*.dll') -Destination (Split-Path $testExe[0]) -Force
+          $testDir = Split-Path $testExe[0]
+          Copy-Item (Join-Path $runtime '*.dll') -Destination $testDir -Force
+          # Use Microsoft's maintained software driver only for headless DirectML tests.
+          $warp = Join-Path $env:RUNNER_TEMP 'recordbox-warp.zip'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg' -OutFile $warp
+          if ((Get-FileHash $warp).Hash.ToLowerInvariant() -ne 'afc058f4d1066edc4231a38f3ab3592b1930f7287d4ac700e6a056e0874bb0be') { throw 'Microsoft WARP checksum mismatch' }
+          $warpDir = Join-Path $env:RUNNER_TEMP 'recordbox-warp'
+          Expand-Archive -LiteralPath $warp -DestinationPath $warpDir
+          Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
           & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --manifest-path app/Cargo.toml --release --locked --features directml

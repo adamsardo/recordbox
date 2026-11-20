@@ -13,7 +13,7 @@
 </p>
 <!-- project-badges:end -->
 
-An unofficial, open-source macOS app for getting ready for a DJ set: organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
+Recordbox is an unofficial, open-source DJ preparation app for macOS and Windows, with an experimental Linux build. Organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
 
 > **Not affiliated with AlphaTheta or Pioneer DJ.** rekordbox is a trademark of AlphaTheta Corporation. This is an independent project that uses rekordbox's preparation workflow as the reference for how things should behave.
 
@@ -63,7 +63,7 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 
 ## Privacy and safety
 
-- Runs entirely on your Mac. No account, no cloud.
+- Library preparation and STEMS processing run locally on your computer. You can use both without an account.
 - Design rule: it never modifies your existing rekordbox library or your original audio files.
 
 ## Running it

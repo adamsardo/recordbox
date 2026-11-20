@@ -252,7 +252,7 @@ impl Graph {
         Ok(graph)
     }
 
-    fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+    pub(super) fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => candle_core::safetensors::load(path, device)?,
             _ => {
