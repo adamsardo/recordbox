@@ -1922,11 +1922,11 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             kit::line(
                 ui,
                 &format!(
-                    "This computer: {}{} cores, {:.0} GB memory, {}.",
+                    "{}{} CPU threads{} · STEMS backend: {}",
                     if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
                     hw.cores,
-                    hw.ram_gb,
-                    if hw.gpu { "GPU (Metal) available" } else { "no usable GPU, separation runs on the CPU" }
+                    if hw.ram_gb > 0.0 { format!(", {:.0} GB memory", hw.ram_gb) } else { String::new() },
+                    crate::stems::backend_label()
                 ),
             );
             note(ui, &format!("Recommended model: {}", crate::stems::choose(hw).name));

@@ -11,6 +11,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from build_archive import cuda_platforms
 
 
 class ReleaseError(Exception):
@@ -110,10 +111,12 @@ def local_release(repository, tag, source, directory):
     names = {f"Recordbox-{tag[1:]}-{platform}.{extension}" for platform, extension in (
         ("macos-arm64", "zip"), ("macos-x86_64", "zip"),
         ("windows-x86_64", "zip"), ("linux-x86_64", "tar.gz"))}
+    names.update(f"Recordbox-{tag[1:]}-{platform}-x86_64-cuda12." + ("zip" if platform == "windows" else "tar.gz")
+                 for platform in cuda_platforms(tag[1:]))
     subjects = names | {"COMMIT-LOG.txt"}
     assets = Path(directory) / "assets"
     if assets.is_symlink() or {p.name for p in assets.iterdir()} != subjects | {"SHA256SUMS"}:
-        raise ReleaseError("Local assets must contain exactly four native archives and both manifests")
+        raise ReleaseError("Local assets must contain every expected archive and both manifests")
     files = {name: assets / name for name in subjects | {"SHA256SUMS"}}
     if any(path.is_symlink() or not path.is_file() or not path.stat().st_size for path in files.values()):
         raise ReleaseError("Assets must be nonempty regular files without symlinks")
@@ -124,7 +127,7 @@ def local_release(repository, tag, source, directory):
             raise ReleaseError("Invalid or duplicate SHA256SUMS entry")
         checksums[match[2]] = match[1]
     if set(checksums) != subjects:
-        raise ReleaseError("SHA256SUMS must cover exactly the four archives and COMMIT-LOG.txt")
+        raise ReleaseError("SHA256SUMS must cover every expected archive and COMMIT-LOG.txt")
     expected = {name: (path.stat().st_size, file_digest(path)) for name, path in files.items()}
     if any(expected[name][1] != digest for name, digest in checksums.items()):
         raise ReleaseError("Local SHA256SUMS mismatch")

@@ -107,8 +107,10 @@ def source_hashes(path, platform):
     return hashes
 
 
-def verify_package(archive, destination, source, version, commit, platform, architecture):
+def verify_package(archive, destination, source, version, commit, platform, architecture, cuda12=False):
     root = "Recordbox.app" if platform == "macos" else f"Recordbox-{version}-{platform}-{architecture}"
+    if cuda12:
+        root += "-cuda12"
     preflight_archive(archive, root)
     bundle = extract_archive(archive, destination)
     resource = bundle / "Contents/Resources" if platform == "macos" else bundle
@@ -140,6 +142,10 @@ def verify_package(archive, destination, source, version, commit, platform, arch
     require(manifest.get("entrypoint") == ("recordbox" if platform == "linux" else executable), "Wrong product entrypoint")
     require(stat.S_IMODE((bundle / executable).stat().st_mode) == 0o755, "Executable permission is missing")
     verify_machine(bundle / executable, platform, architecture)
+    require(target.get("stems") == ("cuda12-sm61" if cuda12 else None), "Wrong STEMS build variant")
+    if cuda12:
+        build_archive.check_cuda_binary(bundle / executable, manifest["runtime"]["system_dependencies"], platform)
+        require(sha256(resource / "CUDA12.md") in source_hashes(source / "docs/CUDA12.md", platform), "Wrong CUDA setup guide")
     for packaged, original in (("LICENSE.txt", "LICENSE"), ("Inter-OFL.txt", "packaging/Inter-OFL.txt"), ("Inter-NOTICE.txt", "app/assets/fonts/README.txt")):
         require(sha256(resource / packaged) in source_hashes(source / original, platform), f"Missing/mismatched license notice: {packaged}")
     if platform == "macos":
@@ -202,7 +208,10 @@ def render_release_downloads(notes, repository, tag):
     for label, (platform, architecture) in zip(labels, TARGETS):
         name = f"Recordbox-{version}-{platform}-{architecture}" + (".tar.gz" if platform == "linux" else ".zip")
         rows.append(f"| {label} | {link(name)} |")
-    rows.extend(["", f"Download {link('SHA256SUMS')} to verify the four release archives and {link('COMMIT-LOG.txt')}",
+    for platform in build_archive.cuda_platforms(version):
+        name = f"Recordbox-{version}-{platform}-x86_64-cuda12" + (".tar.gz" if platform == "linux" else ".zip")
+        rows.append(f"| {platform.capitalize()} x64, CUDA 12 STEMS preview | {link(name)} |")
+    rows.extend(["", f"Download {link('SHA256SUMS')} to verify the release archives and {link('COMMIT-LOG.txt')}",
                  "for the complete source history. See the",
                  f"[build and packaging guide]({base}/blob/{quote(tag, safe='')}/docs/BUILD-AND-PACKAGING.md) for runtime requirements",
                  "and verification.", end])
@@ -224,19 +233,23 @@ def prepare_release(input_root, output, source, commit, tag, repository):
     require(tag == "v" + version, "Tag, VERSION and Cargo versions must agree")
     require(not output.exists() and not output.is_symlink(), "Release output already exists")
     require(input_root.is_dir() and not input_root.is_symlink() and {p.name for p in input_root.iterdir()} == {"packages", "smoke"}, "Unexpected release input layout")
-    archives = [(platform, arch, f"Recordbox-{version}-{platform}-{arch}" + (".tar.gz" if platform == "linux" else ".zip")) for platform, arch in TARGETS]
-    expected = {name + suffix for _, _, name in archives for suffix in ("", ".sha256")}
+    archives = [(platform, arch, cuda12, f"Recordbox-{version}-{platform}-{arch}" +
+                 ("-cuda12" if cuda12 else "") + (".tar.gz" if platform == "linux" else ".zip"))
+                for platform, arch in TARGETS
+                for cuda12 in ((False, True) if platform in build_archive.cuda_platforms(version) else (False,))]
+    expected = {name + suffix for _, _, _, name in archives for suffix in ("", ".sha256")}
     packages = input_root / "packages"; smoke = input_root / "smoke"
     require(packages.is_dir() and not packages.is_symlink() and {p.name for p in packages.iterdir()} == expected
             and all(p.is_file() and not p.is_symlink() for p in packages.iterdir()), "Missing, duplicate or unexpected package files")
     require(smoke.is_dir() and not smoke.is_symlink() and {p.name for p in smoke.iterdir()} == {f"smoke-{p}-{a}-{commit}" for p, a in TARGETS}, "Missing/mixed native smoke artifacts")
     verified = {}
     with tempfile.TemporaryDirectory(prefix="recordbox-release-verify-") as temporary:
-        for platform, arch, name in archives:
+        for platform, arch, cuda12, name in archives:
             archive = packages / name; checksum = sha256(archive)
             require((packages / (name + ".sha256")).read_text(encoding="utf-8") == f"{checksum}  {name}\n", "Native archive checksum sidecar mismatch")
-            manifest = verify_package(archive, Path(temporary) / f"{platform}-{arch}", source, version, commit, platform, arch)
-            verify_smoke(smoke / f"smoke-{platform}-{arch}-{commit}", archive, manifest, commit, platform)
+            manifest = verify_package(archive, Path(temporary) / name, source, version, commit, platform, arch, cuda12)
+            if not cuda12:
+                verify_smoke(smoke / f"smoke-{platform}-{arch}-{commit}", archive, manifest, commit, platform)
             verified[name] = checksum
     notes = (source / f"docs/releases/{version}.md").read_text(encoding="utf-8").strip()
     require(bool(notes), "Release notes are empty")
@@ -244,14 +257,14 @@ def prepare_release(input_root, output, source, commit, tag, repository):
     log = get_commit_log(source, commit); require(bool(log.strip()), "Commit log is empty")
     fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", log)), default=0))
     body = (f"{notes}\n\n<!-- recordbox-release-source: {commit} -->\n\n"
-            f"Source commit: `{commit}`. All four native archives and their matching screenshot smoke reports were verified. "
+            f"Source commit: `{commit}`. The four standard archives passed native screenshot checks. "
             "Archives are unsigned and macOS builds are not notarized. Verify downloads with `SHA256SUMS`.\n\n"
             f"<details>\n<summary>Complete commit history</summary>\n\n{fence}text\n{log.rstrip()}\n{fence}\n\n</details>\n")
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".recordbox-release-", dir=output.parent))
     try:
         assets = staging / "assets"; assets.mkdir()
-        for _, _, name in archives:
+        for _, _, _, name in archives:
             shutil.copyfile(packages / name, assets / name)
             require(sha256(assets / name) == verified[name], "Archive changed while staging release")
         (assets / "COMMIT-LOG.txt").write_text(log, encoding="utf-8")

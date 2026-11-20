@@ -22,6 +22,30 @@ class PackageError(ValueError):
     pass
 
 
+def cuda_platforms(version):
+    # Older release notes and manifests describe only the four original archives.
+    numbers = version_tuple(re.split(r"[-+]", version, maxsplit=1)[0])
+    return ("windows", "linux") if numbers >= (0, 5, 5) else ()
+
+
+CUDA_LIBRARIES = {
+    "windows": {"nvcuda.dll", "cudart64_12.dll", "cublas64_12.dll", "cublaslt64_12.dll",
+                "curand64_10.dll", "nvrtc64_120_0.dll"},
+    "linux": {"libcuda.so.1", "libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
+              "libcurand.so.10", "libnvrtc.so.12"},
+}
+
+
+def check_cuda_binary(binary, dependencies, platform):
+    names = set(dependencies)
+    required = ({"nvcuda.dll", "cublas64_12.dll"} if platform == "windows"
+                else {"libcuda.so.1", "libcublas.so.12"})
+    code = binary.read_bytes()
+    markers = (b".target sm_61", b".entry conv1d_f32(", b".entry softmax_f32(")
+    if not required <= names or not all(marker in code for marker in markers):
+        raise PackageError("CUDA archive requires NVIDIA driver, cuBLAS 12 and embedded Pascal FP32 kernels")
+
+
 def read_release_version(source_root: Path) -> str:
     """Check the release marker and both Cargo declarations without building."""
     try:
@@ -169,7 +193,7 @@ def library_candidates(files: list[Path], directories: list[Path], platform: str
     return candidates
 
 
-def runtime_closure(binary: Path, platform: str, architecture: str, candidates: dict[str, Path]) -> tuple[BinaryInfo, dict[str, Path], list[str], dict[str, str]]:
+def runtime_closure(binary: Path, platform: str, architecture: str, candidates: dict[str, Path], cuda12=False) -> tuple[BinaryInfo, dict[str, Path], list[str], dict[str, str]]:
     main = inspect_binary(binary, platform)
     pending = [(binary, main)]; bundled = {}; system = set(); abi = {}
     while pending:
@@ -181,7 +205,9 @@ def runtime_closure(binary: Path, platform: str, architecture: str, candidates: 
                 abi[name] = version
         for name, resolved in info.dependencies.items():
             key = name.lower() if platform == "windows" else name
-            if key in candidates and not system_dependency(name, resolved, platform):
+            if cuda12 and key in CUDA_LIBRARIES[platform]:
+                system.add(key)
+            elif key in candidates and not system_dependency(name, resolved, platform):
                 if key not in bundled:
                     dependency = candidates[key]
                     bundled[key] = dependency
@@ -246,7 +272,7 @@ exec "$bundle_dir/bin/recordbox" "$@"
 
 def build_archive(binary: Path, source_root: Path, output: Path, platform: str, architecture: str, source_commit: str,
                   runtime_files: list[Path] | None = None, runtime_dirs: list[Path] | None = None,
-                  runtime_notices: list[Path] | None = None) -> dict:
+                  runtime_notices: list[Path] | None = None, cuda12=False) -> dict:
     if platform not in {"macos", "windows", "linux"} or architecture not in {"arm64", "x86_64"}:
         raise PackageError("Unsupported platform or architecture")
     if not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", source_commit):
@@ -256,8 +282,12 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     manifest_path = source_root / "app/Cargo.toml"
     version = read_release_version(source_root)
     candidates = library_candidates(runtime_files or [], runtime_dirs or [], platform)
-    info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates)
-    label = f"Recordbox-{version}-{platform}-{architecture}"
+    if cuda12 and (platform not in cuda_platforms(version) or architecture != "x86_64"):
+        raise PackageError("Unsupported CUDA package target")
+    info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates, cuda12)
+    if cuda12:
+        check_cuda_binary(binary, info.dependencies, platform)
+    label = f"Recordbox-{version}-{platform}-{architecture}" + ("-cuda12" if cuda12 else "")
     bundle_name = "Recordbox.app" if platform == "macos" else label
     archive_name = label + (".tar.gz" if platform == "linux" else ".zip")
     output.mkdir(parents=True, exist_ok=True)
@@ -283,6 +313,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
         for name, path in sorted(bundled.items()):
             write_file(bundle / ("lib" if platform == "linux" else "") / name, path.read_bytes(), 0o644)
         write_file(resources / "LICENSE.txt", (source_root / "LICENSE").read_bytes())
+        if cuda12:
+            write_file(resources / "CUDA12.md", (source_root / "docs/CUDA12.md").read_bytes())
         write_file(resources / "Inter-NOTICE.txt", (source_root / "app/assets/fonts/README.txt").read_bytes())
         write_file(resources / "Inter-OFL.txt", (source_root / "packaging/Inter-OFL.txt").read_bytes())
         for index, notice in enumerate(runtime_notices or [], 1):
@@ -301,6 +333,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
                     "entrypoint": executable if platform != "linux" else "recordbox",
                     "runtime": {"system_dependencies": system, "bundled_libraries": sorted(bundled)},
                     "distribution": {"signing_performed": False, "notarization_performed": False}, "files": files}
+        if cuda12:
+            metadata["target"]["stems"] = "cuda12-sm61"
         write_file(resources / "runtime-manifest.json", (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode())
         archive = staging / archive_name; archive_bundle(bundle, archive, platform)
         checksum = sha256(archive)
@@ -314,6 +348,7 @@ def main() -> None:
     parser.add_argument("--binary", type=Path); parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path); parser.add_argument("--platform", choices=["macos", "windows", "linux"])
     parser.add_argument("--arch", choices=["arm64", "x86_64"]); parser.add_argument("--source-commit")
+    parser.add_argument("--cuda12", action="store_true", help="Package the NVIDIA CUDA 12 STEMS variant")
     parser.add_argument("--check-version", action="store_true", help="Validate VERSION and Cargo versions without packaging")
     parser.add_argument("--tag", help="With --check-version, require the exact v<VERSION> release tag")
     parser.add_argument("--runtime-library", action="append", default=[], type=Path); parser.add_argument("--runtime-dir", action="append", default=[], type=Path)
@@ -321,7 +356,7 @@ def main() -> None:
     args = parser.parse_args()
     packaging = (args.binary, args.output, args.platform, args.arch, args.source_commit)
     if args.tag is not None and not args.check_version: parser.error("--tag requires --check-version")
-    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice):
+    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice or args.cuda12):
         parser.error("--check-version cannot be combined with packaging arguments")
     if not args.check_version and any(value is None for value in packaging):
         parser.error("packaging requires --binary, --output, --platform, --arch and --source-commit")
@@ -332,7 +367,7 @@ def main() -> None:
                 raise PackageError(f"Release tag must be v{version}, received {args.tag!r}")
             print(json.dumps({"status": "passed", "version": version, "tag": args.tag}))
             return
-        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice)
+        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice, args.cuda12)
     except (PackageError, OSError, KeyError, tomllib.TOMLDecodeError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")
     print(json.dumps(result, indent=2))

@@ -480,7 +480,23 @@ mod launch_tests {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: recordbox [--disable-load] [--disable-play] [--screenshot FILE]\n\n  --disable-load  Disable loading tracks into decks for this session.\n  --disable-play  Disable audio playback and previews for this session.\n  --screenshot    Save a picture of the window to FILE and exit.");
+        println!("Usage: recordbox [--disable-load] [--disable-play] [--screenshot FILE] [--stems-cpu] [--stems-device | --compare-stems FILE]\n\n  --disable-load  Disable loading tracks into decks for this session.\n  --disable-play  Disable audio playback and previews for this session.\n  --screenshot    Save a picture of the window to FILE and exit.\n  --stems-cpu     Use CPU separation for this session.\n  --stems-device  Report the selected separation device and exit.\n  --compare-stems FILE  Compare GPU and CPU separation of one local track and exit.");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--stems-cpu") {
+        stems::force_cpu();
+    }
+    if let Some(i) = args.iter().position(|a| a == "--compare-stems") {
+        let result = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("Supply a local audio file after --compare-stems"))
+            .and_then(|path| stems::compare_track(path));
+        if let Err(error) = result {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--stems-device") {
+        println!("STEMS backend: {}", stems::backend_label());
         return Ok(());
     }
     let deck_options = DeckOptions::from_args(&args[1..]);
