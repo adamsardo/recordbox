@@ -563,7 +563,7 @@ jobs:
         with:
           name: release-bundle-${{ github.sha }}
           path: release
-      - name: Upload and verify a draft, then publish
+      - name: Publish or verify the tagged release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -571,4 +571,4 @@ jobs:
           --tag "$GITHUB_REF_NAME" --source-commit "$GITHUB_SHA" --directory release --publish
       - name: Link the completed release
         shell: bash
-        run: echo "[Published $GITHUB_REF_NAME](https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME)" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "[Verified release $GITHUB_REF_NAME](https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME)" >> "$GITHUB_STEP_SUMMARY"

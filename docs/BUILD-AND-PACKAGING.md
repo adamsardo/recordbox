@@ -104,11 +104,12 @@ this block: archive, checksum, history and packaging-guide links are refreshed
 for each release.
 
 `packaging/publish_release.py` creates a draft GitHub Release, uploads the
-standard and CUDA archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploaded assets through
-the API before publishing it. Publication jobs are serialized; only a newer
-stable version can replace the latest release. Existing tags/releases must
-agree with the intended source/assets; publication must not move a tag or
-replace mismatched assets. Pull-request runs and ordinary branch pushes do not
+platform archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploads
+before publishing. If the release is already public, a rerun uses read-only
+requests to compare the tag, release notes and every asset's size and SHA-256
+with the prepared bundle. A mismatch fails the job. Publication jobs run one
+at a time, and only a newer stable version can become latest.
+Pull-request runs and ordinary branch pushes do not
 publish. A tag workflow publishes only to the repository where that tag was
 pushed: a tag in this fork does not create an upstream tag or release. If upstream
 adopts the workflow, its maintainer enables Actions and pushes a matching version

@@ -221,10 +221,50 @@ class PublishTests(unittest.TestCase):
         self.github.annotated = True
         self.assertFalse(self.publish()["draft"])
 
-    def test_published_release_is_never_changed(self):
-        self.prepare_draft()
-        self.github.release["draft"] = False
-        with self.assertRaisesRegex(publisher.ReleaseError, "already published"):
+    def test_rerun_verifies_public_assets_without_writes(self):
+        self.github.digest_missing = True
+        published = self.publish()
+        self.github.mutations.clear()
+        self.github.downloads.clear()
+        self.github.latest = {"tag_name": "v0.6.0", "draft": False, "prerelease": False}
+        self.assertEqual(self.publish(), published)
+        self.assertEqual(len(self.github.downloads), len(self.github.assets))
+        self.assertEqual(self.github.mutations, [])
+
+    def test_public_release_with_missing_or_changed_assets_fails_without_writes(self):
+        self.publish()
+        self.github.mutations.clear()
+        self.github.assets[0]["digest"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(publisher.ReleaseError, "digest mismatch"):
+            self.publish()
+        self.github.assets.pop(0)
+        with self.assertRaisesRegex(publisher.ReleaseError, "missing, extra"):
+            self.publish()
+        self.assertEqual(self.github.mutations, [])
+
+    def test_public_release_with_different_metadata_fails_without_writes(self):
+        published = self.publish()
+        self.github.mutations.clear()
+        for field, value in (("target_commitish", "b" * 40), ("body", "Edited notes"),
+                             ("prerelease", True), ("name", "Another release")):
+            with self.subTest(field=field):
+                self.github.release = {**published, field: value}
+                with self.assertRaisesRegex(publisher.ReleaseError, "does not belong"):
+                    self.publish()
+                self.assertEqual(self.github.mutations, [])
+
+    def test_retarget_during_public_asset_verification_fails_without_writes(self):
+        self.github.digest_missing = True
+        self.publish()
+        self.github.mutations.clear()
+        download_digest = self.github.download_digest
+
+        def move_tag_during_download(path):
+            self.github.tag = "b" * 40
+            return download_digest(path)
+
+        self.github.download_digest = move_tag_during_download
+        with self.assertRaisesRegex(publisher.ReleaseError, "Tag does not resolve"):
             self.publish()
         self.assertEqual(self.github.mutations, [])
 
@@ -251,7 +291,7 @@ class PublishTests(unittest.TestCase):
             return original(path)
 
         self.github.download_digest = concurrent_publication
-        with self.assertRaisesRegex(publisher.ReleaseError, "already published"):
+        with self.assertRaisesRegex(publisher.ReleaseError, "publication state changed"):
             self.publish()
         self.assertFalse(any(method == "PATCH" for method, _ in self.github.mutations))
 
