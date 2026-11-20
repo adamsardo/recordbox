@@ -5,46 +5,121 @@ use ort::{session::builder::SessionBuilder, AsPointer};
 use windows::{
     core::Interface,
     Win32::{
-        Foundation::LUID,
         Graphics::{
             Direct3D::D3D_FEATURE_LEVEL_11_0,
             Direct3D12::{
                 D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                D3D12_COMMAND_QUEUE_DESC,
+                D3D12_COMMAND_QUEUE_DESC, D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
             },
             Dxgi::{
-                CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIFactory4, DXGI_ADAPTER_FLAG_SOFTWARE,
-                DXGI_ERROR_NOT_FOUND,
+                CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+                DXGI_ERROR_NOT_FOUND, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                DXGI_QUERY_VIDEO_MEMORY_INFO,
             },
         },
         AI::MachineLearning::DirectML::{DMLCreateDevice, IDMLDevice, DML_CREATE_DEVICE_FLAG_NONE},
     },
 };
 
-pub(in crate::stems) enum Binding {
-    Radeon(LUID),
-    #[cfg(test)]
-    Warp,
+/// Keep the D3D12 device used for inference so a driver failure can report its own removal reason.
+#[derive(Clone)]
+pub(in crate::stems) struct Binding {
+    adapter: IDXGIAdapter1,
+    d3d: Option<ID3D12Device>,
+    pub(super) name: String,
+    pub(in crate::stems) shared_memory: bool,
 }
 
 impl Binding {
-    fn commands(&self) -> Result<(IDMLDevice, ID3D12CommandQueue)> {
-        // Store the adapter identity across threads. The display's enumeration
-        // order may change between assessment and loading a checkpoint.
-        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1()? };
-        let adapter: IDXGIAdapter = match self {
-            Self::Radeon(luid) => unsafe { factory.EnumAdapterByLuid(*luid)? },
-            #[cfg(test)]
-            Self::Warp => unsafe { factory.EnumWarpAdapter()? },
-        };
-        // Both COM objects must come from the same D3D12 device. All out parameters
-        // are owned COM references, managed by windows-rs.
+    fn open_device(adapter: &IDXGIAdapter1) -> Result<ID3D12Device> {
         let mut d3d: Option<ID3D12Device> = None;
-        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d) }
+        unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d) }
             .context("Creating D3D12 device")?;
-        let d3d = d3d.context("D3D12 returned no device")?;
+        d3d.context("D3D12 returned no device")
+    }
+
+    fn new(adapter: IDXGIAdapter1, name: String) -> Result<Self> {
+        let d3d = Self::open_device(&adapter)?;
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+        // Query node zero of the same adapter that owns the execution queue.
+        let shared_memory = unsafe {
+            d3d.CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE,
+                std::ptr::from_mut(&mut arch).cast(),
+                std::mem::size_of_val(&arch) as u32,
+            )
+        }
+        .is_ok()
+            && arch.UMA.as_bool();
+        Ok(Self {
+            adapter,
+            d3d: Some(d3d),
+            name,
+            shared_memory,
+        })
+    }
+
+    /// Assessment retains the adapter identity. Only a live session owns a compute device.
+    pub(in crate::stems) fn into_standby(mut self) -> Self {
+        self.d3d = None;
+        self
+    }
+
+    pub(super) fn for_model(&self) -> Result<Self> {
+        let mut active = self.clone();
+        if active.d3d.is_none() {
+            active.d3d = Some(Self::open_device(&self.adapter)?);
+        }
+        Ok(active)
+    }
+
+    #[cfg(test)]
+    pub(in crate::stems) fn warp() -> Result<Self> {
+        use windows::Win32::Graphics::Dxgi::IDXGIFactory4;
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1()? };
+        let mut binding = Self::new(unsafe { factory.EnumWarpAdapter()? }, "Microsoft WARP".to_owned())?;
+        // Exercise the integrated Radeon profile on the headless Windows runner.
+        binding.shared_memory = true;
+        Ok(binding)
+    }
+
+    pub(super) fn failure_detail(&self) -> String {
+        let mut lines = vec![self.name.clone()];
+        if let Some(reason) = self
+            .d3d
+            .as_ref()
+            .and_then(|d| unsafe { d.GetDeviceRemovedReason() }.err())
+        {
+            lines.push(format!(
+                "D3D12 device removal reason 0x{:08X} ({reason})",
+                reason.code().0 as u32
+            ));
+        }
+        if let Ok(adapter) = self.adapter.cast::<IDXGIAdapter3>() {
+            for (label, group) in [
+                ("Local", DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+                ("Non-local", DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL),
+            ] {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                if unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.is_ok() && info.Budget != 0 {
+                    lines.push(format!(
+                        "{label} GPU memory: {} MiB in use / {} MiB budget",
+                        info.CurrentUsage >> 20,
+                        info.Budget >> 20
+                    ));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn commands(&self) -> Result<(IDMLDevice, ID3D12CommandQueue)> {
+        let d3d = self
+            .d3d
+            .as_ref()
+            .context("DirectML requires an active D3D12 device")?;
         let mut device = None;
-        unsafe { DMLCreateDevice(&d3d, DML_CREATE_DEVICE_FLAG_NONE, &mut device) }
+        unsafe { DMLCreateDevice(d3d, DML_CREATE_DEVICE_FLAG_NONE, &mut device) }
             .context("Creating DirectML device")?;
         let desc = D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -80,17 +155,10 @@ impl Binding {
     }
 }
 
-pub(in crate::stems) fn select() -> Result<(Binding, String)> {
-    let dll = std::env::current_exe()?.with_file_name("onnxruntime.dll");
-    ensure!(
-        dll.is_file(),
-        "Extract the complete DirectML ZIP with onnxruntime.dll beside recordbox.exe"
-    );
-    ort::init_from(&dll)
-        .context("Loading the packaged ONNX Runtime")?
-        .commit();
+// DXGI adapter descriptions are metadata. This path never creates a D3D12 device, queue or ORT session.
+fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-    let mut failures = Vec::new();
+    let mut adapters = Vec::new();
     for index in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(a) => a,
@@ -107,9 +175,40 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
             .position(|&c| c == 0)
             .unwrap_or(desc.Description.len());
         let name = String::from_utf16_lossy(&desc.Description[..end]);
-        let binding = Binding::Radeon(desc.AdapterLuid);
-        match super::probe(Some(&binding)) {
-            Ok(()) => return Ok((binding, format!("DirectML · {name} · DXGI adapter {index}"))),
+        adapters.push((index, name, adapter));
+    }
+    Ok(adapters)
+}
+
+pub(in crate::stems) fn available() -> Result<String> {
+    candidates()?
+        .into_iter()
+        .next()
+        .map(|(_, name, _)| name)
+        .context("no hardware AMD Radeon adapter")
+}
+
+pub(in crate::stems) fn select() -> Result<(Binding, String)> {
+    let dll = std::env::current_exe()?.with_file_name("onnxruntime.dll");
+    ensure!(
+        dll.is_file(),
+        "Extract the complete DirectML ZIP with onnxruntime.dll beside recordbox.exe"
+    );
+    ort::init_from(&dll)
+        .context("Loading the packaged ONNX Runtime")?
+        .commit();
+    let mut failures = Vec::new();
+    for (index, name, adapter) in candidates()? {
+        match Binding::new(adapter, name.clone()).and_then(|binding| {
+            super::probe(Some(&binding))?;
+            Ok(binding)
+        }) {
+            Ok(binding) => {
+                return Ok((
+                    binding.into_standby(),
+                    format!("DirectML · {name} · DXGI adapter {index}"),
+                ));
+            }
             Err(error) => failures.push(format!("{name}: {error:#}")),
         }
     }

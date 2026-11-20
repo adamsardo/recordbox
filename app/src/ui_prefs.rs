@@ -1926,7 +1926,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
                     if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
                     hw.cores,
                     if hw.ram_gb > 0.0 { format!(", {:.0} GB memory", hw.ram_gb) } else { String::new() },
-                    crate::stems::backend_label()
+                    crate::stems::backend_status().1
                 ),
             );
             note(ui, &format!("Recommended model: {}", crate::stems::choose(hw).name));

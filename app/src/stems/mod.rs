@@ -10,7 +10,7 @@ mod backend;
 #[cfg(feature = "directml")]
 mod directml;
 mod compare;
-pub use backend::{backend_label, force_cpu};
+pub use backend::{backend_label, force_cpu, gpu_active, status as backend_status};
 pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,7 +26,7 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: f64,
     pub apple_silicon: bool,
-    /// The selected separation backend passed its device check.
+    /// A GPU is available for STEMS. Windows Radeon detection is passive until first use.
     pub gpu: bool,
 }
 
@@ -46,7 +46,7 @@ pub fn assess() -> Hardware {
         (String::new(), mem / 1e6)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = backend::gpu_active();
+    let gpu = backend_status().0;
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
@@ -70,25 +70,73 @@ pub const OVERLAP: f64 = 0.25;
 /// segments; against known stems the separation quality is the same within 0.1 dB.
 pub const ANALYSIS_OVERLAP: f64 = 0.1;
 
-/// Loaded models stay in memory (about 170 MB each on the GPU) so that a second track, vocal
-/// detection or key analysis does not read and upload the checkpoint again.
-fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
-    static LOADED: std::sync::Mutex<Vec<(String, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+/// A provider failure can be retried on the CPU. Model, decoder and cancellation errors stay distinct.
+#[derive(Debug)]
+pub(crate) struct DirectMlFailure(pub(super) String);
+impl std::fmt::Display for DirectMlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for DirectMlFailure {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeparationDevice { Selected, GpuOnly, Cpu }
+
+impl SeparationDevice {
+    fn device(self) -> Result<candle_core::Device> {
+        if self == Self::GpuOnly && !backend::gpu_active() {
+            #[cfg(all(windows, feature = "directml"))]
+            return Err(DirectMlFailure(format!("Checking the DirectML device\n{}", backend_label())).into());
+            #[cfg(not(all(windows, feature = "directml")))]
+            anyhow::bail!("GPU separation unavailable: {}", backend_label());
+        }
+        Ok(if self == Self::Cpu { candle_core::Device::Cpu } else { device() })
+    }
+
+    fn load(self, path: &Path) -> Result<htdemucs::Graph> {
+        match self {
+            Self::Selected | Self::GpuOnly => htdemucs::Graph::load_selected(path),
+            Self::Cpu => Ok(htdemucs::Graph::load(path, &candle_core::Device::Cpu)?),
+        }
+    }
+}
+
+// A deck, vocal detection and key analysis can request different checkpoints at the same time.
+static SHARED_GPU_JOB: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn wait_for_shared_gpu<'a>(slot: &'a parking_lot::Mutex<()>, progress: &mut dyn FnMut(f32) -> bool) -> Result<parking_lot::MutexGuard<'a, ()>> {
+    loop {
+        let available = slot.try_lock_for(std::time::Duration::from_millis(100));
+        if !progress(0.0) { anyhow::bail!("stopped"); }
+        if let Some(guard) = available {
+            return Ok(guard);
+        }
+    }
+}
+
+/// Shared-memory DirectML models live for one job. Other backends reuse recent checkpoints.
+fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
+    static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+    let execution = if execution == SeparationDevice::GpuOnly { SeparationDevice::Selected } else { execution };
+    let file_path = models_dir().join(file);
+    let load = || execution.load(&file_path).map(std::sync::Arc::new).with_context(|| format!("Loading {file}"));
+    // Let the last owner release the compiled model, command queue and driver allocations on UMA.
+    if execution == SeparationDevice::Selected && backend::gpu_uses_shared_memory() {
+        return load();
+    }
     let mut loaded = LOADED.lock().map_err(|_| anyhow!("model cache is unusable"))?;
-    if let Some(i) = loaded.iter().position(|(f, _)| f == file) {
+    if let Some(i) = loaded.iter().position(|(f, mode, _)| f == file && *mode == execution) {
         // Most recently used last.
         let entry = loaded.remove(i);
         loaded.push(entry);
     } else {
         // A compiled DirectML session also holds intermediate buffers in shared GPU memory.
-        let capacity = if backend::uses_directml() { 1 } else { 4 };
+        let capacity = if execution == SeparationDevice::Selected && backend::uses_directml() { 1 } else { 4 };
         while loaded.len() >= capacity {
             loaded.remove(0);
         }
-        let g = htdemucs::Graph::load_selected(&models_dir().join(file)).map_err(|e| anyhow!("loading {file}: {e}"))?;
-        loaded.push((file.to_string(), std::sync::Arc::new(g)));
+        loaded.push((file.to_string(), execution, load()?));
     }
-    Ok(loaded.last().unwrap().1.clone())
+    Ok(loaded.last().unwrap().2.clone())
 }
 
 /// Planar stereo (left samples, then right) at 44.1 kHz from interleaved stereo at `sr`.
@@ -302,25 +350,32 @@ fn resample_to_44k(samples: &[f32], sr: u32) -> Vec<f32> {
 
 /// Separate a decoded track with model `m` (which must be downloaded).
 pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Stems> {
+    separate_with_device(m, samples, sr, progress, SeparationDevice::Selected)
+}
+
+pub fn separate_with_device(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool, execution: SeparationDevice) -> Result<Stems> {
     if !progress(0.0) { anyhow::bail!("stopped"); }
-    let device = device();
+    let device = execution.device()?;
+    let _job = if execution != SeparationDevice::Cpu && backend::gpu_uses_shared_memory() {
+        Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?)
+    } else { None };
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
         if !m.per_source {
             if !progress(0.0) { anyhow::bail!("stopped"); }
-            let g = graph(m.files[0])?;
+            let g = graph(m.files[0], execution)?;
             let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb).map_err(|e| anyhow!("{e}"));
+            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb);
         }
         // Model k is the specialist for source k (upstream's weights matrix is the identity),
         // so only that source is taken from it.
         let mut out = Vec::with_capacity(8 * len);
         for (k, f) in m.files.iter().enumerate() {
             if !progress(k as f32 / n_models as f32) { anyhow::bail!("stopped"); }
-            let g = graph(f)?;
+            let g = graph(f, execution)?;
             let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
-            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb).map_err(|e| anyhow!("{e}"))?);
+            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb)?);
         }
         Ok(out)
     };
@@ -342,10 +397,11 @@ pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn 
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
     let device = device();
+    let _job = if backend::gpu_uses_shared_memory() { Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?) } else { None };
     let (planar, len) = planar_44k(samples, sr);
-    let g = graph(file)?;
+    let g = graph(file, SeparationDevice::Selected)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb).map_err(|e| anyhow!("{e}"));
+    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb);
     htdemucs::release_scratch();
     let y = y?;
     Ok(y[..len].iter().zip(&y[len..]).map(|(a, b)| 0.5 * (a + b)).collect())
@@ -582,6 +638,19 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_for_a_shared_gpu_can_be_cancelled_and_the_next_job_can_run() {
+        let slot = parking_lot::Mutex::new(());
+        let first_job = slot.lock();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string());
+            assert_eq!(waiting.join().unwrap(), "stopped");
+        });
+        drop(first_job);
+        assert_eq!(wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string(), "stopped");
+        assert!(wait_for_shared_gpu(&slot, &mut |_| true).is_ok());
+    }
 
     #[test]
     fn cancelled_separation_needs_no_weights_or_decoded_audio() {
