@@ -270,9 +270,6 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // A track dragged from the list and dropped on the player is loaded.
     crate::ui_player2::drop_to_load(app, ui, full);
 
-    if playing || app.searching() != 0 || app.deck.loading.is_some() {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// The largest rectangle of a picture's proportions centred in `bx`.

@@ -337,6 +337,8 @@ pub struct Prefs {
     pub wave_click_play_cue: bool,
     /// Player layout: 0 = 1 Player, 1 = 2 Players, 2 = Simple Player (`browser_only` hides it).
     pub player_layout: u8,
+    /// Maximum automatic playback animation rate. Zero follows the display.
+    pub playback_fps: u8,
     /// Metronome volume step 1–3.
     pub metronome_vol: u8,
     /// Beat jump length shown and chosen in bars (`beat_jump` stays in beats).
@@ -347,6 +349,8 @@ pub struct Prefs {
     pub show_phrase_bar: bool,
     /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
     pub analysis_mode: u8,
+    /// Maximum CPU workers for library analysis. Zero selects the automatic budget.
+    pub analysis_threads: usize,
     /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
     /// track is first analysed; Analyze Key still replaces it.
     pub keep_tag_key: bool,
@@ -787,12 +791,14 @@ impl Default for Prefs {
             beat_count_mode: 0,
             wave_click_play_cue: false,
             player_layout: 0,
+            playback_fps: if cfg!(target_os = "linux") { 30 } else { 0 },
             metronome_vol: 2,
             beat_jump_bars: false,
             show_stems: true,
             // As rekordbox: "Phrase (Full Waveform)" is not ticked until the user ticks it.
             show_phrase_bar: false,
             analysis_mode: 0,
+            analysis_threads: 0,
             keep_tag_key: true,
             palette_enabled: true,
             playlist_search_filter: true,
@@ -1265,7 +1271,7 @@ impl App {
         }
         crate::prefs_ext::set_stream_opts(&prefs);
         let audio_device = prefs.audio_device.clone();
-        let pool = AnalysisPool::new(cc.egui_ctx.clone());
+        let pool = AnalysisPool::new(cc.egui_ctx.clone(), prefs.analysis_threads);
         let mut app = App {
             db,
             prefs,
@@ -3157,7 +3163,7 @@ impl App {
             self.analysis_done += 1;
             self.apply_analysis(id, r);
         }
-        if self.pool.pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        if self.analysis_done == self.analysis_total {
             self.analysis_total = 0;
             self.analysis_done = 0;
         }
@@ -3299,6 +3305,50 @@ impl App {
             None => 0.0,
         }
     }
+    /// egui subtracts predicted_dt from nonzero repaint delays. Account for it
+    /// so a 30 Hz preference does not request another frame after just 16 ms.
+    pub fn repaint_playback(&self, ctx: &egui::Context) {
+        match self.prefs.playback_fps {
+            fps @ (15 | 30) => {
+                let delay = 1.0 / f32::from(fps) + ctx.input(|i| i.predicted_dt);
+                ctx.request_repaint_after_secs(delay);
+            }
+            _ => ctx.request_repaint(),
+        }
+    }
+
+    pub fn update_transport(&mut self, ctx: &egui::Context) {
+        let running = self.player.transport_running();
+        #[cfg(target_os = "linux")]
+        {
+            // Performance mode, including an initialized sampler's independent
+            // sequencer/quantization clock, always keeps its low-latency output.
+            let keep_ready = self.performance() || crate::sampler::SAMPLER.lock().is_some();
+            match self.player.service_output(keep_ready, running, self.prefs.audio_device.as_deref()) {
+                Ok(Some(delay)) => ctx.request_repaint_after_secs(delay.as_secs_f32() + ctx.input(|i| i.predicted_dt)),
+                Err(error) => {
+                    self.player.error = Some(error.to_string());
+                    self.player.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for deck in &self.player.decks {
+                        let mut s = deck.lock();
+                        s.playing = false;
+                        s.search = 0.0;
+                    }
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
+        if running {
+            if self.prefs.browser_only && !self.performance() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            } else {
+                self.repaint_playback(ctx);
+            }
+        }
+    }
+
     pub fn playing(&self) -> bool {
         self.player.state.lock().playing
     }

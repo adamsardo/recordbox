@@ -354,7 +354,9 @@ pub struct Player {
     pub decks: [Arc<Mutex<PlayState>>; 4],
     /// Set by the stream when its device stops working (unplugged, switched off).
     pub lost: Arc<std::sync::atomic::AtomicBool>,
-    _stream: Option<cpal::Stream>,
+    stream: Option<cpal::Stream>,
+    idle_since: Option<std::time::Instant>,
+    parked: bool,
     pub device_rate: u32,
     pub error: Option<String>,
 }
@@ -371,8 +373,8 @@ impl Player {
         let state = decks[0].clone();
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
         match Self::open_stream(decks.clone(), device, lost.clone()) {
-            Ok((s, rate)) => Player { state, decks, lost, _stream: Some(s), device_rate: rate, error: None },
-            Err(e) => Player { state, decks, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
+            Ok((s, rate)) => Player { state, decks, lost, stream: Some(s), idle_since: None, parked: false, device_rate: rate, error: None },
+            Err(e) => Player { state, decks, lost, stream: None, idle_since: None, parked: false, device_rate: 44100, error: Some(e.to_string()) },
         }
     }
 
@@ -405,10 +407,42 @@ impl Player {
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
         let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone())?;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
-        self._stream = Some(s);
+        self.stream = Some(s);
+        self.parked = false;
+        self.idle_since = None;
         self.device_rate = rate;
         self.error = None;
         Ok(())
+    }
+
+    pub fn transport_running(&self) -> bool {
+        self.decks.iter().any(|deck| {
+            let s = deck.lock();
+            s.playing || s.search != 0.0
+        })
+    }
+
+    /// Linux ALSA plugins can keep servicing a silent stream after the decks stop.
+    /// Keep a short cue/resume window before actually releasing the device.
+    #[cfg(target_os = "linux")]
+    pub fn service_output(&mut self, keep_ready: bool, running: bool, device: Option<&str>) -> Result<Option<std::time::Duration>> {
+        use std::time::{Duration, Instant};
+        if keep_ready || running {
+            self.idle_since = None;
+            if self.parked || (running && self.stream.is_none() && !self.lost.load(std::sync::atomic::Ordering::Relaxed)) {
+                self.parked = false;
+                self.switch_device(device)?;
+            }
+            return Ok(None);
+        }
+        if self.stream.is_none() { return Ok(None); }
+        let since = self.idle_since.get_or_insert_with(Instant::now);
+        let remaining = Duration::from_secs(2).saturating_sub(since.elapsed());
+        if !remaining.is_zero() { return Ok(Some(remaining)); }
+        self.stream = None;
+        self.parked = true;
+        HP_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
     }
 
     fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
@@ -2119,6 +2153,46 @@ mod smooth_tests {
                 assert!(out.iter().all(|v| v.is_finite()) && out.iter().any(|v| v.abs() > 0.01));
             }
         }
+    }
+
+    /// Run with a clocked ALSA output (a PulseAudio null sink is sufficient).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working Linux audio output"]
+    fn linux_output_parks_only_after_idle_and_resumes_the_same_deck() {
+        use std::time::{Duration, Instant};
+        let mut player = Player::new();
+        assert!(player.stream.is_some(), "{:?}", player.error);
+        let audio = Arc::new(Decoded { sr: 44100, samples: vec![0.2; 44100 * 2 * 4],
+            raw_frames: 44100 * 4, damaged: 0, truncated: false });
+        player.decks[1].lock().audio = Some(audio.clone());
+        player.decks[1].lock().pos = 4410.0;
+        let keep = player.service_output(false, false, None).unwrap().unwrap();
+        assert!(keep > Duration::ZERO);
+        player.idle_since = Some(Instant::now() - Duration::from_secs(3));
+        player.service_output(false, false, None).unwrap();
+        assert!(player.parked && player.stream.is_none());
+        assert_eq!(player.decks[1].lock().pos, 4410.0);
+        player.decks[1].lock().playing = true;
+        let running = player.transport_running();
+        assert!(running);
+        player.service_output(false, running, None).unwrap();
+        assert!(player.stream.is_some() && !player.parked);
+        let until = Instant::now() + Duration::from_secs(3);
+        while player.decks[1].lock().pos == 4410.0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut deck = player.decks[1].lock();
+        assert!(Arc::ptr_eq(deck.audio.as_ref().unwrap(), &audio));
+        assert!(deck.pos > 4410.0);
+        deck.playing = false;
+        deck.search = 1.0;
+        drop(deck);
+        assert!(player.transport_running());
+        player.decks[1].lock().search = 0.0;
+        player.idle_since = Some(Instant::now() - Duration::from_secs(3));
+        player.service_output(true, false, None).unwrap();
+        assert!(player.stream.is_some() && !player.parked);
     }
 
     /// Opt-in CPU report using the actual callback, synthetic audio and no device.

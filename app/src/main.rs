@@ -188,6 +188,7 @@ impl eframe::App for Gui {
             step!(ui_browser::browser(app, ui));
         });
         step!(ui_dialogs::dialogs(app, ctx));
+        app.update_transport(ctx);
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));

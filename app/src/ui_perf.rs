@@ -115,10 +115,6 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
         }
     }
     read_meters(app, ui);
-    let any = app.player.decks.iter().any(|s| s.lock().playing) || app.px.parked.iter().any(|d| d.loading.is_some()) || app.deck.loading.is_some() || app.searching() != 0;
-    if any {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// Zoom in / RST / zoom out over the left end of the waveforms (one zoom for both decks).

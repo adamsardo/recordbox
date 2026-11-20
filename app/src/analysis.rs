@@ -60,16 +60,36 @@ pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> 
 }
 
 pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
+    analyze_passes(dec, s, false)
+}
+
+/// Called inside the batch's bounded Rayon pool; nested passes share its workers.
+pub(super) fn analyze_file_on_worker(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> {
+    let dec = decode_file(path)?;
+    Ok(analyze_passes(&dec, s, true))
+}
+
+fn analyze_passes(dec: &Decoded, s: &AnalysisSettings, parallel: bool) -> AnalysisResult {
     let mono = dec.mono();
     let sr = dec.sr as f64;
-    let wave = waveform(&mono, sr);
-    let (bpm, grid) = match (s.do_grid, s.dynamic) {
-        (false, _) => (0.0, None),
-        (true, false) => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
-        (true, true) => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
+    // Key detection uses the measured tempo/grid. The waveform and loudness passes
+    // are independent and only borrow the decoded samples.
+    let timing = || {
+        let (bpm, grid) = match (s.do_grid, s.dynamic) {
+            (false, _) => (0.0, None),
+            (true, false) => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
+            (true, true) => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
+        };
+        let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
+        (bpm, grid, key)
     };
-    let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
-    let (lufs, peak) = loudness_and_peak(dec);
+    let wave = || waveform(&mono, sr);
+    let level = || loudness_and_peak(dec);
+    let ((bpm, grid, key), (wave, (lufs, peak))) = if parallel {
+        rayon::join(timing, || rayon::join(wave, level))
+    } else {
+        (timing(), (wave(), level()))
+    };
     // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
     AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak }

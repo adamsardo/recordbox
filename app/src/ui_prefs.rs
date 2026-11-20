@@ -588,6 +588,15 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                 }
             });
             card(ui, "Waveform", |ui| {
+                kit::labeled(ui, "Playback animation", |ui| {
+                    let choices = [(15, "15 frames/s"), (30, "30 frames/s"), (0, "Display rate")];
+                    let current = choices.iter().find(|(n, _)| *n == app.prefs.playback_fps).map_or("Display rate", |v| v.1);
+                    kit::combo("playback_fps", 170.0, current, 14.0).show_ui(ui, |ui| {
+                        for (fps, name) in choices {
+                            ui.selectable_value(&mut app.prefs.playback_fps, fps, name);
+                        }
+                    });
+                });
                 sub(ui, "Full/Preview Waveform");
                 kit::indent(ui, 88.0);
                 if radio(ui, !app.prefs.wave_half, "Full Waveform") {
@@ -1077,6 +1086,20 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
                     }
                 }
             });
+        });
+        kit::labeled(ui, "Analysis workers", |ui| {
+            let before = app.prefs.analysis_threads;
+            let label = if before == 0 { format!("Automatic ({})", app.pool.thread_count()) } else { app.pool.thread_count().to_string() };
+            let busy = app.pool.pending.load(std::sync::atomic::Ordering::Acquire) != 0;
+            ui.add_enabled_ui(!busy, |ui| {
+                kit::combo("analysis_workers", 170.0, label, 14.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.prefs.analysis_threads, 0, "Automatic");
+                    for n in 1..=app.pool.available_cpus.min(12) {
+                        ui.selectable_value(&mut app.prefs.analysis_threads, n, n.to_string());
+                    }
+                });
+            }).response.on_hover_text("Automatic leaves one processor available for playback when possible. Change this between analysis batches.");
+            if app.prefs.analysis_threads != before { app.pool.set_threads(app.prefs.analysis_threads); }
         });
         kit::labeled(ui, "BPM Range", |ui| {
             let (lo, hi) = BPM_RANGES[app.prefs.bpm_range.min(BPM_RANGES.len() - 1)];

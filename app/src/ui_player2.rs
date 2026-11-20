@@ -660,10 +660,6 @@ pub fn two_players(app: &mut App, ui: &mut Ui) {
     if let Some(pp) = pressed.filter(|pp| full.contains(*pp)) {
         app.activate_deck(if pp.y < mid { 0 } else { 1 });
     }
-    let any = app.playing() || app.player.decks[app.partner() as usize].lock().playing || app.other_deck().loading.is_some() || app.deck.loading.is_some() || app.searching() != 0;
-    if any {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// A raised 17 pt tall button of the deck rows with a caps label; `lit`: blue (on).
@@ -1148,7 +1144,4 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
     child.set_clip_rect(sheet);
     crate::ui_player::info_panel(app, &mut child, sheet);
     drop_to_load(app, ui, full);
-    if app.playing() || app.searching() != 0 || app.deck.loading.is_some() {
-        ui.ctx().request_repaint();
-    }
 }

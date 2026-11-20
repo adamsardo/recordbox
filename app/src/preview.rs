@@ -133,6 +133,10 @@ impl Preview {
     /// first time; a click in the track already previewing only moves the position ("Skip").
     pub fn play(&mut self, track: i64, path: &str, frac: f64, gain: f32, device: Option<&str>, ctx: &eframe::egui::Context) {
         self.ensure_stream(device);
+        if self.stream.is_none() {
+            self.stop();
+            return;
+        }
         let mut st = self.state.lock();
         st.error = None;
         st.gain = gain;
@@ -186,23 +190,30 @@ impl Preview {
         st.track = None;
         st.audio = None;
         st.pending = None;
+        // A CPAL stream may join its callback on drop. Release its state lock first.
+        drop(st);
+        self.stream = None;
+    }
+
+    /// Retire a finished/failed preview even if its track row is no longer visible.
+    pub fn poll(&mut self) -> bool {
+        let st = self.state.lock();
+        if st.track.is_some() && (st.playing || st.pending.is_some()) { return true; }
+        let cleanup = st.track.is_some() || self.stream.is_some();
+        drop(st);
+        if cleanup { self.stop(); }
+        false
     }
 
     /// The previewing track and its position as a fraction of the track (None while decoding).
     pub fn status(&self) -> Option<(i64, Option<f64>)> {
-        let mut st = self.state.lock();
-        let t = st.track?;
-        match &st.audio {
-            Some(a) => {
-                if !st.playing {
-                    // Reached the end.
-                    st.track = None;
-                    st.audio = None;
-                    return None;
-                }
-                Some((t, Some(st.pos / a.frames().max(1) as f64)))
-            }
-            None => Some((t, None)),
+        let st = self.state.lock();
+        let track = st.track?;
+        if st.playing {
+            let audio = st.audio.as_ref()?;
+            Some((track, Some(st.pos / audio.frames().max(1) as f64)))
+        } else {
+            st.pending.map(|_| (track, None))
         }
     }
 
@@ -214,6 +225,29 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_retires_the_preview_without_a_visible_row() {
+        let mut preview = Preview::default();
+        {
+            let mut st = preview.state.lock();
+            st.track = Some(1);
+            st.pending = Some(0.0);
+        }
+        assert!(preview.poll());
+        assert_eq!(preview.status(), Some((1, None)));
+        {
+            let mut st = preview.state.lock();
+            st.pending = None;
+            st.audio = Some(Arc::new(Decoded { sr: 44100, samples: vec![0.1; 8],
+                raw_frames: 4, damaged: 0, truncated: false }));
+            st.playing = true;
+            render(&mut st, &mut [0.0; 32], 2, 44100);
+        }
+        assert!(!preview.poll());
+        assert!(preview.state.lock().audio.is_none());
+        assert!(preview.state.lock().track.is_none());
+    }
 
     #[test]
     fn renders_resampled_and_stops_at_the_end() {
