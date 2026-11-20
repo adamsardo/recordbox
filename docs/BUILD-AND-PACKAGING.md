@@ -70,8 +70,12 @@ release bundle is not used as a substitute for verifying them again.
 
 The complete application suite and a **fresh dependency-advisory audit** still
 run on the tag.
-Publication requires those gates plus fresh verification of all four native
-archives and their matching smoke evidence. Only the native compilation/smoke
+Publication requires those gates plus fresh verification of the four standard
+archives and their matching smoke evidence. From v0.5.5, the Windows and Linux
+package jobs also supply CUDA 12 previews. The verifier checks their native
+executables, CUDA imports, Pascal FP32 kernels, setup guide and checksums.
+The one-song comparison runs on a physical GPU. [CUDA setup and test](CUDA12.md)
+Only the native compilation/smoke
 jobs are skipped when that complete trusted set was explicitly selected.
 If discovery finds no complete set or the API is unavailable, every native build
 and smoke job runs as before. Artifact expiry/deletion after selection fails
@@ -92,8 +96,8 @@ with links for that repository and version tag. Future release notes can copy
 this block: archive, checksum, history and packaging-guide links are refreshed
 for each release.
 
-`packaging/publish_release.py` creates a draft GitHub Release, uploads the four
-native archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploaded assets through
+`packaging/publish_release.py` creates a draft GitHub Release, uploads the
+standard and CUDA archives, `COMMIT-LOG.txt` and `SHA256SUMS`, and verifies the uploaded assets through
 the API before publishing it. Publication jobs are serialized; only a newer
 stable version can replace the latest release. Existing tags/releases must
 agree with the intended source/assets; publication must not move a tag or

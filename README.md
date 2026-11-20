@@ -76,6 +76,10 @@ ZIP or Linux x64 archive. Prebuilt packages do not require Rust; see the release
 notes and [installation guide](docs/BUILD-AND-PACKAGING.md) for requirements,
 checksums and known limits.
 
+For NVIDIA STEMS separation on Windows or Linux x64, choose the **CUDA 12**
+preview archive. It targets the Quadro P2000 and other compatible GPUs.
+[Setup and single-track comparison](docs/CUDA12.md)
+
 To build from source, install [Rust through rustup](https://rustup.rs). The
 repository selects the same toolchain as CI. Install your platform's native
 prerequisites from the [build guide](docs/BUILD-AND-PACKAGING.md), then:

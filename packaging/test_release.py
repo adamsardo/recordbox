@@ -29,6 +29,24 @@ class DownloadNotesTests(unittest.TestCase):
             self.assertIn(f"[`{name}`](https://github.com/fantuz/recordbox/releases/download/v0.5.0/{name})", body)
         self.assertIn("https://github.com/fantuz/recordbox/blob/v0.5.0/docs/BUILD-AND-PACKAGING.md", body)
 
+    def test_preview_links_start_with_the_first_cuda_release(self):
+        self.assertNotIn("-cuda12.", release.render_release_downloads(self.notes, "test/recordbox", "v0.5.4"))
+        body = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.5")
+        for target in ("windows-x86_64-cuda12.zip", "linux-x86_64-cuda12.tar.gz"):
+            self.assertIn(f"https://github.com/test/recordbox/releases/download/v0.5.5/Recordbox-0.5.5-{target}", body)
+
+    def test_preview_requires_both_pascal_kernels_and_nvidia_imports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "recordbox.exe"
+            imports = ["nvcuda.dll", "cublas64_12.dll"]
+            binary.write_bytes(b"MZ")
+            with self.assertRaises(package.PackageError):
+                package.check_cuda_binary(binary, imports, "windows")
+            binary.write_bytes(b".target sm_61\n.entry conv1d_f32(\n.entry softmax_f32(")
+            package.check_cuda_binary(binary, imports, "windows")
+            with self.assertRaises(package.PackageError):
+                package.check_cuda_binary(binary, ["nvcuda.dll"], "windows")
+
     def test_copied_download_block_refreshes_future_version_and_repository(self):
         old = release.render_release_downloads(self.notes, "fantuz/recordbox", "v0.5.0")
         body = release.render_release_downloads(old, "adamsardo/recordbox", "v0.6.0")

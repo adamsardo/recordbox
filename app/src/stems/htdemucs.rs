@@ -382,8 +382,11 @@ impl Graph {
         let q = self.linear_weight(q, &w.narrow(0, 0, c)?.contiguous()?, &bias.narrow(0, 0, c)?)?.reshape((b, l, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
         let kp = self.linear_weight(k, &w.narrow(0, c, c)?.contiguous()?, &bias.narrow(0, c, c)?)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
         let vp = self.linear_weight(k, &w.narrow(0, 2 * c, c)?.contiguous()?, &bias.narrow(0, 2 * c, c)?)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
-        let scores = (q.matmul(&kp.transpose(2, 3)?.contiguous()?)? / (head as f64).sqrt())?;
-        let y = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&vp)?.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, l, c))?;
+        // Limit the temporary attention scores on cards with a few GiB of VRAM.
+        // Each query still attends to every key, including across tile boundaries.
+        let rows = if q.device().is_cuda() { 256 } else { l };
+        let attended = attention_rows(&q, &kp.transpose(2, 3)?.contiguous()?, &vp, rows)?;
+        let y = attended.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, l, c))?;
         self.linear(&y, &format!("{name}.out_proj"))
     }
     fn transformer_layer(&self, q: &Tensor, k: Option<&Tensor>, name: &str) -> Result<Tensor> {
@@ -477,6 +480,34 @@ impl Graph {
         let temporal_wave = xt.reshape((b, 4, 2, TRAINING_FRAMES))?.broadcast_mul(&stdt.unsqueeze(1)?)?.broadcast_add(&meant.unsqueeze(1)?)?;
         (spectral_wave + temporal_wave)?.narrow(3, 0, original_len)?.contiguous()
     }
+}
+
+fn attention_rows(q: &Tensor, keys_t: &Tensor, values: &Tensor, rows: usize) -> Result<Tensor> {
+    let (_, _, len, width) = q.dims4()?;
+    let attend = |q: &Tensor| {
+        let scores = (q.matmul(keys_t)? / (width as f64).sqrt())?;
+        candle_nn::ops::softmax_last_dim(&scores)?.matmul(values)
+    };
+    if len <= rows {
+        return attend(q);
+    }
+    let mut parts = Vec::new();
+    for start in (0..len).step_by(rows) {
+        let block = q.narrow(2, start, rows.min(len - start))?.contiguous()?;
+        parts.push(attend(&block)?);
+    }
+    Tensor::cat(&parts, 2)
+}
+
+#[test]
+fn attention_tiles_include_all_keys_and_the_last_partial_tile() {
+    let q = Tensor::from_vec((0..60).map(|i| i as f32 / 30.).collect(), (1, 3, 5, 4), &Device::Cpu).unwrap();
+    let values = q.narrow(2, 0, 3).unwrap().contiguous().unwrap();
+    let keys_t = values.transpose(2, 3).unwrap().contiguous().unwrap();
+    let run = |rows| attention_rows(&q, &keys_t, &values, rows).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let (full, tiled) = (run(5), run(2));
+    assert_eq!(full.len(), tiled.len());
+    assert!(full.iter().zip(tiled).all(|(a, b)| (a - b).abs() < 1e-5));
 }
 
 /// How a track is cut up and what is returned.

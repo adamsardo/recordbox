@@ -280,7 +280,7 @@ class PublishTests(unittest.TestCase):
             self.publish()
         self.assertEqual(self.github.mutations, [])
         (self.directory / "assets" / "extra.zip").write_bytes(b"extra")
-        with self.assertRaisesRegex(publisher.ReleaseError, "exactly four"):
+        with self.assertRaisesRegex(publisher.ReleaseError, "every expected archive"):
             self.publish()
 
     def test_duplicate_checksum_entry_is_rejected(self):

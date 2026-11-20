@@ -179,7 +179,7 @@ jobs:
           - {os: windows-2022, platform: windows, arch: x86_64, binary: recordbox.exe}
           - {os: ubuntu-22.04, platform: linux, arch: x86_64, binary: recordbox}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.platform == 'macos' && 60 || 100 }}
     env:
       VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
       VCPKG_DISABLE_METRICS: '1'
@@ -325,6 +325,37 @@ jobs:
           archives=(dist/*.tar.gz)
           test "${#archives[@]}" -eq 1
           xvfb-run -a -s '-screen 0 1280x960x24' python packaging/smoke_app.py --archive "${archives[0]}" --output smoke --timeout 240
+      - name: Install CUDA 12.9 build components
+        if: runner.os != 'macOS'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: ${{ runner.os == 'Windows' && '["nvcc","cudart","nvrtc","nvrtc_dev","cublas","cublas_dev","curand","curand_dev"]' || '["nvcc","cudart-dev","nvrtc-dev","driver-dev","cccl"]' }}
+          non-cuda-sub-packages: ${{ runner.os == 'Linux' && '["libcublas-dev","libcurand-dev"]' || '[]' }}
+      - name: Build and package Linux CUDA STEMS preview
+        if: runner.os == 'Linux'
+        run: |
+          export LIBRARY_PATH="$CUDA_PATH/lib64/stubs:$CUDA_PATH/lib64"
+          python packaging/build_cuda12.py --target-dir app/target --output cuda-bin
+          python packaging/build_archive.py --binary cuda-bin/recordbox-cuda12 --cuda12 \
+            --platform linux --arch x86_64 --source-commit "$GITHUB_SHA" --output dist \
+            --runtime-notice /usr/share/doc/libssl3/copyright --runtime-notice /usr/share/doc/libasound2/copyright
+      - name: Build Windows CUDA STEMS preview with MSVC
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%V in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%V\VC\Auxiliary\Build\vcvars64.bat"
+          python packaging/build_cuda12.py --target-dir app/target --output cuda-bin
+      - name: Package Windows CUDA STEMS preview
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          python packaging/build_archive.py --binary cuda-bin/recordbox-cuda12.exe --cuda12
+          --platform windows --arch x86_64 --source-commit ${{ github.sha }} --output dist
+          --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin"
+          --runtime-dir "$env:RECORDBOX_VC_CRT"
+          --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
       - name: Upload archives and checksums
         if: ${{ !cancelled() && hashFiles('dist/*.sha256') != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

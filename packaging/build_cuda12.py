@@ -26,7 +26,11 @@ def pascal_kernel_copy(source, destination):
     old = b"moe_builder.build_lib("
     if script.count(old) != 1:
         raise ValueError("Missing Candle static kernel builder")
-    (destination / "build.rs").write_bytes(script.replace(old, b"moe_builder.compute_cap(80).build_lib("))
+    script = script.replace(old, b"moe_builder.compute_cap(80).build_lib(")
+    if os.name == "nt":
+        # rustc resolves -lmoe as moe.lib for the MSVC target.
+        script = script.replace(b'out_dir.join("libmoe.a")', b'out_dir.join("moe.lib")')
+    (destination / "build.rs").write_bytes(script)
     # A scalar half-precision atomic add first appeared on SM 7.0. HTDemucs
     # uses FP32 reductions. Keep all its ordinary SM 6.1 reduction kernels.
     reduce = destination / "src" / "reduce.cu"
