@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use crate::analysis::{analyze_file_on_worker, AnalysisResult, AnalysisSettings};
-use crate::audio::{decode_file, Decoded};
+use crate::audio::{decode_until, Decoded};
 use crate::model::Track;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -88,7 +88,10 @@ impl AnalysisPool {
                     None => { q.active -= 1; return; }
                 }
             };
-            let result = analyze_file_on_worker(&job.path, &job.settings).map_err(|e| e.to_string());
+            // A codec or DSP panic must retire this job and leave the other tracks runnable.
+            let result = std::panic::catch_unwind(|| analyze_file_on_worker(&job.path, &job.settings))
+                .map_err(|_| "track analysis panicked".to_owned())
+                .and_then(|result| result.map_err(|error| error.to_string()));
             let _ = results.send((job.track_id, result));
             pending.fetch_sub(1, Ordering::Release);
             ctx.request_repaint();
@@ -123,10 +126,10 @@ pub fn spawn_import(paths: Vec<std::path::PathBuf>, ctx: egui::Context) -> Recei
     rx
 }
 
-pub fn spawn_load(track_id: i64, path: String, ctx: egui::Context) -> Receiver<(i64, Result<Arc<Decoded>, String>)> {
+pub fn spawn_load(track_id: i64, path: String, ctx: egui::Context, cancel: Arc<AtomicBool>) -> Receiver<(i64, Result<Arc<Decoded>, String>)> {
     let (tx, rx) = unbounded();
     std::thread::spawn(move || {
-        let r = decode_file(&path).map(Arc::new).map_err(|e| e.to_string());
+        let r = decode_until(&path, || cancel.load(Ordering::Relaxed)).map(Arc::new).map_err(|e| e.to_string());
         let _ = tx.send((track_id, r));
         ctx.request_repaint();
     });

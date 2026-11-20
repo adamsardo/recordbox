@@ -170,6 +170,12 @@ impl Col {
     }
 }
 
+impl Prefs {
+    fn auto_stems_on_load(&self, gpu: bool) -> bool {
+        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -233,6 +239,8 @@ pub struct Prefs {
     pub ch_fader_curve: u8,
     /// Separate a track when it is loaded, as rekordbox does while its STEMS function is on.
     pub stems_auto_separate: bool,
+    /// Also start uncached model inference on Load when no accelerator is available.
+    pub stems_auto_cpu: bool,
     /// Most disk space the kept stems may use, in GB (the least recently used go first).
     pub stem_cache_gb: u32,
     /// Import play histories from connected devices automatically.
@@ -489,6 +497,38 @@ impl Default for RelatedRules {
 #[cfg(test)]
 mod prefs_tests {
     #[test]
+    fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
+        let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
+        assert!(!p.auto_stems_on_load(false));
+        assert!(p.auto_stems_on_load(true));
+        p.stems_auto_cpu = true;
+        assert!(p.auto_stems_on_load(false));
+        p.stems_auto_separate = false;
+        assert!(!p.auto_stems_on_load(false));
+        assert!(!p.auto_stems_on_load(true));
+        p.show_stems = false;
+        p.stems_auto_separate = true;
+        assert!(!p.auto_stems_on_load(false));
+    }
+
+    #[test]
+    fn separation_is_cancelled_when_the_last_deck_releases_its_track() {
+        use std::sync::atomic::Ordering;
+        let mut state = super::StemState::new();
+        state.separating = Some((4, 0.25));
+        state.pending = Some(9);
+        state.retain_deck_tracks([None, Some(9), None, Some(4)]);
+        assert!(!state.cancel.load(Ordering::Relaxed));
+        state.retain_deck_tracks([None, Some(9), None, None]);
+        assert!(state.cancel.load(Ordering::Relaxed));
+        assert_eq!(state.pending, Some(9));
+        assert!(state.separating.is_some(), "another model must wait until the cancelled worker exits");
+        state.retain_deck_tracks([None; 4]);
+        assert!(state.pending.is_none());
+        assert!(!state.download_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn unknown_settings_survive_a_save() {
         let json = r#"{"tooltips": false, "future_setting": {"a": 1}, "another": [1, 2]}"#;
         let p: super::Prefs = serde_json::from_str(json).unwrap();
@@ -740,6 +780,7 @@ impl Default for Prefs {
             eq_isolator: false,
             ch_fader_curve: 1,
             stems_auto_separate: true,
+            stems_auto_cpu: false,
             stem_cache_gb: 20,
             import_device_history: true,
             keymap: Default::default(),
@@ -842,6 +883,7 @@ pub enum StemMsg {
     Download(u64, u64),
     DownloadDone(Result<(), String>),
     Progress(i64, f32),
+    Cached(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
     Done(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
 }
 
@@ -856,15 +898,25 @@ pub struct StemState {
     pub error: Option<String>,
     /// Track to separate as soon as the model download finishes.
     pub pending: Option<i64>,
-    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub tx: crossbeam_channel::Sender<StemMsg>,
     pub rx: crossbeam_channel::Receiver<StemMsg>,
 }
 
 impl StemState {
+    fn retain_deck_tracks(&mut self, tracks: [Option<i64>; 4]) {
+        if self.separating.is_some_and(|(id, _)| !tracks.contains(&Some(id))) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.pending.is_some_and(|id| !tracks.contains(&Some(id))) {
+            self.pending = None;
+        }
+    }
+
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), tx, rx }
+        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), download_cancel: Default::default(), tx, rx }
     }
 }
 
@@ -913,6 +965,7 @@ pub enum SideMode {
 }
 
 pub struct Deck {
+    pub cancel_work: Arc<std::sync::atomic::AtomicBool>,
     /// Phrase structure shown under the overview (rekordbox's own, or Recordbox's).
     pub phrases: Option<crate::phrase::Structure>,
     /// Phrase analysis running in the background for (track id).
@@ -958,6 +1011,7 @@ pub struct Deck {
 impl Default for Deck {
     fn default() -> Self {
         Deck {
+            cancel_work: Default::default(),
             phrases: None,
             phrases_rx: None,
             rb_wave: None,
@@ -1131,6 +1185,7 @@ mod collection_category_tests {
 }
 
 pub struct App {
+    pub deck_options: crate::DeckOptions,
     pub db: Db,
     pub prefs: Prefs,
     pub tracks: Vec<Track>,
@@ -1239,7 +1294,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>) -> App {
+    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
         crate::theme::apply(&cc.egui_ctx);
         // SVG images (the recordbox logo).
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -1273,6 +1328,7 @@ impl App {
         let audio_device = prefs.audio_device.clone();
         let pool = AnalysisPool::new(cc.egui_ctx.clone(), prefs.analysis_threads);
         let mut app = App {
+            deck_options,
             db,
             prefs,
             tracks: vec![],
@@ -1313,7 +1369,7 @@ impl App {
             filter_color: 0,
             filter_tags: HashSet::new(),
             filter_tags_all: false,
-            player: Player::with_device(audio_device.as_deref()),
+            player: Player::with_device(audio_device.as_deref(), !deck_options.disable_play),
             px: Default::default(),
             load_target: 0,
             deck: Deck::default(),
@@ -2235,6 +2291,7 @@ impl App {
         let beats = self.deck.beats.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
             let from_rb = base.and_then(|b| {
                 let dat = b.with_extension("DAT");
@@ -2244,7 +2301,7 @@ impl App {
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
             });
-            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
+            let r = from_rb.or_else(|| if beats.is_empty() || cancel.load(std::sync::atomic::Ordering::Relaxed) { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2263,13 +2320,14 @@ impl App {
             return;
         }
         let Some(id) = self.deck.track else { return };
-        if self.vocal_failed.contains(&id) {
+        if self.vocal_failed.contains(&id) || self.stem.loading == Some(id) || self.stem.separating.is_some_and(|(track, _)| track == id) {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
-            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
+            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| !cancel.load(std::sync::atomic::Ordering::Relaxed)).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2527,7 +2585,7 @@ impl App {
         let ctx = self.ctx.clone();
         let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
         let auto = self.prefs.stems_auto_download;
-        let cancel = self.stem.cancel.clone();
+        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let hw = crate::stems::assess();
             let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
@@ -2555,12 +2613,12 @@ impl App {
         if self.stem.downloading.is_some() {
             return;
         }
-        self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stem.download_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stem.downloading = Some((0, 0));
         self.stem.error = None;
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
-        let cancel = self.stem.cancel.clone();
+        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
@@ -2582,24 +2640,34 @@ impl App {
     /// the background, during which the original plays. A separation still running for a
     /// track that is no longer on a deck is stopped.
     fn stems_for_loaded(&mut self, id: i64) {
-        if let Some((sid, _)) = self.stem.separating {
-            if sid != id && !(0..self.deck_count()).any(|n| self.deck_of(n).track == Some(sid)) {
-                self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                self.stem.separating = None;
-            }
-        }
+        if self.deck.audio.is_none() { return; }
         if self.load_cached_stems(id) {
             return;
         }
         let quiet = self.screenshot.is_some() && std::env::var("PREPDECK_SHOT_STEMS").is_err();
         let ready = self.stem.model.as_deref().and_then(crate::stems::spec).map(crate::stems::model_ready).unwrap_or(false);
-        if self.prefs.show_stems && self.prefs.stems_auto_separate && ready && !quiet && self.deck.track == Some(id) {
+        if self.prefs.auto_stems_on_load(self.stem.hw.as_ref().is_some_and(|h| h.gpu)) && ready && !quiet && self.deck.track == Some(id) {
             self.separate_loaded();
+        }
+    }
+
+    /// Keep work shared by two decks until the last one releases the track.
+    pub(crate) fn cancel_orphaned_stems(&mut self) {
+        let tracks = std::array::from_fn(|n| self.deck_of(n as u8).track);
+        self.stem.retain_deck_tracks(tracks);
+    }
+
+    fn resume_pending_stems(&mut self) {
+        if let Some(id) = self.stem.pending.take() {
+            if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
+                self.with_deck(deck, |app| app.separate_loaded());
+            }
         }
     }
 
     /// Start reading a track's kept stems, if it has any (false: it has none).
     fn load_cached_stems(&mut self, id: i64) -> bool {
+        if self.stem.loading == Some(id) { return true; }
         let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return false };
         let path = crate::stems::cache_path(&t.path, &model);
         if !path.exists() {
@@ -2610,7 +2678,7 @@ impl App {
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let r = crate::stems::load(&path).map(std::sync::Arc::new).map_err(|e| e.to_string());
-            let _ = tx.send(StemMsg::Done(id, r));
+            let _ = tx.send(StemMsg::Cached(id, r));
             ctx.request_repaint();
         });
         true
@@ -2619,7 +2687,13 @@ impl App {
     /// Separate the loaded track (downloading the model first if it is missing).
     pub fn separate_loaded(&mut self) {
         let Some(id) = self.deck.track else { return };
-        if self.stem.separating.is_some() || self.stem.loading == Some(id) {
+        if let Some((active, _)) = self.stem.separating {
+            if active != id || self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                self.stem.pending = Some(id);
+            }
+            return;
+        }
+        if self.stem.loading == Some(id) {
             return;
         }
         let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else {
@@ -2640,17 +2714,26 @@ impl App {
         // cannot stop the next.
         let cancel: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
         self.stem.cancel = cancel.clone();
+        let audio = self.deck.audio.clone();
         let cache_limit = self.prefs.stem_cache_gb as u64 * 1_000_000_000;
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().name("rb-stems".into()).spawn(move || {
             let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
-                let dec = crate::audio::decode_file(&t.path)?;
-                let tx2 = tx.clone();
-                let ctx2 = ctx.clone();
+                let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+                let dec = match audio {
+                    Some(audio) => audio,
+                    None => Arc::new(crate::audio::decode_until(&t.path, cancelled)?),
+                };
+                let mut last_progress = 0.0;
                 let st = crate::stems::separate(m, &dec.samples, dec.sr, &mut |p| {
-                    let _ = tx2.send(StemMsg::Progress(id, p));
-                    ctx2.request_repaint();
-                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    if cancelled() { return false; }
+                    if p > last_progress {
+                        last_progress = p;
+                        let _ = tx.send(StemMsg::Progress(id, p));
+                        ctx.request_repaint();
+                    }
+                    true
                 })?;
+                if cancelled() { anyhow::bail!("stopped"); }
                 let kept = crate::stems::cache_path(&t.path, m.id);
                 let _ = crate::stems::save(&kept, &st);
                 crate::stems::trim_cache(cache_limit, &kept);
@@ -2659,9 +2742,15 @@ impl App {
             let _ = tx.send(StemMsg::Done(id, run().map_err(|e| e.to_string())));
             ctx.request_repaint();
         });
+        if let Err(e) = worker {
+            self.stem.separating = None;
+            self.stem.error = Some(format!("Could not start stem separation: {e}"));
+        }
     }
 
     pub fn stop_separation(&mut self) {
+        self.stem.pending = None;
+        self.stem.download_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -2700,15 +2789,10 @@ impl App {
                     match r {
                         Ok(()) => {
                             self.stem.model_ready = true;
-                            if let Some(id) = self.stem.pending.take() {
-                                if self.deck.track == Some(id) {
-                                    self.separate_loaded();
-                                }
-                            }
+                            self.resume_pending_stems();
                         }
                         Err(e) if e == "stopped" => {
                             self.stem.pending = None;
-                            self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
                             self.stem.error = Some(format!("Model download failed: {e}"));
@@ -2722,36 +2806,44 @@ impl App {
                         self.stem.separating = Some((id, p));
                     }
                 }
-                StemMsg::Done(id, r) => {
-                    if self.stem.separating.map(|s| s.0) == Some(id) {
-                        self.stem.separating = None;
+                StemMsg::Cached(id, result) => {
+                    if self.stem.loading == Some(id) { self.stem.loading = None; }
+                    self.apply_stems(id, result);
+                }
+                StemMsg::Done(id, result) => {
+                    self.stem.separating = None;
+                    if !self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.apply_stems(id, result);
                     }
-                    if self.stem.loading == Some(id) {
-                        self.stem.loading = None;
-                    }
-                    match r {
-                        Ok(st) => {
-                            // Separated stems give vocal detection for free.
-                            if self.db.vocal(id).is_none() && st.len > 0 {
-                                let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
-                                let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
-                                // The mix is the sum of the four stems.
-                                let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
-                                let levels = crate::stems::vocal_levels(&mono, &mix);
-                                let _ = self.db.save_vocal(id, &levels);
-                                if self.deck.track == Some(id) && self.deck.vocal.is_none() {
-                                    self.deck.vocal = Some(std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels)));
-                                }
-                            }
-                            if self.deck.track == Some(id) {
-                                self.player.state.lock().stems = Some(st);
-                            }
-                        }
-                        Err(e) if e == "stopped" => self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed),
-                        Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
-                    }
+                    self.resume_pending_stems();
                 }
             }
+        }
+    }
+
+    fn apply_stems(&mut self, id: i64, result: Result<Arc<crate::stems::Stems>, String>) {
+        if !(0..4).any(|n| self.deck_of(n).track == Some(id)) { return; }
+        match result {
+            Ok(st) => {
+                // Separated stems give vocal detection for free.
+                if self.db.vocal(id).is_none() && st.len > 0 {
+                    let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
+                    let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+                    // The mix is the sum of the four stems.
+                    let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
+                    let levels = crate::stems::vocal_levels(&mono, &mix);
+                    let _ = self.db.save_vocal(id, &levels);
+                    let vocal = Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels));
+                    for n in 0..4 {
+                        let deck = self.deck_of_mut(n);
+                        if deck.track == Some(id) && deck.vocal.is_none() { deck.vocal = Some(vocal.clone()); }
+                    }
+                }
+                for n in 0..4 {
+                    if self.deck_of(n).track == Some(id) { self.player.decks[n as usize].lock().stems = Some(st.clone()); }
+                }
+            }
+            Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
         }
     }
 
@@ -3360,7 +3452,7 @@ impl App {
         }
     }
     pub fn set_playing(&mut self, p: bool) {
-        self.player.state.lock().playing = p && self.deck.audio.is_some();
+        self.player.state.lock().playing = p && !self.deck_options.disable_play && self.deck.audio.is_some();
     }
 
     /// Load a track into the load-target deck (`load_target`; deck A outside 2 Players).
@@ -3370,6 +3462,9 @@ impl App {
 
     /// Load a track into the active deck.
     pub fn load_track_here(&mut self, id: i64) {
+        if self.deck_options.disable_load {
+            return self.toast_err("Deck loading is disabled for this session (--disable-load).");
+        }
         // Eject/Load Lock (Performance): not while the deck plays, unless it stands at the end.
         if self.performance() && self.prefs.deck_load_lock && self.playing() && self.pos() < self.deck.duration - 0.05 {
             self.toast_err("Load Lock. Not available during playback.");
@@ -3402,6 +3497,7 @@ impl App {
             s.gain = g;
             keep
         };
+        self.deck.cancel_work.store(true, std::sync::atomic::Ordering::Relaxed);
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
         let metronome = self.deck.metronome;
@@ -3422,7 +3518,7 @@ impl App {
         self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         let first_mem = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).fold(f64::NAN, f64::min);
         self.deck.cue_point = if first_mem.is_nan() { self.deck.beats.first().map(|b| b.time).unwrap_or(0.0) } else { first_mem };
-        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone()));
+        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone(), self.deck.cancel_work.clone()));
         {
             let mut st = self.player.state.lock();
             st.stems = None;
@@ -3431,7 +3527,7 @@ impl App {
                 st.stem_on = [true; 4];
             }
         }
-        self.stems_for_loaded(id);
+        self.cancel_orphaned_stems();
         if t.analyzed == 0 {
             self.analyze(&[id], false);
         }
@@ -3462,18 +3558,27 @@ impl App {
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
                     self.deck.phrases = None;
+                    self.stems_for_loaded(id);
                     self.start_deck_phrases(a.clone());
                     self.start_deck_vocal(a.clone());
                     self.instant_double();
                 }
                 Err(e) => {
-                    if let Some((old, pos, gain)) = self.deck_backup.take() {
+                    let backup = self.deck_backup.take();
+                    self.unload_track();
+                    if let Some((old, pos, gain)) = backup {
                         let mut s = self.player.state.lock();
                         s.audio = old.audio.clone();
                         s.pos = pos;
                         s.gain = gain;
                         drop(s);
                         self.deck = old;
+                        self.deck.cancel_work = Default::default();
+                        if let (Some(id), Some(audio)) = (self.deck.track, self.deck.audio.clone()) {
+                            self.stems_for_loaded(id);
+                            if self.deck.phrases.is_none() { self.start_deck_phrases(audio.clone()); }
+                            if self.deck.vocal.is_none() { self.start_deck_vocal(audio); }
+                        }
                     }
                     self.toast_err(format!("This file cannot be played: {e}"));
                 }
@@ -3545,6 +3650,7 @@ impl App {
         } else {
             let p = self.pos();
             if (p - self.deck.cue_point).abs() < 0.01 {
+                if self.deck_options.disable_play { return; }
                 self.deck.cue_preview = true;
                 self.set_playing(true);
             } else {
@@ -3563,6 +3669,9 @@ impl App {
         }
     }
     pub fn play_pause(&mut self) {
+        if self.deck_options.disable_play {
+            return self.toast_err("Playback is disabled for this session (--disable-play).");
+        }
         if self.deck.audio.is_none() {
             return;
         }
@@ -4157,11 +4266,7 @@ impl App {
         let _ = self.db.conn.execute_batch("COMMIT");
         for id in ids {
             if self.deck.track == Some(*id) {
-                let mut s = self.player.state.lock();
-                s.playing = false;
-                s.audio = None;
-                drop(s);
-                self.deck = Deck::default();
+                self.unload_track();
             }
         }
         self.selected.clear();

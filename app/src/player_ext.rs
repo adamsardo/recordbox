@@ -534,7 +534,7 @@ impl App {
             let mut s = self.player.state.lock();
             if s.audio.as_ref().map(|a| a.sr) == rate {
                 s.pos = pos;
-                s.playing = playing;
+                s.playing = playing && !self.deck_options.disable_play;
             }
         }
         self.push_deck_controls();
@@ -1185,7 +1185,7 @@ impl App {
     /// Hold a SEARCH button: -1 backward, +1 forward, 0 released.
     pub fn search(&mut self, dir: i32) {
         let mut s = self.player.state.lock();
-        s.search = if s.audio.is_some() { dir.signum() as f64 * SEARCH_SPEED } else { 0.0 };
+        s.search = if !self.deck_options.disable_play && s.audio.is_some() { dir.signum() as f64 * SEARCH_SPEED } else { 0.0 };
     }
 
     pub fn searching(&self) -> i32 {
@@ -1201,6 +1201,7 @@ impl App {
 
     /// Empty the active deck (click on the artwork).
     pub fn unload_track(&mut self) {
+        self.deck.cancel_work.store(true, std::sync::atomic::Ordering::Relaxed);
         {
             let mut s = self.player.state.lock();
             s.playing = false;
@@ -1216,6 +1217,7 @@ impl App {
         let x = self.deck.x.carried();
         self.deck = Deck { ctrl_tab, panel_tab, metronome, x, ..Deck::default() };
         self.deck_backup = None;
+        self.cancel_orphaned_stems();
     }
 
     // ------------------------------------------------------------------ cues and loops at a position

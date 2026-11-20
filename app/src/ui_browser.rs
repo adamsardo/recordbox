@@ -1538,7 +1538,7 @@ fn explorer_list(app: &mut App, ui: &mut Ui, dir: &str) {
             if resp.clicked() {
                 sel = Some(fs.clone());
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !app.deck_options.disable_load {
                 match in_col {
                     Some(id) => app.load_track(id),
                     None => {

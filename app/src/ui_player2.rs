@@ -202,6 +202,7 @@ pub fn manual_loop_buttons(app: &mut App, ui: &mut Ui, at: impl Fn(f32, f32) -> 
 
 /// A track dragged from a list and released over `rect` is loaded into the active deck.
 pub fn drop_to_load(app: &mut App, ui: &mut Ui, rect: Rect) {
+    if app.deck_options.disable_load { return; }
     let Some(ids) = app.drag.clone() else { return };
     let Some(pp) = ui.ctx().pointer_latest_pos() else { return };
     if !rect.contains(pp) {
@@ -532,9 +533,7 @@ pub(crate) fn cue_play(app: &mut App, ui: &mut Ui, cue_c: Pos2, play_c: Pos2, ra
         app.cue_up();
     }
     let _ = tip(cr, app, "Set a Cue point if you click during pause. \nMove to the Cue point if you click during playback.");
-    let pr = ui.interact(Rect::from_center_size(play_c, size), ui.id().with("playbtn"), Sense::click());
-    crate::ui_player::play_button_face(&p, play_c, dia, playing, pr.hovered());
-    if tip(pr, app, "Play/Pause").clicked() {
+    if crate::ui_player::play_control(app, ui, play_c, size, dia) {
         app.play_pause_synced();
     }
 }
@@ -1097,9 +1096,7 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
     p.rect_filled(Rect::from_min_max(pos2(l, t + 1.0), pos2(l + 58.0, full.max.y)), 0.0, BG2);
     // PLAY
     let play_c = pos2(l + 29.0, t + 30.0);
-    let pr = ui.interact(Rect::from_center_size(play_c, vec2(42.0, 42.0)), ui.id().with("playbtn"), Sense::click());
-    crate::ui_player::play_button_face(&p, play_c, 40.0, app.playing(), pr.hovered());
-    if tip(pr, app, "Play/Pause").clicked() {
+    if crate::ui_player::play_control(app, ui, play_c, vec2(42.0, 42.0), 40.0) {
         app.play_pause();
     }
     let track = app.deck.track.and_then(|id| app.track(id)).cloned();

@@ -52,7 +52,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 113] = [
+const SETTINGS: [(u8, usize, &str); 116] = [
     (7, 2, "Apply CFX to Sampler using MIC COLOR control knob."),
     (7, 3, "SLOT"),
     (7, 3, "Do not overwrite the loaded Slot."),
@@ -164,6 +164,9 @@ const SETTINGS: [(u8, usize, &str); 113] = [
     (6, 0, "MUTE / SOLO"),
     (6, 0, "Reset the MUTE/SOLO state while loading"),
     (6, 0, "Stem separation model"),
+    (6, 0, "Allow automatic separation on CPU"),
+    (0, 0, "Playback animation"),
+    (1, 0, "Analysis workers"),
     (2, 6, "Supported devices"),
     (0, 0, "Tooltips"),
 ];
@@ -1953,7 +1956,10 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
         toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
-        note(ui, "As rekordbox does while its STEMS function is on. The original plays until the parts are ready. Off: a track is separated when you first press one of its part buttons.");
+        ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
+            toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+        });
+        note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {

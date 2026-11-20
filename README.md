@@ -100,10 +100,10 @@ for installation, system requirements, current platform limitations and the
 checks maintainers can enable. Version tags publish validated packages to GitHub
 Releases; the application packages remain unsigned.
 
-For Linux/Intel playback CPU measurements, see the
-[playback performance guide](docs/PLAYBACK-PERFORMANCE.md). Its synthetic
-benchmarks exercise one-deck rendering and waveform drawing without personal
-music or audio hardware.
+On Linux, run `./recordbox --disable-load` to keep tracks out of the decks, or
+`./recordbox --disable-play` to inspect a loaded track with audio disabled.
+Both switches may be combined. For automatic STEMS separation, analysis workers
+and one-deck CPU measurements, see the [performance guide](docs/PLAYBACK-PERFORMANCE.md).
 
 ## The brief
 

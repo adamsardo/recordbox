@@ -88,6 +88,11 @@ pub fn mp3_timing_class(path: &str) -> Mp3Timing {
 
 /// Decode a whole file. The source file is only read.
 pub fn decode_file(path: &str) -> Result<Decoded> {
+    decode_until(path, || false)
+}
+
+pub fn decode_until(path: &str, cancelled: impl Fn() -> bool) -> Result<Decoded> {
+    if cancelled() { anyhow::bail!("stopped"); }
     let file = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -119,6 +124,7 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     let mut sbuf: Option<SampleBuffer<f32>> = None;
     let mut damaged = 0usize;
     loop {
+        if cancelled() { anyhow::bail!("stopped"); }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(symphonia::core::errors::Error::IoError(_)) => break,
@@ -355,6 +361,7 @@ pub struct Player {
     /// Set by the stream when its device stops working (unplugged, switched off).
     pub lost: Arc<std::sync::atomic::AtomicBool>,
     stream: Option<cpal::Stream>,
+    output_enabled: bool,
     idle_since: Option<std::time::Instant>,
     parked: bool,
     pub device_rate: u32,
@@ -364,18 +371,19 @@ pub struct Player {
 impl Player {
     #[allow(dead_code)]
     pub fn new() -> Player {
-        Self::with_device(None)
+        Self::with_device(None, true)
     }
 
     /// Open the named output device (None: the system's default output).
-    pub fn with_device(device: Option<&str>) -> Player {
+    pub fn with_device(device: Option<&str>, output_enabled: bool) -> Player {
         let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
         let state = decks[0].clone();
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match Self::open_stream(decks.clone(), device, lost.clone()) {
-            Ok((s, rate)) => Player { state, decks, lost, stream: Some(s), idle_since: None, parked: false, device_rate: rate, error: None },
-            Err(e) => Player { state, decks, lost, stream: None, idle_since: None, parked: false, device_rate: 44100, error: Some(e.to_string()) },
+        let mut player = Player { state, decks, lost, stream: None, output_enabled, idle_since: None, parked: false, device_rate: 44100, error: None };
+        if let Err(e) = player.switch_device(device) {
+            player.error = Some(e.to_string());
         }
+        player
     }
 
     /// Names of the output devices this Mac offers. Listing devices can block indefinitely on
@@ -405,6 +413,7 @@ impl Player {
 
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
+        if !self.output_enabled { return Ok(()); }
         let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone())?;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stream = Some(s);
@@ -427,6 +436,7 @@ impl Player {
     #[cfg(target_os = "linux")]
     pub fn service_output(&mut self, keep_ready: bool, running: bool, device: Option<&str>) -> Result<Option<std::time::Duration>> {
         use std::time::{Duration, Instant};
+        if !self.output_enabled { return Ok(None); }
         if keep_ready || running {
             self.idle_since = None;
             if self.parked || (running && self.stream.is_none() && !self.lost.load(std::sync::atomic::Ordering::Relaxed)) {

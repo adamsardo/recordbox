@@ -585,6 +585,7 @@ impl App {
     // ---------------------------------------------------------------- preview
     /// Audition `track` from `frac` (0–1) of its length without loading it.
     pub fn preview_play(&mut self, track: i64, frac: f64) {
+        if self.deck_options.disable_play { return self.toast_err("Preview is disabled for this session (--disable-play)."); }
         let Some(t) = self.track(track).cloned() else { return };
         if t.missing {
             return self.toast_err("File can not be found at the registered location.\nSelect [Relocate] from the right-click menu to register it again.");
