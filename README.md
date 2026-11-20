@@ -80,7 +80,7 @@ preview archive. It targets the Quadro P2000 and other compatible GPUs.
 [CUDA setup and single-track comparison](docs/CUDA12.md)
 
 For a Radeon Vega 8 or another AMD adapter with a DirectX 12 driver, choose
-the **Windows x64 Radeon DirectML** preview ZIP. It includes the inference runtime.
+the **Windows x64 Radeon DirectML** preview ZIP. It includes the inference runtime. Vega 8 driver 26.20.14048.2 and older use manual CPU separation after a full-model GPU hang was reported.
 [Check your adapter and compare one song](docs/DIRECTML.md)
 
 To build from source, install [Rust through rustup](https://rustup.rs). The

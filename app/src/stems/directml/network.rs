@@ -5,7 +5,7 @@ use bumpalo::Bump;
 use candle_core::Tensor;
 use onnx_rs::ast::*;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(super) const BINS: usize = 2048;
 const WIDTH: i64 = 512;
@@ -264,7 +264,15 @@ impl<'a> Network<'a> {
         );
         self.norm(x, &format!("{p}.norm_out"), &[1, 2], false)
     }
-    fn htdemucs(&self) {
+    fn htdemucs(&self) -> Vec<Boundary<'a>> {
+        let mut boundaries = Vec::new();
+        let mut finish = |label, outputs| {
+            boundaries.push(Boundary {
+                label,
+                end: self.graph.borrow().node.len(),
+                outputs,
+            })
+        };
         let frames = Stft::frames(TRAINING_FRAMES) as i64;
         let mut freq = BINS as i64;
         let mut len = TRAINING_FRAMES as i64;
@@ -304,6 +312,13 @@ impl<'a> Network<'a> {
                 x = self.math("Add", &[x, self.math("Mul", &[emb, "two"])]);
             }
             skips.push((x, t, channels, freq, original, extra));
+            finish(
+                ["Encoder 1", "Encoder 2", "Encoder 3", "Encoder 4"][i],
+                [
+                    tensor_info(x, &[1, channels, freq, frames]),
+                    tensor_info(t, &[1, channels, len]),
+                ],
+            );
         }
         let tokens = freq * frames;
         x = self.reshape(x, &[1, 384, tokens]);
@@ -328,6 +343,13 @@ impl<'a> Network<'a> {
             "Add",
             &[self.norm(t, "crosstransformer.norm_in_t", &[-1], false), "pos1"],
         );
+        let transformer_outputs = |x, t| {
+            [
+                tensor_info(x, &[1, tokens, WIDTH]),
+                tensor_info(t, &[1, len, WIDTH]),
+            ]
+        };
+        finish("Transformer inputs", transformer_outputs(x, t));
         for i in 0..5 {
             let cross = i % 2 == 1;
             let old_x = x;
@@ -342,6 +364,16 @@ impl<'a> Network<'a> {
                 len,
                 cross.then_some((old_x, tokens)),
                 &format!("crosstransformer.layers_t.{i}"),
+            );
+            finish(
+                [
+                    "Transformer 1",
+                    "Transformer 2",
+                    "Transformer 3",
+                    "Transformer 4",
+                    "Transformer 5",
+                ][i],
+                transformer_outputs(x, t),
             );
         }
         x = self.transpose(self.reshape(x, &[1, frames, freq, WIDTH]), &[0, 3, 2, 1]);
@@ -381,33 +413,60 @@ impl<'a> Network<'a> {
             if i < 3 {
                 x = self.gelu(x);
                 t = self.gelu(t);
+                finish(
+                    ["Decoder 1", "Decoder 2", "Decoder 3"][i],
+                    [
+                        tensor_info(x, &[1, channels / 2, f * 4, frames]),
+                        tensor_info(t, &[1, channels / 2, original]),
+                    ],
+                );
             }
         }
         self.node("Identity", &[x], &["spec_out"], vec![]);
         self.node("Identity", &[t], &["wave_out"], vec![]);
-        self.graph.borrow_mut().output = vec![
+        let outputs = [
             tensor_info("spec_out", &[1, 16, BINS as i64, frames]),
             tensor_info("wave_out", &[1, 8, len]),
         ];
-    }
-    fn encode(self) -> Vec<u8> {
-        onnx_rs::encode(&Model {
-            ir_version: 8,
-            producer_name: "Recordbox",
-            opset_import: vec![OperatorSetId {
-                domain: "",
-                version: 13,
-            }],
-            graph: Some(self.graph.into_inner()),
-            ..Default::default()
-        })
+        self.graph.borrow_mut().output = outputs.to_vec();
+        finish("Decoder 4", outputs);
+        boundaries
     }
 }
 
-pub(super) fn model(weights: HashMap<String, Tensor>, query_tile: i64) -> candle_core::Result<Vec<u8>> {
+struct Boundary<'a> {
+    label: &'static str,
+    end: usize,
+    outputs: [ValueInfo<'a>; 2],
+}
+
+pub(super) struct ModelPart {
+    pub label: &'static str,
+    pub bytes: Vec<u8>,
+    pub inputs: Vec<String>,
+}
+
+fn onnx_model(graph: Graph<'_>) -> Model<'_> {
+    Model {
+        ir_version: 8,
+        producer_name: "Recordbox",
+        opset_import: vec![OperatorSetId {
+            domain: "",
+            version: 13,
+        }],
+        graph: Some(graph),
+        ..Default::default()
+    }
+}
+
+pub(super) fn model_parts(
+    weights: HashMap<String, Tensor>,
+    query_tile: i64,
+    staged: bool,
+) -> anyhow::Result<Vec<ModelPart>> {
     let names = Bump::new();
     let net = Network::new(&names, query_tile);
-    net.htdemucs();
+    let boundaries = net.htdemucs();
     for (name, tensor) in weights {
         let dims = tensor.dims().iter().map(|&d| d as i64).collect::<Vec<_>>();
         net.floats(
@@ -416,7 +475,57 @@ pub(super) fn model(weights: HashMap<String, Tensor>, query_tile: i64) -> candle
             tensor.flatten_all()?.to_vec1::<f32>()?,
         );
     }
-    Ok(net.encode())
+    let graph = net.graph.into_inner();
+    if !staged {
+        let inputs = graph.input.iter().map(|v| v.name.to_owned()).collect();
+        return Ok(vec![ModelPart {
+            label: "HTDemucs network",
+            inputs,
+            bytes: onnx_rs::encode(&onnx_model(graph)),
+        }]);
+    }
+    // Each boundary exposes the two branch activations. Encoder outputs also feed the
+    // matching decoder through skip connections. Constants and weights stay in the graph.
+    let mut shapes: HashMap<_, _> = graph.input.into_iter().map(|v| (v.name, v)).collect();
+    let mut tensors: HashMap<_, _> = graph.initializer.into_iter().map(|t| (t.name(), t)).collect();
+    let mut nodes = graph.node.into_iter();
+    let mut start = 0;
+    let mut parts = Vec::with_capacity(boundaries.len());
+    for Boundary { label, end, outputs } in boundaries {
+        let mut part = Graph {
+            name: label,
+            output: outputs.to_vec(),
+            ..Default::default()
+        };
+        let mut seen = HashSet::new();
+        for node in nodes.by_ref().take(end - start) {
+            for &name in &node.input {
+                if name.is_empty() || !seen.insert(name) {
+                    continue;
+                }
+                if let Some(tensor) = tensors.remove(name) {
+                    part.initializer.push(tensor);
+                } else if let Some(info) = shapes.get(name) {
+                    part.input.push(info.clone());
+                } else {
+                    anyhow::bail!("Missing {label} input {name}");
+                }
+            }
+            seen.extend(node.output.iter().copied());
+            part.node.push(node);
+        }
+        start = end;
+        let inputs = part.input.iter().map(|v| v.name.to_owned()).collect();
+        // Return the initializers to the pool after encoding. Weights move between the
+        // pool and the graph, so partitioning does not clone their backing arrays.
+        let mut model = onnx_model(part);
+        let bytes = onnx_rs::encode(&model);
+        let encoded = model.graph.take().expect("constructed with a graph");
+        tensors.extend(encoded.initializer.into_iter().map(|t| (t.name(), t)));
+        shapes.extend(outputs.into_iter().map(|v| (v.name, v)));
+        parts.push(ModelPart { label, bytes, inputs });
+    }
+    Ok(parts)
 }
 
 pub(super) fn probe_model() -> Vec<u8> {
@@ -429,5 +538,5 @@ pub(super) fn probe_model() -> Vec<u8> {
     let flat = net.reshape(conv, &[1, 2]);
     net.node("MatMul", &[flat, "column"], &["result"], vec![]);
     net.graph.borrow_mut().output = vec![tensor_info("result", &[1, 1])];
-    net.encode()
+    onnx_rs::encode(&onnx_model(net.graph.into_inner()))
 }

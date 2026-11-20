@@ -2770,6 +2770,7 @@ impl App {
 
     fn resume_pending_stems(&mut self) {
         if let Some((id, execution)) = self.stem.pending.take() {
+            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::radeon_hold().is_some() { return; }
             if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
                 self.with_deck(deck, |app| app.separate_loaded_on(execution));
             }

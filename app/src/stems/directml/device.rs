@@ -8,8 +8,9 @@ use windows::{
         Graphics::{
             Direct3D::D3D_FEATURE_LEVEL_11_0,
             Direct3D12::{
-                D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                D3D12_COMMAND_QUEUE_DESC, D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+                D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_FEATURE_ARCHITECTURE,
+                D3D12_FEATURE_DATA_ARCHITECTURE,
             },
             Dxgi::{
                 CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIDevice, IDXGIFactory1,
@@ -117,7 +118,7 @@ impl Binding {
         lines.join("\n")
     }
 
-    fn commands(&self) -> Result<(IDMLDevice, ID3D12CommandQueue)> {
+    pub(super) fn commands(&self) -> Result<Commands> {
         let d3d = self
             .d3d
             .as_ref()
@@ -126,17 +127,29 @@ impl Binding {
         unsafe { DMLCreateDevice(d3d, DML_CREATE_DEVICE_FLAG_NONE, &mut device) }
             .context("Creating DirectML device")?;
         let desc = D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Type: if self.shared_memory {
+                D3D12_COMMAND_LIST_TYPE_COMPUTE
+            } else {
+                D3D12_COMMAND_LIST_TYPE_DIRECT
+            },
             ..Default::default()
         };
         let queue = unsafe { d3d.CreateCommandQueue(&desc) }.context("Creating DirectML command queue")?;
-        Ok((device.context("DirectML returned no device")?, queue))
+        Ok(Commands {
+            device: device.context("DirectML returned no device")?,
+            queue,
+        })
     }
+}
 
+/// Shared across a model's ORT session builders on the thread compiling its passes.
+pub(super) struct Commands {
+    device: IDMLDevice,
+    queue: ID3D12CommandQueue,
+}
+
+impl Commands {
     pub(super) fn attach(&self, builder: &mut SessionBuilder) -> ort::Result<()> {
-        let (device, queue) = self
-            .commands()
-            .map_err(|error| ort::Error::new(format!("{error:#}")))?;
         // ORT takes strong references to device and queue on success. Requesting
         // DML1 avoids the legacy provider's extra display-handle lookup.
         unsafe {
@@ -152,8 +165,8 @@ impl Binding {
                 .ok_or_else(|| ort::Error::new("DirectML provider API unavailable"))?;
             ort::Error::result_from_status((api.SessionOptionsAppendExecutionProvider_DML1)(
                 builder.ptr_mut(),
-                device.as_raw(),
-                queue.as_raw(),
+                self.device.as_raw(),
+                self.queue.as_raw(),
             ))
         }
     }
@@ -285,8 +298,13 @@ mod tests {
         assert!(detail.contains("D3D12 device removal reason"));
         assert!(!backend::status().0);
         for execution in [SeparationDevice::Selected, SeparationDevice::GpuOnly] {
-            assert!(execution.device().unwrap_err().is::<crate::stems::DirectMlFailure>());
-            let error = crate::stems::graph("queued-before-removal.th", execution).err().unwrap();
+            assert!(execution
+                .device()
+                .unwrap_err()
+                .is::<crate::stems::DirectMlFailure>());
+            let error = crate::stems::graph("queued-before-removal.th", execution)
+                .err()
+                .unwrap();
             assert!(error.is::<crate::stems::DirectMlFailure>());
         }
         assert!(SeparationDevice::Cpu.device()?.is_cpu());
