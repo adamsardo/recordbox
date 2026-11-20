@@ -362,6 +362,8 @@ jobs:
           Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
           & $testExe[0] 'idle_radeon_assessment_does_not_open_a_compute_backend' --ignored --test-threads=1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'stems::directml::device::tests' --include-ignored --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $testExe[0] 'deck_separates_with_both_radeon_models_and_releases_the_gpu_graph' --ignored --test-threads=1 --nocapture

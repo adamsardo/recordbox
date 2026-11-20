@@ -12,9 +12,9 @@ use windows::{
                 D3D12_COMMAND_QUEUE_DESC, D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
             },
             Dxgi::{
-                CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
-                DXGI_ERROR_NOT_FOUND, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
-                DXGI_QUERY_VIDEO_MEMORY_INFO,
+                CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIDevice, IDXGIFactory1,
+                DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
             },
         },
         AI::MachineLearning::DirectML::{DMLCreateDevice, IDMLDevice, DML_CREATE_DEVICE_FLAG_NONE},
@@ -90,6 +90,10 @@ impl Binding {
             .as_ref()
             .and_then(|d| unsafe { d.GetDeviceRemovedReason() }.err())
         {
+            crate::stems::backend::hold_radeon(format!(
+                "DirectML paused for this session · {} · D3D12 device removed (0x{:08X}). Manual CPU separation is available.",
+                self.name, reason.code().0 as u32
+            ));
             lines.push(format!(
                 "D3D12 device removal reason 0x{:08X} ({reason})",
                 reason.code().0 as u32
@@ -155,10 +159,42 @@ impl Binding {
     }
 }
 
+// DXGI returns four 16-bit version fields, in the same order as Device Manager.
+// A Vega 8 using 26.20.14048.2 hung in both HTDemucs modes after passing the probe.
+fn vega_driver_hold(name: &str, version: Option<u64>) -> Option<String> {
+    let name_lower = name.to_ascii_lowercase();
+    if !name_lower
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair == ["vega", "8"])
+    {
+        return None;
+    }
+    const REPORTED: u64 = (26 << 48) | (20 << 32) | (14048 << 16) | 2;
+    if version.is_some_and(|v| v > REPORTED) {
+        return None;
+    }
+    let driver = version.filter(|&v| v != 0).map_or_else(
+        || "unknown version".into(),
+        |v| {
+            format!(
+                "{}.{}.{}.{}",
+                v >> 48,
+                (v >> 32) & 0xffff,
+                (v >> 16) & 0xffff,
+                v & 0xffff
+            )
+        },
+    );
+    Some(format!("DirectML paused · {name} · driver {driver}. A device hang was reported on 26.20.14048.2. Use manual CPU separation or install a newer graphics driver."))
+}
+
 // DXGI adapter descriptions are metadata. This path never creates a D3D12 device, queue or ORT session.
 fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut adapters = Vec::new();
+    let mut held = None;
     for index in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(a) => a,
@@ -175,7 +211,20 @@ fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
             .position(|&c| c == 0)
             .unwrap_or(desc.Description.len());
         let name = String::from_utf16_lossy(&desc.Description[..end]);
+        let version = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }
+            .ok()
+            .map(|v| v as u64);
+        if let Some(reason) = vega_driver_hold(&name, version) {
+            held = Some(reason);
+            continue;
+        }
         adapters.push((index, name, adapter));
+    }
+    if adapters.is_empty() {
+        if let Some(reason) = held {
+            crate::stems::backend::hold_radeon(reason.clone());
+            anyhow::bail!("{reason}");
+        }
     }
     Ok(adapters)
 }
@@ -189,6 +238,7 @@ pub(in crate::stems) fn available() -> Result<String> {
 }
 
 pub(in crate::stems) fn select() -> Result<(Binding, String)> {
+    let eligible = candidates()?;
     let dll = std::env::current_exe()?.with_file_name("onnxruntime.dll");
     ensure!(
         dll.is_file(),
@@ -198,7 +248,7 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
         .context("Loading the packaged ONNX Runtime")?
         .commit();
     let mut failures = Vec::new();
-    for (index, name, adapter) in candidates()? {
+    for (index, name, adapter) in eligible {
         match Binding::new(adapter, name.clone()).and_then(|binding| {
             super::probe(Some(&binding))?;
             Ok(binding)
@@ -217,4 +267,45 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
         "DirectML found no hardware AMD Radeon adapter"
     );
     anyhow::bail!("DirectML device check failed: {}", failures.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "run in a separate process with the software-only D3D12 WARP device"]
+    fn device_removal_stops_queued_gpu_jobs_and_preserves_manual_cpu() -> Result<()> {
+        use crate::stems::{backend, SeparationDevice};
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device5;
+        let binding = Binding::warp()?;
+        let d3d: ID3D12Device5 = binding.d3d.as_ref().unwrap().cast()?;
+        unsafe { d3d.RemoveDevice() };
+        let detail = binding.failure_detail();
+        assert!(detail.contains("D3D12 device removal reason"));
+        assert!(!backend::status().0);
+        for execution in [SeparationDevice::Selected, SeparationDevice::GpuOnly] {
+            assert!(execution.device().unwrap_err().is::<crate::stems::DirectMlFailure>());
+            let error = crate::stems::graph("queued-before-removal.th", execution).err().unwrap();
+            assert!(error.is::<crate::stems::DirectMlFailure>());
+        }
+        assert!(SeparationDevice::Cpu.device()?.is_cpu());
+        Ok(())
+    }
+
+    #[test]
+    fn vega8_driver_guard_is_specific_and_handles_unknown_versions() {
+        let version = (26 << 48) | (20 << 32) | (14048 << 16) | 2;
+        let vega = "AMD Radeon(TM) Vega 8 Graphics";
+        assert!(vega_driver_hold(vega, Some(version))
+            .unwrap()
+            .contains("26.20.14048.2"));
+        for unknown_or_older in [None, Some(0), Some(version - 1)] {
+            assert!(vega_driver_hold(vega, unknown_or_older).is_some());
+        }
+        assert!(vega_driver_hold(vega, Some(version + 1)).is_none());
+        for other in ["Radeon RX Vega 56", "Radeon Vega 80", "AMD Radeon RX 7800 XT"] {
+            assert!(vega_driver_hold(other, Some(version)).is_none());
+        }
+    }
 }

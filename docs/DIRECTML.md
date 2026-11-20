@@ -11,7 +11,9 @@ The Windows x64 DirectML ZIP contains the complete Recordbox application and the
 .\recordbox.exe --compare-stems "C:\Music\example.wav"
 ```
 
-Run `.\recordbox.exe --stems-cpu` to use CPU separation for a session. If the full model fails after the device check succeeds, hover over the failure in the deck’s STEMS strip for the provider message. Click it to copy the full details, including the operation, adapter and available driver diagnostics. Choose **Retry CPU** to restart separation for that track with the same model. Your next track can use DirectML again.
+Run `.\recordbox.exe --stems-cpu` to use CPU separation for a session. If the full model fails after the device check succeeds, hover over the failure in the deck’s STEMS strip for the provider message. Click it to copy the full details, including the operation, adapter and available driver diagnostics. Choose **Retry CPU** to restart separation for that track with the same model. If Windows reports GPU device removal, Recordbox pauses DirectML and automatic separation for the rest of the session. Cached stems still load and manual separation uses the CPU.
+
+Vega 8 driver 26.20.14048.2 passed the small arithmetic check and subsequently hung during full-model inference. Recordbox skips that driver, older revisions and Vega 8 adapters whose driver version Windows cannot report. Preferences identifies the adapter and explains why manual CPU separation is available. Selecting the CPU preference for automatic separation does not override this protection.
 
 At startup and in Preferences, Recordbox reads the adapter name. The STEMS compute device opens when you explicitly check it or start work that needs it. Loading a track can start work if automatic separation or vocal detection is enabled.
 
