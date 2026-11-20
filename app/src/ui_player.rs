@@ -1383,35 +1383,49 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     }
     // Status and actions.
     let model = app.stem.model.as_deref().and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
+    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
+    let error = app.stem.error_for(app.deck.track).filter(|_| !busy && app.stem.loading.is_none());
+    let retry_cpu = error.is_some_and(|e| e.retry_cpu);
     let status = if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
     } else if let Some((_, pr)) = app.stem.separating {
-        format!("Separating with {model}: {:.0}%", pr * 100.0)
+        let cpu = if app.stem.execution == crate::stems::SeparationDevice::Cpu { " on CPU" } else { "" };
+        format!("Separating with {model}{cpu}: {:.0}%", pr * 100.0)
     } else if app.stem.loading.is_some() {
-        "Loading stems…".to_string()
-    } else if let Some(e) = &app.stem.error {
-        e.clone()
+        "Loading stems…".to_owned()
+    } else if retry_cpu {
+        "Radeon separation failed · Click to copy details".to_owned()
+    } else if error.is_some() {
+        "STEMS failed · Click to copy details".to_owned()
     } else if have {
         String::new()
     } else if !loaded {
-        "Load a track to separate it into parts.".to_string()
+        "Load a track to separate it into parts.".to_owned()
     } else {
         format!("Not separated yet. Model: {model}.")
     };
-    p.text(pos2(sx(main, 700.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
-    // Where the model comes from and its licence, on hover over the status line.
-    if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
-        let sr = Rect::from_min_size(pos2(sx(main, 700.0), y - 9.0), vec2(360.0, 18.0));
-        ui.interact(sr, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
+    let status_rect = Rect::from_min_max(pos2(sx(main, 700.0), y - 10.0), pos2(at(1150.0, 84.0).left() - 4.0, y + 10.0));
+    p.with_clip_rect(status_rect).text(status_rect.left_center(), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if error.is_some() { CAUTION_TX } else { DIM2 });
+    if let Some(error) = error {
+        let response = ui.interact(status_rect, ui.id().with("stem_failure_details"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_ui(|ui| { ui.set_max_width(460.0); ui.label(&error.detail); });
+        if response.clicked() {
+            ui.ctx().copy_text(error.detail.clone());
+            app.toast("Copied STEMS error details.");
+        }
+    } else if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
+        ui.interact(status_rect, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
-    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
     if busy {
         if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {
             app.stop_separation();
         }
     } else if !have && loaded {
-        if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", "SEPARATE"), app, "Split this track into vocal, instrument, bass and drum parts").clicked() {
-            app.separate_loaded();
+        let (label, help) = if retry_cpu { ("RETRY CPU", "Retry this track on the CPU with the same model") }
+            else { ("SEPARATE", "Split this track into vocal, instrument, bass and drum parts") };
+        if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", label), app, help).clicked() {
+            if retry_cpu { app.separate_loaded_on(crate::stems::SeparationDevice::Cpu); } else { app.separate_loaded(); }
         }
     }
     if tip(seg_button(ui, at(1222.5, 40.0), "stems_back", "BACK", false), app, "Back to the cue and loop controls").clicked() {

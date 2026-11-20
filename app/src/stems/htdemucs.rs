@@ -17,6 +17,8 @@
 mod metal_fast;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
+#[cfg(any(target_os = "macos", feature = "directml"))]
+use anyhow::Context as _;
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::HashMap;
 use std::path::Path;
@@ -234,19 +236,19 @@ impl Graph {
         Self::from_weights(Self::read_weights(path, device)?, fast)
     }
 
-    pub fn load_selected(path: &Path) -> Result<Self> {
+    pub fn load_selected(path: &Path) -> anyhow::Result<Self> {
         #[cfg(all(windows, feature = "directml"))]
         if let Some(adapter) = super::backend::directml_device() {
             return Self::load_onnx(path, Some(adapter));
         }
-        Self::load(path, &super::device())
+        Ok(Self::load(path, &super::device())?)
     }
 
     #[cfg(feature = "directml")]
-    pub(super) fn load_onnx(path: &Path, adapter: Option<&super::directml::Binding>) -> Result<Self> {
+    pub(super) fn load_onnx(path: &Path, adapter: Option<&super::directml::Binding>) -> anyhow::Result<Self> {
         let _gpu = GPU.lock();
         let weights = Self::read_weights(path, &Device::Cpu)?;
-        let engine = super::directml::Engine::new(weights, adapter).map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        let engine = super::directml::Engine::new(weights, adapter)?;
         let mut graph = Self::from_weights(HashMap::new(), false)?;
         graph.directml = Some(engine);
         Ok(graph)
@@ -589,17 +591,17 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `audio` is planar stereo: left samples then right samples, `len` frames each.
 /// Returns planar [source][channel][frame] (4 × 2 × len), or [channel][frame] of the one
 /// source asked for. The callback reports completed chunks and is also polled between model layers.
-pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> anyhow::Result<Vec<f32>> {
     if len == 0 || audio.len() != 2 * len {
-        candle_core::bail!("empty or malformed input")
+        anyhow::bail!("empty or malformed input")
     }
     if opts.source.is_some_and(|s| s >= 4) {
-        candle_core::bail!("no such source")
+        anyhow::bail!("no such source")
     }
-    if !progress(0, 1) { candle_core::bail!("stopped"); }
+    if !progress(0, 1) { anyhow::bail!("stopped"); }
     #[cfg(target_os = "macos")]
     if let Some(fast) = &graph.fast {
-        return separate_accelerated(audio, len, opts, progress, |spec, wave, source| {
+        return separate_accelerated(audio, len, opts, 2, progress, |spec, wave, source| {
             let (freq, frames, segment) = (NFFT/2, Stft::frames(TRAINING_FRAMES), TRAINING_FRAMES);
             let x = Tensor::from_vec(spec, (4, freq, frames), device)?;
             let xt = Tensor::from_vec(wave, (2, 1, segment), device)?;
@@ -613,8 +615,8 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
     }
     #[cfg(feature = "directml")]
     if let Some(engine) = &graph.directml {
-        return separate_accelerated(audio, len, opts, progress, |spec, wave, source| {
-            engine.forward(spec, wave, source).map_err(|e| candle_core::Error::Msg(format!("{e:#}")))
+        return separate_accelerated(audio, len, opts, engine.buffered_segments(), progress, |spec, wave, source| {
+            engine.forward(spec, wave, source)
         });
     }
     let segment = TRAINING_FRAMES;
@@ -645,7 +647,7 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
             sums[offset + i] += weight[i];
         }
         if !progress(k + 1, offsets.len()) {
-            candle_core::bail!("stopped")
+            anyhow::bail!("stopped")
         }
     }
     for ch in out.chunks_mut(len) {
@@ -687,8 +689,8 @@ struct Raw {
 /// thread prepares segments (normalisation and the forward transform), this thread runs the
 /// network, and a third does the inverse transform and the overlap-add.
 #[cfg(any(target_os = "macos", feature = "directml"))]
-fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool,
-    mut forward: impl FnMut(Vec<f32>, Vec<f32>, Option<usize>) -> Result<(Vec<f32>, Vec<f32>)>) -> Result<Vec<f32>> {
+fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, buffered_segments: usize, progress: &mut dyn FnMut(usize, usize) -> bool,
+    mut forward: impl FnMut(Vec<f32>, Vec<f32>, Option<usize>) -> anyhow::Result<(Vec<f32>, Vec<f32>)>) -> anyhow::Result<Vec<f32>> {
     let segment = TRAINING_FRAMES;
     let freq = NFFT / 2;
     let frames = Stft::frames(segment);
@@ -701,9 +703,9 @@ fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mu
     let mut out = vec![0f32; n_src * 2 * len];
     let (stft, envelope, weight, offsets) = (&stft, &envelope, &weight, &offsets);
 
-    let result = std::thread::scope(|scope| -> Result<()> {
-        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(2);
-        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(2);
+    let result = std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(buffered_segments);
+        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(buffered_segments);
         scope.spawn(move || {
             for &offset in offsets {
                 let input = segment_at(audio, len, offset);
@@ -751,18 +753,18 @@ fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mu
                 });
             }
         });
-        let mut run = || -> Result<()> {
+        let mut run = || -> anyhow::Result<()> {
             for (k, p) in rx_in.iter().enumerate() {
-                if !progress(k, offsets.len()) { candle_core::bail!("stopped"); }
+                if !progress(k, offsets.len()) { anyhow::bail!("stopped"); }
                 let (spec, wave) = {
                     let _gpu = GPU.lock();
-                    forward(p.spec, p.wave, opts.source)?
+                    forward(p.spec, p.wave, opts.source).with_context(|| format!("Separation segment {} of {}", k + 1, offsets.len()))?
                 };
                 if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
-                    candle_core::bail!("stem post-processing stopped")
+                    anyhow::bail!("stem post-processing stopped")
                 }
                 if !progress(k + 1, offsets.len()) {
-                    candle_core::bail!("stopped")
+                    anyhow::bail!("stopped")
                 }
             }
             Ok(())
@@ -772,7 +774,7 @@ fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mu
         drop(rx_in);
         drop(tx_out);
         if post.join().is_err() {
-            candle_core::bail!("stem post-processing failed")
+            anyhow::bail!("stem post-processing failed")
         }
         r
     });
@@ -795,6 +797,28 @@ fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "directml")]
+    #[test]
+    fn driver_failure_on_second_segment_keeps_the_cause_and_returns_no_partial_stems() {
+        let len = TRAINING_FRAMES + 4096;
+        let audio = vec![0.; 2 * len];
+        let mut calls = 0;
+        let result = separate_accelerated(&audio, len, &Options { source: Some(3), ..Default::default() },
+            0, &mut |_, _| true, |spec, wave, _| {
+                calls += 1;
+                if calls == 2 { return Err(crate::stems::DirectMlFailure("simulated provider error".into()).into()); }
+                Ok((spec, wave))
+            });
+        let error = result.unwrap_err();
+        assert!(error.is::<crate::stems::DirectMlFailure>());
+        assert!(format!("{error:#}").contains("Separation segment 2 of 2"));
+        assert_eq!(calls, 2);
+
+        let stopped = separate_accelerated(&audio, len, &Default::default(), 0,
+            &mut |_, _| false, |_, _, _| panic!("Cancelled work called the provider")).unwrap_err();
+        assert!(!stopped.is::<crate::stems::DirectMlFailure>());
+    }
 
     /// Deterministic values in [-1, 1).
     struct Lcg(u64);

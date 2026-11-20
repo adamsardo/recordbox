@@ -361,6 +361,8 @@ jobs:
           Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
           & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'driver_failure_on_second_segment' --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --manifest-path app/Cargo.toml --release --locked --features directml
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python packaging/build_archive.py --binary app/target/release/recordbox.exe --directml-runtime "$runtime" --platform windows --arch x86_64 --source-commit ${{ github.sha }} --output dist --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin" --runtime-dir "$env:RECORDBOX_VC_CRT" --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"

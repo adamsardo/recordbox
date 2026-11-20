@@ -7,6 +7,7 @@ mod network;
 #[cfg(windows)]
 pub(super) use device::{select, Binding};
 #[cfg(not(windows))]
+#[derive(Clone)]
 pub(super) enum Binding {}
 use super::htdemucs::{Stft, TRAINING_FRAMES};
 use anyhow::{ensure, Context, Result};
@@ -16,6 +17,35 @@ use ort::{
 };
 use std::sync::Mutex;
 
+fn shared_memory(adapter: Option<&Binding>) -> bool {
+    #[cfg(windows)]
+    {
+        adapter.is_some_and(|binding| binding.shared_memory)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = adapter;
+        false
+    }
+}
+
+fn query_tile(adapter: Option<&Binding>) -> i64 {
+    if shared_memory(adapter) {
+        network::SHARED_MEMORY_QUERY_TILE
+    } else {
+        network::QUERY_TILE
+    }
+}
+
+fn runtime_error(adapter: Option<&Binding>, stage: &'static str, error: ort::Error) -> anyhow::Error {
+    #[cfg(windows)]
+    if let Some(binding) = adapter {
+        return super::DirectMlFailure(format!("{stage}\n{}\n{error}", binding.failure_detail())).into();
+    }
+    let _ = adapter;
+    anyhow::Error::new(error).context(stage)
+}
+
 fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
     let mut builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level1)?
@@ -24,6 +54,10 @@ fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
     if let Some(binding) = adapter {
         #[cfg(windows)]
         {
+            if binding.shared_memory {
+                // The arena can retain allocations between dispatches. The Vega APU and host share RAM.
+                builder = builder.with_config_entry("ep.dml.disable_memory_arena", "1")?;
+            }
             binding.attach(&mut builder)?;
             // Keep the FP32 operators and their intermediate results explicit.
             // DirectML's whole-graph fusion can alter HTDemucs separation results.
@@ -49,18 +83,33 @@ fn probe(adapter: Option<&Binding>) -> Result<()> {
     Ok(())
 }
 
-pub(super) struct Engine(Mutex<Session>);
+pub(super) struct Engine {
+    session: Mutex<Session>,
+    adapter: Option<Binding>,
+}
 
 impl Engine {
     pub(super) fn new(
         weights: std::collections::HashMap<String, candle_core::Tensor>,
         adapter: Option<&Binding>,
     ) -> Result<Self> {
-        let model = network::model(weights)?;
-        Ok(Self(Mutex::new(
-            session(&model, adapter).context("Preparing the HTDemucs network")?,
-        )))
+        let model = network::model(weights, query_tile(adapter))?;
+        let session = session(&model, adapter)
+            .map_err(|e| runtime_error(adapter, "Preparing the HTDemucs network", e))?;
+        Ok(Self {
+            session: Mutex::new(session),
+            adapter: adapter.cloned(),
+        })
     }
+    pub(super) fn buffered_segments(&self) -> usize {
+        // STFT, inference and overlap-add can still run concurrently on a rendezvous channel.
+        if shared_memory(self.adapter.as_ref()) {
+            0
+        } else {
+            2
+        }
+    }
+
     pub(super) fn forward(
         &self,
         spec: Vec<f32>,
@@ -71,10 +120,12 @@ impl Engine {
         let spec = TensorRef::from_array_view(([1, 4, network::BINS, frames], spec.as_slice()))?;
         let wave = TensorRef::from_array_view(([1, 2, TRAINING_FRAMES], wave.as_slice()))?;
         let mut engine = self
-            .0
+            .session
             .lock()
             .map_err(|_| anyhow::anyhow!("DirectML session interrupted"))?;
-        let outputs = engine.run(ort::inputs!["spec"=>spec,"wave"=>wave])?;
+        let outputs = engine
+            .run(ort::inputs!["spec"=>spec,"wave"=>wave])
+            .map_err(|e| runtime_error(self.adapter.as_ref(), "Running an HTDemucs separation segment", e))?;
         let take = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
             let (actual, data) = outputs[name].try_extract_tensor::<f32>()?;
             ensure!(
@@ -108,7 +159,7 @@ mod tests {
     #[test]
     #[ignore = "requires the Windows DirectML runtime and D3D12 WARP"]
     fn runtime_executes_directml() -> Result<()> {
-        let binding = Binding::Warp;
+        let binding = Binding::warp()?;
         probe(Some(&binding))?;
         println!("DirectML convolution and matrix multiplication passed on D3D12 WARP");
         Ok(())
@@ -119,17 +170,15 @@ mod tests {
     fn onnx_four_stems_match_candle() {
         use crate::stems::{compare::relative_error, htdemucs};
         use candle_core::Device;
-        let path = std::path::PathBuf::from(
-            std::env::var_os("RECORDBOX_TEST_CHECKPOINT").expect("checkpoint path"),
-        );
-        let len = 32768;
+        let path =
+            std::path::PathBuf::from(std::env::var_os("RECORDBOX_TEST_CHECKPOINT").expect("checkpoint path"));
+        // A real song crosses a segment boundary. Exercise repeat dispatch, crop and overlap-add.
+        let len = TRAINING_FRAMES + 4096;
         let audio: Vec<f32> = (0..2 * len)
             .map(|i| {
                 let t = (i % len) as f32 / 44100.;
                 let ch = (i / len + 1) as f32;
-                (t * 440. * ch).sin() * 0.21
-                    + (t * 1293.).sin() * 0.1
-                    + if i % 4096 < 32 { 0.25 } else { 0. }
+                (t * 440. * ch).sin() * 0.21 + (t * 1293.).sin() * 0.1 + if i % 4096 < 32 { 0.25 } else { 0. }
             })
             .collect();
         let run = |model: htdemucs::Graph| {
@@ -143,20 +192,16 @@ mod tests {
             )
             .unwrap()
         };
-        let expected = run(htdemucs::Graph::load(&path, &Device::Cpu).unwrap());
+        let expected = run(crate::stems::SeparationDevice::Cpu.load(&path).unwrap());
         let compare = |label: &str, adapter| {
             let actual = run(htdemucs::Graph::load_onnx(&path, adapter).unwrap());
             let mut maximum = 0.0f64;
-            for (name, (a, b)) in htdemucs::SOURCES.iter().zip(
-                expected
-                    .chunks_exact(2 * len)
-                    .zip(actual.chunks_exact(2 * len)),
-            ) {
+            for (name, (a, b)) in htdemucs::SOURCES
+                .iter()
+                .zip(expected.chunks_exact(2 * len).zip(actual.chunks_exact(2 * len)))
+            {
                 let error = relative_error(a, b).unwrap();
-                println!(
-                    "{label} {name}: {:.4}% relative RMS difference",
-                    100. * error
-                );
+                println!("{label} {name}: {:.4}% relative RMS difference", 100. * error);
                 maximum = maximum.max(error);
             }
             maximum
@@ -167,7 +212,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            let binding = Binding::Warp;
+            let binding = Binding::warp().unwrap();
             let error = compare("DirectML WARP", Some(&binding));
             if error > 0.03 {
                 diagnostics::trace(&path, Some(&binding)).unwrap();

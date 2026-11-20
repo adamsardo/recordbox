@@ -10,7 +10,8 @@ use std::collections::HashMap;
 pub(super) const BINS: usize = 2048;
 const WIDTH: i64 = 512;
 const HEADS: i64 = 8;
-const QUERY_TILE: i64 = 256;
+pub(super) const QUERY_TILE: i64 = 256;
+pub(super) const SHARED_MEMORY_QUERY_TILE: i64 = 64;
 
 fn tensor_info<'a>(name: &'a str, dims: &[i64]) -> ValueInfo<'a> {
     let dim = dims
@@ -51,13 +52,15 @@ fn integers(name: &'static str, values: &[i64]) -> Attribute<'static> {
 
 struct Network<'a> {
     names: &'a Bump,
+    query_tile: i64,
     next: Cell<usize>,
     graph: RefCell<Graph<'a>>,
 }
 impl<'a> Network<'a> {
-    fn new(names: &'a Bump) -> Self {
+    fn new(names: &'a Bump, query_tile: i64) -> Self {
         Self {
             names,
+            query_tile,
             next: Cell::new(0),
             graph: RefCell::new(Graph {
                 name: "recordbox_htdemucs",
@@ -226,8 +229,8 @@ impl<'a> Network<'a> {
         let v = project(k, 2, keys);
         let mut parts = Vec::new();
         // Tile only the query rows. Every query still attends to every key.
-        for start in (0..queries).step_by(QUERY_TILE as usize) {
-            let tile = self.slice(q, 2, start, (start + QUERY_TILE).min(queries));
+        for start in (0..queries).step_by(self.query_tile as usize) {
+            let tile = self.slice(q, 2, start, (start + self.query_tile).min(queries));
             let scores = self.math("Mul", &[self.math("MatMul", &[tile, kt]), "attn_scale"]);
             let probs = self.op("Softmax", &[scores], vec![integer("axis", -1)]);
             parts.push(self.math("MatMul", &[probs, v]));
@@ -401,9 +404,9 @@ impl<'a> Network<'a> {
     }
 }
 
-pub(super) fn model(weights: HashMap<String, Tensor>) -> candle_core::Result<Vec<u8>> {
+pub(super) fn model(weights: HashMap<String, Tensor>, query_tile: i64) -> candle_core::Result<Vec<u8>> {
     let names = Bump::new();
-    let net = Network::new(&names);
+    let net = Network::new(&names, query_tile);
     net.htdemucs();
     for (name, tensor) in weights {
         let dims = tensor.dims().iter().map(|&d| d as i64).collect::<Vec<_>>();
@@ -418,7 +421,7 @@ pub(super) fn model(weights: HashMap<String, Tensor>) -> candle_core::Result<Vec
 
 pub(super) fn probe_model() -> Vec<u8> {
     let names = Bump::new();
-    let net = Network::new(&names);
+    let net = Network::new(&names, QUERY_TILE);
     net.graph.borrow_mut().input = vec![tensor_info("x", &[1, 1, 3])];
     net.floats("kernel", &[1, 1, 2], vec![2., 1.]);
     net.floats("column", &[2, 1], vec![1., 2.]);

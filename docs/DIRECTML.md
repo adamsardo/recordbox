@@ -11,7 +11,9 @@ The Windows x64 DirectML ZIP contains the complete Recordbox application and the
 .\recordbox.exe --compare-stems "C:\Music\example.wav"
 ```
 
-Run `.\recordbox.exe --stems-cpu` to use CPU separation for a session. If DirectML runs out of shared memory or your driver cannot compile the full model, Recordbox reports the error. The standard Windows ZIP also offers CPU separation. The CUDA 12 ZIP targets NVIDIA hardware.
+Run `.\recordbox.exe --stems-cpu` to use CPU separation for a session. If the full model fails after the device check succeeds, hover over the failure in the deck’s STEMS strip for the provider message. Click it to copy the full details, including the operation, adapter and available driver diagnostics. Choose **Retry CPU** to restart separation for that track with the same model. Your next track can use DirectML again.
+
+On integrated adapters such as Vega 8, the DirectML build uses smaller attention tiles and hands each prepared audio segment directly to the next processing stage to conserve shared memory. The standard Windows ZIP also offers CPU separation. The CUDA 12 ZIP targets NVIDIA hardware.
 
 ## Build and verify
 

@@ -70,12 +70,36 @@ pub const OVERLAP: f64 = 0.25;
 /// segments; against known stems the separation quality is the same within 0.1 dB.
 pub const ANALYSIS_OVERLAP: f64 = 0.1;
 
+/// A provider failure can be retried on the CPU. Model, decoder and cancellation errors stay distinct.
+#[derive(Debug)]
+pub(crate) struct DirectMlFailure(pub(super) String);
+impl std::fmt::Display for DirectMlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for DirectMlFailure {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeparationDevice { Selected, Cpu }
+
+impl SeparationDevice {
+    fn device(self) -> candle_core::Device {
+        match self { Self::Selected => device(), Self::Cpu => candle_core::Device::Cpu }
+    }
+
+    fn load(self, path: &Path) -> Result<htdemucs::Graph> {
+        match self {
+            Self::Selected => htdemucs::Graph::load_selected(path),
+            Self::Cpu => Ok(htdemucs::Graph::load(path, &candle_core::Device::Cpu)?),
+        }
+    }
+}
+
 /// Loaded models stay in memory (about 170 MB each on the GPU) so that a second track, vocal
 /// detection or key analysis does not read and upload the checkpoint again.
-fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
-    static LOADED: std::sync::Mutex<Vec<(String, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
+    static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
     let mut loaded = LOADED.lock().map_err(|_| anyhow!("model cache is unusable"))?;
-    if let Some(i) = loaded.iter().position(|(f, _)| f == file) {
+    if let Some(i) = loaded.iter().position(|(f, mode, _)| f == file && *mode == execution) {
         // Most recently used last.
         let entry = loaded.remove(i);
         loaded.push(entry);
@@ -85,10 +109,10 @@ fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
         while loaded.len() >= capacity {
             loaded.remove(0);
         }
-        let g = htdemucs::Graph::load_selected(&models_dir().join(file)).map_err(|e| anyhow!("loading {file}: {e}"))?;
-        loaded.push((file.to_string(), std::sync::Arc::new(g)));
+        let g = execution.load(&models_dir().join(file)).with_context(|| format!("Loading {file}"))?;
+        loaded.push((file.to_string(), execution, std::sync::Arc::new(g)));
     }
-    Ok(loaded.last().unwrap().1.clone())
+    Ok(loaded.last().unwrap().2.clone())
 }
 
 /// Planar stereo (left samples, then right) at 44.1 kHz from interleaved stereo at `sr`.
@@ -302,25 +326,29 @@ fn resample_to_44k(samples: &[f32], sr: u32) -> Vec<f32> {
 
 /// Separate a decoded track with model `m` (which must be downloaded).
 pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Stems> {
+    separate_with_device(m, samples, sr, progress, SeparationDevice::Selected)
+}
+
+pub fn separate_with_device(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool, execution: SeparationDevice) -> Result<Stems> {
     if !progress(0.0) { anyhow::bail!("stopped"); }
-    let device = device();
+    let device = execution.device();
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
         if !m.per_source {
             if !progress(0.0) { anyhow::bail!("stopped"); }
-            let g = graph(m.files[0])?;
+            let g = graph(m.files[0], execution)?;
             let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb).map_err(|e| anyhow!("{e}"));
+            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb);
         }
         // Model k is the specialist for source k (upstream's weights matrix is the identity),
         // so only that source is taken from it.
         let mut out = Vec::with_capacity(8 * len);
         for (k, f) in m.files.iter().enumerate() {
             if !progress(k as f32 / n_models as f32) { anyhow::bail!("stopped"); }
-            let g = graph(f)?;
+            let g = graph(f, execution)?;
             let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
-            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb).map_err(|e| anyhow!("{e}"))?);
+            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb)?);
         }
         Ok(out)
     };
@@ -343,9 +371,9 @@ pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn 
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
     let device = device();
     let (planar, len) = planar_44k(samples, sr);
-    let g = graph(file)?;
+    let g = graph(file, SeparationDevice::Selected)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb).map_err(|e| anyhow!("{e}"));
+    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb);
     htdemucs::release_scratch();
     let y = y?;
     Ok(y[..len].iter().zip(&y[len..]).map(|(a, b)| 0.5 * (a + b)).collect())

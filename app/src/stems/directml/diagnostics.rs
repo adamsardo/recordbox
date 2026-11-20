@@ -71,7 +71,7 @@ fn sampled_model(bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub(super) fn trace(checkpoint: &Path, adapter: Option<&Binding>) -> Result<()> {
     let weights = Graph::read_weights(checkpoint, &candle_core::Device::Cpu)?;
-    let model = sampled_model(&network::model(weights)?)?;
+    let model = sampled_model(&network::model(weights, super::query_tile(adapter))?)?;
     let frames = Stft::frames(TRAINING_FRAMES);
     let signal = |count| {
         (0..count)
