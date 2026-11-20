@@ -17,6 +17,8 @@ import tempfile
 import tomllib
 import zipfile
 
+import directml_runtime
+
 
 class PackageError(ValueError):
     pass
@@ -26,6 +28,27 @@ def cuda_platforms(version):
     # Older release notes and manifests describe only the four original archives.
     numbers = version_tuple(re.split(r"[-+]", version, maxsplit=1)[0])
     return ("windows", "linux") if numbers >= (0, 5, 5) else ()
+
+
+def has_directml(version):
+    return version_tuple(re.split(r"[-+]", version, maxsplit=1)[0]) >= (0, 5, 6)
+
+
+def release_archives(version):
+    targets = (("macos", "arm64"), ("macos", "x86_64"), ("windows", "x86_64"), ("linux", "x86_64"))
+    variants = [(platform, architecture, "") for platform, architecture in targets]
+    variants.extend((platform, "x86_64", "cuda12") for platform in cuda_platforms(version))
+    if has_directml(version):
+        variants.append(("windows", "x86_64", "directml"))
+    for platform, architecture, variant in variants:
+        suffix = f"-{variant}" if variant else ""
+        ext = ".tar.gz" if platform == "linux" else ".zip"
+        yield platform, architecture, variant, f"Recordbox-{version}-{platform}-{architecture}{suffix}{ext}"
+
+
+def check_directml_binary(binary):
+    if b"recordbox_htdemucs" not in binary.read_bytes():
+        raise PackageError("DirectML package requires the compiled HTDemucs ONNX network")
 
 
 CUDA_LIBRARIES = {
@@ -193,9 +216,11 @@ def library_candidates(files: list[Path], directories: list[Path], platform: str
     return candidates
 
 
-def runtime_closure(binary: Path, platform: str, architecture: str, candidates: dict[str, Path], cuda12=False) -> tuple[BinaryInfo, dict[str, Path], list[str], dict[str, str]]:
+def runtime_closure(binary: Path, platform: str, architecture: str, candidates: dict[str, Path], cuda12=False, dynamic_libraries=None) -> tuple[BinaryInfo, dict[str, Path], list[str], dict[str, str]]:
     main = inspect_binary(binary, platform)
-    pending = [(binary, main)]; bundled = {}; system = set(); abi = {}
+    bundled = dict(dynamic_libraries or {})
+    pending = [(binary, main)] + [(path, inspect_binary(path, platform)) for path in bundled.values()]
+    system = set(); abi = {}
     while pending:
         path, info = pending.pop()
         if info.architecture != architecture:
@@ -272,7 +297,7 @@ exec "$bundle_dir/bin/recordbox" "$@"
 
 def build_archive(binary: Path, source_root: Path, output: Path, platform: str, architecture: str, source_commit: str,
                   runtime_files: list[Path] | None = None, runtime_dirs: list[Path] | None = None,
-                  runtime_notices: list[Path] | None = None, cuda12=False) -> dict:
+                  runtime_notices: list[Path] | None = None, cuda12=False, directml=None) -> dict:
     if platform not in {"macos", "windows", "linux"} or architecture not in {"arm64", "x86_64"}:
         raise PackageError("Unsupported platform or architecture")
     if not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", source_commit):
@@ -284,10 +309,18 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     candidates = library_candidates(runtime_files or [], runtime_dirs or [], platform)
     if cuda12 and (platform not in cuda_platforms(version) or architecture != "x86_64"):
         raise PackageError("Unsupported CUDA package target")
-    info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates, cuda12)
+    dynamic = {}
+    if directml is not None:
+        if cuda12 or platform != "windows" or architecture != "x86_64" or not has_directml(version):
+            raise PackageError("Unsupported DirectML package target")
+        directml_runtime.verify(directml)
+        check_directml_binary(binary)
+        dynamic = {name: directml / name for name in directml_runtime.LIBRARIES}
+        candidates.update(dynamic)
+    info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates, cuda12, dynamic)
     if cuda12:
         check_cuda_binary(binary, info.dependencies, platform)
-    label = f"Recordbox-{version}-{platform}-{architecture}" + ("-cuda12" if cuda12 else "")
+    label = f"Recordbox-{version}-{platform}-{architecture}" + ("-cuda12" if cuda12 else "-directml" if directml else "")
     bundle_name = "Recordbox.app" if platform == "macos" else label
     archive_name = label + (".tar.gz" if platform == "linux" else ".zip")
     output.mkdir(parents=True, exist_ok=True)
@@ -313,6 +346,11 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
         for name, path in sorted(bundled.items()):
             write_file(bundle / ("lib" if platform == "linux" else "") / name, path.read_bytes(), 0o644)
         write_file(resources / "LICENSE.txt", (source_root / "LICENSE").read_bytes())
+        if directml:
+            write_file(resources / "DIRECTML.md", (source_root / "docs/DIRECTML.md").read_bytes())
+            for name in directml_runtime.FILES:
+                if name not in dynamic:
+                    write_file(resources / "runtime-notices" / name, (directml / name).read_bytes())
         if cuda12:
             write_file(resources / "CUDA12.md", (source_root / "docs/CUDA12.md").read_bytes())
         write_file(resources / "Inter-NOTICE.txt", (source_root / "app/assets/fonts/README.txt").read_bytes())
@@ -333,6 +371,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
                     "entrypoint": executable if platform != "linux" else "recordbox",
                     "runtime": {"system_dependencies": system, "bundled_libraries": sorted(bundled)},
                     "distribution": {"signing_performed": False, "notarization_performed": False}, "files": files}
+        if directml:
+            metadata["target"]["stems"] = "directml-radeon"
         if cuda12:
             metadata["target"]["stems"] = "cuda12-sm61"
         write_file(resources / "runtime-manifest.json", (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode())
@@ -348,6 +388,7 @@ def main() -> None:
     parser.add_argument("--binary", type=Path); parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path); parser.add_argument("--platform", choices=["macos", "windows", "linux"])
     parser.add_argument("--arch", choices=["arm64", "x86_64"]); parser.add_argument("--source-commit")
+    parser.add_argument("--directml-runtime", type=Path, help="Package Windows Radeon STEMS with the pinned runtime directory")
     parser.add_argument("--cuda12", action="store_true", help="Package the NVIDIA CUDA 12 STEMS variant")
     parser.add_argument("--check-version", action="store_true", help="Validate VERSION and Cargo versions without packaging")
     parser.add_argument("--tag", help="With --check-version, require the exact v<VERSION> release tag")
@@ -356,7 +397,7 @@ def main() -> None:
     args = parser.parse_args()
     packaging = (args.binary, args.output, args.platform, args.arch, args.source_commit)
     if args.tag is not None and not args.check_version: parser.error("--tag requires --check-version")
-    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice or args.cuda12):
+    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice or args.cuda12 or args.directml_runtime):
         parser.error("--check-version cannot be combined with packaging arguments")
     if not args.check_version and any(value is None for value in packaging):
         parser.error("packaging requires --binary, --output, --platform, --arch and --source-commit")
@@ -367,8 +408,8 @@ def main() -> None:
                 raise PackageError(f"Release tag must be v{version}, received {args.tag!r}")
             print(json.dumps({"status": "passed", "version": version, "tag": args.tag}))
             return
-        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice, args.cuda12)
-    except (PackageError, OSError, KeyError, tomllib.TOMLDecodeError) as error:
+        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice, args.cuda12, args.directml_runtime)
+    except (ValueError, OSError, KeyError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")
     print(json.dumps(result, indent=2))
 

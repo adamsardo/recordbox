@@ -35,6 +35,35 @@ class DownloadNotesTests(unittest.TestCase):
         for target in ("windows-x86_64-cuda12.zip", "linux-x86_64-cuda12.tar.gz"):
             self.assertIn(f"https://github.com/test/recordbox/releases/download/v0.5.5/Recordbox-0.5.5-{target}", body)
 
+    def test_radeon_archive_and_platform_labels_follow_the_release_version(self):
+        previous = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.5")
+        self.assertNotIn("-directml.zip", previous)
+        self.assertIn("| Windows x64, experimental |", previous)
+        body = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.6")
+        self.assertIn("| Windows x64 |", body)
+        self.assertIn("| Linux x64, experimental |", body)
+        self.assertNotIn("Windows x64, experimental", body)
+        self.assertIn("https://github.com/test/recordbox/releases/download/v0.5.6/Recordbox-0.5.6-windows-x86_64-directml.zip", body)
+        self.assertEqual(len(list(package.release_archives("0.5.6"))), 7)
+
+    def test_radeon_runtime_verification_rejects_a_missing_or_modified_file(self):
+        from unittest.mock import patch
+        from hashlib import sha256
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hashes = {"onnxruntime.dll": sha256(b"runtime").hexdigest(),
+                      "ort-LICENSE.txt": sha256(b"license").hexdigest()}
+            with patch.dict(package.directml_runtime.FILES, hashes, clear=True):
+                (root / "onnxruntime.dll").write_bytes(b"runtime")
+                with self.assertRaisesRegex(ValueError, "ort-LICENSE"):
+                    package.directml_runtime.verify(root, packaged=True)
+                (root / "runtime-notices").mkdir()
+                (root / "runtime-notices/ort-LICENSE.txt").write_bytes(b"license")
+                package.directml_runtime.verify(root, packaged=True)
+                (root / "onnxruntime.dll").write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "onnxruntime"):
+                    package.directml_runtime.verify(root, packaged=True)
+
     def test_preview_requires_both_pascal_kernels_and_nvidia_imports(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "recordbox.exe"

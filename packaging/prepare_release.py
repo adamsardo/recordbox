@@ -107,10 +107,12 @@ def source_hashes(path, platform):
     return hashes
 
 
-def verify_package(archive, destination, source, version, commit, platform, architecture, cuda12=False):
+def verify_package(archive, destination, source, version, commit, platform, architecture, cuda12=False, directml=False):
     root = "Recordbox.app" if platform == "macos" else f"Recordbox-{version}-{platform}-{architecture}"
     if cuda12:
         root += "-cuda12"
+    elif directml:
+        root += "-directml"
     preflight_archive(archive, root)
     bundle = extract_archive(archive, destination)
     resource = bundle / "Contents/Resources" if platform == "macos" else bundle
@@ -142,7 +144,12 @@ def verify_package(archive, destination, source, version, commit, platform, arch
     require(manifest.get("entrypoint") == ("recordbox" if platform == "linux" else executable), "Wrong product entrypoint")
     require(stat.S_IMODE((bundle / executable).stat().st_mode) == 0o755, "Executable permission is missing")
     verify_machine(bundle / executable, platform, architecture)
-    require(target.get("stems") == ("cuda12-sm61" if cuda12 else None), "Wrong STEMS build variant")
+    require(target.get("stems") == ("cuda12-sm61" if cuda12 else "directml-radeon" if directml else None), "Wrong STEMS build variant")
+    if directml:
+        build_archive.check_directml_binary(bundle / executable)
+        build_archive.directml_runtime.verify(bundle, packaged=True)
+        require(set(build_archive.directml_runtime.LIBRARIES) <= set(manifest["runtime"]["bundled_libraries"]), "Missing DirectML libraries")
+        require(sha256(resource / "DIRECTML.md") in source_hashes(source / "docs/DIRECTML.md", platform), "Wrong DirectML setup guide")
     if cuda12:
         build_archive.check_cuda_binary(bundle / executable, manifest["runtime"]["system_dependencies"], platform)
         require(sha256(resource / "CUDA12.md") in source_hashes(source / "docs/CUDA12.md", platform), "Wrong CUDA setup guide")
@@ -204,13 +211,16 @@ def render_release_downloads(notes, repository, tag):
     def link(name):
         return f"[`{name}`]({download}/{quote(name, safe='')})"
     rows = [start, "## Downloads", "", "| Platform | Archive |", "| --- | --- |"]
-    labels = ("macOS Apple Silicon", "macOS Intel", "Windows x64, experimental", "Linux x64, experimental")
-    for label, (platform, architecture) in zip(labels, TARGETS):
-        name = f"Recordbox-{version}-{platform}-{architecture}" + (".tar.gz" if platform == "linux" else ".zip")
+    labels = {("macos", "arm64"): "macOS Apple Silicon", ("macos", "x86_64"): "macOS Intel",
+              ("windows", "x86_64"): "Windows x64" if build_archive.has_directml(version) else "Windows x64, experimental",
+              ("linux", "x86_64"): "Linux x64, experimental"}
+    for platform, architecture, variant, name in build_archive.release_archives(version):
+        label = labels[platform, architecture]
+        if variant == "cuda12":
+            label = f"{label}, CUDA 12 STEMS preview"
+        elif variant == "directml":
+            label = f"{label}, Radeon DirectML STEMS preview"
         rows.append(f"| {label} | {link(name)} |")
-    for platform in build_archive.cuda_platforms(version):
-        name = f"Recordbox-{version}-{platform}-x86_64-cuda12" + (".tar.gz" if platform == "linux" else ".zip")
-        rows.append(f"| {platform.capitalize()} x64, CUDA 12 STEMS preview | {link(name)} |")
     rows.extend(["", f"Download {link('SHA256SUMS')} to verify the release archives and {link('COMMIT-LOG.txt')}",
                  "for the complete source history. See the",
                  f"[build and packaging guide]({base}/blob/{quote(tag, safe='')}/docs/BUILD-AND-PACKAGING.md) for runtime requirements",
@@ -233,10 +243,7 @@ def prepare_release(input_root, output, source, commit, tag, repository):
     require(tag == "v" + version, "Tag, VERSION and Cargo versions must agree")
     require(not output.exists() and not output.is_symlink(), "Release output already exists")
     require(input_root.is_dir() and not input_root.is_symlink() and {p.name for p in input_root.iterdir()} == {"packages", "smoke"}, "Unexpected release input layout")
-    archives = [(platform, arch, cuda12, f"Recordbox-{version}-{platform}-{arch}" +
-                 ("-cuda12" if cuda12 else "") + (".tar.gz" if platform == "linux" else ".zip"))
-                for platform, arch in TARGETS
-                for cuda12 in ((False, True) if platform in build_archive.cuda_platforms(version) else (False,))]
+    archives = list(build_archive.release_archives(version))
     expected = {name + suffix for _, _, _, name in archives for suffix in ("", ".sha256")}
     packages = input_root / "packages"; smoke = input_root / "smoke"
     require(packages.is_dir() and not packages.is_symlink() and {p.name for p in packages.iterdir()} == expected
@@ -244,11 +251,11 @@ def prepare_release(input_root, output, source, commit, tag, repository):
     require(smoke.is_dir() and not smoke.is_symlink() and {p.name for p in smoke.iterdir()} == {f"smoke-{p}-{a}-{commit}" for p, a in TARGETS}, "Missing/mixed native smoke artifacts")
     verified = {}
     with tempfile.TemporaryDirectory(prefix="recordbox-release-verify-") as temporary:
-        for platform, arch, cuda12, name in archives:
+        for platform, arch, variant, name in archives:
             archive = packages / name; checksum = sha256(archive)
             require((packages / (name + ".sha256")).read_text(encoding="utf-8") == f"{checksum}  {name}\n", "Native archive checksum sidecar mismatch")
-            manifest = verify_package(archive, Path(temporary) / name, source, version, commit, platform, arch, cuda12)
-            if not cuda12:
+            manifest = verify_package(archive, Path(temporary) / name, source, version, commit, platform, arch, variant == "cuda12", variant == "directml")
+            if not variant:
                 verify_smoke(smoke / f"smoke-{platform}-{arch}-{commit}", archive, manifest, commit, platform)
             verified[name] = checksum
     notes = (source / f"docs/releases/{version}.md").read_text(encoding="utf-8").strip()

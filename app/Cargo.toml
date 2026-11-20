@@ -1,6 +1,6 @@
 [package]
 name = "recordbox"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 description = "Local DJ library, track analysis, set preparation and Pioneer-compatible USB export"
 

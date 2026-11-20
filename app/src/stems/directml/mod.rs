@@ -136,6 +136,36 @@ mod tests {
     fn runtime_executes_probe() {
         probe(None).unwrap();
     }
+    // Hosted Windows has a software D3D12 adapter. Exercise DirectML dispatch there
+    // without making it eligible for automatic selection in the application.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the Windows DirectML runtime and a DXGI adapter"]
+    fn runtime_executes_directml() -> Result<()> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+        let mut errors = Vec::new();
+        for index in 0.. {
+            let adapter = match unsafe { factory.EnumAdapters1(index) } {
+                Ok(adapter) => adapter,
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(e.into()),
+            };
+            let desc = unsafe { adapter.GetDesc1()? };
+            match probe(Some(index as i32)) {
+                Ok(()) => {
+                    println!(
+                        "DirectML FP32 probe passed on DXGI adapter {index} (vendor {:#06x})",
+                        desc.VendorId
+                    );
+                    return Ok(());
+                }
+                Err(e) => errors.push(format!("adapter {index}: {e:#}")),
+            }
+        }
+        anyhow::bail!("No working DirectML test adapter: {errors:?}")
+    }
+
     #[test]
     #[ignore = "requires RECORDBOX_TEST_CHECKPOINT and the ONNX Runtime CPU library"]
     fn onnx_four_stems_match_candle() {

@@ -8,7 +8,7 @@ not change Rust code, install dependencies, import a library, or download models
 | --- | --- | --- |
 | macOS ARM64 `.app` + ZIP | Rust, Xcode SDK/Clang, `lipo`, `otool` | Primary platform |
 | macOS x86_64 `.app` + ZIP | Same, on a native x86_64 runner | Primary platform |
-| Windows x86_64 portable ZIP | Rust MSVC, Visual Studio tools including `dumpbin`, OpenSSL runtime | Experimental |
+| Windows x86_64 portable ZIP | Rust MSVC, Visual Studio tools including `dumpbin`, OpenSSL runtime | Supported |
 | Linux x86_64 TAR.GZ | Rust, C compiler, `pkg-config`, ALSA/OpenSSL development packages, `readelf`, `ldd` | Experimental |
 
 The root `rust-toolchain.toml` pins Rust **1.100.0**, rustfmt and Clippy, matching
@@ -75,6 +75,11 @@ archives and their matching smoke evidence. From v0.5.5, the Windows and Linux
 package jobs also supply CUDA 12 previews. The verifier checks their native
 executables, CUDA imports, Pascal FP32 kernels, setup guide and checksums.
 The one-song comparison runs on a physical GPU. [CUDA setup and test](CUDA12.md)
+
+From v0.5.6 the same Windows runner also builds the Radeon DirectML preview.
+Release verification checks its executable, Microsoft runtime DLLs, distribution
+notices and setup guide. [DirectML build and test](DIRECTML.md)
+
 Only the native compilation/smoke
 jobs are skipped when that complete trusted set was explicitly selected.
 If discovery finds no complete set or the API is unavailable, every native build
@@ -293,12 +298,10 @@ diagnostics, not substitutes for the required PNG. In the current application,
 graphics initialization precedes profile creation; a zero exit with neither
 profile nor PNG therefore does not count as a successful smoke test.
 
-Windows/Linux remain experimental: Finder/Apple Music/Audio MIDI Setup and
-`diskutil` integrations are macOS-specific; USB auto-discovery scans `/Volumes`,
-and Metal acceleration is macOS-only. These helpers do not alter that application
-behavior. Native menus are currently attached only on macOS; some shortcuts on
-other platforms may be suppressed by the existing menu state. Windows' hardware
-memory estimate also uses an unsupported `/proc/meminfo` path. These are follow-up
-application issues, rather than changes hidden inside the packaging contribution.
+Windows x64 has a supported portable ZIP. Linux x64 is experimental.
+Finder, Apple Music, Audio MIDI Setup, Metal and the `diskutil` eject action use
+macOS integrations. USB auto-discovery scans `/Volumes`. Native menus attach on
+macOS and the menu state can suppress some shortcuts on other platforms.
+Windows reports physical memory through the system API.
 No Developer ID signing, Windows certificate signing, or notarization
 is performed or claimed.
