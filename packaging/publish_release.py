@@ -11,7 +11,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from build_archive import cuda_platforms
+from build_archive import release_archives
 
 
 class ReleaseError(Exception):
@@ -108,11 +108,7 @@ def local_release(repository, tag, source, directory):
     stable_version(tag)
     if not re.fullmatch(r"[0-9a-f]{40}", source):
         raise ReleaseError("Source commit must be a full lowercase Git commit SHA")
-    names = {f"Recordbox-{tag[1:]}-{platform}.{extension}" for platform, extension in (
-        ("macos-arm64", "zip"), ("macos-x86_64", "zip"),
-        ("windows-x86_64", "zip"), ("linux-x86_64", "tar.gz"))}
-    names.update(f"Recordbox-{tag[1:]}-{platform}-x86_64-cuda12." + ("zip" if platform == "windows" else "tar.gz")
-                 for platform in cuda_platforms(tag[1:]))
+    names = {name for _, _, _, name in release_archives(tag[1:])}
     subjects = names | {"COMMIT-LOG.txt"}
     assets = Path(directory) / "assets"
     if assets.is_symlink() or {p.name for p in assets.iterdir()} != subjects | {"SHA256SUMS"}:

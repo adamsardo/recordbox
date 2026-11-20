@@ -13,6 +13,7 @@ from unittest.mock import patch
 import zipfile
 import zlib
 
+import build_cuda12
 import build_archive as package
 import prepare_release as release
 
@@ -34,6 +35,55 @@ class DownloadNotesTests(unittest.TestCase):
         body = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.5")
         for target in ("windows-x86_64-cuda12.zip", "linux-x86_64-cuda12.tar.gz"):
             self.assertIn(f"https://github.com/test/recordbox/releases/download/v0.5.5/Recordbox-0.5.5-{target}", body)
+
+    def test_radeon_archive_and_platform_labels_follow_the_release_version(self):
+        previous = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.5")
+        self.assertNotIn("-directml.zip", previous)
+        self.assertIn("| Windows x64, experimental |", previous)
+        body = release.render_release_downloads(self.notes, "test/recordbox", "v0.5.6")
+        self.assertIn("| Windows x64 |", body)
+        self.assertIn("| Linux x64, experimental |", body)
+        self.assertNotIn("Windows x64, experimental", body)
+        self.assertIn("https://github.com/test/recordbox/releases/download/v0.5.6/Recordbox-0.5.6-windows-x86_64-directml.zip", body)
+        self.assertEqual(len(list(package.release_archives("0.5.6"))), 7)
+
+    def test_radeon_runtime_verification_rejects_a_missing_or_modified_file(self):
+        from unittest.mock import patch
+        from hashlib import sha256
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hashes = {"onnxruntime.dll": sha256(b"runtime").hexdigest(),
+                      "ort-LICENSE.txt": sha256(b"license").hexdigest()}
+            with patch.dict(package.directml_runtime.FILES, hashes, clear=True):
+                (root / "onnxruntime.dll").write_bytes(b"runtime")
+                with self.assertRaisesRegex(ValueError, "ort-LICENSE"):
+                    package.directml_runtime.verify(root, packaged=True)
+                (root / "runtime-notices").mkdir()
+                (root / "runtime-notices/ort-LICENSE.txt").write_bytes(b"license")
+                package.directml_runtime.verify(root, packaged=True)
+                (root / "onnxruntime.dll").write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "onnxruntime"):
+                    package.directml_runtime.verify(root, packaged=True)
+
+    def test_cuda_source_override_recovers_partial_cache_and_reuses_a_complete_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(build_cuda12, "pascal_kernel_copy", shutil.copytree):
+            root = Path(tmp)
+            source = root / "upstream"
+            source.mkdir()
+            (source / "Cargo.toml").write_text("[package]")
+            (source / "kernel.cu").write_text("compiled kernel")
+            partial = root / "partial"
+            partial.mkdir()
+            (partial / "kernel.cu").write_text("partial")
+            with build_cuda12.kernel_override(source, partial) as used:
+                self.assertNotEqual(used, partial)
+                self.assertEqual((used / "Cargo.toml").read_text(), "[package]")
+                self.assertEqual((used / "kernel.cu").read_text(), "compiled kernel")
+            self.assertEqual((partial / "kernel.cu").read_text(), "partial")
+            stable = root / "stable"
+            for _ in range(2):
+                with build_cuda12.kernel_override(source, stable) as used:
+                    self.assertEqual(used, stable)
 
     def test_preview_requires_both_pascal_kernels_and_nvidia_imports(self):
         with tempfile.TemporaryDirectory() as tmp:

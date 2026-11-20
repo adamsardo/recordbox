@@ -1,6 +1,6 @@
 [package]
 name = "recordbox"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 description = "Local DJ library, track analysis, set preparation and Pioneer-compatible USB export"
 
@@ -9,6 +9,7 @@ name = "recordbox"
 path = "src/main.rs"
 
 [features]
+directml = ["dep:ort", "dep:onnx-rs", "dep:bumpalo", "dep:windows"]
 cuda12 = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
@@ -37,6 +38,9 @@ unicode-normalization = "0.1"
 rand = "0.8"
 # Stem separation (open HTDemucs models, pure-Rust inference).
 candle-core = "0.11.1"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
+onnx-rs = { version = "0.1.3", optional = true }
+bumpalo = { version = "3", optional = true }
 candle-nn = "0.11.1"
 sha2 = "0.10"
 tempfile = "3"
@@ -49,6 +53,7 @@ zip = { version = "9.7.1", default-features = false }
 egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_AI_MachineLearning_DirectML"], optional = true }
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

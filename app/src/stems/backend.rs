@@ -2,13 +2,15 @@ use candle_core::Device;
 use std::sync::OnceLock;
 
 struct Backend {
+    #[cfg(all(windows, feature = "directml"))]
+    directml: Option<super::directml::Binding>,
     device: Device,
     label: String,
 }
 
 impl Backend {
     fn cpu(reason: &str) -> Self {
-        Self { device: Device::Cpu, label: format!("CPU · {reason}") }
+        Self { #[cfg(all(windows, feature = "directml"))] directml: None, device: Device::Cpu, label: format!("CPU · {reason}") }
     }
 }
 
@@ -20,6 +22,30 @@ pub fn force_cpu() {
 
 pub fn device() -> Device {
     BACKEND.get_or_init(select).device.clone()
+}
+
+#[cfg(all(windows, feature = "directml"))]
+pub(super) fn directml_device() -> Option<&'static super::directml::Binding> {
+    BACKEND.get_or_init(select).directml.as_ref()
+}
+
+pub fn uses_directml() -> bool {
+    #[cfg(all(windows, feature = "directml"))]
+    { directml_device().is_some() }
+    #[cfg(not(all(windows, feature = "directml")))]
+    { false }
+}
+
+pub fn gpu_active() -> bool {
+    uses_directml() || !device().is_cpu()
+}
+
+#[cfg(all(windows, feature = "directml"))]
+fn select() -> Backend {
+    match super::directml::select() {
+        Ok((binding, label)) => Backend { device: Device::Cpu, label, directml: Some(binding) },
+        Err(error) => Backend::cpu(&format!("{error:#}")),
+    }
 }
 
 pub fn backend_label() -> &'static str {
@@ -34,12 +60,12 @@ fn select() -> Backend {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), not(feature = "cuda12")))]
+#[cfg(all(not(target_os = "macos"), not(feature = "cuda12"), not(all(windows, feature = "directml"))))]
 fn select() -> Backend {
     Backend::cpu("standard build")
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "cuda12"))]
+#[cfg(all(not(target_os = "macos"), feature = "cuda12", not(all(windows, feature = "directml"))))]
 fn select() -> Backend {
     use candle_core::cuda_backend::cudarc::driver::CudaContext;
     let count = match CudaContext::device_count() {
@@ -57,7 +83,7 @@ fn select() -> Backend {
     Backend::cpu(&format!("CUDA 12 · {}", reasons.join(", ")))
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "cuda12"))]
+#[cfg(all(not(target_os = "macos"), feature = "cuda12", not(all(windows, feature = "directml"))))]
 fn cuda_device(ordinal: usize) -> anyhow::Result<Backend> {
     use candle_core::Tensor;
     // One explicit stream can be used by both the assessment and separation threads.

@@ -1,5 +1,7 @@
 """Build the optional Pascal-compatible Recordbox executable with CUDA Toolkit 12.9."""
 import argparse
+from contextlib import contextmanager
+import filecmp
 import hashlib
 import json
 import os
@@ -41,6 +43,39 @@ def pascal_kernel_copy(source, destination):
     reduce.write_bytes(source_code.replace(half_sum, b"#if __CUDA_ARCH__ >= 700\n" + half_sum + b"\n#endif"))
 
 
+def same_sources(expected, existing):
+    if not existing.is_dir() or existing.is_symlink():
+        return False
+    for entry in expected.rglob("*"):
+        if entry.is_file():
+            other = existing / entry.relative_to(expected)
+            if other.is_symlink() or not other.is_file() or not filecmp.cmp(entry, other, shallow=False):
+                return False
+    return {p.relative_to(expected) for p in expected.rglob("*") if p.is_file()} == {
+        p.relative_to(existing) for p in existing.rglob("*") if p.is_file()
+    }
+
+
+@contextmanager
+def kernel_override(source, stable):
+    # Cargo CI caches may restore a partial directory. Build from a complete
+    # private copy when this happens, without replacing files another build uses.
+    stable.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=stable.parent) as tmp:
+        prepared = Path(tmp) / "candle-kernels"
+        pascal_kernel_copy(source, prepared)
+        if not stable.exists():
+            try:
+                prepared.rename(stable)
+            except OSError:
+                if not stable.is_dir():
+                    raise
+            else:
+                yield stable
+                return
+        yield stable if same_sources(prepared, stable) else prepared
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "dist" / "cuda12")
@@ -64,21 +99,14 @@ def main():
     kernels, = [p for p in metadata["packages"] if p["name"] == "candle-kernels"]
     # A Cargo path override keeps the registry checkout and the signed-off lockfile intact.
     key = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
-    patched = args.target_dir / f"candle-kernels-{kernels['version']}-{key}"
-    if not patched.exists():
-        with tempfile.TemporaryDirectory(dir=args.target_dir) as tmp:
-            copy = Path(tmp) / "candle-kernels"
-            pascal_kernel_copy(Path(kernels["manifest_path"]).parent, copy)
-            try:
-                copy.rename(patched)
-            except OSError:
-                if not patched.is_dir():
-                    raise
+    # Keep source out of the Cargo target tree pruned by rust-cache.
+    stable = ROOT / "dist" / ".cuda-sources" / f"candle-kernels-{kernels['version']}-{key}"
     build_env = dict(os.environ, CUDA_COMPUTE_CAP="61")
-    config = "paths = [" + json.dumps(patched.as_posix()) + "]"
-    subprocess.run(["cargo", "--config", config, "build", *flags, "--release",
-                    "--bin", "recordbox", "--target-dir", str(args.target_dir)],
-                   check=True, env=build_env)
+    with kernel_override(Path(kernels["manifest_path"]).parent, stable) as patched:
+        config = "paths = [" + json.dumps(patched.as_posix()) + "]"
+        subprocess.run(["cargo", "--config", config, "build", *flags, "--release",
+                        "--bin", "recordbox", "--target-dir", str(args.target_dir)],
+                       check=True, env=build_env)
     suffix = ".exe" if os.name == "nt" else ""
     args.output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.target_dir / "release" / ("recordbox" + suffix),

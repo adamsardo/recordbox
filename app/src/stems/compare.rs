@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use candle_core::Device;
 use std::time::Instant;
 
-fn relative_error(reference: &[f32], actual: &[f32]) -> Result<f64> {
+pub(super) fn relative_error(reference: &[f32], actual: &[f32]) -> Result<f64> {
     ensure!(!reference.is_empty() && reference.len() == actual.len(), "different stem lengths");
     let (mut energy, mut difference) = (0.0, 0.0);
     for (&a, &b) in reference.iter().zip(actual) {
@@ -19,7 +19,7 @@ fn relative_error(reference: &[f32], actual: &[f32]) -> Result<f64> {
 pub fn compare_track(path: &str) -> Result<()> {
     println!("STEMS backend: {}", backend_label());
     let accelerator = device();
-    ensure!(!accelerator.is_cpu(), "An active GPU is required to compare against the CPU");
+    ensure!(super::backend::gpu_active(), "An active GPU is required to compare against the CPU");
     let checkpoint = models_dir().join(CATALOG[1].files[0]);
     ensure!(checkpoint.is_file(), "Download HTDemucs in Preferences → Extensions → STEMS first");
     let decoded = crate::audio::decode_file(path)?;
@@ -27,8 +27,7 @@ pub fn compare_track(path: &str) -> Result<()> {
     ensure!(frames > 0, "Empty track");
     let seconds = frames as f64 / f64::from(htdemucs::SAMPLE_RATE);
     println!("HTDemucs · {seconds:.2} seconds of audio · four stereo stems");
-    let run = |device: &Device, label: &str| -> Result<_> {
-        let model = htdemucs::Graph::load(&checkpoint, device)?;
+    let run = |model: htdemucs::Graph, device: &Device, label: &str| -> Result<_> {
         let start = Instant::now();
         let parts = htdemucs::separate(&model, device, &audio, frames, &Default::default(), &mut |_, _| true)?;
         let elapsed = start.elapsed().as_secs_f64();
@@ -36,8 +35,8 @@ pub fn compare_track(path: &str) -> Result<()> {
         ensure!(parts.len() == 8 * frames, "Incomplete {label} output");
         Ok((parts, elapsed))
     };
-    let (gpu, gpu_time) = run(&accelerator, "GPU")?;
-    let (cpu, cpu_time) = run(&Device::Cpu, "CPU")?;
+    let (gpu, gpu_time) = run(htdemucs::Graph::load_selected(&checkpoint)?, &accelerator, "GPU")?;
+    let (cpu, cpu_time) = run(htdemucs::Graph::load(&checkpoint, &Device::Cpu)?, &Device::Cpu, "CPU")?;
     println!("CPU time / GPU time: {:.2}×", cpu_time / gpu_time);
     let mut agree = true;
     for ((name, reference), result) in htdemucs::SOURCES.iter().zip(cpu.chunks_exact(2 * frames)).zip(gpu.chunks_exact(2 * frames)) {

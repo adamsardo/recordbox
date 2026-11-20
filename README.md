@@ -9,11 +9,11 @@
   <br>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/fantuz/recordbox" alt="MIT license" height="20"></a>
   <a href="app/Cargo.toml"><img src="https://img.shields.io/badge/built%20with-Rust-555555?logo=rust" alt="Built with Rust" height="20"></a>
-  <a href="#running-it"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-507269" alt="macOS; experimental Windows and Linux packages" height="20"></a>
+  <a href="#running-it"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-507269" alt="macOS, Windows and experimental Linux packages" height="20"></a>
 </p>
 <!-- project-badges:end -->
 
-An unofficial, open-source macOS app for getting ready for a DJ set: organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
+Recordbox is an unofficial, open-source DJ preparation app for macOS and Windows, with an experimental Linux build. Organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
 
 > **Not affiliated with AlphaTheta or Pioneer DJ.** rekordbox is a trademark of AlphaTheta Corporation. This is an independent project that uses rekordbox's preparation workflow as the reference for how things should behave.
 
@@ -28,8 +28,7 @@ authors and MIT licence preserved.
 </p>
 
 Choose your operating system and processor from the release's **Downloads**
-table. Packages are unsigned; macOS builds are not notarized. Windows and Linux
-packages are experimental.
+table. Packages are unsigned; macOS builds are not notarized. Linux packages are experimental.
 
 ## Status
 
@@ -64,21 +63,25 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 
 ## Privacy and safety
 
-- Runs entirely on your Mac. No account, no cloud.
+- Library preparation and STEMS processing run locally on your computer. You can use both without an account.
 - Design rule: it never modifies your existing rekordbox library or your original audio files.
 
 ## Running it
 
 Downloads for the `fantuz/recordbox` fork are available from
 [the latest release](https://github.com/fantuz/recordbox/releases/latest).
-Choose the macOS app ZIP matching your processor, or an experimental Windows x64
-ZIP or Linux x64 archive. Prebuilt packages do not require Rust; see the release
+Choose the macOS app ZIP matching your processor, the Windows x64 ZIP,
+or the experimental Linux x64 archive. Prebuilt packages do not require Rust; see the release
 notes and [installation guide](docs/BUILD-AND-PACKAGING.md) for requirements,
 checksums and known limits.
 
 For NVIDIA STEMS separation on Windows or Linux x64, choose the **CUDA 12**
 preview archive. It targets the Quadro P2000 and other compatible GPUs.
-[Setup and single-track comparison](docs/CUDA12.md)
+[CUDA setup and single-track comparison](docs/CUDA12.md)
+
+For a Radeon Vega 8 or another AMD adapter with a DirectX 12 driver, choose
+the **Windows x64 Radeon DirectML** preview ZIP. It includes the inference runtime.
+[Check your adapter and compare one song](docs/DIRECTML.md)
 
 To build from source, install [Rust through rustup](https://rustup.rs). The
 repository selects the same toolchain as CI. Install your platform's native
@@ -96,7 +99,7 @@ policy and the limits of CI coverage.
 This is a work in progress: it may not build at every moment while the agent is mid-change.
 
 The **Build and package** GitHub Actions workflow also produces unsigned macOS
-app ZIPs (Apple Silicon and Intel), an experimental Windows x64 portable ZIP and
+app ZIPs (Apple Silicon and Intel), a Windows x64 portable ZIP and
 an experimental Linux x64 archive. Download the artifact for your platform from
 a successful workflow run; artifacts include source/runtime manifests and
 checksum sidecars. See [build checks and packaging](docs/BUILD-AND-PACKAGING.md)
