@@ -2051,7 +2051,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     let missing: Vec<Track> = app.tracks.iter().filter(|t| t.missing).cloned().collect();
     let ids: HashSet<i64> = missing.iter().map(|t| t.id).collect();
     app.ext.missing_sel.retain(|t| ids.contains(t));
-    let busy = app.ext.reloc_rx.is_some() || app.relocate_rx.is_some();
+    let busy = app.relocate_rx.is_some();
     kit::dialog(ctx, "Missing File Manager").open(&mut open).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).frame(egui::Frame::window(&ctx.style()).fill(BG2).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(602.0, 528.0), Sense::hover());
         let p = ui.painter().clone();

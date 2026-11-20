@@ -53,6 +53,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 <h3>Missing files</h3>
 <p>A track whose file has moved shows a warning mark. <i>File &gt; Display All Missing Files</i> lists them. <i>Track &gt; Relocate &gt; Relocate</i> points one track at its file; <i>Auto Relocate</i> searches the folders listed in Preferences &gt; Advanced &gt; Browse; <i>File &gt; Relocate Missing Files…</i> searches a folder you choose.</p>
+<p>Both searches use the saved filename, including names from Windows drives and shares. When a track has a recorded size, one candidate must match that size. With an unknown size, a single available file with the same name can match. The summary distinguishes size conflicts, multiple candidates, unverified files and paths already used by another track. If two missing tracks both match one file, both stay in the list for individual review. Use Relocate to choose a file yourself. Relocation updates the path in your Recordbox collection.</p>
 "#),
     ("playlists", "Playlists", r#"
 <ul>

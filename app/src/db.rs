@@ -226,6 +226,12 @@ impl Db {
         self.conn.query_row("SELECT id FROM tracks WHERE path=?1", [path], |r| r.get(0)).optional().ok().flatten()
     }
 
+    pub fn set_track_path(&self, id: i64, path: &str) -> Result<()> {
+        let changed = self.conn.execute("UPDATE tracks SET path=?1 WHERE id=?2", params![path, id])?;
+        anyhow::ensure!(changed == 1, "The track is no longer in the collection");
+        Ok(())
+    }
+
     /// Insert a track; returns its new id.
     pub fn insert_track(&self, t: &Track) -> Result<i64> {
         self.conn.execute(
