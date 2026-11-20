@@ -7,7 +7,7 @@
 //! - `cue_markers_on_preview`: the Preview column in ui_browser.rs.
 //! - `wave_half`: the enlarged and overview waveforms in ui_player.rs.
 //! - `color_names`: every colour menu, through `Prefs::color_name`; the device colour table.
-//! - `high_precision_grid`, `analysis_mode`: the analysis code.
+//! - `refine_beatgrid_transients`, `analysis_mode`: the analysis code.
 //! - `memory_cue_first_beat`: `App::apply_analysis` calls `memory_cue_at_first_beat`.
 //! - `audio_buffer`, `audio_rate`, `audio_channel`: the output stream (audio.rs).
 //! - `device_bg_color`, `delete_history_after_import`: the USB code.
@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn new_prefs_round_trip() {
         let mut p = Prefs::default();
-        assert!(p.tree_item("Devices") && p.cue_markers_on_preview && p.high_precision_grid && !p.wave_half);
+        assert!(p.tree_item("Devices") && p.cue_markers_on_preview && !p.refine_beatgrid_transients && !p.wave_half);
         p.tree_items.insert("Devices".into(), false);
         p.tree_items.insert("Collection".into(), false);
         p.mytag_to_comments = true;
@@ -836,7 +836,7 @@ mod tests {
         p.wave_half = true;
         p.color_names[2] = "Peak time".into();
         p.color_names[3] = "  ".into();
-        p.high_precision_grid = false;
+        p.refine_beatgrid_transients = true;
         p.memory_cue_first_beat = true;
         p.audio_buffer = 256;
         p.audio_rate = 48000;

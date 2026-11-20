@@ -13,8 +13,6 @@ use egui::{pos2, vec2, Color32, Context, Rect, RichText, Ui};
 
 // Settings another part of the app has to act on. While one is false its control is shown
 // switched off with the reason, so nothing in the window pretends to work.
-/// Analysis reads `prefs.high_precision_grid`.
-const HIGH_PRECISION_WIRED: bool = false;
 /// The device writer deletes an imported history (reads `prefs.delete_history_after_import`).
 const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.
@@ -52,7 +50,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 113] = [
+const SETTINGS: [(u8, usize, &str); 116] = [
     (7, 2, "Apply CFX to Sampler using MIC COLOR control knob."),
     (7, 3, "SLOT"),
     (7, 3, "Do not overwrite the loaded Slot."),
@@ -164,6 +162,9 @@ const SETTINGS: [(u8, usize, &str); 113] = [
     (6, 0, "MUTE / SOLO"),
     (6, 0, "Reset the MUTE/SOLO state while loading"),
     (6, 0, "Stem separation model"),
+    (6, 0, "Allow automatic separation on CPU"),
+    (0, 0, "Playback animation"),
+    (1, 0, "Analysis workers"),
     (2, 6, "Supported devices"),
     (0, 0, "Tooltips"),
 ];
@@ -588,6 +589,15 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                 }
             });
             card(ui, "Waveform", |ui| {
+                kit::labeled(ui, "Playback animation", |ui| {
+                    let choices = [(15, "15 frames/s"), (30, "30 frames/s"), (0, "Display rate")];
+                    let current = choices.iter().find(|(n, _)| *n == app.prefs.playback_fps).map_or("Display rate", |v| v.1);
+                    kit::combo("playback_fps", 170.0, current, 14.0).show_ui(ui, |ui| {
+                        for (fps, name) in choices {
+                            ui.selectable_value(&mut app.prefs.playback_fps, fps, name);
+                        }
+                    });
+                });
                 sub(ui, "Full/Preview Waveform");
                 kit::indent(ui, 88.0);
                 if radio(ui, !app.prefs.wave_half, "Full Waveform") {
@@ -1052,19 +1062,10 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
     }
     let no_cloud = "recordbox has no cloud service: nothing is collected or uploaded.";
     card(ui, "Track Analysis", |ui| {
-        let why = "recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
-        let mut refused = false;
         kit::row(ui, 16.0, |ui| {
-            if HIGH_PRECISION_WIRED {
-                kit::toggle_raw(ui, &mut app.prefs.high_precision_grid, "Use high precision BeatGrid analysis");
-            } else {
-                refused = kit::toggle_off_raw(ui, "Use high precision BeatGrid analysis", why);
-            }
-            kit::help(ui, 37.5, if HIGH_PRECISION_WIRED { "A more precise beat grid, at the cost of a longer analysis." } else { why });
+            kit::toggle_raw(ui, &mut app.prefs.refine_beatgrid_transients, "Use high precision BeatGrid analysis");
+            kit::help(ui, 37.5, "Refine beat timing and tempo against repeated attacks in the audio. Works with Normal and Dynamic. Use Analyze Track to update an existing unlocked grid.");
         });
-        if refused {
-            app.toast(why);
-        }
         separator(ui);
         kit::sub_help(ui, "Track Analysis Mode", Some("Normal: optimized for tracks which have a constant BPM.\nDynamic: for tracks whose tempo changes, the beat grid follows the tempo."));
         kit::labeled(ui, "Analysis Mode", |ui| {
@@ -1077,6 +1078,20 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
                     }
                 }
             });
+        });
+        kit::labeled(ui, "Analysis workers", |ui| {
+            let before = app.prefs.analysis_threads;
+            let label = if before == 0 { format!("Automatic ({})", app.pool.thread_count()) } else { app.pool.thread_count().to_string() };
+            let busy = app.pool.pending.load(std::sync::atomic::Ordering::Acquire) != 0;
+            ui.add_enabled_ui(!busy, |ui| {
+                kit::combo("analysis_workers", 170.0, label, 14.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.prefs.analysis_threads, 0, "Automatic");
+                    for n in 1..=app.pool.available_cpus.min(12) {
+                        ui.selectable_value(&mut app.prefs.analysis_threads, n, n.to_string());
+                    }
+                });
+            }).response.on_hover_text("Automatic leaves one processor available for playback when possible. Change this between analysis batches.");
+            if app.prefs.analysis_threads != before { app.pool.set_threads(app.prefs.analysis_threads); }
         });
         kit::labeled(ui, "BPM Range", |ui| {
             let (lo, hi) = BPM_RANGES[app.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
@@ -1930,7 +1945,10 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
         toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
-        note(ui, "As rekordbox does while its STEMS function is on. The original plays until the parts are ready. Off: a track is separated when you first press one of its part buttons.");
+        ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
+            toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+        });
+        note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {

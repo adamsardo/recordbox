@@ -170,6 +170,12 @@ impl Col {
     }
 }
 
+impl Prefs {
+    fn auto_stems_on_load(&self, gpu: bool) -> bool {
+        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -233,6 +239,8 @@ pub struct Prefs {
     pub ch_fader_curve: u8,
     /// Separate a track when it is loaded, as rekordbox does while its STEMS function is on.
     pub stems_auto_separate: bool,
+    /// Also start uncached model inference on Load when no accelerator is available.
+    pub stems_auto_cpu: bool,
     /// Most disk space the kept stems may use, in GB (the least recently used go first).
     pub stem_cache_gb: u32,
     /// Import play histories from connected devices automatically.
@@ -285,7 +293,7 @@ pub struct Prefs {
     /// View > Color > Customize Color Comments: names of the 8 track colours (Pink..Purple).
     pub color_names: [String; 8],
     /// Analysis: "Use high precision BeatGrid analysis".
-    pub high_precision_grid: bool,
+    pub refine_beatgrid_transients: bool,
     /// CUE Analysis: "Set Memory Cue at the first beat of track when analyzing".
     pub memory_cue_first_beat: bool,
     /// Audio: buffer size in frames (0 = the device's default), sample rate (0 = the
@@ -337,6 +345,8 @@ pub struct Prefs {
     pub wave_click_play_cue: bool,
     /// Player layout: 0 = 1 Player, 1 = 2 Players, 2 = Simple Player (`browser_only` hides it).
     pub player_layout: u8,
+    /// Maximum automatic playback animation rate. Zero follows the display.
+    pub playback_fps: u8,
     /// Metronome volume step 1–3.
     pub metronome_vol: u8,
     /// Beat jump length shown and chosen in bars (`beat_jump` stays in beats).
@@ -347,6 +357,8 @@ pub struct Prefs {
     pub show_phrase_bar: bool,
     /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
     pub analysis_mode: u8,
+    /// Maximum CPU workers for library analysis. Zero selects the automatic budget.
+    pub analysis_threads: usize,
     /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
     /// track is first analysed; Analyze Key still replaces it.
     pub keep_tag_key: bool,
@@ -480,10 +492,76 @@ impl Default for RelatedRules {
     }
 }
 
-/// Distance between two keys on the key wheel: steps around the wheel plus one when the
-/// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
+/// An explicit reanalysis can replace the grid it saw when queued. Edits made
+/// while its audio was being analyzed take precedence over the worker's result.
+fn keep_saved_grid(locked: bool, saved: &Option<BeatGrid>, queued: Option<&Option<BeatGrid>>, measured: bool) -> bool {
+    locked || match queued {
+        Some(before) => before != saved || !measured,
+        None => saved.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod reanalysis_tests {
+    use super::{keep_saved_grid, BeatGrid};
+
+    #[test]
+    fn replacing_a_saved_grid_requires_a_successful_explicit_analysis_and_no_intervening_edit() {
+        let imported = Some(BeatGrid::constant(0.125, 122.0, 2));
+        let edited = Some(BeatGrid::constant(0.181, 122.0, 1));
+        assert!(keep_saved_grid(false, &imported, None, true));
+        assert!(keep_saved_grid(false, &imported, Some(&imported), false));
+        assert!(keep_saved_grid(true, &imported, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&None), true));
+        assert!(keep_saved_grid(false, &None, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &imported, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &None, None, true));
+    }
+}
+
 #[cfg(test)]
 mod prefs_tests {
+    #[test]
+    fn the_old_inactive_precision_switch_does_not_opt_users_into_new_work() {
+        let old: super::Prefs = serde_json::from_str(r#"{"high_precision_grid":true}"#).unwrap();
+        assert!(!old.refine_beatgrid_transients);
+        let saved: super::Prefs = serde_json::from_str(r#"{"refine_beatgrid_transients":true}"#).unwrap();
+        assert!(saved.refine_beatgrid_transients);
+    }
+
+    #[test]
+    fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
+        let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
+        assert!(!p.auto_stems_on_load(false));
+        assert!(p.auto_stems_on_load(true));
+        p.stems_auto_cpu = true;
+        assert!(p.auto_stems_on_load(false));
+        p.stems_auto_separate = false;
+        assert!(!p.auto_stems_on_load(false));
+        assert!(!p.auto_stems_on_load(true));
+        p.show_stems = false;
+        p.stems_auto_separate = true;
+        assert!(!p.auto_stems_on_load(false));
+    }
+
+    #[test]
+    fn separation_is_cancelled_when_the_last_deck_releases_its_track() {
+        use std::sync::atomic::Ordering;
+        let mut state = super::StemState::new();
+        state.separating = Some((4, 0.25));
+        state.pending = Some(9);
+        state.retain_deck_tracks([None, Some(9), None, Some(4)]);
+        assert!(!state.cancel.load(Ordering::Relaxed));
+        state.retain_deck_tracks([None, Some(9), None, None]);
+        assert!(state.cancel.load(Ordering::Relaxed));
+        assert_eq!(state.pending, Some(9));
+        assert!(state.separating.is_some(), "another model must wait until the cancelled worker exits");
+        state.retain_deck_tracks([None; 4]);
+        assert!(state.pending.is_none());
+        assert!(!state.download_cancel.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn unknown_settings_survive_a_save() {
         let json = r#"{"tooltips": false, "future_setting": {"a": 1}, "another": [1, 2]}"#;
@@ -684,11 +762,16 @@ mod related_tests {
     }
 }
 
-/// Two grids describe the same beats (same anchors within 1 ms and 0.01 BPM).
+/// Reuse the original ANLZ beat sections only when the saved anchors still
+/// match the import. Allow floating-point round trips through the library.
+/// Sub-millisecond timing and fractional BPM edits belong to the saved grid.
 pub fn grids_match(a: &BeatGrid, b: &BeatGrid) -> bool {
-    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| (x.time - y.time).abs() < 0.001 && (x.bpm - y.bpm).abs() < 0.01 && x.beat == y.beat)
+    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| {
+        x.beat == y.beat && (x.time - y.time).abs() <= 1e-9 && (x.bpm - y.bpm).abs() <= 1e-9
+    })
 }
 
+/// Distance between keys around the wheel, plus one when the mode differs.
 pub fn key_distance(a: i32, b: i32) -> Option<i32> {
     if !(0..24).contains(&a) || !(0..24).contains(&b) {
         return None;
@@ -736,6 +819,7 @@ impl Default for Prefs {
             eq_isolator: false,
             ch_fader_curve: 1,
             stems_auto_separate: true,
+            stems_auto_cpu: false,
             stem_cache_gb: 20,
             import_device_history: true,
             keymap: Default::default(),
@@ -761,7 +845,7 @@ impl Default for Prefs {
             cue_markers_on_preview: true,
             wave_half: false,
             color_names: crate::prefs_ext::default_color_names(),
-            high_precision_grid: true,
+            refine_beatgrid_transients: false,
             memory_cue_first_beat: false,
             audio_buffer: 0,
             audio_rate: 0,
@@ -787,12 +871,14 @@ impl Default for Prefs {
             beat_count_mode: 0,
             wave_click_play_cue: false,
             player_layout: 0,
+            playback_fps: if cfg!(target_os = "linux") { 30 } else { 0 },
             metronome_vol: 2,
             beat_jump_bars: false,
             show_stems: true,
             // As rekordbox: "Phrase (Full Waveform)" is not ticked until the user ticks it.
             show_phrase_bar: false,
             analysis_mode: 0,
+            analysis_threads: 0,
             keep_tag_key: true,
             palette_enabled: true,
             playlist_search_filter: true,
@@ -836,6 +922,7 @@ pub enum StemMsg {
     Download(u64, u64),
     DownloadDone(Result<(), String>),
     Progress(i64, f32),
+    Cached(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
     Done(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
 }
 
@@ -850,15 +937,25 @@ pub struct StemState {
     pub error: Option<String>,
     /// Track to separate as soon as the model download finishes.
     pub pending: Option<i64>,
-    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub tx: crossbeam_channel::Sender<StemMsg>,
     pub rx: crossbeam_channel::Receiver<StemMsg>,
 }
 
 impl StemState {
+    fn retain_deck_tracks(&mut self, tracks: [Option<i64>; 4]) {
+        if self.separating.is_some_and(|(id, _)| !tracks.contains(&Some(id))) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.pending.is_some_and(|id| !tracks.contains(&Some(id))) {
+            self.pending = None;
+        }
+    }
+
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), tx, rx }
+        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), download_cancel: Default::default(), tx, rx }
     }
 }
 
@@ -907,6 +1004,7 @@ pub enum SideMode {
 }
 
 pub struct Deck {
+    pub cancel_work: Arc<std::sync::atomic::AtomicBool>,
     /// Phrase structure shown under the overview (rekordbox's own, or Recordbox's).
     pub phrases: Option<crate::phrase::Structure>,
     /// Phrase analysis running in the background for (track id).
@@ -952,6 +1050,7 @@ pub struct Deck {
 impl Default for Deck {
     fn default() -> Self {
         Deck {
+            cancel_work: Default::default(),
             phrases: None,
             phrases_rx: None,
             rb_wave: None,
@@ -1125,6 +1224,7 @@ mod collection_category_tests {
 }
 
 pub struct App {
+    pub deck_options: crate::DeckOptions,
     pub db: Db,
     pub prefs: Prefs,
     pub tracks: Vec<Track>,
@@ -1211,6 +1311,8 @@ pub struct App {
     pub relocate_rx: Option<RelocationSearch>,
     /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
     pub key_requested: HashSet<i64>,
+    /// Unlocked grids explicitly requested for replacement by Analyze Track.
+    pub grid_requested: HashMap<i64, Option<BeatGrid>>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
@@ -1233,7 +1335,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>) -> App {
+    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
         crate::theme::apply(&cc.egui_ctx);
         // SVG images (the recordbox logo).
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -1265,8 +1367,9 @@ impl App {
         }
         crate::prefs_ext::set_stream_opts(&prefs);
         let audio_device = prefs.audio_device.clone();
-        let pool = AnalysisPool::new(cc.egui_ctx.clone());
+        let pool = AnalysisPool::new(cc.egui_ctx.clone(), prefs.analysis_threads);
         let mut app = App {
+            deck_options,
             db,
             prefs,
             tracks: vec![],
@@ -1307,7 +1410,7 @@ impl App {
             filter_color: 0,
             filter_tags: HashSet::new(),
             filter_tags_all: false,
-            player: Player::with_device(audio_device.as_deref()),
+            player: Player::with_device(audio_device.as_deref(), !deck_options.disable_play),
             px: Default::default(),
             load_target: 0,
             deck: Deck::default(),
@@ -1327,6 +1430,7 @@ impl App {
             key_job: None,
             vocal_failed: HashSet::new(),
             key_requested: HashSet::new(),
+            grid_requested: HashMap::new(),
             relocate_rx: None,
             audio_retry: None,
             dialogs: Dialogs::default(),
@@ -1730,7 +1834,7 @@ impl App {
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
+        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, high_precision: self.prefs.refine_beatgrid_transients, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
     }
 
     // ------------------------------------------------------------------ loading
@@ -2229,6 +2333,7 @@ impl App {
         let beats = self.deck.beats.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
             let from_rb = base.and_then(|b| {
                 let dat = b.with_extension("DAT");
@@ -2238,7 +2343,7 @@ impl App {
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
             });
-            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
+            let r = from_rb.or_else(|| if beats.is_empty() || cancel.load(std::sync::atomic::Ordering::Relaxed) { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2257,13 +2362,14 @@ impl App {
             return;
         }
         let Some(id) = self.deck.track else { return };
-        if self.vocal_failed.contains(&id) {
+        if self.vocal_failed.contains(&id) || self.stem.loading == Some(id) || self.stem.separating.is_some_and(|(track, _)| track == id) {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
-            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
+            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| !cancel.load(std::sync::atomic::Ordering::Relaxed)).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2521,7 +2627,7 @@ impl App {
         let ctx = self.ctx.clone();
         let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
         let auto = self.prefs.stems_auto_download;
-        let cancel = self.stem.cancel.clone();
+        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let hw = crate::stems::assess();
             let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
@@ -2549,12 +2655,12 @@ impl App {
         if self.stem.downloading.is_some() {
             return;
         }
-        self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stem.download_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stem.downloading = Some((0, 0));
         self.stem.error = None;
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
-        let cancel = self.stem.cancel.clone();
+        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
@@ -2576,24 +2682,34 @@ impl App {
     /// the background, during which the original plays. A separation still running for a
     /// track that is no longer on a deck is stopped.
     fn stems_for_loaded(&mut self, id: i64) {
-        if let Some((sid, _)) = self.stem.separating {
-            if sid != id && !(0..self.deck_count()).any(|n| self.deck_of(n).track == Some(sid)) {
-                self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                self.stem.separating = None;
-            }
-        }
+        if self.deck.audio.is_none() { return; }
         if self.load_cached_stems(id) {
             return;
         }
         let quiet = self.screenshot.is_some() && std::env::var("PREPDECK_SHOT_STEMS").is_err();
         let ready = self.stem.model.as_deref().and_then(crate::stems::spec).map(crate::stems::model_ready).unwrap_or(false);
-        if self.prefs.show_stems && self.prefs.stems_auto_separate && ready && !quiet && self.deck.track == Some(id) {
+        if self.prefs.auto_stems_on_load(self.stem.hw.as_ref().is_some_and(|h| h.gpu)) && ready && !quiet && self.deck.track == Some(id) {
             self.separate_loaded();
+        }
+    }
+
+    /// Keep work shared by two decks until the last one releases the track.
+    pub(crate) fn cancel_orphaned_stems(&mut self) {
+        let tracks = std::array::from_fn(|n| self.deck_of(n as u8).track);
+        self.stem.retain_deck_tracks(tracks);
+    }
+
+    fn resume_pending_stems(&mut self) {
+        if let Some(id) = self.stem.pending.take() {
+            if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
+                self.with_deck(deck, |app| app.separate_loaded());
+            }
         }
     }
 
     /// Start reading a track's kept stems, if it has any (false: it has none).
     fn load_cached_stems(&mut self, id: i64) -> bool {
+        if self.stem.loading == Some(id) { return true; }
         let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return false };
         let path = crate::stems::cache_path(&t.path, &model);
         if !path.exists() {
@@ -2604,7 +2720,7 @@ impl App {
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let r = crate::stems::load(&path).map(std::sync::Arc::new).map_err(|e| e.to_string());
-            let _ = tx.send(StemMsg::Done(id, r));
+            let _ = tx.send(StemMsg::Cached(id, r));
             ctx.request_repaint();
         });
         true
@@ -2613,7 +2729,13 @@ impl App {
     /// Separate the loaded track (downloading the model first if it is missing).
     pub fn separate_loaded(&mut self) {
         let Some(id) = self.deck.track else { return };
-        if self.stem.separating.is_some() || self.stem.loading == Some(id) {
+        if let Some((active, _)) = self.stem.separating {
+            if active != id || self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                self.stem.pending = Some(id);
+            }
+            return;
+        }
+        if self.stem.loading == Some(id) {
             return;
         }
         let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else {
@@ -2634,17 +2756,26 @@ impl App {
         // cannot stop the next.
         let cancel: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
         self.stem.cancel = cancel.clone();
+        let audio = self.deck.audio.clone();
         let cache_limit = self.prefs.stem_cache_gb as u64 * 1_000_000_000;
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().name("rb-stems".into()).spawn(move || {
             let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
-                let dec = crate::audio::decode_file(&t.path)?;
-                let tx2 = tx.clone();
-                let ctx2 = ctx.clone();
+                let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+                let dec = match audio {
+                    Some(audio) => audio,
+                    None => Arc::new(crate::audio::decode_until(&t.path, cancelled)?),
+                };
+                let mut last_progress = 0.0;
                 let st = crate::stems::separate(m, &dec.samples, dec.sr, &mut |p| {
-                    let _ = tx2.send(StemMsg::Progress(id, p));
-                    ctx2.request_repaint();
-                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    if cancelled() { return false; }
+                    if p > last_progress {
+                        last_progress = p;
+                        let _ = tx.send(StemMsg::Progress(id, p));
+                        ctx.request_repaint();
+                    }
+                    true
                 })?;
+                if cancelled() { anyhow::bail!("stopped"); }
                 let kept = crate::stems::cache_path(&t.path, m.id);
                 let _ = crate::stems::save(&kept, &st);
                 crate::stems::trim_cache(cache_limit, &kept);
@@ -2653,9 +2784,15 @@ impl App {
             let _ = tx.send(StemMsg::Done(id, run().map_err(|e| e.to_string())));
             ctx.request_repaint();
         });
+        if let Err(e) = worker {
+            self.stem.separating = None;
+            self.stem.error = Some(format!("Could not start stem separation: {e}"));
+        }
     }
 
     pub fn stop_separation(&mut self) {
+        self.stem.pending = None;
+        self.stem.download_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -2694,15 +2831,10 @@ impl App {
                     match r {
                         Ok(()) => {
                             self.stem.model_ready = true;
-                            if let Some(id) = self.stem.pending.take() {
-                                if self.deck.track == Some(id) {
-                                    self.separate_loaded();
-                                }
-                            }
+                            self.resume_pending_stems();
                         }
                         Err(e) if e == "stopped" => {
                             self.stem.pending = None;
-                            self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
                             self.stem.error = Some(format!("Model download failed: {e}"));
@@ -2716,36 +2848,44 @@ impl App {
                         self.stem.separating = Some((id, p));
                     }
                 }
-                StemMsg::Done(id, r) => {
-                    if self.stem.separating.map(|s| s.0) == Some(id) {
-                        self.stem.separating = None;
+                StemMsg::Cached(id, result) => {
+                    if self.stem.loading == Some(id) { self.stem.loading = None; }
+                    self.apply_stems(id, result);
+                }
+                StemMsg::Done(id, result) => {
+                    self.stem.separating = None;
+                    if !self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.apply_stems(id, result);
                     }
-                    if self.stem.loading == Some(id) {
-                        self.stem.loading = None;
-                    }
-                    match r {
-                        Ok(st) => {
-                            // Separated stems give vocal detection for free.
-                            if self.db.vocal(id).is_none() && st.len > 0 {
-                                let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
-                                let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
-                                // The mix is the sum of the four stems.
-                                let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
-                                let levels = crate::stems::vocal_levels(&mono, &mix);
-                                let _ = self.db.save_vocal(id, &levels);
-                                if self.deck.track == Some(id) && self.deck.vocal.is_none() {
-                                    self.deck.vocal = Some(std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels)));
-                                }
-                            }
-                            if self.deck.track == Some(id) {
-                                self.player.state.lock().stems = Some(st);
-                            }
-                        }
-                        Err(e) if e == "stopped" => self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed),
-                        Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
-                    }
+                    self.resume_pending_stems();
                 }
             }
+        }
+    }
+
+    fn apply_stems(&mut self, id: i64, result: Result<Arc<crate::stems::Stems>, String>) {
+        if !(0..4).any(|n| self.deck_of(n).track == Some(id)) { return; }
+        match result {
+            Ok(st) => {
+                // Separated stems give vocal detection for free.
+                if self.db.vocal(id).is_none() && st.len > 0 {
+                    let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
+                    let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+                    // The mix is the sum of the four stems.
+                    let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
+                    let levels = crate::stems::vocal_levels(&mono, &mix);
+                    let _ = self.db.save_vocal(id, &levels);
+                    let vocal = Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels));
+                    for n in 0..4 {
+                        let deck = self.deck_of_mut(n);
+                        if deck.track == Some(id) && deck.vocal.is_none() { deck.vocal = Some(vocal.clone()); }
+                    }
+                }
+                for n in 0..4 {
+                    if self.deck_of(n).track == Some(id) { self.player.decks[n as usize].lock().stems = Some(st.clone()); }
+                }
+            }
+            Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
         }
     }
 
@@ -3157,7 +3297,7 @@ impl App {
             self.analysis_done += 1;
             self.apply_analysis(id, r);
         }
-        if self.pool.pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        if self.analysis_done == self.analysis_total {
             self.analysis_total = 0;
             self.analysis_done = 0;
         }
@@ -3169,6 +3309,7 @@ impl App {
         let had_analysis = self.db.wave(id).is_some();
         let keep_tag_key = self.prefs.keep_tag_key;
         let key_requested = self.key_requested.remove(&id);
+        let requested_grid = self.grid_requested.remove(&id);
         let mut locked_peak: Option<f32> = None;
         let Some(t) = self.track_mut(id) else { return };
         match r {
@@ -3191,8 +3332,7 @@ impl App {
                 t.raw_samples = res.raw_samples;
                 t.gain_db = res.gain_db;
                 let measured_peak = res.peak;
-                // A locked grid, or one that came with an imported library, is kept as it is.
-                let keep_grid = t.grid_locked || existing_grid.is_some();
+                let keep_grid = keep_saved_grid(t.grid_locked, &existing_grid, requested_grid.as_ref(), res.grid.is_some());
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
                 if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid && !keep_tag_key)))) {
@@ -3280,15 +3420,16 @@ impl App {
         self.save_track_quiet(id);
     }
 
-    /// Re-analyse ignoring the stored grid (explicit "Analyze Track" from the menu).
+    /// Explicitly request a new grid when the user selects BPM / Grid and Analyze Track.
     pub fn reanalyze(&mut self, ids: &[i64]) {
-        for id in ids {
-            let locked = self.track(*id).map(|t| t.grid_locked).unwrap_or(true);
-            if !locked {
-                let _ = self.db.conn.execute("DELETE FROM grids WHERE track_id=?1", [id]);
+        let settings = self.analysis_settings();
+        let with_grid = settings.do_grid;
+        let submitted = self.analyze_with(ids, true, settings);
+        if with_grid {
+            for id in submitted {
+                self.grid_requested.insert(id, self.db.grid(id).filter(|g| !g.is_empty()));
             }
         }
-        self.analyze(ids, true);
     }
 
     // ------------------------------------------------------------------ player
@@ -3299,6 +3440,50 @@ impl App {
             None => 0.0,
         }
     }
+    /// egui subtracts predicted_dt from nonzero repaint delays. Account for it
+    /// so a 30 Hz preference does not request another frame after just 16 ms.
+    pub fn repaint_playback(&self, ctx: &egui::Context) {
+        match self.prefs.playback_fps {
+            fps @ (15 | 30) => {
+                let delay = 1.0 / f32::from(fps) + ctx.input(|i| i.predicted_dt);
+                ctx.request_repaint_after_secs(delay);
+            }
+            _ => ctx.request_repaint(),
+        }
+    }
+
+    pub fn update_transport(&mut self, ctx: &egui::Context) {
+        let running = self.player.transport_running();
+        #[cfg(target_os = "linux")]
+        {
+            // Performance mode, including an initialized sampler's independent
+            // sequencer/quantization clock, always keeps its low-latency output.
+            let keep_ready = self.performance() || crate::sampler::SAMPLER.lock().is_some();
+            match self.player.service_output(keep_ready, running, self.prefs.audio_device.as_deref()) {
+                Ok(Some(delay)) => ctx.request_repaint_after_secs(delay.as_secs_f32() + ctx.input(|i| i.predicted_dt)),
+                Err(error) => {
+                    self.player.error = Some(error.to_string());
+                    self.player.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for deck in &self.player.decks {
+                        let mut s = deck.lock();
+                        s.playing = false;
+                        s.search = 0.0;
+                    }
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
+        if running {
+            if self.prefs.browser_only && !self.performance() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            } else {
+                self.repaint_playback(ctx);
+            }
+        }
+    }
+
     pub fn playing(&self) -> bool {
         self.player.state.lock().playing
     }
@@ -3310,7 +3495,7 @@ impl App {
         }
     }
     pub fn set_playing(&mut self, p: bool) {
-        self.player.state.lock().playing = p && self.deck.audio.is_some();
+        self.player.state.lock().playing = p && !self.deck_options.disable_play && self.deck.audio.is_some();
     }
 
     /// Load a track into the load-target deck (`load_target`; deck A outside 2 Players).
@@ -3320,6 +3505,9 @@ impl App {
 
     /// Load a track into the active deck.
     pub fn load_track_here(&mut self, id: i64) {
+        if self.deck_options.disable_load {
+            return self.toast_err("Deck loading is disabled for this session (--disable-load).");
+        }
         // Eject/Load Lock (Performance): not while the deck plays, unless it stands at the end.
         if self.performance() && self.prefs.deck_load_lock && self.playing() && self.pos() < self.deck.duration - 0.05 {
             self.toast_err("Load Lock. Not available during playback.");
@@ -3352,6 +3540,7 @@ impl App {
             s.gain = g;
             keep
         };
+        self.deck.cancel_work.store(true, std::sync::atomic::Ordering::Relaxed);
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
         let metronome = self.deck.metronome;
@@ -3372,7 +3561,7 @@ impl App {
         self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         let first_mem = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).fold(f64::NAN, f64::min);
         self.deck.cue_point = if first_mem.is_nan() { self.deck.beats.first().map(|b| b.time).unwrap_or(0.0) } else { first_mem };
-        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone()));
+        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone(), self.deck.cancel_work.clone()));
         {
             let mut st = self.player.state.lock();
             st.stems = None;
@@ -3381,7 +3570,7 @@ impl App {
                 st.stem_on = [true; 4];
             }
         }
-        self.stems_for_loaded(id);
+        self.cancel_orphaned_stems();
         if t.analyzed == 0 {
             self.analyze(&[id], false);
         }
@@ -3412,18 +3601,27 @@ impl App {
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
                     self.deck.phrases = None;
+                    self.stems_for_loaded(id);
                     self.start_deck_phrases(a.clone());
                     self.start_deck_vocal(a.clone());
                     self.instant_double();
                 }
                 Err(e) => {
-                    if let Some((old, pos, gain)) = self.deck_backup.take() {
+                    let backup = self.deck_backup.take();
+                    self.unload_track();
+                    if let Some((old, pos, gain)) = backup {
                         let mut s = self.player.state.lock();
                         s.audio = old.audio.clone();
                         s.pos = pos;
                         s.gain = gain;
                         drop(s);
                         self.deck = old;
+                        self.deck.cancel_work = Default::default();
+                        if let (Some(id), Some(audio)) = (self.deck.track, self.deck.audio.clone()) {
+                            self.stems_for_loaded(id);
+                            if self.deck.phrases.is_none() { self.start_deck_phrases(audio.clone()); }
+                            if self.deck.vocal.is_none() { self.start_deck_vocal(audio); }
+                        }
                     }
                     self.toast_err(format!("This file cannot be played: {e}"));
                 }
@@ -3495,6 +3693,7 @@ impl App {
         } else {
             let p = self.pos();
             if (p - self.deck.cue_point).abs() < 0.01 {
+                if self.deck_options.disable_play { return; }
                 self.deck.cue_preview = true;
                 self.set_playing(true);
             } else {
@@ -3513,6 +3712,9 @@ impl App {
         }
     }
     pub fn play_pause(&mut self) {
+        if self.deck_options.disable_play {
+            return self.toast_err("Playback is disabled for this session (--disable-play).");
+        }
         if self.deck.audio.is_none() {
             return;
         }
@@ -4107,11 +4309,7 @@ impl App {
         let _ = self.db.conn.execute_batch("COMMIT");
         for id in ids {
             if self.deck.track == Some(*id) {
-                let mut s = self.player.state.lock();
-                s.playing = false;
-                s.audio = None;
-                drop(s);
-                self.deck = Deck::default();
+                self.unload_track();
             }
         }
         self.selected.clear();
@@ -4675,7 +4873,11 @@ impl App {
             }
         }
         for (id, r) in analyzed {
-            self.apply_analysis(id, r);
+            // The library worker owns any explicit grid/key request for this track.
+            // An overlapping USB export uses its own analysis settings.
+            if self.track(id).is_some_and(|t| t.analyzed != 3) {
+                self.apply_analysis(id, r);
+            }
         }
         if let Some(r) = report {
             self.export_report = Some(r);

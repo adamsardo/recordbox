@@ -299,11 +299,13 @@ fn resample_to_44k(samples: &[f32], sr: u32) -> Vec<f32> {
 
 /// Separate a decoded track with model `m` (which must be downloaded).
 pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Stems> {
+    if !progress(0.0) { anyhow::bail!("stopped"); }
     let device = device();
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
         if !m.per_source {
+            if !progress(0.0) { anyhow::bail!("stopped"); }
             let g = graph(m.files[0])?;
             let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
             return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb).map_err(|e| anyhow!("{e}"));
@@ -312,6 +314,7 @@ pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMu
         // so only that source is taken from it.
         let mut out = Vec::with_capacity(8 * len);
         for (k, f) in m.files.iter().enumerate() {
+            if !progress(k as f32 / n_models as f32) { anyhow::bail!("stopped"); }
             let g = graph(f)?;
             let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
             out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb).map_err(|e| anyhow!("{e}"))?);
@@ -332,6 +335,7 @@ pub fn separate_vocals(samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -
 /// One source (0 drums, 1 bass, 2 other, 3 vocals) as mono 44.1 kHz, running a single model:
 /// that source's specialist of HTDemucs fine-tuned when downloaded, else HTDemucs.
 pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Vec<f32>> {
+    if !progress(0.0) { anyhow::bail!("stopped"); }
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
     let device = device();
@@ -575,6 +579,12 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_separation_needs_no_weights_or_decoded_audio() {
+        let err = super::separate(&super::CATALOG[1], &[], 44_100, &mut |_| false).err().unwrap();
+        assert_eq!(err.to_string(), "stopped");
+    }
 
     #[test]
     fn chooses_best_model_for_hardware() {

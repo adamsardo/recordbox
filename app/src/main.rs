@@ -188,6 +188,7 @@ impl eframe::App for Gui {
             step!(ui_browser::browser(app, ui));
         });
         step!(ui_dialogs::dialogs(app, ctx));
+        app.update_transport(ctx);
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -445,8 +446,44 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
 }
 
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeckOptions {
+    pub disable_load: bool,
+    pub disable_play: bool,
+}
+
+impl DeckOptions {
+    fn from_args(args: &[String]) -> Self {
+        Self {
+            disable_load: args.iter().any(|arg| arg == "--disable-load"),
+            disable_play: args.iter().any(|arg| arg == "--disable-play"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::DeckOptions;
+
+    #[test]
+    fn deck_switches_are_independent_and_session_only() {
+        for (args, load, play) in [
+            (vec![], false, false), (vec!["--disable-load"], true, false),
+            (vec!["--disable-play"], false, true), (vec!["--disable-play", "--disable-load"], true, true)
+        ] {
+            let args: Vec<_> = args.into_iter().map(String::from).collect();
+            assert_eq!(DeckOptions::from_args(&args), DeckOptions { disable_load: load, disable_play: play });
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
+        println!("Usage: recordbox [--disable-load] [--disable-play] [--screenshot FILE]\n\n  --disable-load  Disable loading tracks into decks for this session.\n  --disable-play  Disable audio playback and previews for this session.\n  --screenshot    Save a picture of the window to FILE and exit.");
+        return Ok(());
+    }
+    let deck_options = DeckOptions::from_args(&args[1..]);
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
     let shot_mode = screenshot.is_some();
     let mut viewport = egui::ViewportBuilder::default().with_title("recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
@@ -475,7 +512,7 @@ fn main() -> eframe::Result<()> {
     }
     let t0 = std::time::Instant::now();
     eframe::run_native("recordbox", options, Box::new(move |cc| {
-        let app = App::new(cc, screenshot);
+        let app = App::new(cc, screenshot, deck_options);
         if bench_on() {
             eprintln!("bench: ready to draw {:.0} ms after launch", t0.elapsed().as_secs_f32() * 1000.0);
         }

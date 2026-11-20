@@ -80,6 +80,19 @@ pub(crate) fn cue_button_face(p: &egui::Painter, c: Pos2, dia: f32, lit: bool, l
     p.text(c - vec2(0.0, 0.25), Align2::CENTER_CENTER, "CUE", caps(9.0 * k), if loaded { WHITE } else { hex(0x323232) });
 }
 
+pub(crate) fn play_control(app: &App, ui: &mut Ui, center: Pos2, hit_size: egui::Vec2, diameter: f32) -> bool {
+    let enabled = !app.deck_options.disable_play;
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let response = ui.interact(Rect::from_center_size(center, hit_size), ui.id().with("playbtn"), sense);
+    play_button_face(ui.painter(), center, diameter, app.playing(), enabled && response.hovered());
+    if !enabled {
+        ui.painter().circle_filled(center, diameter / 2.0, Color32::from_black_alpha(150));
+        response.on_hover_text("Playback is disabled for this session (--disable-play).");
+        return false;
+    }
+    tip(response, app, "Play/Pause").clicked()
+}
+
 /// The round PLAY button on the same grid: stopped, a 40 % green ring and a grey triangle;
 /// playing, the full ring, a raised face and white pause bars.
 pub(crate) fn play_button_face(p: &egui::Painter, c: Pos2, dia: f32, playing: bool, hovered: bool) {
@@ -155,9 +168,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     }
     // PLAY
     let play_c = pos2(lx + 40.0, ly + 214.0);
-    let pr = ui.interact(Rect::from_center_size(play_c, vec2(42.0, 42.0)), ui.id().with("playbtn"), Sense::click());
-    play_button_face(&p, play_c, 40.0, playing, pr.hovered());
-    if tip(pr, app, "Play/Pause").clicked() {
+    if play_control(app, ui, play_c, vec2(42.0, 42.0), 40.0) {
         app.play_pause();
     }
 
@@ -270,9 +281,6 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // A track dragged from the list and dropped on the player is loaded.
     crate::ui_player2::drop_to_load(app, ui, full);
 
-    if playing || app.searching() != 0 || app.deck.loading.is_some() {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// The largest rectangle of a picture's proportions centred in `bx`.

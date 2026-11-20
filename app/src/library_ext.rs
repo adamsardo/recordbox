@@ -511,11 +511,18 @@ impl App {
         let vol = self.player.state.lock().volume;
         // Preferences > Audio > Preview Volume: the middle of the slider is the master volume.
         self.ext.preview.set_volume(vol * (self.prefs.preview_volume * 2.0).clamp(0.0, 2.0));
-        if self.ext.preview.state.lock().track.is_some() {
+        if self.ext.preview.poll() {
             if !self.ctx.input(|i| i.focused) && self.screenshot.is_none() {
                 self.ext.preview.stop();
             } else {
-                self.ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                // A decode completion wakes the UI. Only an advancing playhead needs ticks.
+                if self.ext.preview.state.lock().playing {
+                    if self.prefs.playback_fps == 0 {
+                        self.ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                    } else {
+                        self.repaint_playback(&self.ctx);
+                    }
+                }
             }
         }
         let err = self.ext.preview.state.lock().error.take();
@@ -578,6 +585,7 @@ impl App {
     // ---------------------------------------------------------------- preview
     /// Audition `track` from `frac` (0–1) of its length without loading it.
     pub fn preview_play(&mut self, track: i64, frac: f64) {
+        if self.deck_options.disable_play { return self.toast_err("Preview is disabled for this session (--disable-play)."); }
         let Some(t) = self.track(track).cloned() else { return };
         if t.missing {
             return self.toast_err("File can not be found at the registered location.\nSelect [Relocate] from the right-click menu to register it again.");

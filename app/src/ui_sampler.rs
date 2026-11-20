@@ -1065,7 +1065,7 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
         }
         ui.separator();
         for d in 0..decks {
-            if ui.button(format!("Sequence Load (Deck{})", d + 1)).clicked() {
+            if ui.add_enabled(!app.deck_options.disable_load, egui::Button::new(format!("Sequence Load (Deck{})", d + 1))).clicked() {
                 app.sampler_sequence_load(d);
                 ui.close_menu();
             }

@@ -507,6 +507,31 @@ mod pqtz_tests {
     }
 
     #[test]
+    fn refined_grid_replaces_native_usb_timing_even_below_a_millisecond() {
+        use crate::export::anlz;
+        let original = fixture(0, &[(1, 12000, 200), (2, 12000, 700)]);
+        let native = parse_pqtz_grid(&original).unwrap();
+        let stored: BeatGrid = serde_json::from_str(&serde_json::to_string(&native).unwrap()).unwrap();
+        assert!(crate::app::grids_match(&native, &stored));
+        let different_bpm = BeatGrid::constant(0.2, 120.003, 1);
+        assert!(!crate::app::grids_match(&native, &different_bpm));
+
+        let refined = BeatGrid::constant(0.200475, 120.0, 1);
+        let overrides = anlz::Overrides {
+            sections: HashMap::from([
+                ("PQTZ".into(), original[28..].to_vec()),
+                ("PQT2".into(), anlz::pqt2(&[(1, 12000, 200), (2, 12000, 700)], &[0, 0])),
+            ]),
+            grid_same: crate::app::grids_match(&native, &refined),
+            pssi: None, device: Default::default(), pvdi: None,
+        };
+        let files = anlz::build_with("/Contents/test.wav", &refined.beats(1.0), &Default::default(), &[], 44100, 44100, Some(&overrides));
+        let ext = anlz::section_list(&files.ext);
+        let section = &ext.iter().find(|(tag, _)| tag == "PQT2").unwrap().1;
+        assert_eq!(anlz::pqt2_fractions(section), [475, 475]);
+    }
+
+    #[test]
     fn pqtz_materialized_export_applies_shift_once() {
         let original = fixture(200, &[(1, 12000, 100)]);
         let g = parse_pqtz_grid(&original).unwrap();

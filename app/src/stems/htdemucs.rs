@@ -397,13 +397,14 @@ impl Graph {
         let x = (x + y.broadcast_mul(&self.w(&format!("{name}.gamma_2.scale"))?)?)?;
         self.gn(&x.transpose(1, 2)?.contiguous()?, &format!("{name}.norm_out"))?.transpose(1, 2)?.contiguous()
     }
-    fn transformer(&self, x: &Tensor, xt: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn transformer(&self, x: &Tensor, xt: &Tensor, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<(Tensor, Tensor)> {
         let (b, c, f, t) = x.dims4()?;
         let tt = xt.dim(2)?;
         let x = x.permute((0, 3, 2, 1))?.contiguous()?.reshape((b, t * f, c))?;
         let mut x = self.ln(&x, "crosstransformer.norm_in")?.broadcast_add(&Tensor::from_vec(pos2(f, t, c), (1, t * f, c), x.device())?)?;
         let mut xt = self.ln(&xt.transpose(1, 2)?.contiguous()?, "crosstransformer.norm_in_t")?.broadcast_add(&Tensor::from_vec(pos1(tt, c), (1, tt, c), xt.device())?)?;
         for i in 0..5 {
+            checkpoint()?;
             let prefix = format!("crosstransformer.layers.{i}");
             let tp = format!("crosstransformer.layers_t.{i}");
             if i % 2 == 0 {
@@ -431,7 +432,8 @@ impl Graph {
     }
 
     /// One model pass: [1, 2, L] (L <= 343980) -> [1, 4, 2, L].
-    pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input: &Tensor, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<Tensor> {
+        checkpoint()?;
         let (b, c, original_len) = input.dims3()?;
         if b != 1 || c != 2 || original_len == 0 || original_len > TRAINING_FRAMES {
             candle_core::bail!("HTDemucs input must be [1, 2, L] with 1 <= L <= {TRAINING_FRAMES}")
@@ -447,6 +449,7 @@ impl Graph {
         let mut saved_t = vec![];
         let mut lengths_t = vec![];
         for i in 0..4 {
+            checkpoint()?;
             lengths_t.push(xt.dim(2)?);
             xt = self.encode(&xt, &format!("tencoder.{i}"), false)?;
             x = self.encode(&x, &format!("encoder.{i}"), true)?;
@@ -460,10 +463,11 @@ impl Graph {
         let (_, co, f, t) = x.dims4()?;
         x = self.conv1(&x.reshape((b, co, f * t))?, "channel_upsampler", 0, 1, 1)?.reshape((b, 512, f, t))?;
         xt = self.conv1(&xt, "channel_upsampler_t", 0, 1, 1)?;
-        (x, xt) = self.transformer(&x, &xt)?;
+        (x, xt) = self.transformer(&x, &xt, checkpoint)?;
         x = self.conv1(&x.reshape((b, 512, f * t))?, "channel_downsampler", 0, 1, 1)?.reshape((b, co, f, t))?;
         xt = self.conv1(&xt, "channel_downsampler_t", 0, 1, 1)?;
         for i in 0..4 {
+            checkpoint()?;
             x = self.decode(&x, &saved.pop().unwrap(), &format!("decoder.{i}"), true, t, i == 3)?;
             xt = self.decode(&xt, &saved_t.pop().unwrap(), &format!("tdecoder.{i}"), false, lengths_t.pop().unwrap(), i == 3)?;
         }
@@ -528,8 +532,7 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// overlapping segments with triangular weights, chunks padded from the surrounding audio).
 /// `audio` is planar stereo: left samples then right samples, `len` frames each.
 /// Returns planar [source][channel][frame] (4 × 2 × len), or [channel][frame] of the one
-/// source asked for. `progress(done, total)` is called after each chunk; returning false
-/// cancels.
+/// source asked for. The callback reports completed chunks and is also polled between model layers.
 pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
     if len == 0 || audio.len() != 2 * len {
         candle_core::bail!("empty or malformed input")
@@ -537,6 +540,7 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
     if opts.source.is_some_and(|s| s >= 4) {
         candle_core::bail!("no such source")
     }
+    if !progress(0, 1) { candle_core::bail!("stopped"); }
     #[cfg(target_os = "macos")]
     if let Some(fast) = &graph.fast {
         return separate_fast(fast, device, audio, len, opts, progress);
@@ -551,7 +555,10 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
         let x = Tensor::from_vec(segment_at(audio, len, offset), (1, 2, segment), device)?;
         let y = {
             let _gpu = GPU.lock();
-            graph.forward(&x)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
+            graph.forward(&x, &mut || {
+                if !progress(k, offsets.len()) { candle_core::bail!("stopped"); }
+                Ok(())
+            })?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
         };
         let crop = (segment - chunk_len) / 2;
         for (n, &s) in sources.iter().enumerate() {
@@ -673,6 +680,7 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
         });
         let mut run = || -> Result<()> {
             for (k, p) in rx_in.iter().enumerate() {
+                if !progress(k, offsets.len()) { candle_core::bail!("stopped"); }
                 let (spec, wave) = {
                     let _gpu = GPU.lock();
                     let x = Tensor::from_vec(p.spec, (4, freq, frames), device)?;

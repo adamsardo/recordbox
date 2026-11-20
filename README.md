@@ -42,7 +42,7 @@ The upstream project is being built in the open with an AI coding agent (Claude 
 ## What it's aiming for
 
 - **Library:** import, browse, search and organise your tracks
-- **Analysis:** tempo, beat grid, key and waveforms
+- **Analysis:** tempo, optional high-precision beat grids for steady and changing tempos, key and waveforms
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
 - **USB export:** drives that CDJ/XDJ players can read, the same way rekordbox does
 
@@ -100,10 +100,10 @@ for installation, system requirements, current platform limitations and the
 checks maintainers can enable. Version tags publish validated packages to GitHub
 Releases; the application packages remain unsigned.
 
-For Linux/Intel playback CPU measurements, see the
-[playback performance guide](docs/PLAYBACK-PERFORMANCE.md). Its synthetic
-benchmarks exercise one-deck rendering and waveform drawing without personal
-music or audio hardware.
+On Linux, run `./recordbox --disable-load` to keep tracks out of the decks, or
+`./recordbox --disable-play` to inspect a loaded track with audio disabled.
+Both switches may be combined. For automatic STEMS separation, analysis workers
+and one-deck CPU measurements, see the [performance guide](docs/PLAYBACK-PERFORMANCE.md).
 
 ## The brief
 

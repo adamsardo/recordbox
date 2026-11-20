@@ -292,12 +292,12 @@ impl Cue {
 
 /// A beat grid made of tempo segments. Each anchor marks a beat at `time` with tempo `bpm`;
 /// beats continue at that tempo until the next anchor.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BeatGrid {
     pub anchors: Vec<GridAnchor>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GridAnchor {
     pub time: f64,
     pub bpm: f64,

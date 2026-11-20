@@ -552,7 +552,7 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         return;
     }
     let one = sel.len() == 1;
-    if one && ui.button("Load to Player").clicked() {
+    if one && ui.add_enabled(!app.deck_options.disable_load, egui::Button::new("Load to Player")).clicked() {
         app.load_track(sel[0]);
         ui.close_menu();
     }
@@ -1511,7 +1511,7 @@ pub fn source_list(app: &mut App, ui: &mut Ui, kind: u8, node: &str) {
                     s.anchor = Some(ri);
                 }
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !app.deck_options.disable_load {
                 match app.db.track_by_path(&t.path) {
                     Some(id) => app.load_track(id),
                     None => {

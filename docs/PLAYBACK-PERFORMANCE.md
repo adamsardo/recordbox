@@ -5,7 +5,7 @@ an unprepared track can also queue analysis before Play is pressed. These costs
 need separate measurements: a fast audio callback does not establish low CPU
 usage for the window, graphics driver, decoder or background jobs.
 
-The playback changes retain the existing animation cadence and audio controls:
+The waveform, library and mixer share these optimizations.
 
 - Each deck caches the overview waveform's static display data. Track loading,
   analysis replacement, width, display style and native waveform changes
@@ -28,6 +28,92 @@ The playback changes retain the existing animation cadence and audio controls:
 RustFFT and Candle's matrix backend already select supported SIMD at runtime.
 Public builds retain their existing CPU compatibility, dependencies and
 numerical backends. The changes keep the existing floating-point mode.
+
+## Linux deck loading and playback
+
+The published 0.5.3 Linux build can start HTDemucs when an already-analyzed
+track is loaded and the model has been downloaded. Ejecting the track previously
+left the separation worker running. In the Linux build, the model runs on the
+CPU even when the window uses an accelerated OpenGL driver.
+
+Ordinary deck loads now reuse cached stems. To split an uncached track, press a
+stem part button. To do that automatically on a CPU, turn on both **Separate
+tracks when they are loaded** and **Allow automatic separation on CPU** in
+**Preferences → Extensions → STEMS**. This opt-in also applies to preferences
+saved by older versions. When the last deck releases a track, the worker checks
+for cancellation between model layers. A tensor operation already underway
+finishes first. A second deck holding the same track can keep using the job.
+Explicit library analysis has its own queue.
+
+The blue dial next to Preferences sets the master volume. Drag it, scroll over it
+or use the default keyboard shortcuts `=` and `-`. Double-click restores the default level.
+The two bars beside it read the live stereo output. The small bar farther right
+shows the time spent in the most recent audio callback as a percentage of one
+buffer period. A tooltip shows the value. The footer identifies a model download,
+separation or cancellation while it is underway. These controls work in Export
+and Performance. See the setting-panel diagrams on pages 70 and 128–129 of the
+[rekordbox 7.2.18 manual](https://cdn.rekordbox.com/files/20260807093645/rekordbox7.2.18_manual_EN.pdf).
+
+The standalone launcher accepts these session options. Running `./recordbox`
+again restores ordinary loading and playback.
+
+| Command | Use |
+| --- | --- |
+| `./recordbox --disable-load` | Browse, import, analyze and audition in the library. Deck Load, including Return, double-click, drag and Sequence Load, is disabled. |
+| `./recordbox --disable-play` | Load and inspect tracks, waveforms and cues with audio output and library previews disabled. |
+| `./recordbox --disable-load --disable-play` | Work on the library with both deck loading and audio disabled. |
+
+Linux defaults to 30 frames per second during playback. Choose 15 fps, 30 fps or
+the display rate under **Preferences → View → Display Type → Waveform → Playback
+animation**. Export mode releases idle audio output after two seconds and
+reopens it on demand. Performance mode and an initialized sampler keep their
+output clock ready; library preview releases its own output on Stop or completion.
+
+## Track analysis workers
+
+In **Preferences → Analysis → Track Analysis → Analysis workers**, Automatic
+uses one fewer worker than the available logical CPUs, with a minimum of one
+and a maximum of twelve. On a four-core machine this gives three workers.
+Pick one worker to limit CPU usage during a set. A single track can overlap
+waveform and loudness measurement with tempo and key detection. Key detection
+follows the beat grid. Several tracks share the same worker limit.
+
+To time a local collection, put one audio path per line in `tracks.txt` and run
+from the repository root on an otherwise idle machine.
+
+```sh
+PREPDECK_PATHS="$PWD/tracks.txt" PREPDECK_N=1 cargo test --manifest-path app/Cargo.toml --locked --release jobs::throughput_probe::analysis_workers -- --ignored --nocapture
+PREPDECK_PATHS="$PWD/tracks.txt" PREPDECK_N=3 cargo test --manifest-path app/Cargo.toml --locked --release jobs::throughput_probe::analysis_workers -- --ignored --nocapture
+```
+
+## High-precision beat grids
+
+Turn on **Preferences → Analysis → Track Analysis → Use high precision BeatGrid
+analysis** to refine beat times and fractional BPM using repeated attacks in the
+audio. **Normal** fits a steady tempo. **Dynamic** refines each detected tempo
+segment and preserves the beat numbering across changes. The option starts off,
+including when upgrading from a version that showed an inactive switch.
+
+New analyses use the setting immediately. For an already analyzed track, select
+**BPM / Grid** and choose **Track → Analyze Track**. Automatic analysis preserves
+imported grids. Explicit reanalysis replaces an unlocked grid only when a new
+grid is available and the saved grid still matches the one that was queued.
+USB export writes refined beat times across the DAT and EXT analysis files,
+including the fraction of a millisecond in the EXT beat grid.
+
+The Rust pass samples up to 128 predicted beats per segment and looks for
+consistent attacks within 40 ms of each beat. Sparse or conflicting evidence
+leaves the initial estimate in place. The pass uses the already decoded audio
+and works offline. Its focus is timing and small tempo corrections. A wrong
+half-time choice or first downbeat still needs the grid editor.
+
+On two 64-second generated tracks with known kick and offbeat timings, the
+95th-percentile error went from 4.34 to 0.44 ms at 44.1 kHz and from 4.84 to
+0.46 ms at 48 kHz. On the four bundled demo tracks, three workers took a
+median of 0.779 seconds with standard analysis and 0.790 seconds with refinement
+on the cloud Linux machine. The seven timed runs per setting had overlapping
+ranges. To compare your collection, add `PREPDECK_PRECISE=1` to the worker
+timing command above and repeat it with the same files and workers.
 
 ## Simulate one deck without music or audio hardware
 
@@ -74,15 +160,15 @@ application CPU utilization. They cannot establish that a large process-wide
 CPU increase has been reproduced or eliminated.
 
 The original overview rebuilt whole-track columns and display transforms on
-each repaint. Playing requests continuous repaint; the effective cadence can
-follow a high-refresh display. Caching this unchanged work addresses a cost
+each repaint. Playback used to request a repaint every frame. The playback animation setting
+now controls its cadence. Caching this unchanged work addresses a cost
 that exists even with one deck and no effects. It does not slow the interface
 or promise that every graphics driver will use less CPU by the same amount.
 
 For a local comparison, use the same track, window size, display refresh rate,
 device sample rate and controls. Measure after decoding and initial analysis
 settle, then compare again immediately after loading an unprepared track.
-Keep explicit thread settings and CPU power mode unchanged between runs.
+Keep the worker setting and CPU power mode consistent between runs.
 Containers, hybrid Intel CPUs and laptops under thermal limits can behave
 differently from the cloud Xeon. Model inference was not measured here.
 
@@ -129,8 +215,10 @@ Inspect threads during playback with:
 top -H -p $(pgrep -n -x recordbox)
 ```
 
-The main thread has the same thread ID as the process ID. Compare it with
-`cpal_alsa_out` and any `llvmpipe-*` workers. A busy main thread points toward
+The main thread has the same thread ID as the process ID. Sample before Load,
+after Load while paused, during Play, and several seconds after Eject. Compare
+`rb-stems`, Candle's matrix workers and `rb-analysis-*` with `cpal_alsa_out`
+and any `llvmpipe-*` workers. A busy main thread points toward
 interface or driver work; a busy ALSA output thread needs device/callback
 investigation. This is a diagnostic distinction, not an automatic diagnosis.
 
