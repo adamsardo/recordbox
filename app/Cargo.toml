@@ -8,6 +8,9 @@ description = "Local DJ library, track analysis, set preparation and Pioneer-com
 name = "recordbox"
 path = "src/main.rs"
 
+[features]
+cuda12 = ["candle-core/cuda", "candle-nn/cuda"]
+
 [dependencies]
 eframe = "0.31.1"
 winit = "0.30"
@@ -44,6 +47,9 @@ arboard = { version = "3", default-features = false }
 # are compressed already).
 zip = { version = "9.7.1", default-features = false }
 egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11.1", features = ["metal"] }

@@ -6,9 +6,12 @@
 //! rekordbox's own (vendor) models are never used.
 
 pub mod htdemucs;
+mod backend;
+mod compare;
+pub use backend::{backend_label, force_cpu};
+pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
-use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -21,7 +24,7 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: f64,
     pub apple_silicon: bool,
-    /// A Metal GPU Candle can use.
+    /// The selected separation backend passed its device check.
     pub gpu: bool,
 }
 
@@ -34,32 +37,29 @@ pub fn assess() -> Hardware {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let (cpu, ram_gb) = if cfg!(target_os = "macos") {
         (sysctl("machdep.cpu.brand_string").unwrap_or_default(), sysctl("hw.memsize").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1e9)
+    } else if cfg!(windows) {
+        (String::new(), windows_ram_gb())
     } else {
         let mem = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("MemTotal")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())).unwrap_or(0.0);
         (String::new(), mem / 1e6)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = device().is_metal();
+    let gpu = !device().is_cpu();
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
-fn metal_device() -> Option<Device> {
-    #[cfg(target_os = "macos")]
-    {
-        Device::new_metal(0).ok()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+#[cfg(windows)]
+fn windows_ram_gb() -> f64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // The API writes to this correctly sized structure for the duration of the call.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 { 0.0 } else { status.ullTotalPhys as f64 / 1e9 }
 }
 
-/// The device a model runs on: the Metal GPU when there is one, otherwise the CPU. Made
-/// once and kept, so loaded models and compiled GPU kernels stay usable between tracks.
-pub fn device() -> Device {
-    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
-    DEVICE.get_or_init(|| metal_device().unwrap_or(Device::Cpu)).clone()
-}
+#[cfg(not(windows))]
+fn windows_ram_gb() -> f64 { 0.0 }
+
+pub use backend::device;
 
 /// Share of each model segment that overlaps the next. Upstream's default; see
 /// checks/stem-speed-study.md for what lower values cost and save.
