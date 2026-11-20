@@ -217,6 +217,8 @@ def render_release_downloads(notes, repository, tag):
     for platform, architecture, variant, name in build_archive.release_archives(version):
         label = labels[platform, architecture]
         if variant == "cuda12":
+            if not build_archive.has_directml(version):
+                label = f"{platform.capitalize()} x64"
             label = f"{label}, CUDA 12 STEMS preview"
         elif variant == "directml":
             label = f"{label}, Radeon DirectML STEMS preview"

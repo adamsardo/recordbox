@@ -13,6 +13,7 @@ from unittest.mock import patch
 import zipfile
 import zlib
 
+import build_cuda12
 import build_archive as package
 import prepare_release as release
 
@@ -63,6 +64,26 @@ class DownloadNotesTests(unittest.TestCase):
                 (root / "onnxruntime.dll").write_bytes(b"changed")
                 with self.assertRaisesRegex(ValueError, "onnxruntime"):
                     package.directml_runtime.verify(root, packaged=True)
+
+    def test_cuda_source_override_recovers_partial_cache_and_reuses_a_complete_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(build_cuda12, "pascal_kernel_copy", shutil.copytree):
+            root = Path(tmp)
+            source = root / "upstream"
+            source.mkdir()
+            (source / "Cargo.toml").write_text("[package]")
+            (source / "kernel.cu").write_text("compiled kernel")
+            partial = root / "partial"
+            partial.mkdir()
+            (partial / "kernel.cu").write_text("partial")
+            with build_cuda12.kernel_override(source, partial) as used:
+                self.assertNotEqual(used, partial)
+                self.assertEqual((used / "Cargo.toml").read_text(), "[package]")
+                self.assertEqual((used / "kernel.cu").read_text(), "compiled kernel")
+            self.assertEqual((partial / "kernel.cu").read_text(), "partial")
+            stable = root / "stable"
+            for _ in range(2):
+                with build_cuda12.kernel_override(source, stable) as used:
+                    self.assertEqual(used, stable)
 
     def test_preview_requires_both_pascal_kernels_and_nvidia_imports(self):
         with tempfile.TemporaryDirectory() as tmp:
