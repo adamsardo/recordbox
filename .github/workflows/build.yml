@@ -325,12 +325,12 @@ jobs:
           archives=(dist/*.tar.gz)
           test "${#archives[@]}" -eq 1
           xvfb-run -a -s '-screen 0 1280x960x24' python packaging/smoke_app.py --archive "${archives[0]}" --output smoke --timeout 240
-      - name: Cache the public HTDemucs validation checkpoint
+      - name: Cache the public HTDemucs validation checkpoints
         if: runner.os == 'Windows'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/recordbox-model/955717e8-8726e21a.th
-          key: recordbox-htdemucs-8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4
+          path: ${{ runner.temp }}/recordbox-radeon-test/models/*.th
+          key: recordbox-htdemucs-8726e21a-ba3fe64a-e57c48e6-ef3bcb9c-f3cf25b2
       - name: Build and test the Windows Radeon DirectML preview
         if: runner.os == 'Windows'
         shell: pwsh
@@ -340,7 +340,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:ORT_DYLIB_PATH = Join-Path $runtime 'onnxruntime.dll'
           $env:PATH = "$runtime;$env:PATH"
-          $modelDir = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'recordbox-model')
+          $env:PREPDECK_DATA = Join-Path $env:RUNNER_TEMP 'recordbox-radeon-test'
+          $modelDir = New-Item -ItemType Directory -Force (Join-Path $env:PREPDECK_DATA 'models')
           $env:RECORDBOX_TEST_CHECKPOINT = Join-Path $modelDir '955717e8-8726e21a.th'
           if (-not (Test-Path $env:RECORDBOX_TEST_CHECKPOINT)) {
             Invoke-WebRequest 'https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th' -OutFile $env:RECORDBOX_TEST_CHECKPOINT
@@ -359,7 +360,11 @@ jobs:
           $warpDir = Join-Path $env:RUNNER_TEMP 'recordbox-warp'
           Expand-Archive -LiteralPath $warp -DestinationPath $warpDir
           Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
+          & $testExe[0] 'idle_radeon_assessment_does_not_open_a_compute_backend' --ignored --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'deck_separates_with_both_radeon_models_and_releases_the_gpu_graph' --ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $testExe[0] 'driver_failure_on_second_segment' --test-threads=1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

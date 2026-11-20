@@ -1382,10 +1382,10 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
     }
     // Status and actions.
-    let model = app.stem.model.as_deref().and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
+    let model = app.stem.active_model.or(app.stem.model.as_deref()).and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
     let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
     let error = app.stem.error_for(app.deck.track).filter(|_| !busy && app.stem.loading.is_none());
-    let retry_cpu = error.is_some_and(|e| e.retry_cpu);
+    let retry_cpu = error.is_some_and(|e| e.retry_model.is_some());
     let status = if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
     } else if let Some((_, pr)) = app.stem.separating {

@@ -5,7 +5,7 @@ mod device;
 mod diagnostics;
 mod network;
 #[cfg(windows)]
-pub(super) use device::{select, Binding};
+pub(super) use device::{available, select, Binding};
 #[cfg(not(windows))]
 #[derive(Clone)]
 pub(super) enum Binding {}
@@ -93,14 +93,28 @@ impl Engine {
         weights: std::collections::HashMap<String, candle_core::Tensor>,
         adapter: Option<&Binding>,
     ) -> Result<Self> {
-        let model = network::model(weights, query_tile(adapter))?;
-        let session = session(&model, adapter)
-            .map_err(|e| runtime_error(adapter, "Preparing the HTDemucs network", e))?;
+        #[cfg(windows)]
+        let adapter = adapter
+            .map(|candidate| {
+                candidate.for_model().map_err(|e| {
+                    super::DirectMlFailure(format!(
+                        "Opening the DirectML device for HTDemucs\n{}\n{e:#}",
+                        candidate.failure_detail()
+                    ))
+                })
+            })
+            .transpose()?;
+        #[cfg(not(windows))]
+        let adapter = adapter.cloned();
+        let model = network::model(weights, query_tile(adapter.as_ref()))?;
+        let session = session(&model, adapter.as_ref())
+            .map_err(|e| runtime_error(adapter.as_ref(), "Preparing the HTDemucs network", e))?;
         Ok(Self {
             session: Mutex::new(session),
-            adapter: adapter.cloned(),
+            adapter,
         })
     }
+
     pub(super) fn buffered_segments(&self) -> usize {
         // STFT, inference and overlap-add can still run concurrently on a rendezvous channel.
         if shared_memory(self.adapter.as_ref()) {

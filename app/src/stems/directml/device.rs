@@ -25,17 +25,21 @@ use windows::{
 #[derive(Clone)]
 pub(in crate::stems) struct Binding {
     adapter: IDXGIAdapter1,
-    d3d: ID3D12Device,
+    d3d: Option<ID3D12Device>,
     pub(super) name: String,
-    pub(super) shared_memory: bool,
+    pub(in crate::stems) shared_memory: bool,
 }
 
 impl Binding {
-    fn new(adapter: IDXGIAdapter1, name: String) -> Result<Self> {
+    fn open_device(adapter: &IDXGIAdapter1) -> Result<ID3D12Device> {
         let mut d3d: Option<ID3D12Device> = None;
-        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d) }
+        unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d) }
             .context("Creating D3D12 device")?;
-        let d3d = d3d.context("D3D12 returned no device")?;
+        d3d.context("D3D12 returned no device")
+    }
+
+    fn new(adapter: IDXGIAdapter1, name: String) -> Result<Self> {
+        let d3d = Self::open_device(&adapter)?;
         let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
         // Query node zero of the same adapter that owns the execution queue.
         let shared_memory = unsafe {
@@ -49,14 +53,28 @@ impl Binding {
             && arch.UMA.as_bool();
         Ok(Self {
             adapter,
-            d3d,
+            d3d: Some(d3d),
             name,
             shared_memory,
         })
     }
 
+    /// Assessment retains the adapter identity. Only a live session owns a compute device.
+    pub(in crate::stems) fn into_standby(mut self) -> Self {
+        self.d3d = None;
+        self
+    }
+
+    pub(super) fn for_model(&self) -> Result<Self> {
+        let mut active = self.clone();
+        if active.d3d.is_none() {
+            active.d3d = Some(Self::open_device(&self.adapter)?);
+        }
+        Ok(active)
+    }
+
     #[cfg(test)]
-    pub(super) fn warp() -> Result<Self> {
+    pub(in crate::stems) fn warp() -> Result<Self> {
         use windows::Win32::Graphics::Dxgi::IDXGIFactory4;
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1()? };
         let mut binding = Self::new(unsafe { factory.EnumWarpAdapter()? }, "Microsoft WARP".to_owned())?;
@@ -67,7 +85,11 @@ impl Binding {
 
     pub(super) fn failure_detail(&self) -> String {
         let mut lines = vec![self.name.clone()];
-        if let Err(reason) = unsafe { self.d3d.GetDeviceRemovedReason() } {
+        if let Some(reason) = self
+            .d3d
+            .as_ref()
+            .and_then(|d| unsafe { d.GetDeviceRemovedReason() }.err())
+        {
             lines.push(format!(
                 "D3D12 device removal reason 0x{:08X} ({reason})",
                 reason.code().0 as u32
@@ -92,7 +114,10 @@ impl Binding {
     }
 
     fn commands(&self) -> Result<(IDMLDevice, ID3D12CommandQueue)> {
-        let d3d = &self.d3d;
+        let d3d = self
+            .d3d
+            .as_ref()
+            .context("DirectML requires an active D3D12 device")?;
         let mut device = None;
         unsafe { DMLCreateDevice(d3d, DML_CREATE_DEVICE_FLAG_NONE, &mut device) }
             .context("Creating DirectML device")?;
@@ -130,17 +155,10 @@ impl Binding {
     }
 }
 
-pub(in crate::stems) fn select() -> Result<(Binding, String)> {
-    let dll = std::env::current_exe()?.with_file_name("onnxruntime.dll");
-    ensure!(
-        dll.is_file(),
-        "Extract the complete DirectML ZIP with onnxruntime.dll beside recordbox.exe"
-    );
-    ort::init_from(&dll)
-        .context("Loading the packaged ONNX Runtime")?
-        .commit();
+// DXGI adapter descriptions are metadata. This path never creates a D3D12 device, queue or ORT session.
+fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-    let mut failures = Vec::new();
+    let mut adapters = Vec::new();
     for index in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(a) => a,
@@ -157,11 +175,40 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
             .position(|&c| c == 0)
             .unwrap_or(desc.Description.len());
         let name = String::from_utf16_lossy(&desc.Description[..end]);
+        adapters.push((index, name, adapter));
+    }
+    Ok(adapters)
+}
+
+pub(in crate::stems) fn available() -> Result<String> {
+    candidates()?
+        .into_iter()
+        .next()
+        .map(|(_, name, _)| name)
+        .context("no hardware AMD Radeon adapter")
+}
+
+pub(in crate::stems) fn select() -> Result<(Binding, String)> {
+    let dll = std::env::current_exe()?.with_file_name("onnxruntime.dll");
+    ensure!(
+        dll.is_file(),
+        "Extract the complete DirectML ZIP with onnxruntime.dll beside recordbox.exe"
+    );
+    ort::init_from(&dll)
+        .context("Loading the packaged ONNX Runtime")?
+        .commit();
+    let mut failures = Vec::new();
+    for (index, name, adapter) in candidates()? {
         match Binding::new(adapter, name.clone()).and_then(|binding| {
             super::probe(Some(&binding))?;
             Ok(binding)
         }) {
-            Ok(binding) => return Ok((binding, format!("DirectML · {name} · DXGI adapter {index}"))),
+            Ok(binding) => {
+                return Ok((
+                    binding.into_standby(),
+                    format!("DirectML · {name} · DXGI adapter {index}"),
+                ));
+            }
             Err(error) => failures.push(format!("{name}: {error:#}")),
         }
     }

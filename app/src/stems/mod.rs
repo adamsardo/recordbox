@@ -10,7 +10,7 @@ mod backend;
 #[cfg(feature = "directml")]
 mod directml;
 mod compare;
-pub use backend::{backend_label, force_cpu};
+pub use backend::{backend_label, force_cpu, gpu_active, status as backend_status};
 pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,7 +26,7 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: f64,
     pub apple_silicon: bool,
-    /// The selected separation backend passed its device check.
+    /// A GPU is available for STEMS. Windows Radeon detection is passive until first use.
     pub gpu: bool,
 }
 
@@ -46,7 +46,7 @@ pub fn assess() -> Hardware {
         (String::new(), mem / 1e6)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = backend::gpu_active();
+    let gpu = backend_status().0;
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
@@ -79,25 +79,50 @@ impl std::fmt::Display for DirectMlFailure {
 impl std::error::Error for DirectMlFailure {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeparationDevice { Selected, Cpu }
+pub enum SeparationDevice { Selected, GpuOnly, Cpu }
 
 impl SeparationDevice {
-    fn device(self) -> candle_core::Device {
-        match self { Self::Selected => device(), Self::Cpu => candle_core::Device::Cpu }
+    fn device(self) -> Result<candle_core::Device> {
+        if self == Self::GpuOnly && !backend::gpu_active() {
+            #[cfg(all(windows, feature = "directml"))]
+            return Err(DirectMlFailure(format!("Checking the DirectML device\n{}", backend_label())).into());
+            #[cfg(not(all(windows, feature = "directml")))]
+            anyhow::bail!("GPU separation unavailable: {}", backend_label());
+        }
+        Ok(if self == Self::Cpu { candle_core::Device::Cpu } else { device() })
     }
 
     fn load(self, path: &Path) -> Result<htdemucs::Graph> {
         match self {
-            Self::Selected => htdemucs::Graph::load_selected(path),
+            Self::Selected | Self::GpuOnly => htdemucs::Graph::load_selected(path),
             Self::Cpu => Ok(htdemucs::Graph::load(path, &candle_core::Device::Cpu)?),
         }
     }
 }
 
-/// Loaded models stay in memory (about 170 MB each on the GPU) so that a second track, vocal
-/// detection or key analysis does not read and upload the checkpoint again.
+// A deck, vocal detection and key analysis can request different checkpoints at the same time.
+static SHARED_GPU_JOB: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn wait_for_shared_gpu<'a>(slot: &'a parking_lot::Mutex<()>, progress: &mut dyn FnMut(f32) -> bool) -> Result<parking_lot::MutexGuard<'a, ()>> {
+    loop {
+        let available = slot.try_lock_for(std::time::Duration::from_millis(100));
+        if !progress(0.0) { anyhow::bail!("stopped"); }
+        if let Some(guard) = available {
+            return Ok(guard);
+        }
+    }
+}
+
+/// Shared-memory DirectML models live for one job. Other backends reuse recent checkpoints.
 fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
     static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+    let execution = if execution == SeparationDevice::GpuOnly { SeparationDevice::Selected } else { execution };
+    let file_path = models_dir().join(file);
+    let load = || execution.load(&file_path).map(std::sync::Arc::new).with_context(|| format!("Loading {file}"));
+    // Let the last owner release the compiled model, command queue and driver allocations on UMA.
+    if execution == SeparationDevice::Selected && backend::gpu_uses_shared_memory() {
+        return load();
+    }
     let mut loaded = LOADED.lock().map_err(|_| anyhow!("model cache is unusable"))?;
     if let Some(i) = loaded.iter().position(|(f, mode, _)| f == file && *mode == execution) {
         // Most recently used last.
@@ -105,12 +130,11 @@ fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdem
         loaded.push(entry);
     } else {
         // A compiled DirectML session also holds intermediate buffers in shared GPU memory.
-        let capacity = if backend::uses_directml() { 1 } else { 4 };
+        let capacity = if execution == SeparationDevice::Selected && backend::uses_directml() { 1 } else { 4 };
         while loaded.len() >= capacity {
             loaded.remove(0);
         }
-        let g = execution.load(&models_dir().join(file)).with_context(|| format!("Loading {file}"))?;
-        loaded.push((file.to_string(), execution, std::sync::Arc::new(g)));
+        loaded.push((file.to_string(), execution, load()?));
     }
     Ok(loaded.last().unwrap().2.clone())
 }
@@ -331,7 +355,10 @@ pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMu
 
 pub fn separate_with_device(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool, execution: SeparationDevice) -> Result<Stems> {
     if !progress(0.0) { anyhow::bail!("stopped"); }
-    let device = execution.device();
+    let device = execution.device()?;
+    let _job = if execution != SeparationDevice::Cpu && backend::gpu_uses_shared_memory() {
+        Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?)
+    } else { None };
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
@@ -370,6 +397,7 @@ pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn 
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
     let device = device();
+    let _job = if backend::gpu_uses_shared_memory() { Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?) } else { None };
     let (planar, len) = planar_44k(samples, sr);
     let g = graph(file, SeparationDevice::Selected)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
@@ -610,6 +638,19 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_for_a_shared_gpu_can_be_cancelled_and_the_next_job_can_run() {
+        let slot = parking_lot::Mutex::new(());
+        let first_job = slot.lock();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string());
+            assert_eq!(waiting.join().unwrap(), "stopped");
+        });
+        drop(first_job);
+        assert_eq!(wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string(), "stopped");
+        assert!(wait_for_shared_gpu(&slot, &mut |_| true).is_ok());
+    }
 
     #[test]
     fn cancelled_separation_needs_no_weights_or_decoded_audio() {
