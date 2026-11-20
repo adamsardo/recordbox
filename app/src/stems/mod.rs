@@ -10,7 +10,7 @@ mod backend;
 #[cfg(feature = "directml")]
 mod directml;
 mod compare;
-pub use backend::{backend_label, force_cpu, gpu_active, status as backend_status};
+pub use backend::{backend_label, force_cpu, gpu_active, radeon_hold, status as backend_status};
 pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
@@ -83,13 +83,16 @@ pub enum SeparationDevice { Selected, GpuOnly, Cpu }
 
 impl SeparationDevice {
     fn device(self) -> Result<candle_core::Device> {
+        if self == Self::Cpu { return Ok(candle_core::Device::Cpu); }
+        let selected = device();
+        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
         if self == Self::GpuOnly && !backend::gpu_active() {
             #[cfg(all(windows, feature = "directml"))]
             return Err(DirectMlFailure(format!("Checking the DirectML device\n{}", backend_label())).into());
             #[cfg(not(all(windows, feature = "directml")))]
             anyhow::bail!("GPU separation unavailable: {}", backend_label());
         }
-        Ok(if self == Self::Cpu { candle_core::Device::Cpu } else { device() })
+        Ok(selected)
     }
 
     fn load(self, path: &Path) -> Result<htdemucs::Graph> {
@@ -116,6 +119,10 @@ fn wait_for_shared_gpu<'a>(slot: &'a parking_lot::Mutex<()>, progress: &mut dyn 
 /// Shared-memory DirectML models live for one job. Other backends reuse recent checkpoints.
 fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
     static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+    // A preceding job may have lost the GPU while this job waited for its turn.
+    if execution != SeparationDevice::Cpu {
+        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
+    }
     let execution = if execution == SeparationDevice::GpuOnly { SeparationDevice::Selected } else { execution };
     let file_path = models_dir().join(file);
     let load = || execution.load(&file_path).map(std::sync::Arc::new).with_context(|| format!("Loading {file}"));

@@ -13,9 +13,9 @@ use super::htdemucs::{Stft, TRAINING_FRAMES};
 use anyhow::{ensure, Context, Result};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
+    value::{DynValue, Tensor, TensorRef},
 };
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 fn shared_memory(adapter: Option<&Binding>) -> bool {
     #[cfg(windows)]
@@ -29,6 +29,7 @@ fn shared_memory(adapter: Option<&Binding>) -> bool {
     }
 }
 
+#[cfg(test)]
 fn query_tile(adapter: Option<&Binding>) -> i64 {
     if shared_memory(adapter) {
         network::SHARED_MEMORY_QUERY_TILE
@@ -37,28 +38,52 @@ fn query_tile(adapter: Option<&Binding>) -> i64 {
     }
 }
 
-fn runtime_error(adapter: Option<&Binding>, stage: &'static str, error: ort::Error) -> anyhow::Error {
+fn runtime_error(adapter: Option<&Binding>, stage: &str, error: ort::Error) -> anyhow::Error {
     #[cfg(windows)]
     if let Some(binding) = adapter {
         return super::DirectMlFailure(format!("{stage}\n{}\n{error}", binding.failure_detail())).into();
     }
     let _ = adapter;
-    anyhow::Error::new(error).context(stage)
+    anyhow::Error::new(error).context(stage.to_owned())
 }
 
-fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
-    let mut builder = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level1)?
-        .with_parallel_execution(false)?
-        .with_memory_pattern(false)?;
-    if let Some(binding) = adapter {
+struct Provider<'a> {
+    binding: &'a Binding,
+    #[cfg(windows)]
+    commands: device::Commands,
+}
+
+impl<'a> Provider<'a> {
+    fn new(binding: &'a Binding) -> Result<Self> {
         #[cfg(windows)]
         {
-            if binding.shared_memory {
+            let commands = binding.commands().map_err(|e| {
+                super::DirectMlFailure(format!(
+                    "Opening the DirectML execution queue\n{}\n{e:#}",
+                    binding.failure_detail()
+                ))
+            })?;
+            Ok(Self { binding, commands })
+        }
+        #[cfg(not(windows))]
+        match *binding {}
+    }
+}
+
+fn session(model: &[u8], provider: Option<&Provider<'_>>) -> ort::Result<Session> {
+    let mut builder = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level1)?
+        .with_intra_threads(1)?
+        .with_parallel_execution(false)?
+        .with_memory_pattern(false)?;
+    if let Some(provider) = provider {
+        #[cfg(windows)]
+        {
+            if provider.binding.shared_memory {
                 // The arena can retain allocations between dispatches. The Vega APU and host share RAM.
                 builder = builder.with_config_entry("ep.dml.disable_memory_arena", "1")?;
             }
-            binding.attach(&mut builder)?;
+            provider.commands.attach(&mut builder)?;
             // Keep the FP32 operators and their intermediate results explicit.
             // DirectML's whole-graph fusion can alter HTDemucs separation results.
             builder = builder
@@ -66,7 +91,7 @@ fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
                 .with_disable_cpu_fallback()?;
         }
         #[cfg(not(windows))]
-        match *binding {}
+        match *provider.binding {}
     } else {
         // Only the numerical regression test uses the ONNX CPU execution provider.
         builder = builder.with_intra_threads(2)?;
@@ -75,7 +100,8 @@ fn session(model: &[u8], adapter: Option<&Binding>) -> ort::Result<Session> {
 }
 
 fn probe(adapter: Option<&Binding>) -> Result<()> {
-    let mut session = session(&network::probe_model(), adapter)?;
+    let provider = adapter.map(Provider::new).transpose()?;
+    let mut session = session(&network::probe_model(), provider.as_ref())?;
     let input = TensorRef::from_array_view(([1, 1, 3], &[1f32, 2., 3.][..]))?;
     let outputs = session.run(ort::inputs![input])?;
     let (_, result) = outputs["result"].try_extract_tensor::<f32>()?;
@@ -83,8 +109,15 @@ fn probe(adapter: Option<&Binding>) -> Result<()> {
     Ok(())
 }
 
+struct Pass {
+    label: &'static str,
+    inputs: Vec<String>,
+    release: Vec<String>,
+    session: Session,
+}
+
 pub(super) struct Engine {
-    session: Mutex<Session>,
+    passes: Mutex<Vec<Pass>>,
     adapter: Option<Binding>,
 }
 
@@ -106,11 +139,41 @@ impl Engine {
             .transpose()?;
         #[cfg(not(windows))]
         let adapter = adapter.cloned();
-        let model = network::model(weights, query_tile(adapter.as_ref()))?;
-        let session = session(&model, adapter.as_ref())
-            .map_err(|e| runtime_error(adapter.as_ref(), "Preparing the HTDemucs network", e))?;
+        // The CPU provider is used only in numerical tests and exercises the same
+        // partitioning as an integrated GPU.
+        let staged = adapter.is_none() || shared_memory(adapter.as_ref());
+        let tile = if staged {
+            network::SHARED_MEMORY_QUERY_TILE
+        } else {
+            network::QUERY_TILE
+        };
+        let parts = network::model_parts(weights, tile, staged)?;
+        let mut last_use = HashMap::new();
+        for (index, part) in parts.iter().enumerate() {
+            for name in &part.inputs {
+                last_use.insert(name.clone(), index);
+            }
+        }
+        let provider = adapter.as_ref().map(Provider::new).transpose()?;
+        let mut passes = Vec::with_capacity(parts.len());
+        for (index, part) in parts.into_iter().enumerate() {
+            let session = session(&part.bytes, provider.as_ref())
+                .map_err(|e| runtime_error(adapter.as_ref(), &format!("Preparing {}", part.label), e))?;
+            let release = part
+                .inputs
+                .iter()
+                .filter(|name| last_use[*name] == index)
+                .cloned()
+                .collect();
+            passes.push(Pass {
+                label: part.label,
+                inputs: part.inputs,
+                release,
+                session,
+            });
+        }
         Ok(Self {
-            session: Mutex::new(session),
+            passes: Mutex::new(passes),
             adapter,
         })
     }
@@ -131,17 +194,60 @@ impl Engine {
         source: Option<usize>,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let frames = Stft::frames(TRAINING_FRAMES);
-        let spec = TensorRef::from_array_view(([1, 4, network::BINS, frames], spec.as_slice()))?;
-        let wave = TensorRef::from_array_view(([1, 2, TRAINING_FRAMES], wave.as_slice()))?;
-        let mut engine = self
-            .session
+        let mut values = HashMap::<String, DynValue>::from([
+            (
+                "spec".into(),
+                Tensor::from_array(([1, 4, network::BINS, frames], spec))?.into_dyn(),
+            ),
+            (
+                "wave".into(),
+                Tensor::from_array(([1, 2, TRAINING_FRAMES], wave))?.into_dyn(),
+            ),
+        ]);
+        let mut passes = self
+            .passes
             .lock()
             .map_err(|_| anyhow::anyhow!("DirectML session interrupted"))?;
-        let outputs = engine
-            .run(ort::inputs!["spec"=>spec,"wave"=>wave])
-            .map_err(|e| runtime_error(self.adapter.as_ref(), "Running an HTDemucs separation segment", e))?;
+        for pass in passes.iter_mut() {
+            if self.adapter.is_some() {
+                if let Some(reason) = super::radeon_hold() {
+                    return Err(super::DirectMlFailure(reason.to_owned()).into());
+                }
+            }
+            let inputs = pass
+                .inputs
+                .iter()
+                .map(|name| {
+                    Ok((
+                        name.as_str(),
+                        values
+                            .get(name)
+                            .with_context(|| format!("Missing {} input {name}", pass.label))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // ORT's default output binding copies GPU outputs to CPU memory and waits for
+            // readback. The next pass therefore cannot get ahead of this one on the display GPU.
+            let outputs = pass
+                .session
+                .run(inputs)
+                .map_err(|e| runtime_error(self.adapter.as_ref(), &format!("Running {}", pass.label), e))?;
+            for name in &pass.release {
+                values.remove(name);
+            }
+            for (name, value) in outputs {
+                // A device-only tensor here would bypass the readback between passes.
+                value
+                    .try_extract_tensor::<f32>()
+                    .with_context(|| format!("Reading {} output {name}", pass.label))?;
+                values.insert(name.to_owned(), value);
+            }
+        }
         let take = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
-            let (actual, data) = outputs[name].try_extract_tensor::<f32>()?;
+            let (actual, data) = values
+                .get(name)
+                .with_context(|| format!("Missing {name} output"))?
+                .try_extract_tensor::<f32>()?;
             ensure!(
                 actual.iter().copied().eq(shape.iter().map(|&n| n as i64)),
                 "Unexpected {name} output shape"

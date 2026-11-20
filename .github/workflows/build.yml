@@ -174,11 +174,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-26, platform: macos, arch: arm64, binary: recordbox}
+          - {os: macos-15, retry_os: macos-26, platform: macos, arch: arm64, binary: recordbox}
           - {os: macos-15-intel, platform: macos, arch: x86_64, binary: recordbox}
           - {os: windows-2022, platform: windows, arch: x86_64, binary: recordbox.exe}
           - {os: ubuntu-22.04, platform: linux, arch: x86_64, binary: recordbox}
-    runs-on: ${{ matrix.os }}
+    # Both macOS images are free native Apple Silicon runners. A targeted rerun can try the other queue.
+    runs-on: ${{ github.run_attempt == '2' && matrix.retry_os || matrix.os }}
     timeout-minutes: ${{ matrix.platform == 'macos' && 60 || 100 }}
     env:
       VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
@@ -256,7 +257,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: app -> target
-          shared-key: package-${{ matrix.os }}-${{ matrix.arch }}-1.100.0
+          shared-key: package-${{ github.run_attempt == '2' && matrix.retry_os || matrix.os }}-${{ matrix.arch }}-1.100.0
           env-vars: ${{ runner.os == 'Windows' && 'VCPKG_COMMIT OPENSSL_' || '' }}
           cache-on-failure: true
       - name: Compile the release executable
@@ -361,6 +362,8 @@ jobs:
           Expand-Archive -LiteralPath $warp -DestinationPath $warpDir
           Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
           & $testExe[0] 'idle_radeon_assessment_does_not_open_a_compute_backend' --ignored --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'stems::directml::device::tests' --include-ignored --test-threads=1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

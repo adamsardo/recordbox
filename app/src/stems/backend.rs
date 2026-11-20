@@ -16,6 +16,19 @@ impl Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
+// A removed D3D device cannot be used again. Keep the first reason so that queued
+// workers and the UI agree, even after the model that observed it is dropped.
+static RADEON_HOLD: OnceLock<String> = OnceLock::new();
+
+pub fn radeon_hold() -> Option<&'static str> {
+    RADEON_HOLD.get().map(String::as_str)
+}
+
+#[cfg(all(windows, feature = "directml"))]
+pub(super) fn hold_radeon(reason: String) {
+    let _ = RADEON_HOLD.set(reason);
+}
+
 pub fn force_cpu() {
     let _ = BACKEND.set(Backend::cpu("selected for this session"));
 }
@@ -31,7 +44,7 @@ pub(super) fn directml_device() -> Option<&'static super::directml::Binding> {
 
 pub fn uses_directml() -> bool {
     #[cfg(all(windows, feature = "directml"))]
-    { directml_device().is_some() }
+    { directml_device().is_some() && radeon_hold().is_none() }
     #[cfg(not(all(windows, feature = "directml")))]
     { false }
 }
@@ -49,6 +62,7 @@ pub fn gpu_active() -> bool {
 
 #[cfg(all(windows, feature = "directml"))]
 fn select() -> Backend {
+    if let Some(reason) = radeon_hold() { return Backend::cpu(reason); }
     match super::directml::select() {
         Ok((binding, label)) => Backend { device: Device::Cpu, label, directml: Some(binding) },
         Err(error) => Backend::cpu(&format!("{error:#}")),
@@ -59,6 +73,7 @@ fn select() -> Backend {
 pub fn status() -> (bool, &'static str) {
     #[cfg(all(windows, feature = "directml"))]
     {
+        if let Some(reason) = radeon_hold() { return (false, reason); }
         if let Some(active) = BACKEND.get() {
             return (active.directml.is_some(), &active.label);
         }
@@ -67,14 +82,15 @@ pub fn status() -> (bool, &'static str) {
             Ok(name) => (true, format!("{name} · DirectML checked on first use")),
             Err(e) => (false, format!("CPU · {e:#}")),
         });
-        (*available, label)
+        radeon_hold().map_or((*available, label.as_str()), |reason| (false, reason))
     }
     #[cfg(not(all(windows, feature = "directml")))]
     { (gpu_active(), backend_label()) }
 }
 
 pub fn backend_label() -> &'static str {
-    &BACKEND.get_or_init(select).label
+    let selected = BACKEND.get_or_init(select);
+    radeon_hold().unwrap_or(&selected.label)
 }
 
 #[cfg(target_os = "macos")]

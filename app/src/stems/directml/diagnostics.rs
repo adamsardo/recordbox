@@ -71,7 +71,7 @@ fn sampled_model(bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub(super) fn trace(checkpoint: &Path, adapter: Option<&Binding>) -> Result<()> {
     let weights = Graph::read_weights(checkpoint, &candle_core::Device::Cpu)?;
-    let model = sampled_model(&network::model(weights, super::query_tile(adapter))?)?;
+    let model = sampled_model(&network::model_parts(weights, super::query_tile(adapter), false)?.remove(0).bytes)?;
     let frames = Stft::frames(TRAINING_FRAMES);
     let signal = |count| {
         (0..count)
@@ -80,8 +80,9 @@ pub(super) fn trace(checkpoint: &Path, adapter: Option<&Binding>) -> Result<()> 
     };
     let spec = signal(4 * network::BINS * frames);
     let wave = signal(2 * TRAINING_FRAMES);
-    let run = |binding| -> Result<Vec<(String, Vec<f32>)>> {
-        let mut engine = session(&model, binding)?;
+    let run = |binding: Option<&Binding>| -> Result<Vec<(String, Vec<f32>)>> {
+        let provider = binding.map(super::Provider::new).transpose()?;
+        let mut engine = session(&model, provider.as_ref())?;
         let spec = TensorRef::from_array_view(([1, 4, network::BINS, frames], spec.as_slice()))?;
         let wave = TensorRef::from_array_view(([1, 2, TRAINING_FRAMES], wave.as_slice()))?;
         let outputs = engine.run(ort::inputs!["spec"=>spec,"wave"=>wave])?;

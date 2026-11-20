@@ -171,8 +171,8 @@ impl Col {
 }
 
 impl Prefs {
-    fn auto_stems_on_load(&self, gpu: bool) -> bool {
-        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu)
+    pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
+        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::radeon_hold().is_none()
     }
 }
 
@@ -2462,7 +2462,11 @@ impl App {
                     let d = crate::audio::decode_file(&path).ok()?;
                     let mono = crate::stems::mono_44k(&d.samples, d.sr);
                     if !crate::stems::gpu_active() { return Some(crate::key::detect_key(&mono, 44100.0)); }
-                    let drums = crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true).ok()?;
+                    let drums = match crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true) {
+                        Ok(drums) => drums,
+                        Err(_) if crate::stems::radeon_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
+                        Err(_) => return None,
+                    };
                     let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
                     Some(crate::key::detect_key(&harm, 44100.0))
                 })()
@@ -2766,6 +2770,7 @@ impl App {
 
     fn resume_pending_stems(&mut self) {
         if let Some((id, execution)) = self.stem.pending.take() {
+            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::radeon_hold().is_some() { return; }
             if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
                 self.with_deck(deck, |app| app.separate_loaded_on(execution));
             }
@@ -2793,7 +2798,8 @@ impl App {
 
     /// Separate the loaded track (downloading the model first if it is missing).
     pub fn separate_loaded(&mut self) {
-        self.separate_loaded_on(crate::stems::SeparationDevice::Selected);
+        let mode = if crate::stems::radeon_hold().is_some() { crate::stems::SeparationDevice::Cpu } else { crate::stems::SeparationDevice::Selected };
+        self.separate_loaded_on(mode);
     }
 
     pub fn separate_loaded_on(&mut self, execution: crate::stems::SeparationDevice) {

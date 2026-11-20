@@ -1868,14 +1868,15 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
     let tip = format!("Prioritize sound quality: {} — {}\nPrioritize speed: {} — {}", quality.name, quality.about, speed.name, speed.about);
     kit::card_help(ui, "STEMS Analysis Process", Some(&tip), |ui| {
         ui.add_space(-2.0);
-        let able = app.stem.hw.as_ref().map(|hw| crate::stems::runs_on(quality, hw)).unwrap_or(true);
+        let able = app.stem.hw.as_ref().is_none_or(|hw| hw.ram_gb >= quality.min_ram_gb && crate::stems::backend_status().0);
         let mut pick = None;
         if able || cur == quality.id {
             if radio(ui, cur == quality.id, "Prioritize sound quality") {
                 pick = Some(quality);
             }
         } else {
-            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} needs a GPU and {:.0} GB of memory, which this computer does not have.", quality.name, quality.min_ram_gb));
+            let ram = app.stem.hw.as_ref().map_or(0.0, |hw| hw.ram_gb);
+            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} requires GPU separation and {:.0} GB of memory. Detected {:.0} GB. STEMS backend: {}", quality.name, quality.min_ram_gb, ram, crate::stems::backend_status().1));
         }
         if radio(ui, cur != quality.id, "Prioritize speed") {
             pick = Some(speed);
@@ -1944,11 +1945,18 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         if let Some((d, t)) = app.stem.downloading {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
-        toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
-        ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
-            toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+        let automatic_available = crate::stems::radeon_hold().is_none();
+        ui.add_enabled_ui(automatic_available, |ui| {
+            toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
+            ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
+                toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+            });
         });
-        note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
+        if automatic_available {
+            note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
+        } else {
+            note(ui, "Automatic separation is paused. Cached parts still load. Choose Separate or Retry CPU to process one track.");
+        }
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {
