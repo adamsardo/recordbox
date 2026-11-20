@@ -205,6 +205,8 @@ pub(crate) fn pos2(f: usize, t: usize, c: usize) -> Vec<f32> {
 
 /// One loaded HTDemucs network.
 pub struct Graph {
+    #[cfg(feature = "directml")]
+    directml: Option<super::directml::Engine>,
     /// The checkpoint's tensors by name: the reference graph (any device).
     weights: HashMap<String, Tensor>,
     /// Weights prepared for the fused Metal kernels; when present, `separate` uses them and
@@ -228,8 +230,29 @@ impl Graph {
     }
 
     fn load_as(path: &Path, device: &Device, fast: bool) -> Result<Self> {
-        // Uploading weights encodes GPU work too.
         let _gpu = GPU.lock();
+        Self::from_weights(Self::read_weights(path, device)?, fast)
+    }
+
+    pub fn load_selected(path: &Path) -> Result<Self> {
+        #[cfg(all(windows, feature = "directml"))]
+        if let Some(adapter) = super::backend::directml_adapter() {
+            return Self::load_onnx(path, Some(adapter));
+        }
+        Self::load(path, &super::device())
+    }
+
+    #[cfg(feature = "directml")]
+    pub(super) fn load_onnx(path: &Path, adapter: Option<i32>) -> Result<Self> {
+        let _gpu = GPU.lock();
+        let weights = Self::read_weights(path, &Device::Cpu)?;
+        let engine = super::directml::Engine::new(weights, adapter).map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        let mut graph = Self::from_weights(HashMap::new(), false)?;
+        graph.directml = Some(engine);
+        Ok(graph)
+    }
+
+    fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => candle_core::safetensors::load(path, device)?,
             _ => {
@@ -248,16 +271,18 @@ impl Graph {
         if weights.len() != 533 {
             candle_core::bail!("expected an HTDemucs checkpoint with 533 tensors, found {}", weights.len())
         }
-        Self::from_weights(weights, fast)
+        Ok(weights)
     }
 
     fn from_weights(weights: HashMap<String, Tensor>, fast: bool) -> Result<Self> {
         #[cfg(target_os = "macos")]
         if fast {
-            return Ok(Self { fast: Some(metal_fast::Fast::new(&weights)?), weights: HashMap::new() });
+            return Ok(Self { #[cfg(feature = "directml")] directml: None, fast: Some(metal_fast::Fast::new(&weights)?), weights: HashMap::new() });
         }
         let _ = fast;
         Ok(Self {
+            #[cfg(feature = "directml")]
+            directml: None,
             weights,
             #[cfg(target_os = "macos")]
             fast: None,
@@ -574,7 +599,23 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
     if !progress(0, 1) { candle_core::bail!("stopped"); }
     #[cfg(target_os = "macos")]
     if let Some(fast) = &graph.fast {
-        return separate_fast(fast, device, audio, len, opts, progress);
+        return separate_accelerated(audio, len, opts, progress, |spec, wave, source| {
+            let (freq, frames, segment) = (NFFT/2, Stft::frames(TRAINING_FRAMES), TRAINING_FRAMES);
+            let x = Tensor::from_vec(spec, (4, freq, frames), device)?;
+            let xt = Tensor::from_vec(wave, (2, 1, segment), device)?;
+            let (mut y, mut yt) = fast.forward(&x, &xt)?;
+            if let Some(s) = source {
+                y = y.narrow(0, s * 4, 4)?;
+                yt = yt.narrow(0, s * 2, 2)?;
+            }
+            Ok((metal_fast::read(&y)?, metal_fast::read(&yt)?))
+        });
+    }
+    #[cfg(feature = "directml")]
+    if let Some(engine) = &graph.directml {
+        return separate_accelerated(audio, len, opts, progress, |spec, wave, source| {
+            engine.forward(spec, wave, source).map_err(|e| candle_core::Error::Msg(format!("{e:#}")))
+        });
     }
     let segment = TRAINING_FRAMES;
     let (offsets, weight) = plan(len, opts.overlap);
@@ -624,7 +665,7 @@ fn mean_std(x: &[f32]) -> (f32, f32) {
 }
 
 /// One segment ready for the GPU: normalised spectrogram and waveform with their statistics.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "directml"))]
 struct Prepared {
     offset: usize,
     spec: Vec<f32>,
@@ -634,7 +675,7 @@ struct Prepared {
 }
 
 /// The network's two outputs for one segment, still normalised.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "directml"))]
 struct Raw {
     offset: usize,
     spec: Vec<f32>,
@@ -642,11 +683,12 @@ struct Raw {
     stats: [(f32, f32); 2],
 }
 
-/// The Metal path: three stages run side by side so the GPU never waits for the CPU. A
+/// The accelerated path: three stages run side by side so the GPU never waits for the CPU. A
 /// thread prepares segments (normalisation and the forward transform), this thread runs the
 /// network, and a third does the inverse transform and the overlap-add.
-#[cfg(target_os = "macos")]
-fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+#[cfg(any(target_os = "macos", feature = "directml"))]
+fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool,
+    mut forward: impl FnMut(Vec<f32>, Vec<f32>, Option<usize>) -> Result<(Vec<f32>, Vec<f32>)>) -> Result<Vec<f32>> {
     let segment = TRAINING_FRAMES;
     let freq = NFFT / 2;
     let frames = Stft::frames(segment);
@@ -714,14 +756,7 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
                 if !progress(k, offsets.len()) { candle_core::bail!("stopped"); }
                 let (spec, wave) = {
                     let _gpu = GPU.lock();
-                    let x = Tensor::from_vec(p.spec, (4, freq, frames), device)?;
-                    let xt = Tensor::from_vec(p.wave, (2, 1, segment), device)?;
-                    let (mut y, mut yt) = fast.forward(&x, &xt)?;
-                    if let Some(s) = opts.source {
-                        y = y.narrow(0, s * 4, 4)?;
-                        yt = yt.narrow(0, s * 2, 2)?;
-                    }
-                    (metal_fast::read(&y)?, metal_fast::read(&yt)?)
+                    forward(p.spec, p.wave, opts.source)?
                 };
                 if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
                     candle_core::bail!("stem post-processing stopped")

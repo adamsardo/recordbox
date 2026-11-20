@@ -7,6 +7,8 @@
 
 pub mod htdemucs;
 mod backend;
+#[cfg(feature = "directml")]
+mod directml;
 mod compare;
 pub use backend::{backend_label, force_cpu};
 pub use compare::compare_track;
@@ -44,7 +46,7 @@ pub fn assess() -> Hardware {
         (String::new(), mem / 1e6)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = !device().is_cpu();
+    let gpu = backend::gpu_active();
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
@@ -78,11 +80,12 @@ fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
         let entry = loaded.remove(i);
         loaded.push(entry);
     } else {
-        let g = htdemucs::Graph::load(&models_dir().join(file), &device()).map_err(|e| anyhow!("loading {file}: {e}"))?;
-        // Room for the four fine-tuned specialists.
-        while loaded.len() >= 4 {
+        // A compiled DirectML session also holds intermediate buffers in shared GPU memory.
+        let capacity = if backend::directml_adapter().is_some() { 1 } else { 4 };
+        while loaded.len() >= capacity {
             loaded.remove(0);
         }
+        let g = htdemucs::Graph::load_selected(&models_dir().join(file)).map_err(|e| anyhow!("loading {file}: {e}"))?;
         loaded.push((file.to_string(), std::sync::Arc::new(g)));
     }
     Ok(loaded.last().unwrap().1.clone())
