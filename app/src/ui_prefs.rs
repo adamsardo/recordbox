@@ -13,8 +13,6 @@ use egui::{pos2, vec2, Color32, Context, Rect, RichText, Ui};
 
 // Settings another part of the app has to act on. While one is false its control is shown
 // switched off with the reason, so nothing in the window pretends to work.
-/// Analysis reads `prefs.high_precision_grid`.
-const HIGH_PRECISION_WIRED: bool = false;
 /// The device writer deletes an imported history (reads `prefs.delete_history_after_import`).
 const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.
@@ -1064,19 +1062,10 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
     }
     let no_cloud = "recordbox has no cloud service: nothing is collected or uploaded.";
     card(ui, "Track Analysis", |ui| {
-        let why = "recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
-        let mut refused = false;
         kit::row(ui, 16.0, |ui| {
-            if HIGH_PRECISION_WIRED {
-                kit::toggle_raw(ui, &mut app.prefs.high_precision_grid, "Use high precision BeatGrid analysis");
-            } else {
-                refused = kit::toggle_off_raw(ui, "Use high precision BeatGrid analysis", why);
-            }
-            kit::help(ui, 37.5, if HIGH_PRECISION_WIRED { "A more precise beat grid, at the cost of a longer analysis." } else { why });
+            kit::toggle_raw(ui, &mut app.prefs.refine_beatgrid_transients, "Use high precision BeatGrid analysis");
+            kit::help(ui, 37.5, "Refine beat timing and tempo against repeated attacks in the audio. Works with Normal and Dynamic. Use Analyze Track to update an existing unlocked grid.");
         });
-        if refused {
-            app.toast(why);
-        }
         separator(ui);
         kit::sub_help(ui, "Track Analysis Mode", Some("Normal: optimized for tracks which have a constant BPM.\nDynamic: for tracks whose tempo changes, the beat grid follows the tempo."));
         kit::labeled(ui, "Analysis Mode", |ui| {

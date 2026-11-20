@@ -481,6 +481,31 @@ mod tests {
     }
 
     #[test]
+    fn precision_keeps_a_tempo_step_and_bar_positions() {
+        let sr = 22_050.0;
+        let mut t = 0.198;
+        let times: Vec<_> = (0..148).map(|i| {
+            let beat = t;
+            t += 60.0 / if i < 76 { 120.0 } else { 132.0 };
+            beat
+        }).collect();
+        let seconds = t + 0.1;
+        let x = clicks(&times, seconds, sr);
+        let mut opts = super::super::AnalysisSettings { dynamic: true, ..Default::default() };
+        let normal = super::super::analyze_grid(&x, sr, &opts).1.unwrap();
+        opts.high_precision = true;
+        let refined = super::super::analyze_grid(&x, sr, &opts).1.unwrap();
+        assert!(refined.anchors.len() >= 2);
+        assert_eq!(normal.anchors.iter().map(|a| a.beat).collect::<Vec<_>>(), refined.anchors.iter().map(|a| a.beat).collect::<Vec<_>>());
+        assert!((refined.first_bpm() - 120.0).abs() < 0.3);
+        assert!((refined.anchors.last().unwrap().bpm - 132.0).abs() < 0.3);
+        let before = worst_error(&normal, &times, seconds, 3.0);
+        let after = worst_error(&refined, &times, seconds, 3.0);
+        eprintln!("precision tempo step: worst beat error {before:.6} -> {after:.6} seconds");
+        assert!(after < 0.030 && after <= before + 0.001, "{before} -> {after}");
+    }
+
+    #[test]
     fn tempo_ramp_is_followed() {
         let sr = 22050.0;
         let mut times = vec![];

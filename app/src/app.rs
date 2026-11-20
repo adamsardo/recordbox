@@ -293,7 +293,7 @@ pub struct Prefs {
     /// View > Color > Customize Color Comments: names of the 8 track colours (Pink..Purple).
     pub color_names: [String; 8],
     /// Analysis: "Use high precision BeatGrid analysis".
-    pub high_precision_grid: bool,
+    pub refine_beatgrid_transients: bool,
     /// CUE Analysis: "Set Memory Cue at the first beat of track when analyzing".
     pub memory_cue_first_beat: bool,
     /// Audio: buffer size in frames (0 = the device's default), sample rate (0 = the
@@ -496,6 +496,14 @@ impl Default for RelatedRules {
 /// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
 #[cfg(test)]
 mod prefs_tests {
+    #[test]
+    fn the_old_inactive_precision_switch_does_not_opt_users_into_new_work() {
+        let old: super::Prefs = serde_json::from_str(r#"{"high_precision_grid":true}"#).unwrap();
+        assert!(!old.refine_beatgrid_transients);
+        let saved: super::Prefs = serde_json::from_str(r#"{"refine_beatgrid_transients":true}"#).unwrap();
+        assert!(saved.refine_beatgrid_transients);
+    }
+
     #[test]
     fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
         let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
@@ -806,7 +814,7 @@ impl Default for Prefs {
             cue_markers_on_preview: true,
             wave_half: false,
             color_names: crate::prefs_ext::default_color_names(),
-            high_precision_grid: true,
+            refine_beatgrid_transients: false,
             memory_cue_first_beat: false,
             audio_buffer: 0,
             audio_rate: 0,
@@ -1272,6 +1280,8 @@ pub struct App {
     pub relocate_rx: Option<RelocationSearch>,
     /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
     pub key_requested: HashSet<i64>,
+    /// Unlocked grids explicitly requested for replacement by Analyze Track.
+    pub grid_requested: HashMap<i64, Option<BeatGrid>>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
@@ -1389,6 +1399,7 @@ impl App {
             key_job: None,
             vocal_failed: HashSet::new(),
             key_requested: HashSet::new(),
+            grid_requested: HashMap::new(),
             relocate_rx: None,
             audio_retry: None,
             dialogs: Dialogs::default(),
@@ -1792,7 +1803,7 @@ impl App {
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
+        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, high_precision: self.prefs.refine_beatgrid_transients, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
     }
 
     // ------------------------------------------------------------------ loading
@@ -3267,6 +3278,7 @@ impl App {
         let had_analysis = self.db.wave(id).is_some();
         let keep_tag_key = self.prefs.keep_tag_key;
         let key_requested = self.key_requested.remove(&id);
+        let requested_grid = self.grid_requested.remove(&id);
         let mut locked_peak: Option<f32> = None;
         let Some(t) = self.track_mut(id) else { return };
         match r {
@@ -3290,7 +3302,10 @@ impl App {
                 t.gain_db = res.gain_db;
                 let measured_peak = res.peak;
                 // A locked grid, or one that came with an imported library, is kept as it is.
-                let keep_grid = t.grid_locked || existing_grid.is_some();
+                let keep_grid = t.grid_locked || match requested_grid {
+                    Some(before) => before != existing_grid || res.grid.is_none(),
+                    None => existing_grid.is_some(),
+                };
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
                 if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid && !keep_tag_key)))) {
@@ -3380,13 +3395,14 @@ impl App {
 
     /// Re-analyse ignoring the stored grid (explicit "Analyze Track" from the menu).
     pub fn reanalyze(&mut self, ids: &[i64]) {
-        for id in ids {
-            let locked = self.track(*id).map(|t| t.grid_locked).unwrap_or(true);
-            if !locked {
-                let _ = self.db.conn.execute("DELETE FROM grids WHERE track_id=?1", [id]);
+        let settings = self.analysis_settings();
+        let with_grid = settings.do_grid;
+        let submitted = self.analyze_with(ids, true, settings);
+        if with_grid {
+            for id in submitted {
+                self.grid_requested.insert(id, self.db.grid(id).filter(|g| !g.is_empty()));
             }
         }
-        self.analyze(ids, true);
     }
 
     // ------------------------------------------------------------------ player
