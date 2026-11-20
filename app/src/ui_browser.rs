@@ -128,37 +128,65 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
         }
         let _ = resp.on_hover_text(if *built { format!("Show/Hide {name} panel") } else { format!("{name} panel: not built in recordbox yet.") });
     }
+}
+
+fn master_volume_control(ui: &mut Ui, center: egui::Pos2, volume: f32, tooltips: bool) -> Option<f32> {
+    let (dial, drag) = crate::ui_perf::turn_knob(ui, center, "master_volume", volume, crate::audio::DEFAULT_VOLUME);
+    // The dial sits against the top of the screen. A wheel can turn it through its full range.
+    let wheel = if dial.hovered() { ui.input(|i| i.raw_scroll_delta.y) } else { 0.0 };
+    let changed = drag.or_else(|| (wheel != 0.0).then(|| (volume + wheel * 0.001).clamp(0.0, 1.0)));
+    let level = changed.unwrap_or(volume);
+    crate::icons_player::master_volume(ui.painter(), center, level);
+    if tooltips {
+        dial.on_hover_ui(|ui| {
+            ui.label(format!("Master volume · {:.0}%", level * 100.0));
+            ui.label("Drag or scroll to adjust. Double-click to reset.");
+        });
+    }
+    changed
+}
+
+fn header_output(app: &mut App, ui: &mut Ui, r: Rect) {
+    crate::ui_perf::read_meters(app, ui);
+    let p = ui.painter().clone();
     let rx = r.max.x;
     let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
+    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, chrono::Local::now().format("%H:%M").to_string(), FontId::proportional(10.7), WHITE);
     let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
     let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
     crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if gear.on_hover_text("Preferences").clicked() {
-        app.dialogs.prefs_open = true;
+    if crate::ui_player::tip(gear, app, "Preferences").clicked() { app.dialogs.prefs_open = true; }
+
+    let volume = app.player.state.lock().volume;
+    if let Some(volume) = master_volume_control(ui, pos2(rx - 223.0, ty + 14.0), volume, app.prefs.tooltips) {
+        for deck in &app.player.decks { deck.lock().volume = volume; }
     }
-    // Master level meter: two 3 pt bars (L over R), 80 pt wide.
-    for c in 0..2 {
-        let br = Rect::from_min_size(pos2(rx - 204.0, ty + 9.5 + 6.0 * c as f32), vec2(80.0, 3.0));
-        p.rect_filled(br, 0.0, hex(0x323232));
-        let db = app.px.master_db[c];
-        let f = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
-        if f > 0.0 {
-            p.rect_filled(Rect::from_min_size(br.min, vec2(br.width() * f, 3.0)), 0.0, if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) });
+    for (channel, &db) in app.px.master_db.iter().enumerate() {
+        let bar = Rect::from_min_size(pos2(rx - 204.0, ty + 9.0 + 6.0 * channel as f32), vec2(80.0, 3.0));
+        p.rect_filled(bar, 0.0, hex(0x323232));
+        let level = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
+        if level > 0.0 {
+            let color = if !app.performance() { hex(0xB0B0B0) } else if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) };
+            p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * level, 3.0)), 0.0, color);
         }
     }
-    // Master volume (the same slider as in EXPORT mode's top bar).
-    let vr = Rect::from_min_max(pos2(rx - 105.0, ty + 6.0), pos2(rx - 70.0, ty + 22.0));
-    let vresp = ui.interact(vr, ui.id().with("perfvol"), Sense::click_and_drag());
-    let mut vol = app.player.state.lock().volume;
-    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on() || vresp.clicked()) {
-        vol = ((pp.x - vr.min.x) / vr.width()).clamp(0.0, 1.0);
-        app.player.state.lock().volume = vol;
+    let bar = Rect::from_min_size(pos2(rx - 102.0, ty + 13.0), vec2(32.0, 3.0));
+    p.rect_filled(bar, 0.0, hex(0x323232));
+    let load = app.player.buffer_load_percent();
+    if let Some(percent) = load {
+        let width = bar.width() * (percent / 100.0).min(1.0);
+        p.rect_filled(Rect::from_min_size(bar.min, vec2(width, bar.height())), 0.0, if percent >= 100.0 { CAUTION_TX } else { BLUE });
     }
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.max.x, ty + 15.5)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.min.x + vr.width() * vol, ty + 15.5)), 0.0, BLUE);
-    let _ = vresp.on_hover_text("Master Volume");
+    if app.prefs.tooltips {
+        ui.interact(bar.expand2(vec2(3.0, 6.0)), ui.id().with("buffer_load"), Sense::hover()).on_hover_ui(|ui| {
+            if let Some(percent) = load {
+                ui.label(format!("Audio buffer load · {percent:.1}%"));
+                ui.label("100% means the output callback used its entire buffer period.");
+            } else {
+                ui.label("Audio buffer load · output idle");
+            }
+        });
+    }
 }
 
 /// right-hand items measured from the right edge of a 1512 pt window).
@@ -188,6 +216,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
     });
+    header_output(app, ui, r);
     if perf {
         performance_header(app, ui, r);
         return;
@@ -223,54 +252,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         app.prefs.auto_analysis = !app.prefs.auto_analysis;
         app.save_prefs();
     }
-    // Right side, measured from the right edge (1512 pt window): gear 14 pt centred at −261,
-    // sync mark 18 pt centred at −223, level meter −204..−124, volume −102..−70, clock ends −21.5.
-    let rx = r.max.x;
-    let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
-    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
-    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if tipf(gear, "Preferences").clicked() {
-        app.dialogs.prefs_open = true;
-    }
-    // Sync / analysis activity mark (turns while work is running).
-    let busy = app.analysis_total > 0 || app.export_job.is_some() || app.importing.is_some();
-    let spin = if busy { ui.input(|i| i.time) as f32 * 4.0 } else { 0.0 };
-    crate::icons_player::sync_mark(&p, pos2(rx - 223.0, ty + 14.0), spin, BLUE);
-    if busy {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-    }
-    // Level meter (left and right): two 80 × 3 pt bars at y 9–12 and 15–18.
-    let bars = [Rect::from_min_max(pos2(rx - 204.0, ty + 9.0), pos2(rx - 124.0, ty + 12.0)), Rect::from_min_max(pos2(rx - 204.0, ty + 15.0), pos2(rx - 124.0, ty + 18.0))];
-    for b in bars {
-        p.rect_filled(b, 0.0, hex(0x323232));
-    }
-    if app.playing() {
-        if let Some(w) = &app.deck.wave {
-            let f = (app.pos() * WAVE_FPS) as usize;
-            if let Some(fr) = w.frames.get(f) {
-                let lvl = (fr[0] as f32 / 255.0).min(1.0);
-                for b in bars {
-                    p.rect_filled(Rect::from_min_max(b.min, pos2(b.min.x + b.width() * lvl, b.max.y)), 0.0, hex(0xB0B0B0));
-                }
-            }
-        }
-    }
-    // Master volume slider: a 32 × 3 pt bar at y 13–16.
-    let sl = Rect::from_min_max(pos2(rx - 102.0, ty + 8.0), pos2(rx - 70.0, ty + 21.0));
-    let sresp = ui.interact(sl.expand2(vec2(3.0, 0.0)), ui.id().with("vol"), Sense::click_and_drag());
-    let mut v = app.player.state.lock().volume;
-    if sresp.dragged() || sresp.clicked() {
-        if let Some(pp) = sresp.interact_pointer_pos() {
-            v = ((pp.x - sl.min.x) / sl.width()).clamp(0.0, 1.0);
-            app.player.state.lock().volume = v;
-        }
-    }
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.max.x, ty + 16.0)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.min.x + (sl.width() * v).max(2.0), ty + 16.0)), 0.0, BLUE);
-    let _ = tipf(sresp, "Master volume (preview)");
+
 }
 
 fn menus(app: &mut App, ui: &mut Ui) {
@@ -443,8 +425,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         let (d, t, txt) = &job.last;
         p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Exporting {}/{} · {}", d, t, txt), rb(11.5), TEXT);
     } else if app.analysis_total > 0 {
-        let pending = app.pool.pending.load(std::sync::atomic::Ordering::Relaxed);
-        p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Analyzing… {} of {}", app.analysis_total - pending, app.analysis_total), rb(11.5), TEXT);
+        p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Analyzing… {} of {}", app.analysis_done, app.analysis_total), rb(11.5), TEXT);
         let stop = ui.interact(Rect::from_min_size(pos2(mid.max.x - 120.0, mid.min.y), vec2(110.0, mid.height())), ui.id().with("stopan"), Sense::click());
         p.text(pos2(mid.max.x - 64.0, mid.center().y), Align2::CENTER_CENTER, "Stop Analyzing", rb(11.0), BLUE);
         if stop.clicked() {
@@ -452,6 +433,19 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         }
     } else if app.importing.is_some() {
         p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Importing… {}", app.import_count), rb(11.5), TEXT);
+    } else if let Some((id, progress)) = app.stem.separating {
+        let title = app.track(id).map(|t| t.display_title()).unwrap_or_default();
+        let text = if app.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            format!("Stopping stem separation · {title}")
+        } else {
+            format!("Stem separation · {:.0}% · {title}", progress * 100.0)
+        };
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
+    } else if let Some((done, total)) = app.stem.downloading {
+        let text = if total > 0 { format!("Downloading stem model · {:.0}%", 100.0 * done as f64 / total as f64) } else { "Downloading stem model…".to_owned() };
+        p.text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
+    } else if app.stem.loading.is_some() {
+        p.text(mid.left_center(), Align2::LEFT_CENTER, "Reading cached stems…", rb(11.5), TEXT);
     }
 }
 
@@ -2793,5 +2787,36 @@ mod collection_render_tests {
                 eprintln!("cpu_collection_categories_cost tracks={} groups={name} legacy={legacy} cold_ms={cold_ms:.3} warm_median_ms={:.3} frames_per_run=5 runs=3 includes=egui_widgets_and_tessellation", tracks.len(), times[1]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod master_volume_tests {
+    use super::*;
+
+    #[test]
+    fn the_header_dial_requires_input_and_accepts_the_mouse_wheel() {
+        let ctx = egui::Context::default();
+        let center = pos2(100.0, 14.0);
+        let mut level = 0.5;
+        let mut frame = |time, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 60.0))),
+                time: Some(time), events, ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(v) = master_volume_control(ui, center, level, false) { level = v; }
+                });
+            });
+            level
+        };
+        assert_eq!(frame(0.0, vec![]), 0.5);
+        assert_eq!(frame(5.0, vec![egui::Event::PointerMoved(center)]), 0.5);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Default::default() };
+        let changed = frame(5.1, vec![wheel.clone()]);
+        assert!((changed - 0.55).abs() < 0.001);
+        assert_eq!(frame(15.0, vec![]), changed);
+        assert_eq!(frame(16.0, vec![egui::Event::PointerMoved(pos2(180.0, 45.0)), wheel]), changed);
     }
 }

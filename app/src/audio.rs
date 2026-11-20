@@ -304,13 +304,15 @@ pub struct PlayState {
     dsp: Box<DeckDsp>,
 }
 
+pub const DEFAULT_VOLUME: f32 = 0.9;
+
 impl Default for PlayState {
     fn default() -> Self {
         PlayState {
             audio: None,
             pos: 0.0,
             playing: false,
-            volume: 0.9,
+            volume: DEFAULT_VOLUME,
             gain: 1.0,
             loop_range: None,
             metronome: None,
@@ -362,6 +364,7 @@ pub struct Player {
     pub lost: Arc<std::sync::atomic::AtomicBool>,
     stream: Option<cpal::Stream>,
     output_enabled: bool,
+    buffer_load: Arc<std::sync::atomic::AtomicU32>,
     idle_since: Option<std::time::Instant>,
     parked: bool,
     pub device_rate: u32,
@@ -379,7 +382,7 @@ impl Player {
         let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
         let state = decks[0].clone();
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut player = Player { state, decks, lost, stream: None, output_enabled, idle_since: None, parked: false, device_rate: 44100, error: None };
+        let mut player = Player { state, decks, lost, stream: None, output_enabled, buffer_load: Default::default(), idle_since: None, parked: false, device_rate: 44100, error: None };
         if let Err(e) = player.switch_device(device) {
             player.error = Some(e.to_string());
         }
@@ -414,7 +417,9 @@ impl Player {
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
         if !self.output_enabled { return Ok(()); }
-        let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone())?;
+        let buffer_load = Arc::default();
+        let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone(), Arc::clone(&buffer_load))?;
+        self.buffer_load = buffer_load;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stream = Some(s);
         self.parked = false;
@@ -455,7 +460,13 @@ impl Player {
         Ok(None)
     }
 
-    fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
+    /// Elapsed time in the most recent output callback as a percentage of its buffer period.
+    pub fn buffer_load_percent(&self) -> Option<f32> {
+        self.stream.as_ref()?;
+        Some(f32::from_bits(self.buffer_load.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>, buffer_load: Arc<std::sync::atomic::AtomicU32>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
@@ -468,6 +479,13 @@ impl Player {
         let (cfg, config, first_ch) = crate::prefs_ext::stream_config(&dev)?;
         let rate = cfg.sample_rate().0;
         let channels = cfg.channels() as usize;
+        let record_time = move |start: std::time::Instant, samples: usize| {
+            let frames = samples / channels;
+            if frames > 0 {
+                let percent = start.elapsed().as_secs_f64() * f64::from(rate) * 100.0 / frames as f64;
+                buffer_load.store((percent as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        };
         let st = state.clone();
         let stream = match cfg.sample_format() {
             cpal::SampleFormat::F32 => {
@@ -480,24 +498,28 @@ impl Player {
                 HP_ACTIVE.store(hp.is_some(), std::sync::atomic::Ordering::Relaxed);
                 dev.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| match hp {
-                    Some(h) => {
-                        let frames = data.len() / channels.max(1);
-                        pair.clear();
-                        pair.resize(frames * 2, 0.0);
-                        phones.clear();
-                        phones.resize(frames * 2, 0.0);
-                        render_cue(&st, &mut pair, &mut phones, 2, rate);
-                        data.fill(0.0);
-                        for ((f, m), c) in data.chunks_mut(channels).zip(pair.chunks(2)).zip(phones.chunks(2)) {
-                            f[first_ch] = m[0];
-                            f[first_ch + 1] = m[1];
-                            f[h] = c[0].clamp(-1.0, 1.0);
-                            f[h + 1] = c[1].clamp(-1.0, 1.0);
+                move |data: &mut [f32], _| {
+                    let start = std::time::Instant::now();
+                    match hp {
+                        Some(h) => {
+                            let frames = data.len() / channels.max(1);
+                            pair.clear();
+                            pair.resize(frames * 2, 0.0);
+                            phones.clear();
+                            phones.resize(frames * 2, 0.0);
+                            render_cue(&st, &mut pair, &mut phones, 2, rate);
+                            data.fill(0.0);
+                            for ((f, m), c) in data.chunks_mut(channels).zip(pair.chunks(2)).zip(phones.chunks(2)) {
+                                f[first_ch] = m[0];
+                                f[first_ch + 1] = m[1];
+                                f[h] = c[0].clamp(-1.0, 1.0);
+                                f[h + 1] = c[1].clamp(-1.0, 1.0);
+                            }
                         }
+                        None if first_ch == 0 => render(&st, data, channels, rate),
+                        None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
                     }
-                    None if first_ch == 0 => render(&st, data, channels, rate),
-                    None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
+                    record_time(start, data.len());
                 },
                 move |e| {
                     eprintln!("audio error: {e}");
@@ -516,11 +538,13 @@ impl Player {
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [i16], _| {
+                        let start = std::time::Instant::now();
                         tmp.resize(data.len(), 0.0);
                         render(&st2, &mut tmp, channels, rate);
                         for (d, s) in data.iter_mut().zip(tmp.iter().copied()) {
                             *d = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                         }
+                        record_time(start, data.len());
                     },
                     move |e| {
                         eprintln!("audio error: {e}");
@@ -1548,6 +1572,17 @@ mod deck_mix_tests {
     }
     fn playing(level: f32) -> PlayState {
         PlayState { audio: Some(dc(level, 44100)), playing: true, volume: 1.0, gain: 1.0, ..Default::default() }
+    }
+
+    #[test]
+    fn playback_disabled_never_opens_an_output() {
+        let mut player = super::Player::with_device(None, false);
+        assert!(player.buffer_load_percent().is_none());
+        player.switch_device(None).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(player.service_output(true, true, None).unwrap().is_none());
+        assert!(player.stream.is_none());
+        assert!(player.buffer_load_percent().is_none());
     }
 
     #[test]

@@ -45,6 +45,15 @@ for cancellation between model layers. A tensor operation already underway
 finishes first. A second deck holding the same track can keep using the job.
 Explicit library analysis has its own queue.
 
+The blue dial next to Preferences sets the master volume. Drag it, scroll over it
+or use the default keyboard shortcuts `=` and `-`. Double-click restores the default level.
+The two bars beside it read the live stereo output. The small bar farther right
+shows the time spent in the most recent audio callback as a percentage of one
+buffer period. A tooltip shows the value. The footer identifies a model download,
+separation or cancellation while it is underway. These controls work in Export
+and Performance. See the setting-panel diagrams on pages 70 and 128–129 of the
+[rekordbox 7.2.18 manual](https://cdn.rekordbox.com/files/20260807093645/rekordbox7.2.18_manual_EN.pdf).
+
 The standalone launcher accepts these session options. Running `./recordbox`
 again restores ordinary loading and playback.
 
