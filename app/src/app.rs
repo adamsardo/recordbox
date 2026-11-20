@@ -762,11 +762,16 @@ mod related_tests {
     }
 }
 
-/// Two grids describe the same beats (same anchors within 1 ms and 0.01 BPM).
+/// Reuse the original ANLZ beat sections only when the saved anchors still
+/// match the import. Allow floating-point round trips through the library.
+/// Sub-millisecond timing and fractional BPM edits belong to the saved grid.
 pub fn grids_match(a: &BeatGrid, b: &BeatGrid) -> bool {
-    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| (x.time - y.time).abs() < 0.001 && (x.bpm - y.bpm).abs() < 0.01 && x.beat == y.beat)
+    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| {
+        x.beat == y.beat && (x.time - y.time).abs() <= 1e-9 && (x.bpm - y.bpm).abs() <= 1e-9
+    })
 }
 
+/// Distance between keys around the wheel, plus one when the mode differs.
 pub fn key_distance(a: i32, b: i32) -> Option<i32> {
     if !(0..24).contains(&a) || !(0..24).contains(&b) {
         return None;
@@ -4868,7 +4873,11 @@ impl App {
             }
         }
         for (id, r) in analyzed {
-            self.apply_analysis(id, r);
+            // The library worker owns any explicit grid/key request for this track.
+            // An overlapping USB export uses its own analysis settings.
+            if self.track(id).is_some_and(|t| t.analyzed != 3) {
+                self.apply_analysis(id, r);
+            }
         }
         if let Some(r) = report {
             self.export_report = Some(r);

@@ -502,7 +502,7 @@ mod tests {
         let before = worst_error(&normal, &times, seconds, 3.0);
         let after = worst_error(&refined, &times, seconds, 3.0);
         eprintln!("precision tempo step: worst beat error {before:.6} -> {after:.6} seconds");
-        assert!(after < 0.030 && after <= before + 0.001, "{before} -> {after}");
+        assert!(after < 0.002 && after < before, "{before} -> {after}");
     }
 
     #[test]

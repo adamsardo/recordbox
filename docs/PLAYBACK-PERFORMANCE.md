@@ -98,6 +98,8 @@ New analyses use the setting immediately. For an already analyzed track, select
 **BPM / Grid** and choose **Track → Analyze Track**. Automatic analysis preserves
 imported grids. Explicit reanalysis replaces an unlocked grid only when a new
 grid is available and the saved grid still matches the one that was queued.
+USB export writes refined beat times across the DAT and EXT analysis files,
+including the fraction of a millisecond in the EXT beat grid.
 
 The Rust pass samples up to 128 predicted beats per segment and looks for
 consistent attacks within 40 ms of each beat. Sparse or conflicting evidence
@@ -107,9 +109,11 @@ half-time choice or first downbeat still needs the grid editor.
 
 On two 64-second generated tracks with known kick and offbeat timings, the
 95th-percentile error went from 4.34 to 0.44 ms at 44.1 kHz and from 4.84 to
-0.46 ms at 48 kHz. These fixtures measure timing against a known reference.
-To compare analysis time on your collection, add `PREPDECK_PRECISE=1` to
-the worker timing command above and repeat it with the same files and workers.
+0.46 ms at 48 kHz. On the four bundled demo tracks, three workers took a
+median of 0.779 seconds with standard analysis and 0.790 seconds with refinement
+on the cloud Linux machine. The seven timed runs per setting had overlapping
+ranges. To compare your collection, add `PREPDECK_PRECISE=1` to the worker
+timing command above and repeat it with the same files and workers.
 
 ## Simulate one deck without music or audio hardware
 
