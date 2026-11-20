@@ -42,7 +42,7 @@ The upstream project is being built in the open with an AI coding agent (Claude 
 ## What it's aiming for
 
 - **Library:** import, browse, search and organise your tracks
-- **Analysis:** tempo, beat grid, key and waveforms
+- **Analysis:** tempo, optional high-precision beat grids for steady and changing tempos, key and waveforms
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
 - **USB export:** drives that CDJ/XDJ players can read, the same way rekordbox does
 

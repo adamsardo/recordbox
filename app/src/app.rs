@@ -492,8 +492,34 @@ impl Default for RelatedRules {
     }
 }
 
-/// Distance between two keys on the key wheel: steps around the wheel plus one when the
-/// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
+/// An explicit reanalysis can replace the grid it saw when queued. Edits made
+/// while its audio was being analyzed take precedence over the worker's result.
+fn keep_saved_grid(locked: bool, saved: &Option<BeatGrid>, queued: Option<&Option<BeatGrid>>, measured: bool) -> bool {
+    locked || match queued {
+        Some(before) => before != saved || !measured,
+        None => saved.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod reanalysis_tests {
+    use super::{keep_saved_grid, BeatGrid};
+
+    #[test]
+    fn replacing_a_saved_grid_requires_a_successful_explicit_analysis_and_no_intervening_edit() {
+        let imported = Some(BeatGrid::constant(0.125, 122.0, 2));
+        let edited = Some(BeatGrid::constant(0.181, 122.0, 1));
+        assert!(keep_saved_grid(false, &imported, None, true));
+        assert!(keep_saved_grid(false, &imported, Some(&imported), false));
+        assert!(keep_saved_grid(true, &imported, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&None), true));
+        assert!(keep_saved_grid(false, &None, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &imported, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &None, None, true));
+    }
+}
+
 #[cfg(test)]
 mod prefs_tests {
     #[test]
@@ -3301,11 +3327,7 @@ impl App {
                 t.raw_samples = res.raw_samples;
                 t.gain_db = res.gain_db;
                 let measured_peak = res.peak;
-                // A locked grid, or one that came with an imported library, is kept as it is.
-                let keep_grid = t.grid_locked || match requested_grid {
-                    Some(before) => before != existing_grid || res.grid.is_none(),
-                    None => existing_grid.is_some(),
-                };
+                let keep_grid = keep_saved_grid(t.grid_locked, &existing_grid, requested_grid.as_ref(), res.grid.is_some());
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
                 if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid && !keep_tag_key)))) {
@@ -3393,7 +3415,7 @@ impl App {
         self.save_track_quiet(id);
     }
 
-    /// Re-analyse ignoring the stored grid (explicit "Analyze Track" from the menu).
+    /// Explicitly request a new grid when the user selects BPM / Grid and Analyze Track.
     pub fn reanalyze(&mut self, ids: &[i64]) {
         let settings = self.analysis_settings();
         let with_grid = settings.do_grid;

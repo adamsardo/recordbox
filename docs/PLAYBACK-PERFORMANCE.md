@@ -86,6 +86,31 @@ PREPDECK_PATHS="$PWD/tracks.txt" PREPDECK_N=1 cargo test --manifest-path app/Car
 PREPDECK_PATHS="$PWD/tracks.txt" PREPDECK_N=3 cargo test --manifest-path app/Cargo.toml --locked --release jobs::throughput_probe::analysis_workers -- --ignored --nocapture
 ```
 
+## High-precision beat grids
+
+Turn on **Preferences → Analysis → Track Analysis → Use high precision BeatGrid
+analysis** to refine beat times and fractional BPM using repeated attacks in the
+audio. **Normal** fits a steady tempo. **Dynamic** refines each detected tempo
+segment and preserves the beat numbering across changes. The option starts off,
+including when upgrading from a version that showed an inactive switch.
+
+New analyses use the setting immediately. For an already analyzed track, select
+**BPM / Grid** and choose **Track → Analyze Track**. Automatic analysis preserves
+imported grids. Explicit reanalysis replaces an unlocked grid only when a new
+grid is available and the saved grid still matches the one that was queued.
+
+The Rust pass samples up to 128 predicted beats per segment and looks for
+consistent attacks within 40 ms of each beat. Sparse or conflicting evidence
+leaves the initial estimate in place. The pass uses the already decoded audio
+and works offline. Its focus is timing and small tempo corrections. A wrong
+half-time choice or first downbeat still needs the grid editor.
+
+On two 64-second generated tracks with known kick and offbeat timings, the
+95th-percentile error went from 4.34 to 0.44 ms at 44.1 kHz and from 4.84 to
+0.46 ms at 48 kHz. These fixtures measure timing against a known reference.
+To compare analysis time on your collection, add `PREPDECK_PRECISE=1` to
+the worker timing command above and repeat it with the same files and workers.
+
 ## Simulate one deck without music or audio hardware
 
 From the source checkout, after installing the normal native build dependencies:

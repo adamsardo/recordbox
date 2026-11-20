@@ -164,16 +164,19 @@ pub fn spawn_export(req: crate::export::usb::ExportRequest, ctx: egui::Context) 
 #[cfg(test)]
 mod throughput_probe {
     /// Opt-in: PREPDECK_PATHS=<file with one audio path per line> PREPDECK_N=<workers>.
+    /// Add PREPDECK_PRECISE=1 to measure high-precision grid analysis on the same files.
     /// Prints how long analysing those files takes with that many workers.
     #[test]
     #[ignore]
     fn analysis_workers() {
         let paths: Vec<String> = std::fs::read_to_string(std::env::var("PREPDECK_PATHS").unwrap()).unwrap().lines().map(|s| s.to_string()).collect();
         let n = std::env::var("PREPDECK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let high_precision = std::env::var("PREPDECK_PRECISE").as_deref() == Ok("1");
+        let settings = super::AnalysisSettings { high_precision, ..Default::default() };
         let pool = super::AnalysisPool::new(eframe::egui::Context::default(), n);
         let start = std::time::Instant::now();
         for (i, path) in paths.iter().enumerate() {
-            pool.submit(super::AnalysisJob { track_id: i as i64, path: path.clone(), settings: Default::default() });
+            pool.submit(super::AnalysisJob { track_id: i as i64, path: path.clone(), settings: settings.clone() });
         }
         for _ in &paths { pool.rx.recv().unwrap().1.unwrap(); }
         eprintln!("{} files, {} workers: {:.3} s", paths.len(), pool.thread_count(), start.elapsed().as_secs_f64());
@@ -227,8 +230,11 @@ mod analysis_pool_tests {
         crate::demo::write_wav(&path, sr, &samples).unwrap();
         let path = path.to_str().unwrap();
         let workers = build_workers(3);
-        for (dynamic, do_grid, do_key) in [(false,true,true), (true,true,true), (false,false,false)] {
-            let settings = AnalysisSettings { dynamic, do_grid, do_key, ..Default::default() };
+        for (dynamic, high_precision, do_grid, do_key) in [
+            (false, false, true, true), (true, false, true, true),
+            (false, true, true, true), (true, true, true, true), (false, true, false, false),
+        ] {
+            let settings = AnalysisSettings { dynamic, high_precision, do_grid, do_key, ..Default::default() };
             let a = crate::analysis::analyze_file(path, &settings).unwrap();
             let b = workers.install(|| analyze_file_on_worker(path, &settings)).unwrap();
             assert_eq!((a.duration.to_bits(), a.raw_samples, a.sample_rate, a.bpm.to_bits(), a.key),
