@@ -446,6 +446,52 @@ jobs:
           overwrite: true
           retention-days: 14
 
+      - name: Validate and package the experimental Linux Vulkan build
+        if: runner.os == 'Linux' && !startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          test -f "${icds[0]}"
+          export VK_ICD_FILENAMES="${icds[0]}"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/vulkan-runtime"
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+
+          cargo_args=(--manifest-path app/Cargo.toml --release --locked --features vulkan)
+          for test_name in stems::vulkan::tests::projection_limits_bound_every_submission_and_buffer \
+                           stems::vulkan::tests::software_vulkan_linear_matches_reference \
+                           stems::htdemucs::vulkan_transformer_projections_match_cpu \
+                           stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override; do
+            cargo test "${cargo_args[@]}" "$test_name" -- --exact --include-ignored | tee "$RUNNER_TEMP/vulkan-test.log"
+            grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/vulkan-test.log"
+          done
+
+          cargo build "${cargo_args[@]}"
+          python packaging/build_archive.py --binary app/target/release/recordbox --vulkan \
+            --platform linux --arch x86_64 --source-commit "$GITHUB_SHA" --output vulkan-dist \
+            --runtime-notice /usr/share/doc/libssl3/copyright --runtime-notice /usr/share/doc/libasound2/copyright
+          (cd vulkan-dist && sha256sum --check *.tar.gz.sha256)
+          archive=(vulkan-dist/*-linux-x86_64-vulkan.tar.gz)
+          dest="$RUNNER_TEMP/vulkan-smoke"
+          mkdir "$dest"
+          tar -xzf "${archive[0]}" -C "$dest"
+          launcher=("$dest"/*/recordbox)
+          "${launcher[0]}" --stems-status | grep -F 'Linux Vulkan'
+          "${launcher[0]}" --stems-device | grep -F 'STEMS backend: CPU ·'
+          "${launcher[0]}" --stems-cpu --stems-device | grep -F 'CPU · selected for this session'
+      - name: Upload the Linux Vulkan preview
+        if: runner.os == 'Linux' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vulkan-preview-linux-x86_64-${{ github.sha }}
+          path: |
+            vulkan-dist/*.tar.gz
+            vulkan-dist/*.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
   release_assets:
     name: Verify release assets
     needs: [version, tests, audit, packages]

@@ -297,7 +297,7 @@ exec "$bundle_dir/bin/recordbox" "$@"
 
 def build_archive(binary: Path, source_root: Path, output: Path, platform: str, architecture: str, source_commit: str,
                   runtime_files: list[Path] | None = None, runtime_dirs: list[Path] | None = None,
-                  runtime_notices: list[Path] | None = None, cuda12=False, directml=None) -> dict:
+                  runtime_notices: list[Path] | None = None, cuda12=False, directml=None, vulkan=False) -> dict:
     if platform not in {"macos", "windows", "linux"} or architecture not in {"arm64", "x86_64"}:
         raise PackageError("Unsupported platform or architecture")
     if not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", source_commit):
@@ -307,6 +307,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     manifest_path = source_root / "app/Cargo.toml"
     version = read_release_version(source_root)
     candidates = library_candidates(runtime_files or [], runtime_dirs or [], platform)
+    if vulkan and (platform != "linux" or architecture != "x86_64" or cuda12 or directml is not None):
+        raise PackageError("The Vulkan preview requires a separate Linux x86_64 build")
     if cuda12 and (platform not in cuda_platforms(version) or architecture != "x86_64"):
         raise PackageError("Unsupported CUDA package target")
     dynamic = {}
@@ -320,7 +322,13 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     info, bundled, system, abi = runtime_closure(binary, platform, architecture, candidates, cuda12, dynamic)
     if cuda12:
         check_cuda_binary(binary, info.dependencies, platform)
-    label = f"Recordbox-{version}-{platform}-{architecture}" + ("-cuda12" if cuda12 else "-directml" if directml else "")
+    label = f"Recordbox-{version}-{platform}-{architecture}"
+    if vulkan:
+        label += "-vulkan"
+    elif cuda12:
+        label += "-cuda12"
+    elif directml:
+        label += "-directml"
     bundle_name = "Recordbox.app" if platform == "macos" else label
     archive_name = label + (".tar.gz" if platform == "linux" else ".zip")
     output.mkdir(parents=True, exist_ok=True)
@@ -353,6 +361,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
                     write_file(resources / "runtime-notices" / name, (directml / name).read_bytes())
         if cuda12:
             write_file(resources / "CUDA12.md", (source_root / "docs/CUDA12.md").read_bytes())
+        if vulkan:
+            write_file(resources / "VULKAN.md", (source_root / "docs/VULKAN.md").read_bytes())
         write_file(resources / "Inter-NOTICE.txt", (source_root / "app/assets/fonts/README.txt").read_bytes())
         write_file(resources / "Inter-OFL.txt", (source_root / "packaging/Inter-OFL.txt").read_bytes())
         for index, notice in enumerate(runtime_notices or [], 1):
@@ -375,6 +385,8 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
             metadata["target"]["stems"] = "directml-radeon"
         if cuda12:
             metadata["target"]["stems"] = "cuda12-sm61"
+        if vulkan:
+            metadata["target"]["stems"] = "vulkan"
         write_file(resources / "runtime-manifest.json", (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode())
         archive = staging / archive_name; archive_bundle(bundle, archive, platform)
         checksum = sha256(archive)
@@ -390,6 +402,7 @@ def main() -> None:
     parser.add_argument("--arch", choices=["arm64", "x86_64"]); parser.add_argument("--source-commit")
     parser.add_argument("--directml-runtime", type=Path, help="Package Windows Radeon STEMS with the pinned runtime directory")
     parser.add_argument("--cuda12", action="store_true", help="Package the NVIDIA CUDA 12 STEMS variant")
+    parser.add_argument("--vulkan", action="store_true", help="Package the experimental Linux Vulkan STEMS build")
     parser.add_argument("--check-version", action="store_true", help="Validate VERSION and Cargo versions without packaging")
     parser.add_argument("--tag", help="With --check-version, require the exact v<VERSION> release tag")
     parser.add_argument("--runtime-library", action="append", default=[], type=Path); parser.add_argument("--runtime-dir", action="append", default=[], type=Path)
@@ -397,7 +410,7 @@ def main() -> None:
     args = parser.parse_args()
     packaging = (args.binary, args.output, args.platform, args.arch, args.source_commit)
     if args.tag is not None and not args.check_version: parser.error("--tag requires --check-version")
-    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice or args.cuda12 or args.directml_runtime):
+    if args.check_version and (any(value is not None for value in packaging) or args.runtime_library or args.runtime_dir or args.runtime_notice or args.cuda12 or args.directml_runtime or args.vulkan):
         parser.error("--check-version cannot be combined with packaging arguments")
     if not args.check_version and any(value is None for value in packaging):
         parser.error("packaging requires --binary, --output, --platform, --arch and --source-commit")
@@ -408,7 +421,7 @@ def main() -> None:
                 raise PackageError(f"Release tag must be v{version}, received {args.tag!r}")
             print(json.dumps({"status": "passed", "version": version, "tag": args.tag}))
             return
-        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice, args.cuda12, args.directml_runtime)
+        result = build_archive(args.binary.resolve(), args.source_root.resolve(), args.output.resolve(), args.platform, args.arch, args.source_commit, args.runtime_library, args.runtime_dir, args.runtime_notice, args.cuda12, args.directml_runtime, args.vulkan)
     except (ValueError, OSError, KeyError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")
     print(json.dumps(result, indent=2))

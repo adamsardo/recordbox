@@ -139,6 +139,25 @@ class Archives(unittest.TestCase):
             self.assertTrue(all(entry.isfile() or entry.isdir() for entry in archive))
         self.assertIn(b'"$bundle_dir/bin/recordbox" "$@"', (Path(result["bundle"]) / "recordbox").read_bytes())
 
+    def test_linux_vulkan_preview_is_distinct_from_release_archives(self):
+        (self.source / "docs").mkdir()
+        guide = self.source / "docs/VULKAN.md"
+        guide.write_text("Vulkan preview fixture\n")
+        result = self.build("linux", "x86_64", vulkan=True)
+        archive_name = Path(result["archive"]).name
+        self.assertEqual(archive_name, "Recordbox-0.1.0-linux-x86_64-vulkan.tar.gz")
+        self.assertEqual(result["manifest"]["target"]["stems"], "vulkan")
+        self.assertEqual((Path(result["bundle"]) / "VULKAN.md").read_bytes(), guide.read_bytes())
+        self.assertFalse(any(variant == "vulkan" for _, _, variant, _ in package.release_archives("0.5.8")))
+
+    def test_vulkan_preview_rejects_other_targets_and_mixed_backends(self):
+        for platform, architecture, options in (("macos", "arm64", {}), ("windows", "x86_64", {}),
+                                                ("linux", "arm64", {}), ("linux", "x86_64", {"cuda12": True}),
+                                                ("linux", "x86_64", {"directml": self.root})):
+            with self.subTest(platform=platform, architecture=architecture, options=options):
+                with self.assertRaisesRegex(package.PackageError, "separate Linux x86_64 build"):
+                    self.build(platform, architecture, vulkan=True, **options)
+
     def test_non_system_dependency_is_rejected(self):
         for platform, dependency in (("macos", "/opt/homebrew/opt/openssl/lib/libcrypto.3.dylib"), ("macos", "@rpath/libcrypto.3.dylib"), ("linux", "/home/builder/libcustom.so")):
             with self.subTest(platform=platform, dependency=dependency), self.assertRaises(package.PackageError):

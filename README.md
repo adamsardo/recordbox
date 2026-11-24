@@ -83,6 +83,10 @@ For a Radeon Vega 8 or another AMD adapter with a DirectX 12 driver, choose
 the **Windows x64 Radeon DirectML** preview ZIP. It includes the inference runtime. Vega 8 driver 26.20.14048.2 and older use manual CPU separation after a full-model GPU hang was reported.
 [Check your adapter and compare one song](docs/DIRECTML.md)
 
+For **experimental Linux x64 Vulkan STEMS**, download the Vulkan preview artifact
+from the PR build. It runs the model's transformer linear layers on the GPU and
+the remaining stages on the CPU. [Linux Vulkan setup and comparison](docs/VULKAN.md)
+
 To build from source, install [Rust through rustup](https://rustup.rs). The
 repository selects the same toolchain as CI. Install your platform's native
 prerequisites from the [build guide](docs/BUILD-AND-PACKAGING.md), then:
