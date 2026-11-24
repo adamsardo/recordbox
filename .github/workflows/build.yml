@@ -116,7 +116,8 @@ jobs:
         env:
           RECORDBOX_TEST_PYREKORDBOX: ${{ github.workspace }}/fixtures/pyrekordbox
           RECORDBOX_TEST_RBOX: ${{ github.workspace }}/fixtures/rbox
-        run: cargo test --manifest-path app/Cargo.toml --locked rbimport::writeback:: -- --ignored --test-threads=1
+        run: |
+          cargo test --manifest-path app/Cargo.toml --locked rbimport::writeback:: -- --ignored --test-threads=1
       - name: Formatting report (existing formatting debt is advisory)
         shell: bash
         run: |
