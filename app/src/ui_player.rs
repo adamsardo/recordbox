@@ -1382,7 +1382,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
     }
     // Status and actions.
-    let model = app.stem.active_model.or(app.stem.model.as_deref()).and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
+    let model_info = app.stem.status_model();
+    let model = model_info.map_or("checking this computer…", |m| m.name);
     let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
     let error = app.stem.error_for(app.deck.track).filter(|_| !busy && app.stem.loading.is_none());
     let retry_cpu = error.is_some_and(|e| e.retry_model.is_some());
@@ -1417,7 +1418,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
     } else if let Some(reason) = crate::stems::radeon_hold() {
         ui.interact(status_rect, ui.id().with("stem_driver_status"), Sense::hover()).on_hover_text(reason);
-    } else if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
+    } else if let Some(m) = model_info {
         ui.interact(status_rect, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
     if busy {

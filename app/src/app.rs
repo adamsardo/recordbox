@@ -570,6 +570,16 @@ mod prefs_tests {
     }
 
     #[test]
+    fn model_details_follow_the_running_job_when_the_preference_changes() {
+        let mut state = super::StemState::new();
+        state.active_model = Some("htdemucs");
+        state.model = Some("htdemucs_ft".into());
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs");
+        state.active_model = None;
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs fine-tuned");
+    }
+
+    #[test]
     fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
         let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
         assert!(!p.auto_stems_on_load(false));
@@ -1015,9 +1025,13 @@ impl StemState {
         }
     }
 
+    pub fn status_model(&self) -> Option<&'static crate::stems::ModelSpec> {
+        self.active_model.or(self.model.as_deref()).and_then(crate::stems::spec)
+    }
+
     pub fn separation_status(&self) -> Option<String> {
         let (_, progress) = self.separating?;
-        let model = self.active_model.and_then(crate::stems::spec)?.name;
+        let model = self.status_model()?.name;
         let cpu = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() { " on CPU" } else { "" };
         Some(if progress == 0.0 {
             format!("Starting {model}{cpu} · waiting for the first segment")
