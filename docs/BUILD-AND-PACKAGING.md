@@ -76,11 +76,18 @@ package jobs also supply CUDA 12 previews. The verifier checks their native
 executables, CUDA imports, Pascal FP32 kernels, setup guide and checksums.
 The one-song comparison runs on a physical GPU. [CUDA setup and test](CUDA12.md)
 
-Apple Silicon packaging requests the free native macOS 15 image. On the first retry the workflow requests macOS 26 and uses the matching build cache. Both images build the ARM64 archive and launch the extracted app.
+Apple Silicon packaging requests the free native macOS 26 image. On the first retry the workflow requests macOS 15 and uses the matching build cache. Both images build the ARM64 archive and launch the extracted app.
 
 From v0.5.6 the same Windows runner also builds the Radeon DirectML preview.
 Release verification checks its executable, Microsoft runtime DLLs, distribution
 notices and setup guide. [DirectML build and test](DIRECTML.md)
+
+From v0.6.0 the Linux package job also supplies the experimental Vulkan + CPU
+archive. It runs the projection tests with Mesa's software Vulkan driver and
+checks the extracted launcher's diagnostics and CPU selection. Release
+verification checks the embedded shader against the tagged source, the setup
+guide and the archive checksum. Testing acceleration on a physical GPU requires
+a Linux machine with a compatible driver. [Vulkan setup and test](VULKAN.md)
 
 Only the native compilation/smoke
 jobs are skipped when that complete trusted set was explicitly selected.

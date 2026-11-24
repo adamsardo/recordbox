@@ -139,7 +139,7 @@ class Archives(unittest.TestCase):
             self.assertTrue(all(entry.isfile() or entry.isdir() for entry in archive))
         self.assertIn(b'"$bundle_dir/bin/recordbox" "$@"', (Path(result["bundle"]) / "recordbox").read_bytes())
 
-    def test_linux_vulkan_preview_is_distinct_from_release_archives(self):
+    def test_linux_vulkan_preview_has_distinct_name_shader_and_guide(self):
         (self.source / "docs").mkdir()
         guide = self.source / "docs/VULKAN.md"
         guide.write_text("Vulkan preview fixture\n")

@@ -40,6 +40,8 @@ def release_archives(version):
     variants.extend((platform, "x86_64", "cuda12") for platform in cuda_platforms(version))
     if has_directml(version):
         variants.append(("windows", "x86_64", "directml"))
+    if version_tuple(re.split(r"[-+]", version, maxsplit=1)[0]) >= (0, 6, 0):
+        variants.append(("linux", "x86_64", "vulkan"))
     for platform, architecture, variant in variants:
         suffix = f"-{variant}" if variant else ""
         ext = ".tar.gz" if platform == "linux" else ".zip"
@@ -49,6 +51,12 @@ def release_archives(version):
 def check_directml_binary(binary):
     if b"recordbox_htdemucs" not in binary.read_bytes():
         raise PackageError("DirectML package requires the compiled HTDemucs ONNX network")
+
+
+def check_vulkan_binary(binary, source_root):
+    shader = (source_root / "app/src/stems/vulkan/linear.wgsl").read_bytes()
+    if not shader or shader not in binary.read_bytes():
+        raise PackageError("The Vulkan build must contain the HTDemucs projection shader from this checkout")
 
 
 CUDA_LIBRARIES = {
@@ -310,9 +318,7 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     if vulkan:
         if platform != "linux" or architecture != "x86_64" or cuda12 or directml is not None:
             raise PackageError("The Vulkan preview requires a separate Linux x86_64 build")
-        shader = (source_root / "app/src/stems/vulkan/linear.wgsl").read_bytes()
-        if not shader or shader not in binary.read_bytes():
-            raise PackageError("The Vulkan build must contain the HTDemucs projection shader from this checkout")
+        check_vulkan_binary(binary, source_root)
     if cuda12 and (platform not in cuda_platforms(version) or architecture != "x86_64"):
         raise PackageError("Unsupported CUDA package target")
     dynamic = {}

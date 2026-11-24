@@ -66,6 +66,11 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 - Library preparation and STEMS processing run locally on your computer. You can use both without an account.
 - Design rule: it never modifies your existing rekordbox library or your original audio files.
 
+The circular arrows at the bottom of the library sidebar open a review of the
+detected rekordbox desktop database and the active Recordbox library. Confirming
+the import merges the snapshot into Recordbox. The separate **Device Sync Manager**
+can write to a USB drive. [Library sync and supported formats](docs/LIBRARY-SYNC.md)
+
 ## Running it
 
 Downloads for the `fantuz/recordbox` fork are available from
@@ -83,8 +88,8 @@ For a Radeon Vega 8 or another AMD adapter with a DirectX 12 driver, choose
 the **Windows x64 Radeon DirectML** preview ZIP. It includes the inference runtime. Vega 8 driver 26.20.14048.2 and older use manual CPU separation after a full-model GPU hang was reported.
 [Check your adapter and compare one song](docs/DIRECTML.md)
 
-For **experimental Linux x64 Vulkan STEMS**, download the Vulkan preview artifact
-from the PR build. It runs the model's transformer linear layers on the GPU and
+For **experimental Linux x64 Vulkan STEMS**, choose the Linux x64 Vulkan archive
+from the release downloads. It runs the model's transformer linear layers on the GPU and
 the remaining stages on the CPU. [Linux Vulkan setup and comparison](docs/VULKAN.md)
 
 To build from source, install [Rust through rustup](https://rustup.rs). The

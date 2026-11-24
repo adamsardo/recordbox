@@ -5,7 +5,7 @@ The Linux x64 Vulkan preview runs HTDemucs transformer linear layers on a physic
 ## Try it on Linux
 
 1. Install the Vulkan loader and a driver for your GPU. On Debian with Radeon Vega graphics, the packages are `libvulkan1` and `mesa-vulkan-drivers`. The optional `vulkan-tools` package provides `vulkaninfo --summary`. Look for your Radeon in that output. A device named `llvmpipe` runs on the CPU.
-2. Download the `vulkan-preview-linux-x86_64-<commit>` artifact from a successful **Build and package** workflow run for this change. Unzip the artifact, run `sha256sum -c *.sha256` beside the tarball, then unpack `Recordbox-<version>-linux-x86_64-vulkan.tar.gz` into its own directory. [Build and package runs](https://github.com/fantuz/recordbox/actions/workflows/build.yml)
+2. From release 0.6.0 onward, download `Recordbox-<version>-linux-x86_64-vulkan.tar.gz` and `SHA256SUMS` from the same release. Run `sha256sum --check --ignore-missing SHA256SUMS` beside the tarball, confirm that its filename is reported as `OK`, then unpack it into its own directory. Development builds also provide a `vulkan-preview-linux-x86_64-<commit>` Actions artifact with its own checksum. [Releases](https://github.com/fantuz/recordbox/releases) · [Build and package runs](https://github.com/fantuz/recordbox/actions/workflows/build.yml)
 3. Open a terminal in the extracted directory and inspect the device.
 
    ```sh
