@@ -5,9 +5,9 @@
 //! another attempt. SQLite reads the validated copy before Recordbox merges the result into
 //! its own collection.
 
-pub(crate) mod merge;
 #[cfg(test)]
 mod grid_oracle;
+pub(crate) mod merge;
 pub(crate) mod writeback;
 
 use anyhow::{anyhow, Context, Result};

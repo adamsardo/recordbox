@@ -21,7 +21,8 @@ fn whole_grid_nudge_matches_four_native_files() -> Result<()> {
             .join("before")
             .join("ANLZ0000")
             .with_extension(extension);
-        fs::copy(source, dat.with_extension(extension))?;
+        fs::copy(source, dat.with_extension(extension))
+            .with_context(|| format!("Opening before/ANLZ0000.{extension}"))?;
     }
     let initial = grid::inspect(&share, analysis)?;
     ensure!(
@@ -47,8 +48,10 @@ fn whole_grid_nudge_matches_four_native_files() -> Result<()> {
             .join("after")
             .join("ANLZ0000")
             .with_extension(extension);
+        let expected =
+            fs::read(expected).with_context(|| format!("Opening after/ANLZ0000.{extension}"))?;
         ensure!(
-            fs::read(dat.with_extension(extension))? == fs::read(expected)?,
+            fs::read(dat.with_extension(extension))? == expected,
             "Edited {extension} bytes differ from the native capture"
         );
     }

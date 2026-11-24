@@ -184,8 +184,8 @@ fn registered_grid_nudge_rechecks_ownership_and_backs_up_both_tables() -> Result
         .map(|index| Beat {
             index,
             beat: index as u8 + 1,
-            time: 0.25 + 0.5 * index as f64,
-            bpm: 120.0,
+            time: 31.946 + 0.5 * index as f64,
+            bpm: if index < 2 { 120.00 } else { 120.01 },
         })
         .collect();
     let mut files = anlz::build(&f.audio, &beats, &Default::default(), &[], 0, 44100);
@@ -218,8 +218,13 @@ fn registered_grid_nudge_rechecks_ownership_and_backs_up_both_tables() -> Result
     )?;
     let id = rb.track_at_path(&f.audio)?.unwrap().id;
     let mut grid = rb.grid_checked(id)?.context("expected an imported grid")?;
-    grid.anchors[0].time += 0.001;
+    assert_eq!(grid.anchors.len(), 2);
+    for anchor in &mut grid.anchors {
+        anchor.time += 0.001;
+    }
     rb.save_grid(id, &grid)?;
+    // A valid persisted JSON representation can differ from its reserialization.
+    rb.conn.execute("UPDATE native_edit_baseline SET value=' '||value WHERE track_id=? AND field='Beat grid'", [id])?;
     drop(rb);
     let plan = preview(&f.local, &f.source)?;
     let i = plan
@@ -281,6 +286,17 @@ fn registered_grid_nudge_rechecks_ownership_and_backs_up_both_tables() -> Result
         &grid
     ));
     assert!(preview(&f.local, &f.source)?.rows.is_empty());
+
+    // Simulate the native change being saved before Recordbox acknowledges it.
+    // The floating-point sum 31.946 + 0.001 differs from native 31947/1000.
+    let base = &plan.rows[i].baseline;
+    Db::open(&f.local)?.conn.execute(
+        "UPDATE native_edit_baseline SET value=?1, proof=?2 WHERE track_id=?3 AND field='Beat grid'",
+        params![base.stored_value, base.proof, id],
+    )?;
+    let repeated = preview(&f.local, &f.source)?;
+    assert_eq!(repeated.rows.len(), 1);
+    assert_eq!(repeated.rows[0].reason.as_deref(), Some("Already applied"));
     Ok(())
 }
 

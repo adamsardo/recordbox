@@ -71,6 +71,13 @@ enum Edit {
 }
 
 impl Edit {
+    fn same_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Grid(a), Self::Grid(b)) => crate::app::grids_match(a, b),
+            _ => self == other,
+        }
+    }
+
     fn field(&self) -> Field {
         match self {
             Self::Rating(_) => Field::Rating,
@@ -239,7 +246,7 @@ pub(super) fn record_import(
     for (field, proof) in fields {
         if local
             .as_ref()
-            .is_none_or(|t| local_edit(db, t, field.field()).is_ok_and(|l| l == field))
+            .is_none_or(|t| local_edit(db, t, field.field()).is_ok_and(|l| l.same_value(&field)))
         {
             save.execute(params![
                 id,
@@ -263,6 +270,8 @@ struct Baseline {
     uuid: String,
     path: String,
     field: Edit,
+    // Apply compares the reviewed SQLite text under the writer lock.
+    stored_value: String,
     proof: String,
 }
 
@@ -307,12 +316,14 @@ fn local_db(path: &Path, write: bool) -> Result<Db> {
 
 const READ_BASELINES:&str="SELECT track_id,native_id,uuid,path,value,proof FROM native_edit_baseline WHERE source=? ORDER BY track_id,field";
 fn read_baseline(r: &rusqlite::Row<'_>) -> Result<Baseline> {
+    let stored_value: String = r.get(4)?;
     Ok(Baseline {
         local_id: r.get(0)?,
         id: r.get(1)?,
         uuid: r.get(2)?,
         path: r.get(3)?,
-        field: serde_json::from_str(&r.get::<_, String>(4)?)?,
+        field: serde_json::from_str(&stored_value)?,
+        stored_value,
         proof: r.get(5)?,
     })
 }
@@ -642,7 +653,7 @@ fn checked_current(
             );
             let snap = grid::inspect(&share, &analysis)?;
             let proof = grid_proof(&analysis, &snap.dat_sha256());
-            if &snap.grid == new_grid
+            if crate::app::grids_match(&snap.grid, new_grid)
                 || !at_baseline(&Edit::Grid(snap.grid.clone()), &proof, baseline)
             {
                 return Ok(guard(Edit::Grid(snap.grid), proof, Mutation::ObserveOnly));
@@ -738,7 +749,7 @@ pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
                 Some(format!("Unsupported local edit: {error:#}")),
             ),
         };
-        if problem.is_none() && desired == base.field {
+        if problem.is_none() && desired.same_value(&base.field) {
             continue;
         }
         let mut row = Row {
@@ -778,7 +789,7 @@ pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
                 row.current = now.value.display();
                 row.guard = now.guard;
                 row.companion = now.companion;
-                if now.value == row.desired {
+                if now.value.same_value(&row.desired) {
                     row.reason = Some("Already applied".into());
                 } else if !at_baseline(&now.value, &now.proof, &row.baseline) {
                     row.reason = Some("Conflict: the native field changed since import".into());
@@ -914,7 +925,7 @@ pub(crate) fn apply(
                     base.id,
                     base.uuid,
                     base.path,
-                    serde_json::to_string(&base.field)?,
+                    base.stored_value,
                     base.proof
                 ],
                 |r| r.get(0),
