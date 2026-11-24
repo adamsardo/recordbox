@@ -46,7 +46,9 @@ impl Libraries {
              CREATE TABLE contentCue(ID TEXT PRIMARY KEY, UUID TEXT, ContentID TEXT, Cues TEXT,
                 rb_cue_count INTEGER, rb_local_deleted INTEGER, updated_at TEXT, rb_local_synced INTEGER, rb_local_usn INTEGER);
              CREATE TABLE contentFile(ID TEXT PRIMARY KEY, ContentID TEXT, Path TEXT, Hash TEXT, Size INTEGER,
-                rb_local_path TEXT, rb_local_deleted INTEGER, updated_at TEXT, rb_local_synced INTEGER, rb_local_usn INTEGER);
+                rb_local_path TEXT, rb_local_deleted INTEGER, updated_at TEXT, rb_local_synced INTEGER, rb_local_usn INTEGER,
+                rb_insync_hash, rb_insync_local_usn, rb_file_hash_dirty, rb_local_file_status, rb_in_progress,
+                rb_process_type, rb_temp_path, rb_file_size_dirty, rb_data_status, rb_local_data_status, usn);
              CREATE TABLE djmdKey(ID TEXT PRIMARY KEY, ScaleName TEXT, rb_local_deleted INTEGER DEFAULT 0);
              INSERT INTO djmdKey(ID,ScaleName) VALUES ('1','Am'),('2','Gm');
              CREATE TABLE agentRegistry(registry_id TEXT PRIMARY KEY, int_1 INTEGER, updated_at TEXT);
@@ -159,6 +161,126 @@ fn a_desktop_change_after_review_aborts_the_selected_batch() -> Result<()> {
     let now = f.state(&master)?;
     assert!(apply(&f.local, &f.source, &plan, &selected).is_err());
     assert_eq!(f.state(&master)?, now);
+    Ok(())
+}
+
+#[test]
+fn registered_grid_nudge_rechecks_ownership_and_backs_up_both_tables() -> Result<()> {
+    use crate::{export::anlz, model::Beat};
+    use md5::{Digest, Md5};
+
+    let f = Libraries::new()?;
+    let analysis = "/PIONEER/USBANLZ/P001/ANLZ0000.DAT";
+    let share = f.source.join("share");
+    let dat = share.join(analysis.trim_start_matches('/'));
+    std::fs::create_dir_all(dat.parent().unwrap())?;
+    let master = f.source.join("master.db");
+    let db = native(&master)?;
+    db.execute(
+        "UPDATE djmdContent SET AnalysisDataPath=? WHERE ID='10'",
+        [analysis],
+    )?;
+    let beats: Vec<_> = (0..4)
+        .map(|index| Beat {
+            index,
+            beat: index as u8 + 1,
+            time: 0.25 + 0.5 * index as f64,
+            bpm: 120.0,
+        })
+        .collect();
+    let mut files = anlz::build(&f.audio, &beats, &Default::default(), &[], 0, 44100);
+    let rev = files.ext.windows(4).position(|tag| tag == b"PQT2").unwrap() + 16;
+    files.ext[rev..rev + 4].copy_from_slice(&0x0200_0002u32.to_be_bytes());
+    let siblings = [
+        ("DAT", files.dat),
+        ("EXT", files.ext),
+        ("2EX", files.ex2),
+        ("3EX", embedding::test_embedding(b"0")),
+    ];
+    for (ext, bytes) in &siblings {
+        std::fs::write(dat.with_extension(ext), bytes)?;
+        db.execute(
+            "INSERT INTO contentFile(ID,ContentID,Path,Hash,Size,rb_local_deleted,rb_local_synced)
+            VALUES(?1,'10',?2,?3,?4,0,0)",
+            params![
+                ext,
+                format!("/PIONEER/USBANLZ/P001/ANLZ0000.{ext}"),
+                format!("{:x}", Md5::digest(bytes)),
+                i64::try_from(bytes.len())?
+            ],
+        )?;
+    }
+    drop(db);
+    let rb = Db::open(&f.local)?;
+    rbimport::merge::apply(
+        &rb,
+        &rbimport::load_from(&f.source, f.local.parent().unwrap())?,
+    )?;
+    let id = rb.track_at_path(&f.audio)?.unwrap().id;
+    let mut grid = rb.grid_checked(id)?.context("expected an imported grid")?;
+    grid.anchors[0].time += 0.001;
+    rb.save_grid(id, &grid)?;
+    drop(rb);
+    let plan = preview(&f.local, &f.source)?;
+    let i = plan
+        .rows
+        .iter()
+        .position(|r| r.field == Field::Grid)
+        .unwrap();
+    assert_eq!(plan.rows[i].reason, None);
+
+    // Another owner claiming the unassigned embedding between review and apply
+    // invalidates the selected changes, even when its bytes still match.
+    native(&master)?.execute(
+        "INSERT INTO contentFile(ID,ContentID,Path,rb_local_deleted)
+        SELECT 'second','20',Path,0 FROM contentFile WHERE ID='3EX'",
+        [],
+    )?;
+    assert!(apply(&f.local, &f.source, &plan, &[i]).is_err());
+    for (ext, original) in &siblings {
+        assert_eq!(&std::fs::read(dat.with_extension(ext))?, original);
+    }
+    native(&master)?.execute("DELETE FROM contentFile WHERE ID='second'", [])?;
+    let receipt = apply(&f.local, &f.source, &plan, &[i])?;
+    assert_eq!(receipt.applied, 1);
+    let backups = [
+        std::fs::read(receipt.backup.join("0.original"))?,
+        std::fs::read(receipt.backup.join("1.original"))?,
+    ];
+    let current = native(&master)?;
+    let old = native(&receipt.backup.join("master.db"))?;
+    for (ext, original) in &siblings {
+        let actual = std::fs::read(dat.with_extension(ext))?;
+        let registered = |c: &Connection| {
+            c.query_row(
+                "SELECT Hash,Size FROM contentFile WHERE ID=?",
+                [ext],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+        };
+        assert_eq!(
+            registered(&current)?,
+            (format!("{:x}", Md5::digest(&actual)), actual.len() as i64)
+        );
+        assert_eq!(
+            registered(&old)?,
+            (
+                format!("{:x}", Md5::digest(original)),
+                original.len() as i64
+            )
+        );
+        if matches!(*ext, "DAT" | "EXT") {
+            assert_ne!(&actual, original);
+            assert!(backups.contains(original));
+        } else {
+            assert_eq!(&actual, original);
+        }
+    }
+    assert!(crate::app::grids_match(
+        &grid::inspect(&share, analysis)?.grid,
+        &grid
+    ));
+    assert!(preview(&f.local, &f.source)?.rows.is_empty());
     Ok(())
 }
 

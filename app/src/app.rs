@@ -3636,17 +3636,22 @@ impl App {
 
     pub fn set_deck_grid(&mut self, g: BeatGrid, save: bool) {
         let dur = if self.deck.duration > 0.0 { self.deck.duration } else { self.deck.track.and_then(|id| self.track(id)).map(|t| t.duration).unwrap_or(0.0) };
+        let bpm = g.first_bpm();
+        let tempo_changed = bpm != self.deck.grid.first_bpm();
         self.deck.beats = g.beats(dur);
+        self.deck.bpm_text = format!("{bpm:.2}");
         self.deck.grid = g;
-        self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         if save {
             if let Some(id) = self.deck.track {
-                let _ = self.db.save_grid(id, &self.deck.grid);
-                let bpm = self.deck.grid.first_bpm();
-                if let Some(t) = self.track_mut(id) {
-                    t.bpm = bpm;
+                if let Err(err) = self.db.save_grid(id, &self.deck.grid) {
+                    self.toast_err(format!("Could not save the beat grid: {err}"));
+                } else if tempo_changed {
+                    // Native tracks can have a summary BPM distinct from their first beat.
+                    if let Some(t) = self.track_mut(id) {
+                        t.bpm = bpm;
+                    }
+                    self.save_track(id);
                 }
-                self.save_track(id);
             }
         }
         self.update_metronome();

@@ -1,6 +1,6 @@
-//! Patch a desktop analysis grid in place in its existing PMAI container. A global
-//! millisecond offset is native PQTZ metadata. The raw beat times and the PQT2
-//! fractions stay intact. Rotating bar numbers also updates the companion PQT2.
+//! Patch a desktop analysis grid in its existing PMAI container. A whole-grid
+//! nudge shifts each DAT timestamp and clears the measured 0x02000002 EXT mirror.
+//! The older 0x01000002 mirror uses the signed PQTZ offset and keeps its fractions.
 //! Rebuilding a constant tempo additionally requires a known, cue-free file set
 //! and an unambiguous last beat from its detailed waveform. Entries derived from
 //! beat indices (e.g. phrases) must never be copied across a reindexing.
@@ -16,6 +16,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const FRACTIONAL_PQT2: u32 = 0x0100_0002;
+const DESKTOP_PQT2: u32 = 0x0200_0002;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GridSnapshot {
@@ -26,15 +28,19 @@ pub struct GridSnapshot {
     ex2_sha256: Option<[u8; 32]>,
     additional_sha256: Vec<(String, [u8; 32])>,
     has_embedding: bool,
+    pqt2_revision: Option<u32>,
 }
 
 impl GridSnapshot {
-    /// Exact-profile .3EX records native tempo in d11; the relation between d12 and
-    /// grid phase is not decoded. Preserve this timing data alongside its source.
+    /// Tempo changes and bar rotations have not been verified for these profiles.
     pub(super) fn ensure_timing_editable(&self) -> Result<()> {
         ensure!(
             !self.has_embedding,
-            "The native .3EX embedding contains timing metadata. Use rekordbox to edit BPM or the beat grid for this track"
+            "The native .3EX embedding contains timing metadata. Use rekordbox for this timing edit"
+        );
+        ensure!(
+            self.pqt2_revision != Some(DESKTOP_PQT2),
+            "Only a whole-grid timing shift is supported for native PQT2 revision 0x02000002"
         );
         Ok(())
     }
@@ -283,7 +289,11 @@ fn path_section(bytes: &[u8]) -> Result<Option<&[u8]>> {
     Ok(found)
 }
 
-fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
+fn native_grid(
+    share: &Path,
+    analysis_path: &str,
+    owner: Option<(&str, Option<[u8; 32]>)>,
+) -> Result<NativeGrid> {
     let dat = read_sidecar(share, analysis_path, "DAT")?.context("Missing analysis DAT file")?;
     let pqtz = grid_section(&dat, b"PQTZ")?.context("No native PQTZ beat grid")?;
     let raw = &dat[pqtz.clone()];
@@ -315,6 +325,20 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
         grid_section(bytes, b"")?;
     }
     let extra = additional_sidecars(share, analysis_path)?;
+    if let (Some((id, registered)), Some(sidecar)) = (owner, extra.iter().find(|s| s.is_embedding))
+    {
+        match super::embedding::owner(&sidecar.bytes) {
+            Some(super::embedding::Owner::Track(native_id)) => ensure!(
+                native_id == id.as_bytes(),
+                "Native .3EX embedding belongs to another track"
+            ),
+            Some(super::embedding::Owner::Unassigned) => ensure!(
+                registered == Some(Sha256::digest(&sidecar.bytes).into()),
+                "The .3EX embedding has no track ID; a shift needs a uniquely owned registration with matching file size and checksum"
+            ),
+            None => bail!("Unrecognized .3EX embedding"),
+        }
+    }
     for other in extra.iter().filter(|s| !s.is_embedding) {
         ensure!(
             path_section(&other.bytes)?.is_none_or(|p| p == path),
@@ -326,26 +350,41 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
         Some(bytes) => grid_section(bytes, b"PQT2")?,
         None => None,
     };
-    if let (Some(bytes), Some(range)) = (&ext, &pqt2) {
+    let pqt2_revision = if let (Some(bytes), Some(range)) = (&ext, &pqt2) {
         let extended = &bytes[range.clone()];
-        let count = (raw.len() - 24) / 8;
         ensure!(
-            extended.len() == 56 + count * 2 && extended[4..8] == 56u32.to_be_bytes(),
-            "PQT2 count or header differs from the DAT grid"
+            extended.len() >= 56 && extended[4..8] == 56u32.to_be_bytes(),
+            "Invalid native PQT2 header"
         );
         let revision = u32::from_be_bytes(extended[16..20].try_into()?);
         ensure!(
-            revision == 0x0100_0002,
+            matches!(revision, FRACTIONAL_PQT2 | DESKTOP_PQT2),
             "Unsupported PQT2 revision 0x{revision:08X}. Use rekordbox to edit timing for this track"
         );
-        let fractions = anlz::pqt2_fractions(extended);
+        // Desktop edits leave a canonical 56-byte empty mirror alongside a
+        // populated DAT. Otherwise the anchors, count and checksum must match it.
+        let cleared = revision == DESKTOP_PQT2 && extended.len() == 56;
+        let count = if cleared { 0 } else { (raw.len() - 24) / 8 };
         ensure!(
-            fractions.len() == count
-                && fractions.iter().all(|v| *v <= 999)
-                && extended == anlz::pqt2(&anlz::pqtz_entries(raw), &fractions),
+            extended.len() == 56 + count * 2,
+            "PQT2 count differs from the DAT grid"
+        );
+        let entries = if cleared {
+            Vec::new()
+        } else {
+            anlz::pqtz_entries(raw)
+        };
+        let fractions = anlz::pqt2_fractions(extended);
+        let mut expected = anlz::pqt2(&entries, &fractions);
+        expected[16..20].copy_from_slice(&revision.to_be_bytes());
+        ensure!(
+            extended == expected,
             "PQT2 header fields, beat records, checksum or fractions disagree with the DAT grid"
         );
-    }
+        Some(revision)
+    } else {
+        None
+    };
     let retime_frames = retime_evidence(&dat, ext.as_deref(), ex2.as_deref(), &extra)
         .map_err(|err| err.to_string());
     let state = GridSnapshot {
@@ -354,6 +393,7 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
         dat_sha256: Sha256::digest(&dat).into(),
         ext_sha256: ext.as_ref().map(|b| Sha256::digest(b).into()),
         ex2_sha256: ex2.as_ref().map(|b| Sha256::digest(b).into()),
+        pqt2_revision,
         has_embedding: extra.iter().any(|s| s.is_embedding),
         additional_sha256: extra
             .into_iter()
@@ -577,7 +617,7 @@ fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>>
 }
 
 pub fn inspect(share: &Path, analysis_path: &str) -> Result<GridSnapshot> {
-    Ok(native_grid(share, analysis_path)?.state)
+    Ok(native_grid(share, analysis_path, None)?.state)
 }
 
 /// Returns complete replacement bytes for the transaction's verified backup and
@@ -587,8 +627,11 @@ pub fn plan(
     analysis_path: &str,
     baseline: &GridSnapshot,
     desired: &BeatGrid,
+    owner_id: &str,
+    registered_embedding: Option<[u8; 32]>,
 ) -> Result<Vec<FileChange>> {
-    let mut native = native_grid(share, analysis_path)?;
+    let owner = (&baseline.grid != desired).then_some((owner_id, registered_embedding));
+    let mut native = native_grid(share, analysis_path, owner)?;
     ensure!(
         &native.state == baseline,
         "Analysis files changed since the grid preview"
@@ -597,12 +640,12 @@ pub fn plan(
     if source == desired {
         return Ok(Vec::new());
     }
-    baseline.ensure_timing_editable()?;
     ensure!(
         !desired.anchors.is_empty() && desired.anchors.len() == source.anchors.len(),
         "Grid segment insertion or removal requires native reanalysis"
     );
     if source.anchors.len() == 1 && (desired.anchors[0].bpm - source.anchors[0].bpm).abs() > 1e-9 {
+        baseline.ensure_timing_editable()?;
         return retime(native, desired);
     }
     let shift = (desired.anchors[0].time - source.anchors[0].time) * 1000.;
@@ -626,13 +669,31 @@ pub fn plan(
         return Ok(Vec::new());
     }
     let position = native.pqtz.start;
-    let old_shift = i16::from_be_bytes(native.dat[position + 18..position + 20].try_into()?);
-    let total = f64::from(old_shift) + shift.round();
-    ensure!(
-        (f64::from(i16::MIN)..=f64::from(i16::MAX)).contains(&total),
-        "Offset exceeds the native signed millisecond field"
-    );
-    native.dat[position + 18..position + 20].copy_from_slice(&(total as i16).to_be_bytes());
+    let shift_records = rotation == 0 && baseline.pqt2_revision != Some(FRACTIONAL_PQT2);
+    if shift_records {
+        // The two desktop captures moved the stored millisecond timestamps,
+        // preserving BPM, beat-in-bar and the existing header offset.
+        let delta = shift.round();
+        ensure!(
+            delta.abs() <= f64::from(u32::MAX),
+            "Shift exceeds native timestamp range"
+        );
+        for entry in native.dat[position + 24..native.pqtz.end].chunks_exact_mut(8) {
+            let ms = u32::from_be_bytes(entry[4..8].try_into()?);
+            let shifted = u32::try_from(i64::from(ms) + delta as i64)
+                .context("Shift crosses the native timestamp range")?;
+            entry[4..8].copy_from_slice(&shifted.to_be_bytes());
+        }
+    } else {
+        baseline.ensure_timing_editable()?;
+        let old_shift = i16::from_be_bytes(native.dat[position + 18..position + 20].try_into()?);
+        let total = f64::from(old_shift) + shift.round();
+        ensure!(
+            (f64::from(i16::MIN)..=f64::from(i16::MAX)).contains(&total),
+            "Offset exceeds the native signed millisecond field"
+        );
+        native.dat[position + 18..position + 20].copy_from_slice(&(total as i16).to_be_bytes());
+    }
     if rotation != 0 {
         for entry in native.dat[position + 24..native.pqtz.end].chunks_exact_mut(8) {
             let old = u16::from_be_bytes([entry[0], entry[1]]);
@@ -648,13 +709,22 @@ pub fn plan(
     );
     let dat_path = Path::new("share").join(&native.state.dat_path);
     let mut changes = vec![];
-    if rotation != 0 {
-        if let (Some(mut ext), Some(range), Some(digest)) =
-            (native.ext, native.pqt2, native.state.ext_sha256)
-        {
+    if let (Some(mut ext), Some(range), Some(digest)) =
+        (native.ext, native.pqt2, native.state.ext_sha256)
+    {
+        let replacement = if shift_records && range.len() > 56 {
+            let mut empty = anlz::pqt2(&[], &[]);
+            empty[16..20].copy_from_slice(&DESKTOP_PQT2.to_be_bytes());
+            Some(empty)
+        } else if rotation != 0 {
             let entries = anlz::pqtz_entries(&native.dat[native.pqtz]);
             let fractions = anlz::pqt2_fractions(&ext[range.clone()]);
-            ext[range].copy_from_slice(&anlz::pqt2(&entries, &fractions));
+            Some(anlz::pqt2(&entries, &fractions))
+        } else {
+            None
+        };
+        if let Some(section) = replacement {
+            replace_section(&mut ext, range, &section)?;
             changes.push(FileChange {
                 relative_path: dat_path.with_extension("EXT"),
                 expected_sha256: digest,
@@ -676,6 +746,15 @@ mod tests {
     use crate::model::{Beat, Waveform};
 
     const LOCATION: &str = "/PIONEER/USBANLZ/P001/00000001/ANLZ0000.DAT";
+
+    fn plan(
+        share: &Path,
+        path: &str,
+        snap: &GridSnapshot,
+        desired: &BeatGrid,
+    ) -> Result<Vec<FileChange>> {
+        super::plan(share, path, snap, desired, "123", None)
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
@@ -786,7 +865,7 @@ mod tests {
         let ext = dat.with_extension("EXT");
         let mut bytes = fs::read(&ext)?;
         let offset = grid_section(&bytes, b"PQT2")?.unwrap().start + 16;
-        for revision in [0x0200_0002u32, 0x1234_abcd] {
+        for revision in [0x0300_0002u32, 0x1234_abcd] {
             bytes[offset..offset + 4].copy_from_slice(&revision.to_be_bytes());
             fs::write(&ext, &bytes)?;
             let error = plan(&share, LOCATION, &snap, &desired).unwrap_err();
@@ -795,6 +874,120 @@ mod tests {
                 .contains(&format!("Unsupported PQT2 revision 0x{revision:08X}")));
             assert_eq!(fs::read(&ext)?, bytes);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_nudge_matches_native_timestamps_and_empties_only_the_mirror() -> Result<()> {
+        let (root, share, dat) = fixture();
+        let ext = dat.with_extension("EXT");
+        let mut original_ext = fs::read(&ext)?;
+        let mirror = grid_section(&original_ext, b"PQT2")?.unwrap();
+        original_ext[mirror.start + 16..mirror.start + 20]
+            .copy_from_slice(&DESKTOP_PQT2.to_be_bytes());
+        fs::write(&ext, &original_ext)?;
+        let original = fs::read(&dat)?;
+        let section = grid_section(&original, b"PQTZ")?.unwrap();
+        let mut expected = original.clone();
+        for entry in expected[section.start + 24..section.end].chunks_exact_mut(8) {
+            let ms = u32::from_be_bytes(entry[4..8].try_into()?);
+            entry[4..8].copy_from_slice(&(ms + 1).to_be_bytes());
+        }
+        let mut expected_ext = original_ext.clone();
+        let mut header = original_ext[mirror.start..mirror.start + 56].to_vec();
+        header[8..12].copy_from_slice(&56u32.to_be_bytes());
+        header[24..].fill(0);
+        replace_section(&mut expected_ext, mirror.clone(), &header)?;
+
+        let baseline = inspect(&share, LOCATION)?;
+        let mut desired = baseline.grid.clone();
+        desired.anchors[0].time += 0.001;
+        let changes = plan(&share, LOCATION, &baseline, &desired)?;
+        assert_eq!(changes.len(), 2);
+        for patch in changes {
+            fs::write(root.path().join(patch.relative_path), patch.contents)?;
+        }
+        assert_eq!(fs::read(&dat)?, expected);
+        assert_eq!(fs::read(&ext)?, expected_ext);
+        let cleared = inspect(&share, LOCATION)?;
+        assert!(crate::app::grids_match(&cleared.grid, &desired));
+        let back = plan(&share, LOCATION, &cleared, &baseline.grid)?;
+        assert_eq!(back.len(), 1, "A second nudge keeps the cleared mirror");
+        assert_eq!(back[0].contents, original);
+        for change in [
+            BeatGrid::constant(0.100, 120., 2),
+            BeatGrid::constant(0.100, 130., 1),
+        ] {
+            assert!(plan(&share, LOCATION, &cleared, &change).is_err());
+        }
+        let mut corrupt = expected_ext;
+        corrupt[mirror.start + 44] = 1;
+        fs::write(ext, corrupt)?;
+        assert!(inspect(&share, LOCATION).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nudge_without_mirror_keeps_per_beat_jitter_and_pqtz_offset() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let ext = dat.with_extension("EXT");
+        let mut bytes = fs::read(&ext)?;
+        let mirror = grid_section(&bytes, b"PQT2")?.unwrap();
+        replace_section(&mut bytes, mirror, &[])?;
+        fs::write(&ext, &bytes)?;
+        let mut original = fs::read(&dat)?;
+        let section = grid_section(&original, b"PQTZ")?.unwrap();
+        original[section.start + 18..section.start + 20].copy_from_slice(&5i16.to_be_bytes());
+        // Give interior beats distinct tempos and timing offsets that cannot be
+        // reconstructed by regenerating a regular grid from its first anchor.
+        for (i, entry) in original[section.start + 24..section.end]
+            .chunks_exact_mut(8)
+            .enumerate()
+        {
+            let ms = u32::from_be_bytes(entry[4..8].try_into()?);
+            entry[4..8].copy_from_slice(&(ms + (i % 3) as u32).to_be_bytes());
+            entry[2..4].copy_from_slice(&(12000 + (i % 2) as u16).to_be_bytes());
+        }
+        fs::write(&dat, &original)?;
+        let baseline = inspect(&share, LOCATION)?;
+        let mut desired = baseline.grid.clone();
+        for anchor in &mut desired.anchors {
+            anchor.time -= 0.001;
+        }
+        let patches = plan(&share, LOCATION, &baseline, &desired)?;
+        assert_eq!(patches.len(), 1);
+        let raw = &patches[0].contents;
+        assert_eq!(raw[..section.start + 24], original[..section.start + 24]);
+        assert_eq!(raw[section.end..], original[section.end..]);
+        let before = anlz::pqtz_entries(&original[section.clone()]);
+        let after = anlz::pqtz_entries(&raw[section]);
+        for ((bar, bpm, ms), entry) in before.into_iter().zip(after) {
+            assert_eq!((bar, bpm, ms - 1), entry);
+        }
+        assert_eq!(fs::read(ext)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn nudge_rejects_overflow_at_either_end_of_raw_timestamps() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        fs::remove_file(dat.with_extension("EXT"))?;
+        let mut bytes = fs::read(&dat)?;
+        let section = grid_section(&bytes, b"PQTZ")?.unwrap();
+        // Both requested first-anchor times below fit in the model. Only checking
+        // every raw timestamp catches the negative first or overflowing last beat.
+        bytes[section.start + 18..section.start + 20].copy_from_slice(&5i16.to_be_bytes());
+        bytes[section.start + 28..section.start + 32].copy_from_slice(&0u32.to_be_bytes());
+        bytes[section.end - 4..section.end].copy_from_slice(&u32::MAX.to_be_bytes());
+        fs::write(&dat, &bytes)?;
+        let baseline = inspect(&share, LOCATION)?;
+        for delta in [-0.001, 0.001] {
+            let mut desired = baseline.grid.clone();
+            desired.anchors[0].time += delta;
+            let error = plan(&share, LOCATION, &baseline, &desired).unwrap_err();
+            assert!(error.to_string().contains("timestamp range"), "{error:#}");
+        }
+        assert_eq!(fs::read(dat)?, bytes);
         Ok(())
     }
 
@@ -1006,6 +1199,14 @@ mod tests {
                     for a in &mut shift.anchors {
                         a.time += 0.001;
                     }
+                    let embedded_bytes = fs::read(path.with_extension("3EX")).ok();
+                    let owner = match embedded_bytes
+                        .as_deref()
+                        .and_then(super::super::embedding::owner)
+                    {
+                        Some(super::super::embedding::Owner::Track(id)) => std::str::from_utf8(id)?,
+                        _ => "",
+                    };
                     if snap.has_embedding {
                         let mut rotate = snap.grid.clone();
                         for a in &mut rotate.anchors {
@@ -1013,20 +1214,43 @@ mod tests {
                         }
                         let mut tempo = snap.grid.clone();
                         tempo.anchors[0].bpm += 1.;
-                        for requested in [&shift, &rotate, &tempo] {
-                            let failure = plan(&share, &native_path, &snap, requested)
-                                .err()
-                                .context("timing edit escaped .3EX guard")?;
-                            assert!(failure.to_string().contains(".3EX embedding"));
+                        for requested in [&rotate, &tempo] {
+                            assert!(super::plan(
+                                &share,
+                                &native_path,
+                                &snap,
+                                requested,
+                                owner,
+                                None
+                            )
+                            .is_err());
                         }
+                    }
+                    let files = super::plan(&share, &native_path, &snap, &shift, owner, None);
+                    if snap.has_embedding && snap.pqt2_revision == Some(FRACTIONAL_PQT2) {
+                        assert!(files.unwrap_err().to_string().contains(".3EX embedding"));
                         protected_grids += 1;
                     } else {
-                        let files = plan(&share, &native_path, &snap, &shift)?;
+                        let files = files?;
                         assert_eq!(files.len(), 1);
                         let before = fs::read(path)?;
-                        let offset = grid_section(&before, b"PQTZ")?.unwrap().start + 18;
-                        assert_eq!(&files[0].contents[..offset], &before[..offset]);
-                        assert_eq!(&files[0].contents[offset + 2..], &before[offset + 2..]);
+                        let range = grid_section(&before, b"PQTZ")?.unwrap();
+                        if snap.pqt2_revision == Some(FRACTIONAL_PQT2) {
+                            assert_eq!(
+                                &files[0].contents[..range.start + 18],
+                                &before[..range.start + 18]
+                            );
+                            assert_eq!(
+                                &files[0].contents[range.start + 20..],
+                                &before[range.start + 20..]
+                            );
+                        } else {
+                            let original = anlz::pqtz_entries(&before[range.clone()]);
+                            let shifted = anlz::pqtz_entries(&files[0].contents[range]);
+                            for ((bar, bpm, t), after) in original.into_iter().zip(shifted) {
+                                assert_eq!(after, (bar, bpm, t + 1));
+                            }
+                        }
                         editable_grids += 1;
                     }
                 }
@@ -1038,7 +1262,7 @@ mod tests {
             let expected = if version == 6 {
                 (2, 4, 0, 0, 2)
             } else {
-                (10, 22, 29, 10, 0)
+                (10, 22, 29, 2, 8)
             };
             assert_eq!(
                 (grids, empty, embeddings, protected_grids, editable_grids),

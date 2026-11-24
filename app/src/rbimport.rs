@@ -6,6 +6,8 @@
 //! its own collection.
 
 pub(crate) mod merge;
+#[cfg(test)]
+mod grid_oracle;
 pub(crate) mod writeback;
 
 use anyhow::{anyhow, Context, Result};

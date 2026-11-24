@@ -30,6 +30,16 @@ fn ensure_idle(db: &Connection, id: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_local_path(registered: Option<String>, target: &Path, name: &str) -> Result<()> {
+    if let Some(path) = registered.filter(|p| !p.is_empty()) {
+        ensure!(
+            Path::new(&path).canonicalize().ok().as_ref() == Some(&target.canonicalize()?),
+            "The registered local path for {name} points to a different file"
+        );
+    }
+    Ok(())
+}
+
 /// A missing optional disk sibling is meaningful only if the native file registry
 /// also has no record of it. Check the entire registered set before editing native
 /// cues or a grid. Return a digest only for a .3EX that has one native registered
@@ -102,11 +112,13 @@ pub(super) fn check_inventory(
         {
             // The verified row above owns this path. A second track claiming the
             // same path makes the row unsuitable as independent evidence of ownership.
-            let shared: bool = db.query_row(
+            let (shared, local): (bool, Option<String>) = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM contentFile
-                 WHERE ID!=?1 AND rb_local_deleted=0 AND ltrim(replace(Path,char(92),'/'),'/')=?2 COLLATE NOCASE)",
-                params![id, normalized.trim_start_matches('/')], |r| r.get(0))?;
+                 WHERE ID!=?1 AND rb_local_deleted=0 AND ltrim(replace(Path,char(92),'/'),'/')=?2 COLLATE NOCASE),
+                 rb_local_path FROM contentFile WHERE ID=?1",
+                params![id, normalized.trim_start_matches('/')], |r| Ok((r.get(0)?, r.get(1)?)))?;
             if !shared {
+                check_local_path(local, &share.join(relative.with_extension(ext)), &recorded)?;
                 embedding_hash = Some(Sha256::digest(&bytes).into());
             }
         }
@@ -147,9 +159,9 @@ fn registrations(
         );
         let mut matches = db.prepare(
             "SELECT ID,ContentID,Path,Hash,Size,rb_local_path FROM contentFile
-             WHERE replace(Path,char(92),'/')=? COLLATE NOCASE AND rb_local_deleted=0",
+             WHERE ltrim(replace(Path,char(92),'/'),'/')=? COLLATE NOCASE AND rb_local_deleted=0",
         )?;
-        let mut candidates = matches.query([&path])?;
+        let mut candidates = matches.query([path.trim_start_matches('/')])?;
         let Some(row) = candidates.next()? else {
             ensure!(!has_files, "The desktop registration for {path} is missing");
             continue;
@@ -163,18 +175,13 @@ fn registrations(
         ensure!(
             candidates.next()?.is_none()
                 && registered_owner == owner
-                && registered_path.replace('\\', "/") == path,
+                && registered_path.replace('\\', "/").trim_start_matches('/')
+                    == path.trim_start_matches('/'),
             "Ambiguous native file registration for {path}"
         );
         ensure_idle(db, &id, &path)?;
         let target = source.join(&file.relative_path);
-        if let Some(registered) = local.filter(|s| !s.is_empty()) {
-            ensure!(
-                Path::new(&registered).canonicalize().ok().as_ref()
-                    == Some(&target.canonicalize()?),
-                "The registered local path for {path} points to a different file"
-            );
-        }
+        check_local_path(local, &target, &path)?;
         let (stem, extension) = path
             .rsplit_once('.')
             .context("Missing analysis file extension")?;
@@ -294,6 +301,18 @@ mod tests {
             check_inventory(&db, "1", &share, source)?,
             Some(Sha256::digest(&embedding).into())
         );
+        db.execute(
+            "UPDATE contentFile SET rb_local_path=?1 WHERE ID='embedding'",
+            [target.to_string_lossy().as_ref()],
+        )?;
+        assert!(check_inventory(&db, "1", &share, source)
+            .unwrap_err()
+            .to_string()
+            .contains("registered local path"));
+        db.execute(
+            "UPDATE contentFile SET rb_local_path=NULL WHERE ID='embedding'",
+            [],
+        )?;
         db.execute("INSERT INTO contentFile(ID,ContentID,Path,rb_local_deleted) VALUES('other owner','2',?1,0)",[recorded])?;
         assert_eq!(check_inventory(&db, "1", &share, source)?, None);
         db.execute(
@@ -306,6 +325,13 @@ mod tests {
             contents: b"changed".to_vec(),
         }];
         check(&db, "1", dir.path(), &changes)?;
+        db.execute(
+            "INSERT INTO contentFile(ID,ContentID,Path,rb_local_deleted)
+                    SELECT 'alias','2',ltrim(Path,'/'),0 FROM contentFile WHERE ID='f'",
+            [],
+        )?;
+        assert!(check(&db, "1", dir.path(), &changes).is_err());
+        db.execute("DELETE FROM contentFile WHERE ID='alias'", [])?;
         assert!(check(&db, "other", dir.path(), &changes).is_err());
         db.execute("UPDATE contentFile SET rb_in_progress=1", [])?;
         assert!(check(&db, "1", dir.path(), &changes).is_err());

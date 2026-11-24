@@ -2,7 +2,7 @@
 //! specific native record agreed during a desktop import.
 pub(crate) mod cues;
 mod embedding;
-mod grid;
+pub(super) mod grid;
 #[cfg(test)]
 mod integration_tests;
 mod location;
@@ -647,8 +647,8 @@ fn checked_current(
             {
                 return Ok(guard(Edit::Grid(snap.grid), proof, Mutation::ObserveOnly));
             }
-            snap.ensure_timing_editable()?;
-            registration::check_inventory(c, &baseline.id, &share, &analysis)?;
+            let registered_embedding =
+                registration::check_inventory(c, &baseline.id, &share, &analysis)?;
             let revision =
                 next_grid_revision(r.get::<_, Option<String>>("AnalysisUpdated")?.as_deref())?;
             let mut companion = None;
@@ -671,7 +671,14 @@ fn checked_current(
                     companion = Some(Field::Bpm);
                 }
             }
-            let files = grid::plan(&share, &analysis, &snap, new_grid)?;
+            let files = grid::plan(
+                &share,
+                &analysis,
+                &snap,
+                new_grid,
+                &baseline.id,
+                registered_embedding,
+            )?;
             ensure!(
                 !files.is_empty(),
                 "Grid edit is below native timing precision"
