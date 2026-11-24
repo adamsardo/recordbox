@@ -1,0 +1,476 @@
+//! Manual desktop library sync. An import is always inbound. Writing into rekordbox
+//! requires its own field preview, selection and confirmation.
+use crate::app::App;
+use crate::db::Db;
+use crate::rbimport::writeback::{self, Plan, Receipt};
+use crate::theme::CAUTION_TX;
+use crate::ui_kit::{self as kit, btn};
+use crossbeam_channel::Receiver;
+use eframe::egui::{self, Context, RichText, Ui};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Import,
+    WriteBack,
+}
+
+enum ResultView {
+    Preview(Plan),
+    Applied(Receipt),
+    Recovered(PathBuf),
+}
+
+enum Outbound {
+    Ready,
+    Working {
+        label: &'static str,
+        writing: bool,
+        rx: Receiver<anyhow::Result<ResultView>>,
+    },
+    Preview {
+        plan: Plan,
+        selected: BTreeSet<usize>,
+        links: Vec<Option<usize>>,
+        page: usize,
+        confirm: bool,
+    },
+    Applied(Receipt),
+    Recovered(PathBuf),
+    Failed(String),
+}
+
+pub struct Review {
+    desktop: Option<PathBuf>,
+    local: Option<PathBuf>,
+    found: bool,
+    direction: Option<Direction>,
+    outbound: Outbound,
+    recovery: Result<bool, String>,
+    confirm_recovery: bool,
+}
+
+impl Review {
+    pub fn new(db: &Db) -> Self {
+        let desktop = crate::rbimport::default_library_dir();
+        let found = desktop.as_ref().is_some_and(|dir| dir.join("master.db").is_file());
+        let recovery = Self::check_recovery(desktop.as_deref());
+        Self {
+            desktop,
+            local: db.conn.path().filter(|p| !p.is_empty()).map(PathBuf::from),
+            found,
+            direction: None,
+            outbound: Outbound::Ready,
+            recovery,
+            confirm_recovery: false,
+        }
+    }
+
+    fn check_recovery(desktop: Option<&Path>) -> Result<bool, String> {
+        match desktop {
+            Some(dir) => writeback::pending(dir)
+                .map_err(|e| format!("Could not check the desktop library for an interrupted write-back. {e:#}")),
+            None => Ok(false),
+        }
+    }
+
+    pub fn status(&self) -> Option<&'static str> {
+        match &self.outbound {
+            Outbound::Working { label, .. } => Some(label),
+            _ => None,
+        }
+    }
+
+    fn start(
+        &mut self,
+        ctx: &Context,
+        label: &'static str,
+        writing: bool,
+        work: impl FnOnce(&Path, &Path) -> anyhow::Result<ResultView> + Send + 'static,
+    ) {
+        let (Some(local), Some(desktop)) = (self.local.clone(), self.desktop.clone()) else {
+            self.outbound =
+                Outbound::Failed("Could not locate both libraries. Reopen library sync to check their paths.".into());
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        self.outbound = match std::thread::Builder::new().name("rb-writeback".into()).spawn(move || {
+            let _ = tx.send(work(&local, &desktop));
+            ctx.request_repaint();
+        }) {
+            Ok(_) => Outbound::Working { label, writing, rx },
+            Err(e) => Outbound::Failed(format!("Could not start the worker. {e}")),
+        };
+    }
+
+    fn poll(&mut self) {
+        let Outbound::Working { rx, .. } = &self.outbound else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "The worker stopped before it could report a result. Check for pending recovery and preview again."
+            )),
+        };
+        self.recovery = Self::check_recovery(self.desktop.as_deref());
+        self.confirm_recovery = false;
+        self.outbound = match result {
+            Ok(ResultView::Preview(plan)) => Outbound::Preview {
+                links: selection_links(&plan),
+                plan,
+                selected: BTreeSet::new(),
+                page: 0,
+                confirm: false,
+            },
+            Ok(ResultView::Applied(receipt)) => Outbound::Applied(receipt),
+            Ok(ResultView::Recovered(path)) => Outbound::Recovered(path),
+            Err(error) => Outbound::Failed(format!("{error:#}")),
+        };
+    }
+}
+
+pub fn show(app: &mut App, ctx: &Context) {
+    let Some(review) = &mut app.dialogs.library_sync_review else {
+        return;
+    };
+    review.poll();
+    if matches!(review.outbound, Outbound::Working { writing: true, .. }) && ctx.input(|i| i.viewport().close_requested()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    }
+    let mut open = true;
+    let mut close = false;
+    let mut import = false;
+    let working = review.status().is_some();
+    let mut window = egui::Window::new("Review rekordbox library sync")
+        .id(egui::Id::new("library_sync_review"))
+        .collapsible(false)
+        .default_width(620.0)
+        .vscroll(true);
+    if !working {
+        window = window.open(&mut open);
+    }
+    window.show(ctx, |ui| {
+        kit::apply_style(ui);
+        ui.heading("Sync direction");
+        let previous = review.direction;
+        ui.add_enabled_ui(!working, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut review.direction, Some(Direction::Import), "Import · rekordbox → Recordbox");
+                ui.radio_value(&mut review.direction, Some(Direction::WriteBack), "Write back · Recordbox → rekordbox");
+            });
+        });
+        if review.direction != previous {
+            review.outbound = Outbound::Ready;
+            review.confirm_recovery = false;
+        }
+
+        let source = review.desktop.as_ref().map(|dir| dir.join("master.db"));
+        let local = review.local.as_deref();
+        match review.direction {
+            Some(Direction::Import) => {
+                library_path(ui, "Read from · desktop rekordbox library", source.as_deref());
+                library_path(ui, "Write to · active Recordbox library", local);
+            }
+            Some(Direction::WriteBack) => {
+                library_path(ui, "Read from · active Recordbox library", local);
+                library_path(ui, "Write to · original desktop rekordbox library", source.as_deref());
+            }
+            None => {
+                library_path(ui, "Desktop rekordbox library", source.as_deref());
+                library_path(ui, "Active Recordbox library", local);
+            }
+        }
+        if !review.found {
+            ui.colored_label(CAUTION_TX, "Desktop master.db could not be found at the default location.");
+        }
+        if let Err(error) = &review.recovery {
+            ui.colored_label(CAUTION_TX, error);
+            if ui.add(btn("Recheck recovery status")).clicked() {
+                review.recovery = Review::check_recovery(review.desktop.as_deref());
+            }
+        }
+        ui.separator();
+        match review.direction {
+            Some(Direction::Import) => {
+                ui.label("Import reads a private snapshot of the desktop database and its write-ahead log, plus available analysis and audio metadata.");
+                ui.label("Source changes can replace local metadata, cues, grids and My Tags. Import rebuilds the managed rekordbox playlists and histories using locally accessible tracks. Keep your own playlists outside that folder.");
+                if app.prefs.auto_analysis {
+                    ui.label("Auto Analysis is enabled. Adding tracks can queue analysis in Recordbox.");
+                }
+                if matches!(review.recovery, Ok(true)) {
+                    ui.colored_label(CAUTION_TX, "An interrupted write-back needs review. Choose Write back to inspect recovery before importing.");
+                }
+                import = ui.add_enabled(review.found && matches!(review.recovery, Ok(false)), btn("Import into Recordbox")).clicked();
+            }
+            Some(Direction::WriteBack) => writeback_view(review, ui),
+            None => {}
+        }
+        if !working {
+            close = ui.add(btn("Close")).clicked();
+        }
+    });
+    if import || close || !open {
+        app.dialogs.library_sync_review = None;
+    }
+    if import {
+        app.start_rekordbox_sync();
+    }
+}
+
+fn library_path(ui: &mut Ui, label: &str, path: Option<&Path>) {
+    ui.label(RichText::new(label).strong());
+    ui.add(
+        egui::Label::new(
+            path.map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Path unavailable".into()),
+        )
+        .selectable(true)
+        .wrap(),
+    );
+}
+
+fn changes(n: usize) -> String {
+    format!("{n} change{}", if n == 1 { "" } else { "s" })
+}
+
+fn writeback_view(review: &mut Review, ui: &mut Ui) {
+    if let Some(status) = review.status() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(status);
+        });
+        return;
+    }
+    if let Outbound::Failed(message) = &review.outbound {
+        ui.colored_label(CAUTION_TX, message);
+    }
+    if review.recovery.is_err() {
+        return;
+    }
+    if matches!(review.recovery, Ok(true)) {
+        ui.label(
+            "An interrupted write-back has a recovery record. Close desktop rekordbox and its agents before resolving it.",
+        );
+        if review.confirm_recovery {
+            ui.label("Recovery keeps a verified database commit or restores the previous analysis files when the database did not commit. It stops if the files no longer match the saved recovery record.");
+            ui.horizontal(|ui| {
+                if ui.add(btn("Confirm recovery")).clicked() {
+                    review.start(
+                        ui.ctx(),
+                        "Recovering the interrupted write-back…",
+                        true,
+                        |local, desktop| writeback::recover(local, desktop).map(ResultView::Recovered),
+                    );
+                }
+                if ui.add(btn("Back")).clicked() {
+                    review.confirm_recovery = false;
+                }
+            });
+        } else if ui.add(btn("Review recovery…")).clicked() {
+            review.confirm_recovery = true;
+        }
+        return;
+    }
+    let mut apply = false;
+    match &mut review.outbound {
+        Outbound::Preview {
+            plan,
+            selected,
+            links,
+            page,
+            confirm,
+        } => {
+            if *confirm {
+                let count = selected.len();
+                ui.label(format!(
+                    "Apply {} to the original desktop library shown above?",
+                    changes(count)
+                ));
+                if let Some(path) = review.local.as_deref().and_then(|p| writeback::backup_root(p).ok()) {
+                    library_path(ui, "Create recovery backup in", Some(&path));
+                }
+                ui.label("Recordbox rechecks the selected fields and creates a verified recovery copy of the database and affected analysis files before writing. Keep desktop rekordbox and its agents closed until the operation finishes.");
+                ui.horizontal_wrapped(|ui| {
+                    apply = ui
+                        .add_enabled(count > 0, btn(format!("Back up and apply {}", changes(count))))
+                        .clicked();
+                    if ui.add(btn("Back to selection")).clicked() {
+                        *confirm = false;
+                    }
+                });
+                if !apply {
+                    return;
+                }
+            } else {
+                preview_rows(ui, plan, selected, links, page);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!selected.is_empty(), btn("Review selected changes")).clicked() {
+                        *confirm = true;
+                    }
+                });
+            }
+        }
+        Outbound::Applied(receipt) => {
+            ui.label(format!(
+                "Applied {} to the desktop rekordbox library.",
+                changes(receipt.applied)
+            ));
+            library_path(ui, "Recovery backup", Some(&receipt.backup));
+        }
+        Outbound::Recovered(backup) => {
+            ui.label("Recovery completed. A fresh preview will show the current values.");
+            library_path(ui, "Recovery backup", Some(backup));
+        }
+        Outbound::Ready => {
+            ui.label("Compare imported ratings, cues, BPM, keys and beat grids. Select the changes to apply after reviewing their current values.");
+        }
+        Outbound::Failed(_) | Outbound::Working { .. } => {}
+    }
+
+    if apply {
+        if let Outbound::Preview { plan, selected, .. } = std::mem::replace(&mut review.outbound, Outbound::Ready) {
+            let rows = selected.into_iter().collect::<Vec<_>>();
+            review.start(
+                ui.ctx(),
+                "Backing up and applying the selected changes…",
+                true,
+                move |local, desktop| writeback::apply(local, desktop, &plan, &rows).map(ResultView::Applied),
+            );
+        }
+    } else if ui
+        .add_enabled(
+            review.found && review.local.is_some(),
+            btn(if matches!(review.outbound, Outbound::Ready) {
+                "Preview changes"
+            } else {
+                "Refresh preview"
+            }),
+        )
+        .clicked()
+    {
+        review.start(
+            ui.ctx(),
+            "Comparing Recordbox edits with the desktop library…",
+            false,
+            |local, desktop| writeback::preview(local, desktop).map(ResultView::Preview),
+        );
+    }
+}
+
+/// A row links to itself for a standalone change or to its partner for a coupled BPM/grid.
+fn selection_links(plan: &Plan) -> Vec<Option<usize>> {
+    let eligible: HashMap<_, _> = plan
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.reason.is_none())
+        .map(|(index, r)| ((r.local_id, r.field), index))
+        .collect();
+    plan.rows
+        .iter()
+        .enumerate()
+        .map(|(index, r)| {
+            if r.reason.is_some() {
+                return None;
+            }
+            match r.companion {
+                Some(field) => eligible.get(&(r.local_id, field)).copied(),
+                None => Some(index),
+            }
+        })
+        .collect()
+}
+
+fn select_row(selected: &mut BTreeSet<usize>, links: &[Option<usize>], index: usize, checked: bool) {
+    if let Some(partner) = links[index] {
+        if checked {
+            selected.extend([index, partner]);
+        } else {
+            selected.remove(&index);
+            selected.remove(&partner);
+        }
+    }
+}
+
+fn preview_rows(ui: &mut Ui, plan: &Plan, selected: &mut BTreeSet<usize>, links: &[Option<usize>], page: &mut usize) {
+    const PAGE_SIZE: usize = 20;
+    if plan.tracked == 0 {
+        ui.label("No tracks have an import baseline for this desktop library. Import it into Recordbox before editing tracks for write-back.");
+    } else if plan.rows.is_empty() {
+        ui.label(format!("No changes to review across {} tracked tracks.", plan.tracked));
+    }
+    if plan.rows.is_empty() {
+        return;
+    }
+    ui.label(format!(
+        "{} to review · {} selected",
+        changes(plan.rows.len()),
+        selected.len()
+    ));
+    let start = *page * PAGE_SIZE;
+    let end = plan.rows.len().min(start + PAGE_SIZE);
+    egui::ScrollArea::both()
+        .id_salt("writeback_changes")
+        .max_height(265.0)
+        .show(ui, |ui| {
+            egui::Grid::new("writeback_rows")
+                .striped(true)
+                .num_columns(5)
+                .max_col_width(135.0)
+                .show(ui, |ui| {
+                    for label in ["Track and field", "At import", "In rekordbox", "From Recordbox", "Status"] {
+                        ui.strong(label);
+                    }
+                    ui.end_row();
+                    for index in start..end {
+                        let row = &plan.rows[index];
+                        let mut checked = selected.contains(&index);
+                        let label = format!("{} · {}", row.track, row.field.label());
+                        if ui
+                            .add_enabled(links[index].is_some(), egui::Checkbox::new(&mut checked, label))
+                            .changed()
+                        {
+                            select_row(selected, links, index, checked);
+                        }
+                        for value in [&row.before, &row.current, &row.proposed] {
+                            ui.add(egui::Label::new(value.as_str()).selectable(true).wrap());
+                        }
+                        if let Some(reason) = &row.reason {
+                            ui.label(reason);
+                        } else if let Some(field) = row.companion {
+                            if links[index].is_some() {
+                                ui.label(format!("Selected together with {}", field.label()));
+                            } else {
+                                ui.label(format!("Requires an eligible {} change", field.label()));
+                            }
+                        } else {
+                            ui.label("Eligible");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    ui.horizontal_wrapped(|ui| {
+        if ui.add(btn("Select eligible on this page")).clicked() {
+            for index in start..end {
+                select_row(selected, links, index, true);
+            }
+        }
+        if ui.add_enabled(!selected.is_empty(), btn("Clear selection")).clicked() {
+            selected.clear();
+        }
+        if plan.rows.len() > PAGE_SIZE {
+            if ui.add_enabled(*page > 0, btn("Previous")).clicked() {
+                *page -= 1;
+            }
+            ui.label(format!("Page {} of {}", *page + 1, plan.rows.len().div_ceil(PAGE_SIZE)));
+            if ui.add_enabled(end < plan.rows.len(), btn("Next")).clicked() {
+                *page += 1;
+            }
+        }
+    });
+}

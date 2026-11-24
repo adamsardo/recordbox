@@ -1,0 +1,156 @@
+//! Local desktop libraries can register each ANLZ file in contentFile. Verify
+//! the existing native MD5 and size before replacing either value. SHA-256
+//! independently binds the reviewed file to the recovery operation.
+use super::storage::FileChange;
+use anyhow::{ensure, Context, Result};
+use md5::Md5;
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+
+struct Registration {
+    id: String,
+    hash: String,
+    size: i64,
+}
+
+fn registrations(
+    db: &Connection,
+    owner: &str,
+    source: &Path,
+    files: &[FileChange],
+) -> Result<Vec<Registration>> {
+    if files.is_empty() {
+        return Ok(vec![]);
+    }
+    let shared: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM djmdContent owner JOIN djmdContent other ON
+         ltrim(replace(other.AnalysisDataPath,char(92),'/'),'/') =
+         ltrim(replace(owner.AnalysisDataPath,char(92),'/'),'/') COLLATE NOCASE
+         WHERE owner.ID=? AND other.ID!=owner.ID AND other.rb_local_deleted=0)",
+        [owner],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        !shared,
+        "Another native track references the same beat-grid files"
+    );
+    let table: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='contentFile' COLLATE NOCASE)",
+        [], |r| r.get(0),
+    )?;
+    if !table {
+        return Ok(vec![]);
+    }
+    let has_files: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM contentFile WHERE ContentID=? AND rb_local_deleted=0)",
+        [owner],
+        |r| r.get(0),
+    )?;
+    let mut result = Vec::new();
+    for file in files {
+        let relative = file.relative_path.strip_prefix("share")?;
+        let path = format!(
+            "/{}",
+            relative
+                .to_str()
+                .context("Non-Unicode ANLZ registration path")?
+                .replace('\\', "/")
+        );
+        let mut matches = db.prepare(
+            "SELECT ID,ContentID,Path,Hash,Size,rb_local_path FROM contentFile
+             WHERE replace(Path,char(92),'/')=? COLLATE NOCASE AND rb_local_deleted=0",
+        )?;
+        let mut candidates = matches.query([&path])?;
+        let Some(row) = candidates.next()? else {
+            ensure!(!has_files, "The desktop registration for {path} is missing");
+            continue;
+        };
+        let id: String = row.get(0)?;
+        let registered_owner: String = row.get(1)?;
+        let registered_path: String = row.get(2)?;
+        let hash: String = row.get(3)?;
+        let size: i64 = row.get(4)?;
+        let local: Option<String> = row.get(5)?;
+        ensure!(
+            candidates.next()?.is_none()
+                && registered_owner == owner
+                && registered_path.replace('\\', "/") == path,
+            "Ambiguous native file registration for {path}"
+        );
+        let idle: bool = db.query_row(
+            "SELECT rb_local_synced=0 AND coalesce(rb_file_hash_dirty,0)=0 AND coalesce(rb_file_size_dirty,0)=0
+             AND coalesce(rb_in_progress,0)=0 AND coalesce(rb_local_file_status,0)=0 AND coalesce(rb_process_type,0)=0
+             AND coalesce(rb_temp_path,'')='' AND coalesce(rb_insync_hash,'')='' AND coalesce(rb_insync_local_usn,0)=0
+             AND coalesce(rb_data_status,0)=0 AND coalesce(rb_local_data_status,0)=0 AND coalesce(usn,0)=0
+             FROM contentFile WHERE ID=? AND rb_local_deleted=0",
+            [&id], |r| r.get(0),
+        ).context("Unrecognized or incomplete native file-registration state")?;
+        ensure!(
+            idle,
+            "{path} has cloud, dirty or pending file-registration state"
+        );
+        let target = source.join(&file.relative_path);
+        if let Some(registered) = local.filter(|s| !s.is_empty()) {
+            ensure!(
+                Path::new(&registered).canonicalize().ok().as_ref()
+                    == Some(&target.canonicalize()?),
+                "The registered local path for {path} points to a different file"
+            );
+        }
+        let (stem, extension) = path
+            .rsplit_once('.')
+            .context("Missing analysis file extension")?;
+        let old =
+            super::grid::read_sidecar(&source.join("share"), &format!("{stem}.DAT"), extension)?
+                .context("Registered analysis file is missing")?;
+        let before_sha: [u8; 32] = Sha256::digest(&old).into();
+        ensure!(
+            before_sha == file.expected_sha256
+                && i64::try_from(old.len())? == size
+                && hash.eq_ignore_ascii_case(&format!("{:x}", Md5::digest(&old))),
+            "Native registration size or checksum is stale for {path}"
+        );
+        let new_hash = format!("{:x}", Md5::digest(&file.contents));
+        result.push(Registration {
+            id,
+            hash: if hash.bytes().any(|b| b.is_ascii_uppercase()) {
+                new_hash.to_ascii_uppercase()
+            } else {
+                new_hash
+            },
+            size: i64::try_from(file.contents.len())?,
+        });
+    }
+    Ok(result)
+}
+
+pub(super) fn check(
+    db: &Connection,
+    owner: &str,
+    source: &Path,
+    files: &[FileChange],
+) -> Result<()> {
+    registrations(db, owner, source, files).map(|_| ())
+}
+
+pub(super) fn update(
+    db: &Connection,
+    owner: &str,
+    source: &Path,
+    files: &[FileChange],
+    usn: &mut i64,
+    timestamp: &str,
+) -> Result<()> {
+    for registration in registrations(db, owner, source, files)? {
+        *usn = usn
+            .checked_add(1)
+            .context("Desktop update counter overflow")?;
+        ensure!(db.execute(
+            "UPDATE contentFile SET Hash=?1,Size=?2,rb_local_usn=?3,updated_at=?4,rb_local_synced=0
+             WHERE ID=?5 AND ContentID=?6 AND rb_local_deleted=0",
+            params![registration.hash,registration.size,*usn,timestamp,registration.id,owner],
+        )? == 1, "Native analysis registration changed during write-back");
+    }
+    Ok(())
+}

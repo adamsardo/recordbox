@@ -1,6 +1,17 @@
 # Sync the desktop rekordbox library
 
-The two arrows at the bottom left of the collection browser and **File → Review rekordbox library sync…** open a review of a **one-way import into Recordbox**. Check the paths before continuing. **Source** is AlphaTheta rekordbox’s desktop `master.db`. **Destination** is the `library.db` Recordbox actually has open. The Recordbox footer also shows the active library. **File → Show Library Folder** opens its directory. You can open the review and close it after checking both paths. **Import into Recordbox** starts the manual import.
+Open the two arrows at the bottom left of the collection browser or choose **File → Review rekordbox library sync…**. Check the paths and choose a direction.
+
+| Direction | Source | Destination |
+| --- | --- | --- |
+| **rekordbox → Recordbox** | A snapshot of the installed AlphaTheta desktop `master.db` | The active Recordbox `library.db` |
+| **Recordbox → rekordbox** | Selected edits in the active Recordbox collection | The installed AlphaTheta desktop library and any analysis files included in the review |
+
+Opening the chooser lets you inspect both paths. On Windows the expected AlphaTheta database is `%APPDATA%\Pioneer\rekordbox\master.db`. On macOS it is `~/Library/Pioneer/rekordbox/master.db`. The Recordbox footer identifies its own active library. **File → Show Library Folder** opens its directory.
+
+## Import into Recordbox
+
+Choose **rekordbox → Recordbox**, then **Import into Recordbox** to start the import.
 
 | What Recordbox touches | What happens |
 | --- | --- |
@@ -9,7 +20,7 @@ The two arrows at the bottom left of the collection browser and **File → Revie
 | Recordbox’s data folder | The snapshot is staged here. Confirming sync commits tracks, cues, grids, My Tags, imported playlists and sync state together in Recordbox’s collection. A database write failure rolls back the merge. Reading embedded artwork can also create a local artwork cache entry. |
 | USB devices and cloud accounts | Device exports have their own Sync Manager. Desktop library sync makes no provider API requests. An on-demand file can still be hydrated by the operating system when an application reads it. |
 
-## What happens to existing work?
+### What happens to existing Recordbox work?
 
 - **Tracks** are matched by their recorded file path. Recordbox remembers the source content ID and a fingerprint of source changes. New local tracks are added. A changed source track can replace local metadata, including a rating. An unchanged source generally preserves local edits, while absent cues or a missing grid can be filled in. A path previously removed from Recordbox is skipped.
 - **Cues and grids** on a changed track can be replaced by source values. An empty source cue list preserves existing cues. A locked local grid keeps its tempo and timing. Changes to source My Tag assignments can update tags in Recordbox.
@@ -25,7 +36,46 @@ $env:PREPDECK_DATA = Join-Path $env:TEMP ("Recordbox-test-" + [guid]::NewGuid())
 .\recordbox.exe
 ```
 
-On Linux, run `PREPDECK_DATA="$(mktemp -d)" ./recordbox`. Both examples keep the test collection in the temporary folder after Recordbox exits.
+On Linux, run `PREPDECK_DATA="$(mktemp -d)" ./recordbox`. Both examples keep the test Recordbox collection in the temporary folder after Recordbox exits. **The override changes the Recordbox data folder only.** For a write-back test, use an operating-system account with a disposable AlphaTheta desktop library and check the `master.db` path in the chooser.
+
+## Write reviewed changes to rekordbox
+
+The write-back pilot targets desktop libraries with a recognized native schema. Start with a disposable AlphaTheta profile on the rekordbox version you use. Native application acceptance requires reopening that library in AlphaTheta rekordbox and checking the selected tracks there.
+
+1. Import from that desktop library to establish a baseline, then edit the tracks in Recordbox.
+2. Choose **Recordbox → rekordbox** and preview the changes. The comparison needs an unambiguous track in the same native library and a saved baseline. For example, if both libraries had two stars at import and you set four in Recordbox, the proposed rating is four. If rekordbox now has five, the conflict is skipped. If both already show four, there is nothing to apply.
+3. Select eligible edits, choose **Review selected changes**, and check the target path and count. Quit rekordbox and its background agent before confirming. Use a local desktop library for the pilot. Cloud and network synchronization need separate acceptance testing.
+4. Choose **Back up and apply** for the displayed number of changes. Recordbox checks the native library again under a SQLite writer lock and saves a verified encrypted recovery copy that includes committed changes from the write-ahead log. The result identifies the recovery folder under `native-recovery` beside your active Recordbox `library.db`.
+
+Even a one-rating write-back needs enough free space for a complete database recovery copy. Grid edits can also touch analysis files under the native library’s `share` folder. Keep the entire recovery folder so the affected files and database can be recovered together.
+
+If the application stops during a grid write-back, close desktop rekordbox and its agents, reopen the arrows, and select **Write back → Review recovery… → Confirm recovery**. Recovery checks the database state and affected file hashes. A verified committed change is kept. If the database did not commit, recovery can restore the corresponding original analysis files. If any recorded state has since changed unexpectedly, keep the recovery folder and investigate before attempting another sync. The small `.recordbox-writeback.lock` file can remain beside `master.db` between operations. The operating system releases its lock when the operation ends.
+
+| Field | What the pilot can review |
+| --- | --- |
+| Rating | The native zero-to-five-star value for a matched track. |
+| BPM | The track's numeric BPM. If that number tracks a constant-tempo native grid, review and select the corresponding grid change together with the BPM change. |
+| Key | A change to an existing, unambiguous native key entry. An unknown key or ambiguous mapping is skipped. |
+| Cues | Change comments and colors, reassign an existing hot cue to another pad at the same time, or remove an existing cue when its native mirrors can stay consistent. Referenced hot-cue banks and unsupported sidecar cue data can block an edit. Creating cues and changing their start or loop times require native seek information that Recordbox does not generate. |
+| Beat grid | Shift a supported grid in whole milliseconds or change which beat starts the bar. A constant-tempo grid can also be retimed when its native analysis files supply the timing evidence and have no dependent cue positions. Edits that add or remove tempo segments, or depend on unrecognized analysis files, are skipped. |
+
+The pilot draws on Library Workbench’s native backup writer for per-row update counters, the library-wide change counter and the relationship between cue rows and the serialized cue list. Workbench performs those edits in an exported backup copy. A Recordbox write-back targets the installed library identified in its own review. [Workbench native writer](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/native_export.py) · [Recordbox field checks](../app/src/rbimport/writeback/mod.rs) · [Cue edits](../app/src/rbimport/writeback/cues.rs) · [Grid edits](../app/src/rbimport/writeback/grid.rs)
+
+## Locate separated STEMS
+
+After Recordbox separates a track, it caches the four stereo parts in a `.stems` file. `PDSTEMS1` is the first eight bytes of that file. Open **Preferences → Extensions → STEMS** and copy the **Recordbox STEMS cache** path. The built-in manual also shows this directory in its **Stems** chapter.
+
+| System | Default Recordbox STEMS folder |
+| --- | --- |
+| Windows | `%APPDATA%\Recordbox\stems` |
+| macOS | `~/Library/Application Support/Recordbox/stems` |
+| Linux | `$XDG_DATA_HOME/Recordbox/stems`, normally `~/.local/share/Recordbox/stems` |
+
+Setting `PREPDECK_DATA` puts the cache in the `stems` subfolder of that directory. Filenames have the form `<24 hex characters>-<model>.stems`. Recordbox hashes the audio path, file size and modification time in seconds for the prefix. The file header stores the format and frame count. Library Workbench can inspect its structure in **Library lab → Formats & STEMS**. [Recordbox cache code](../app/src/stems/mod.rs) · [Workbench format inspector](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/FORMATS-AND-STEMS.md)
+
+AlphaTheta’s own per-track STEMS storage and a compatible import format remain unverified. AlphaTheta documents `.rbsc` as a captured DRUMS sample. A useful native sample for whole-track separation starts with a short self-created track in a disposable AlphaTheta library. Record the rekordbox version, OS, mode and STEMS setting, inventory the library and cache before and after separation, then check whether any generated file persists after quitting and reopening rekordbox. Ratings, cues, BPM, key and beat-grid write-back can be tested independently of STEMS. [AlphaTheta sample capture in Workbench](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/DISCOVERY-ASSETS-HISTORY.md) · [Workbench STEMS evidence](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/STEMS-WORKFLOWS.md)
+
+## Sync a USB drive
 
 **Device Sync Manager** is a separate action for a selected drive. It can write classic device catalogs, audio, artwork and analysis files. The review lists previously managed playlists selected for removal. Depending on the settings, sync can replace cues on the device or remove tracks and corresponding files. Check the target drive, cue option and deletion settings before confirming a device operation. [Device Sync Manager](../app/src/device_ext.rs) · [USB export](../app/src/export/usb.rs)
 
@@ -33,7 +83,7 @@ On Linux, run `PREPDECK_DATA="$(mktemp -d)" ./recordbox`. Both examples keep the
 
 | Source or destination | Recordbox | Library Workbench |
 | --- | --- | --- |
-| Desktop v6/v7 `master.db` | Imports supported records from a private snapshot into a local DJ collection. | Captures the source for inspection, including missing and cloud file references. Its snapshot reader handles WAL and rollback-journal evidence. |
+| Desktop v6/v7 `master.db` | Imports supported records from a private snapshot. The manual write-back pilot checks the native schema, identity and baseline before offering edits. | Captures the source for inspection, including missing and cloud file references. Its snapshot reader handles WAL and rollback-journal evidence. |
 | Desktop v5 and earlier `.edb` | Use a collection XML export for interchange. | Detects legacy database files and inventories them. Use XML for track-level analysis. |
 | Collection XML | Imports and exports tracks, playlist links, supported cues and tempo information. | Inspects XML alone, or pairs it with a native backup for review and edited export. |
 | Backup ZIP | Creates and restores Recordbox’s own backups, identified by their manifest and `library.db`. | Opens AlphaTheta’s Backup Library ZIP and can prepare an edited native backup copy. |

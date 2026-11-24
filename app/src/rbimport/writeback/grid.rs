@@ -1,0 +1,671 @@
+//! Patch a desktop analysis grid in place in its existing PMAI container. A global
+//! millisecond offset is native PQTZ metadata. The raw beat times and the PQT2
+//! fractions stay intact. Rotating bar numbers also updates the companion PQT2.
+//! Rebuilding a constant tempo additionally requires a known, cue-free file set
+//! and an unambiguous last beat from its detailed waveform. Entries derived from
+//! beat indices (e.g. phrases) must never be copied across a reindexing.
+use super::storage::FileChange;
+use crate::export::anlz;
+use crate::model::BeatGrid;
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{ErrorKind, Read};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GridSnapshot {
+    pub grid: BeatGrid,
+    dat_path: PathBuf,
+    dat_sha256: [u8; 32],
+    ext_sha256: Option<[u8; 32]>,
+    ex2_sha256: Option<[u8; 32]>,
+}
+
+impl GridSnapshot {
+    pub fn dat_sha256(&self) -> [u8; 32] {
+        self.dat_sha256
+    }
+}
+
+fn analysis_relative_path(input: &str) -> Result<PathBuf> {
+    ensure!(input.len() <= 32_768, "Native analysis path is too long");
+    let path = input.strip_prefix('/').unwrap_or(input);
+    let parts: Vec<_> = path.split('/').collect();
+    ensure!(
+        parts.len() >= 3 && parts[0].eq_ignore_ascii_case("PIONEER") && parts[1].eq_ignore_ascii_case("USBANLZ"),
+        "Expected a PIONEER/USBANLZ desktop analysis path"
+    );
+    for part in &parts[..parts.len() - 1] {
+        ensure!(
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "Unsupported analysis directory in the desktop path"
+        );
+    }
+    let name = parts.last().unwrap();
+    let stem = name.strip_suffix(".DAT").and_then(|s| s.strip_prefix("ANLZ"));
+    ensure!(
+        stem.is_some_and(|s| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+        "Expected an ANLZxxxx.DAT analysis file"
+    );
+    Ok(parts.iter().collect())
+}
+
+fn link(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Includes junctions as well as ordinary symbolic links.
+        meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Read bounded PMAI bytes. Missing companions are optional, permission errors and
+/// links (including dangling links) must never be mistaken for missing evidence.
+pub fn read_sidecar(share: &Path, analysis_path: &str, extension: &str) -> Result<Option<Vec<u8>>> {
+    ensure!(matches!(extension, "DAT" | "EXT" | "2EX"), "Unknown analysis companion");
+    let relative = analysis_relative_path(analysis_path)?.with_extension(extension);
+    let share_meta = fs::symlink_metadata(share)?;
+    ensure!(
+        share_meta.is_dir() && !link(&share_meta),
+        "Linked analysis share directory"
+    );
+    let mut path = share.to_path_buf();
+    for component in relative.parent().unwrap().components() {
+        path.push(component);
+        let meta = fs::symlink_metadata(&path).context("Opening the analysis directory")?;
+        ensure!(
+            meta.is_dir() && !link(&meta),
+            "Linked or unavailable analysis directory"
+        );
+    }
+    // Windows generally ignores extension case, Linux distinguishes it. An equally
+    // named differently cased file must never be mistaken for an absent companion.
+    let name = relative.file_name().unwrap();
+    let mut candidates = 0;
+    for (index, entry) in fs::read_dir(&path)?.enumerate() {
+        ensure!(index < 4096, "Too many files in the analysis directory");
+        if entry?.file_name().eq_ignore_ascii_case(name) {
+            candidates += 1;
+        }
+    }
+    ensure!(candidates <= 1, "Ambiguous analysis filenames differing only in case");
+    path.push(name);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == ErrorKind::NotFound && candidates == 0 => return Ok(None),
+        Err(error) => return Err(error).context("Opening analysis file with its recorded name"),
+    };
+    ensure!(
+        meta.is_file() && !link(&meta) && meta.len() <= MAX_BYTES,
+        "Linked, oversized or irregular analysis file"
+    );
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    fs::File::open(&path)?.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 == meta.len(), "Analysis file changed while reading");
+    anlz::validate(&bytes).map_err(|reason| anyhow!("Invalid {extension} analysis file: {reason}"))?;
+    Ok(Some(bytes))
+}
+
+struct NativeGrid {
+    state: GridSnapshot,
+    dat: Vec<u8>,
+    ext: Option<Vec<u8>>,
+    pqtz: Range<usize>,
+    pqt2: Option<Range<usize>>,
+    retime_frames: Result<u32, String>,
+}
+
+// read_sidecar validates every section's framing before sections are traversed.
+fn sections(data: &[u8]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut offset = 28;
+    std::iter::from_fn(move || {
+        if offset == data.len() {
+            return None;
+        }
+        let start = offset;
+        offset += u32::from_be_bytes(data[start + 8..start + 12].try_into().unwrap()) as usize;
+        Some(start..offset)
+    })
+}
+
+fn grid_section(bytes: &[u8], expected: &[u8]) -> Result<Option<Range<usize>>> {
+    let mut found = None;
+    for range in sections(bytes) {
+        let tag = &bytes[range.start..range.start + 4];
+        if tag.starts_with(b"PQT") {
+            ensure!(
+                tag == expected && found.is_none(),
+                "Unknown, misplaced or repeated native beat-grid section"
+            );
+            found = Some(range);
+        }
+    }
+    Ok(found)
+}
+
+fn path_section(bytes: &[u8]) -> Result<Option<&[u8]>> {
+    let mut found = None;
+    for range in sections(bytes) {
+        if bytes[range.clone()].starts_with(b"PPTH") {
+            ensure!(
+                found.is_none() && anlz::parse_ppth(&bytes[range.clone()]).is_some(),
+                "Invalid analysis media path"
+            );
+            found = Some(&bytes[range]);
+        }
+    }
+    Ok(found)
+}
+
+fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
+    let dat = read_sidecar(share, analysis_path, "DAT")?.context("Missing analysis DAT file")?;
+    let pqtz = grid_section(&dat, b"PQTZ")?.context("No native PQTZ beat grid")?;
+    let raw = &dat[pqtz.clone()];
+    ensure!(
+        raw.get(4..8) == Some(&24u32.to_be_bytes()) && raw.get(12..18) == Some(&[0, 0, 0, 0, 0, 8]),
+        "Unknown native PQTZ header revision"
+    );
+    ensure!(
+        raw.len() <= 24 + 1_000_000 * 8,
+        "Native beat grid exceeds the pilot limit"
+    );
+    let grid = crate::rbimport::parse_pqtz_grid(&dat).context("Invalid native PQTZ beat records")?;
+    let ext = read_sidecar(share, analysis_path, "EXT")?;
+    let ex2 = read_sidecar(share, analysis_path, "2EX")?;
+    let path = path_section(&dat)?.context("The DAT file has no recorded media path")?;
+    for companion in [ext.as_deref(), ex2.as_deref()].into_iter().flatten() {
+        ensure!(
+            path_section(companion)? == Some(path),
+            "Analysis companions refer to different media paths"
+        );
+    }
+    if let Some(bytes) = &ex2 {
+        grid_section(bytes, b"")?;
+    }
+    let pqt2 = match &ext {
+        Some(bytes) => grid_section(bytes, b"PQT2")?,
+        None => None,
+    };
+    if let (Some(bytes), Some(range)) = (&ext, &pqt2) {
+        let extended = &bytes[range.clone()];
+        let count = (raw.len() - 24) / 8;
+        ensure!(
+            extended.len() == 56 + count * 2 && extended[4..8] == 56u32.to_be_bytes(),
+            "PQT2 count or header differs from the DAT grid"
+        );
+        let fractions = anlz::pqt2_fractions(extended);
+        ensure!(
+            fractions.len() == count
+                && fractions.iter().all(|v| *v <= 999)
+                && extended == anlz::pqt2(&anlz::pqtz_entries(raw), &fractions),
+            "PQT2 revision, beat records, checksum or fractions disagree with the DAT grid"
+        );
+    }
+    let retime_frames = retime_evidence(
+        &dat,
+        ext.as_deref(),
+        ex2.as_deref(),
+        &share.join(analysis_relative_path(analysis_path)?),
+    )
+    .map_err(|err| err.to_string());
+    let state = GridSnapshot {
+        grid,
+        dat_path: analysis_relative_path(analysis_path)?,
+        dat_sha256: Sha256::digest(&dat).into(),
+        ext_sha256: ext.as_ref().map(|b| Sha256::digest(b).into()),
+        ex2_sha256: ex2.as_ref().map(|b| Sha256::digest(b).into()),
+    };
+    Ok(NativeGrid {
+        state,
+        dat,
+        ext,
+        pqtz,
+        pqt2,
+        retime_frames,
+    })
+}
+
+// Detailed waveforms have one frame per 1/150 s. Only use that evidence when
+// the file revision and shape agree, and both possible endpoints produce the
+// same beat count. This avoids inventing a duration from rounded DB seconds.
+fn retime_evidence(dat: &[u8], ext: Option<&[u8]>, ex2: Option<&[u8]>, path: &Path) -> Result<u32> {
+    let ext = ext.context("Retiming requires a paired EXT with a detailed waveform")?;
+    let mut frames = None;
+    for bytes in [Some(dat), Some(ext), ex2].into_iter().flatten() {
+        for range in sections(bytes) {
+            let tag = &bytes[range.clone()];
+            match &tag[..4] {
+                b"PPTH" | b"PVBR" | b"PWAV" | b"PWV2" | b"PWV4" | b"PWV6" | b"PWV7" | b"PWVC" | b"PQTZ" | b"PQT2" => {}
+                b"PWV3" | b"PWV5" => {
+                    let (width, revision): (usize, u32) = if &tag[..4] == b"PWV3" {
+                        (1, 0x0096_0000)
+                    } else {
+                        (2, 0x0096_0305)
+                    };
+                    ensure!(
+                        tag.len() >= 24
+                            && tag[4..8] == 24u32.to_be_bytes()
+                            && tag[12..16] == (width as u32).to_be_bytes()
+                            && tag[20..24] == revision.to_be_bytes(),
+                        "Unrecognized detailed waveform revision"
+                    );
+                    let n = u32::from_be_bytes(tag[16..20].try_into()?);
+                    ensure!(
+                        n > 0 && tag.len() == 24 + width * n as usize && frames.is_none_or(|prev| prev == n),
+                        "Detailed waveform counts disagree or are empty"
+                    );
+                    frames = Some(n);
+                }
+                b"PCOB" => ensure!(
+                    tag.len() == 24 && tag[4..8] == 24u32.to_be_bytes() && tag[18..20] == [0, 0],
+                    "Retiming native analysis with cue or loop references needs review in rekordbox"
+                ),
+                b"PCO2" => ensure!(
+                    tag.len() == 20 && tag[4..8] == 20u32.to_be_bytes() && tag[16..18] == [0, 0],
+                    "Retiming native analysis with extended cue references needs review in rekordbox"
+                ),
+                tag => bail!(
+                    "Retiming analysis containing {} needs review in rekordbox",
+                    String::from_utf8_lossy(tag)
+                ),
+            }
+        }
+    }
+    let stem = path.file_stem().unwrap().to_string_lossy();
+    for entry in fs::read_dir(path.parent().unwrap())? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if let Some((prefix, extension)) = name.split_once('.') {
+            ensure!(
+                !prefix.eq_ignore_ascii_case(&stem)
+                    || ["DAT", "EXT", "2EX"]
+                        .iter()
+                        .any(|allowed| extension.eq_ignore_ascii_case(allowed)),
+                "Retiming analysis with an unverified companion ({extension}) needs review in rekordbox"
+            );
+        }
+    }
+    frames.context("Retiming requires a validated 150 Hz detailed waveform")
+}
+
+fn replace_section(file: &mut Vec<u8>, range: Range<usize>, section: &[u8]) -> Result<()> {
+    let new_len = file.len() - range.len() + section.len();
+    ensure!(new_len as u64 <= MAX_BYTES, "Updated analysis file exceeds size limit");
+    file.splice(range, section.iter().copied());
+    file[8..12].copy_from_slice(&(new_len as u32).to_be_bytes());
+    Ok(())
+}
+
+fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>> {
+    let frames = native.retime_frames.map_err(anyhow::Error::msg)?;
+    let ext = native.ext.as_mut().context("Missing extended timing file")?;
+    let range = native
+        .pqt2
+        .context("Retiming requires verified PQT2 fractional timing")?;
+    let old_fractions = anlz::pqt2_fractions(&ext[range.clone()]);
+    let raw = &native.dat[native.pqtz.clone()];
+    let native_shift = i16::from_be_bytes(raw[18..20].try_into()?) as i64;
+    let entries = anlz::pqtz_entries(raw);
+    let first = entries.first().context("Empty original grid")?;
+    let old_first_us = (i64::from(first.2) + native_shift) * 1000 + i64::from(old_fractions[0]);
+    let old_period_us = 6_000_000_000.0 / f64::from(first.1);
+    for (index, (entry, frac)) in entries.iter().zip(&old_fractions).enumerate() {
+        let adjusted = (i64::from(entry.2) + native_shift) * 1000 + i64::from(*frac);
+        let expected = old_first_us as f64 + index as f64 * old_period_us;
+        ensure!(
+            entry.1 == first.1
+                && entry.0 == ((first.0 as usize - 1 + index) % 4 + 1) as u16
+                && (adjusted as f64 - expected).abs() < 1100.0,
+            "Original beat records vary from their nominal constant grid"
+        );
+    }
+    let end_lower = u64::from(frames - 1) * 1_000_000 / 150;
+    let end_upper = (u64::from(frames) * 1_000_000).div_ceil(150);
+    let old_last = entries.last().unwrap();
+    let old_last_us =
+        ((i64::from(old_last.2) + native_shift) * 1000 + i64::from(*old_fractions.last().unwrap())) as f64;
+    ensure!(
+        old_first_us >= 0
+            && (old_first_us as f64) < old_period_us
+            && old_last_us < end_lower as f64
+            && old_last_us + old_period_us > end_upper as f64,
+        "Original grid does not unambiguously cover the waveform"
+    );
+    let anchor = desired.anchors[0];
+    let bpm = (anchor.bpm * 100.).round();
+    ensure!(
+        (40.0..=499.0).contains(&anchor.bpm)
+            && (anchor.bpm * 100. - bpm).abs() < 1e-6
+            && (1..=4).contains(&anchor.beat)
+            && anchor.time.is_finite()
+            && anchor.time >= 0.0,
+        "Retiming requires a representable constant BPM, first beat and bar number"
+    );
+    let first_ms = (anchor.time * 1000.).round();
+    ensure!(
+        anchor.time < 60. / anchor.bpm && (anchor.time * 1000. - first_ms).abs() < 1e-6,
+        "Set the tempo at the track's first beat with millisecond precision to write this grid"
+    );
+    let first_us = first_ms as u64 * 1000 + u64::from(old_fractions[0]);
+    ensure!(
+        (first_us as f64) < 60_000_000. / anchor.bpm,
+        "Fractional timing crosses the first beat boundary"
+    );
+    let bpm = bpm as u64;
+    let mut beats = Vec::new();
+    let mut fractions = Vec::new();
+    // Integer microseconds avoid cumulative floating-point drift.
+    for index in 0..=1_000_000u64 {
+        let us = first_us + (index * 6_000_000_000 + bpm / 2) / bpm;
+        if us > end_upper {
+            break;
+        }
+        ensure!(
+            us < end_lower,
+            "Track endpoint is too close to a proposed beat to determine its inclusion"
+        );
+        ensure!(
+            index < 1_000_000 && us / 1000 <= u64::from(u32::MAX),
+            "Updated grid exceeds native file limits"
+        );
+        beats.push((
+            ((u64::from(anchor.beat) - 1 + index) % 4 + 1) as u16,
+            bpm as u16,
+            (us / 1000) as u32,
+        ));
+        fractions.push((us % 1000) as u16);
+    }
+    ensure!(!beats.is_empty(), "Updated grid has no beats within the track");
+    let mut pqtz = raw[..24].to_vec();
+    pqtz[8..12].copy_from_slice(&((24 + beats.len() * 8) as u32).to_be_bytes());
+    pqtz[18..20].copy_from_slice(&0i16.to_be_bytes());
+    pqtz[20..24].copy_from_slice(&(beats.len() as u32).to_be_bytes());
+    for &(number, tempo, time) in &beats {
+        pqtz.extend_from_slice(&number.to_be_bytes());
+        pqtz.extend_from_slice(&tempo.to_be_bytes());
+        pqtz.extend_from_slice(&time.to_be_bytes());
+    }
+    replace_section(&mut native.dat, native.pqtz, &pqtz)?;
+    replace_section(ext, range, &anlz::pqt2(&beats, &fractions))?;
+    let reread = crate::rbimport::parse_pqtz_grid(&native.dat).context("Rebuilt grid is unreadable")?;
+    ensure!(
+        crate::app::grids_match(&reread, desired),
+        "Rebuilt grid differs from requested anchors"
+    );
+    let path = Path::new("share").join(&native.state.dat_path);
+    Ok(vec![
+        FileChange {
+            relative_path: path.with_extension("EXT"),
+            expected_sha256: native.state.ext_sha256.unwrap(),
+            contents: native.ext.unwrap(),
+        },
+        FileChange {
+            relative_path: path,
+            expected_sha256: native.state.dat_sha256,
+            contents: native.dat,
+        },
+    ])
+}
+
+pub fn inspect(share: &Path, analysis_path: &str) -> Result<GridSnapshot> {
+    Ok(native_grid(share, analysis_path)?.state)
+}
+
+/// Returns complete replacement bytes for the transaction's verified backup and
+/// recovery journal. Nothing is written by this function.
+pub fn plan(share: &Path, analysis_path: &str, baseline: &GridSnapshot, desired: &BeatGrid) -> Result<Vec<FileChange>> {
+    let mut native = native_grid(share, analysis_path)?;
+    ensure!(
+        &native.state == baseline,
+        "Analysis files changed since the grid preview"
+    );
+    let source = &baseline.grid;
+    ensure!(
+        !desired.anchors.is_empty() && desired.anchors.len() == source.anchors.len(),
+        "Grid segment insertion or removal requires native reanalysis"
+    );
+    if source.anchors.len() == 1 && (desired.anchors[0].bpm - source.anchors[0].bpm).abs() > 1e-9 {
+        return retime(native, desired);
+    }
+    let shift = (desired.anchors[0].time - source.anchors[0].time) * 1000.;
+    let rotation = (i32::from(desired.anchors[0].beat) - i32::from(source.anchors[0].beat)).rem_euclid(4);
+    for (from, to) in source.anchors.iter().zip(&desired.anchors) {
+        ensure!(
+            to.time.is_finite() && to.time >= 0. && (1..=4).contains(&to.beat) && (to.bpm - from.bpm).abs() <= 1e-9,
+            "Native multi-tempo grids support whole-grid timing and bar-phase edits"
+        );
+        ensure!(
+            ((to.time - from.time) * 1000. - shift.round()).abs() <= 1e-6
+                && (i32::from(to.beat) - i32::from(from.beat)).rem_euclid(4) == rotation,
+            "The grid edit is not a uniform whole-millisecond shift or bar rotation"
+        );
+    }
+    if shift.round() == 0. && rotation == 0 {
+        return Ok(Vec::new());
+    }
+    let position = native.pqtz.start;
+    let old_shift = i16::from_be_bytes(native.dat[position + 18..position + 20].try_into()?);
+    let total = f64::from(old_shift) + shift.round();
+    ensure!(
+        (f64::from(i16::MIN)..=f64::from(i16::MAX)).contains(&total),
+        "Offset exceeds the native signed millisecond field"
+    );
+    native.dat[position + 18..position + 20].copy_from_slice(&(total as i16).to_be_bytes());
+    if rotation != 0 {
+        for entry in native.dat[position + 24..native.pqtz.end].chunks_exact_mut(8) {
+            let old = u16::from_be_bytes([entry[0], entry[1]]);
+            let bar = (i32::from(old) - 1 + rotation).rem_euclid(4) as u16 + 1;
+            entry[..2].copy_from_slice(&bar.to_be_bytes());
+        }
+    }
+    let reread = crate::rbimport::parse_pqtz_grid(&native.dat)
+        .context("Edited grid has unsupported preroll or invalid beats")?;
+    ensure!(
+        crate::app::grids_match(&reread, desired),
+        "Edited native grid does not round-trip to the requested anchors"
+    );
+    let dat_path = Path::new("share").join(&native.state.dat_path);
+    let mut changes = vec![];
+    if rotation != 0 {
+        if let (Some(mut ext), Some(range), Some(digest)) = (native.ext, native.pqt2, native.state.ext_sha256) {
+            let entries = anlz::pqtz_entries(&native.dat[native.pqtz]);
+            let fractions = anlz::pqt2_fractions(&ext[range.clone()]);
+            ext[range].copy_from_slice(&anlz::pqt2(&entries, &fractions));
+            changes.push(FileChange {
+                relative_path: dat_path.with_extension("EXT"),
+                expected_sha256: digest,
+                contents: ext,
+            });
+        }
+    }
+    changes.push(FileChange {
+        relative_path: dat_path,
+        expected_sha256: baseline.dat_sha256,
+        contents: native.dat,
+    });
+    Ok(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Beat, Waveform};
+
+    const LOCATION: &str = "/PIONEER/USBANLZ/P001/00000001/ANLZ0000.DAT";
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("share");
+        let dat = share.join(LOCATION.trim_start_matches('/'));
+        fs::create_dir_all(dat.parent().unwrap()).unwrap();
+        let beats = (0..20)
+            .map(|index| Beat {
+                index,
+                time: 0.10025 + index as f64 * 0.5,
+                bpm: 120.,
+                beat: (index % 4 + 1) as u8,
+            })
+            .collect::<Vec<_>>();
+        let wave = Waveform {
+            frames: vec![[0; 8]; 1500],
+        };
+        let files = anlz::build("/music/grid.wav", &beats, &wave, &[], 0, 44100);
+        fs::write(&dat, files.dat).unwrap();
+        fs::write(dat.with_extension("EXT"), files.ext).unwrap();
+        fs::write(dat.with_extension("2EX"), files.ex2).unwrap();
+        (root, share, dat)
+    }
+
+    #[test]
+    fn desktop_offset_changes_only_signed_header_and_keeps_companions() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let baseline = inspect(&share, LOCATION)?;
+        let before = fs::read(&dat)?;
+        let ext_before = fs::read(dat.with_extension("EXT"))?;
+        let mut desired = baseline.grid.clone();
+        desired.anchors[0].time -= 0.021;
+        let changes = plan(&share, LOCATION, &baseline, &desired)?;
+        assert_eq!(changes.len(), 1);
+        let edit = &changes[0];
+        let offset = grid_section(&before, b"PQTZ")?.unwrap().start + 18;
+        assert_eq!(edit.expected_sha256, <[u8; 32]>::from(Sha256::digest(&before)));
+        assert_eq!(edit.contents[..offset], before[..offset]);
+        assert_eq!(edit.contents[offset..offset + 2], (-21i16).to_be_bytes());
+        assert_eq!(edit.contents[offset + 2..], before[offset + 2..]);
+        assert_eq!(fs::read(dat)?, before);
+        assert_eq!(
+            fs::read(share.join(&baseline.dat_path).with_extension("EXT"))?,
+            ext_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotating_downbeat_rebuilds_only_paired_extended_metadata() -> Result<()> {
+        let (root, share, dat) = fixture();
+        let baseline = inspect(&share, LOCATION)?;
+        let before = fs::read(dat.with_extension("EXT"))?;
+        let section = grid_section(&before, b"PQT2")?.unwrap();
+        let mut desired = baseline.grid.clone();
+        desired.anchors[0].beat = 4;
+        let changes = plan(&share, LOCATION, &baseline, &desired)?;
+        assert_eq!(changes.len(), 2);
+        for patch in changes {
+            if patch.relative_path.extension().unwrap() == "EXT" {
+                assert_eq!(before[..section.start], patch.contents[..section.start]);
+                assert_eq!(before[section.start + 56..], patch.contents[section.start + 56..]);
+            }
+            fs::write(root.path().join(patch.relative_path), patch.contents)?;
+        }
+        let after = inspect(&share, LOCATION)?;
+        assert_eq!(after.grid, desired);
+        assert!(plan(&share, LOCATION, &after, &desired)?.is_empty());
+        assert!(plan(&share, LOCATION, &baseline, &desired).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_or_inconsistent_companions_and_nonuniform_edits_are_rejected() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let before = inspect(&share, LOCATION)?;
+        let mut desired = before.grid.clone();
+        desired.anchors[0].time += 0.0004;
+        assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        desired.anchors[0].bpm = 130.;
+        assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        let ext = dat.with_extension("EXT");
+        let bytes = fs::read(&ext)?;
+        let offset = grid_section(&bytes, b"PQT2")?.unwrap().start;
+        for field in [16, 24, 40, 44, 56] {
+            let mut changed = bytes.clone();
+            changed[offset + field] ^= 0x80;
+            fs::write(&ext, changed)?;
+            assert!(inspect(&share, LOCATION).is_err());
+        }
+        assert!(inspect(&share, "/PIONEER/USBANLZ/../../ANLZ0000.DAT").is_err());
+        assert!(inspect(&share, "//PIONEER/USBANLZ/P001/ANLZ0000.DAT").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn constant_tempo_rebuild_adjusts_count_and_fractional_timing() -> Result<()> {
+        let (root, share, dat) = fixture();
+        let before = inspect(&share, LOCATION)?;
+        let ambiguous = BeatGrid::constant(0.398, 125., 1);
+        let err = plan(&share, LOCATION, &before, &ambiguous).unwrap_err();
+        assert!(err.to_string().contains("endpoint"), "{err}");
+        let ext_path = dat.with_extension("EXT");
+        let ext = fs::read(&ext_path)?;
+        let old_range = grid_section(&ext, b"PQT2")?.unwrap();
+        let original_first_fraction = anlz::pqt2_fractions(&ext[old_range.clone()])[0];
+        let desired = BeatGrid::constant(before.grid.anchors[0].time, 127.0, 1);
+        let changes = plan(&share, LOCATION, &before, &desired)?;
+        assert_eq!(changes.len(), 2);
+        for patch in changes {
+            fs::write(root.path().join(patch.relative_path), patch.contents)?;
+        }
+        let after = inspect(&share, LOCATION)?;
+        assert_eq!(after.grid, desired);
+        let rewritten = fs::read(&ext_path)?;
+        let new_range = grid_section(&rewritten, b"PQT2")?.unwrap();
+        assert_eq!(ext[12..old_range.start], rewritten[12..new_range.start]);
+        assert_eq!(ext[old_range.end..], rewritten[new_range.end..]);
+        let fractions = anlz::pqt2_fractions(&rewritten[new_range]);
+        assert_eq!(fractions.len(), 21);
+        assert_eq!(fractions[0], original_first_fraction);
+        let bytes = fs::read(&dat)?;
+        let native_beats = anlz::pqtz_entries(&bytes[grid_section(&bytes, b"PQTZ")?.unwrap()]);
+        for (i, (&(bar, bpm, ms), fraction)) in native_beats.iter().zip(fractions).enumerate() {
+            assert_eq!((bar, bpm), ((i % 4 + 1) as u16, 12700));
+            let expected_us = 100000. + f64::from(original_first_fraction) + i as f64 * 60_000_000. / 127.;
+            assert!((f64::from(ms) * 1000. + f64::from(fraction) - expected_us).abs() <= 0.5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retiming_refuses_phrases_and_unverified_native_companions() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let third = dat.with_extension("3EX");
+        fs::write(&third, b"unknown analysis")?;
+        let before = inspect(&share, LOCATION)?;
+        let desired = BeatGrid::constant(before.grid.anchors[0].time, 127., 1);
+        assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        fs::remove_file(third)?;
+        let ext = dat.with_extension("EXT");
+        let mut bytes = fs::read(&ext)?;
+        bytes.extend_from_slice(b"PSSI");
+        bytes.extend_from_slice(&12u32.to_be_bytes());
+        bytes.extend_from_slice(&12u32.to_be_bytes());
+        let size = bytes.len() as u32;
+        bytes[8..12].copy_from_slice(&size.to_be_bytes());
+        fs::write(&ext, bytes)?;
+        let before = inspect(&share, LOCATION)?;
+        assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_analysis_companion_is_never_used() -> Result<()> {
+        let (root, share, dat) = fixture();
+        let ext = dat.with_extension("EXT");
+        let moved = root.path().join("outside.ext");
+        fs::rename(&ext, &moved)?;
+        std::os::unix::fs::symlink(&moved, &ext)?;
+        assert!(inspect(&share, LOCATION).is_err());
+        Ok(())
+    }
+}

@@ -13,8 +13,8 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
     ("start", "Getting started", r#"
 <p>recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
 <ul>
-<li><b>Your music files are only read.</b> Tags, cues, grids and everything else you edit are kept in recordbox's own library, never written into the audio files.</li>
-<li>The collection footer shows your active Recordbox library. Use the lower-left arrows to <a href='#desktop-library-sync'>review an import from desktop rekordbox</a>.</li>
+<li><b>Your music files are read-only during desktop sync.</b> Editing a track saves your work in Recordbox's library.</li>
+<li>The collection footer shows your active Recordbox library. Use the lower-left arrows to <a href='#desktop-library-sync'>choose the direction of desktop library sync</a>.</li>
 <li>Choose <i>File &gt; Show Library Folder</i> to open the active Recordbox data folder in your file manager.</li>
 </ul>
 <h3>The window</h3>
@@ -25,14 +25,15 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li><i>File &gt; Import &gt; Import Track</i> adds files; <i>Import Folder</i> adds a folder and everything inside it. You can also drag files or folders from Finder onto the track list or a playlist.</li>
 <li><i>File &gt; Import &gt; Import Playlist</i> reads an M3U/M3U8 playlist and creates a playlist with its tracks.</li>
 <li><i>File &gt; Import Collection from rekordbox xml…</i> reads a collection exported from rekordbox (tracks, cues, grids, playlists).</li>
-<li><i>File &gt; Review rekordbox library sync…</i> shows the installed desktop source and active Recordbox destination.</li>
+<li><i>File &gt; Review rekordbox library sync…</i> opens the direction chooser for the installed AlphaTheta library and the active Recordbox library.</li>
 <li>The <b>Explorer</b> source browses folders on disk; tracks there can be loaded or imported.</li>
 </ul>
 <p>Supported files: MP3, AAC/M4A, WAV, AIFF, FLAC, ALAC. With <b>Auto Analysis</b> on (Track &gt; Auto Analysis, or Preferences &gt; Analysis) new tracks are analysed as they arrive.</p>
 <h3 id="desktop-library-sync">Desktop library sync</h3>
-<p>The two arrows at the bottom left open a review. Check the source <code>master.db</code> and the destination <code>library.db</code>. Close the review to leave your collection as it is, or choose <b>Import into Recordbox</b> to continue.</p>
-<p>Recordbox reads a private copy of the desktop database and its write-ahead log. It can also read analysis files, tags and artwork for local audio. It adds tracks and can apply rekordbox changes to metadata, cues, grids and My Tags in the destination. The imported <b>rekordbox</b> playlist folder is rebuilt each time. Keep playlists you edit outside that folder.</p>
-<p>For a first test, use <i>File &gt; Library &gt; Backup Library</i> to save your current Recordbox work. To import at each launch, enable <b>Import the installed rekordbox library at startup</b> in <i>Preferences &gt; Advanced &gt; Others</i>. Device Sync Manager is a separate action that can write playlists and media to a selected USB drive.</p>
+<p>Open the arrows at the bottom left and check the two paths. <code>master.db</code> belongs to AlphaTheta rekordbox. <code>library.db</code> is your active Recordbox collection.</p>
+<p><b>rekordbox → Recordbox</b> imports from a private snapshot of the desktop database and its write-ahead log. Recordbox can read analysis files, tags and artwork for local audio. Confirming imports metadata, cues, grids and My Tags into Recordbox. The imported <b>rekordbox</b> playlist folder is rebuilt each time. Keep playlists you edit outside that folder.</p>
+<p><b>Recordbox → rekordbox</b> opens the write-back pilot. Preview the changes, check the destination, select eligible edits and review them before applying. Quit AlphaTheta rekordbox and its background agent before writing. The confirmed operation saves a verified recovery copy and applies the selected changes to the original desktop library. Start with a disposable AlphaTheta profile for the version you use.</p>
+<p><i>File &gt; Library &gt; Backup Library</i> saves your Recordbox collection. To import from rekordbox at launch, enable <b>Import the installed rekordbox library at startup</b> in <i>Preferences &gt; Advanced &gt; Others</i>. Writing back always requires a manual review. Device Sync Manager can write playlists and media to a selected USB drive.</p>
 "#),
     ("analysis", "Track analysis", r#"
 <p>Analysis finds the BPM and beat grid, the key, the waveforms, the loudness (for Auto Gain), phrases and vocal positions.</p>
@@ -106,7 +107,8 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 "#),
     ("stems", "Stems", r#"
-<p>recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Extensions &gt; STEMS). Separated stems are kept so each track is only split once. A track is separated when it is loaded, and the original plays until its parts are ready. The part buttons mute and unmute parts (or solo them); Preferences &gt; Extensions &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
+<p>Recordbox can split a loaded track into vocal, instrument, bass and drum parts with a local separation model. Choose the model in <i>Preferences &gt; Extensions &gt; STEMS</i>. After a successful separation, Recordbox saves a <code>.stems</code> file for reuse with that track and model. The header starts with <code>PDSTEMS1</code>. Desktop library sync handles track edits separately from these audio caches.</p>
+<p>The part buttons mute, unmute or solo a part. Preferences controls three or four parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
 "#),
     ("export", "Exporting to USB", r#"
 <ol>
@@ -172,6 +174,10 @@ pub fn html(prefs: &Prefs) -> String {
     s.push_str("<a href=\"#keys\">Keyboard shortcuts</a></nav>");
     for (a, t, body) in CHAPTERS {
         s.push_str(&format!("<h2 id=\"{a}\">{}</h2>{body}", esc(t)));
+        if a == "stems" {
+            let folder = crate::db::data_dir_for_inspection().join("stems");
+            s.push_str(&format!("<p>Recordbox STEMS cache on this computer<br><code>{}</code></p>", esc(&folder.to_string_lossy())));
+        }
     }
     s.push_str("<h2 id=\"keys\">Keyboard shortcuts</h2><p>Change them in Preferences &gt; Keyboard. Fixed menu shortcuts: ⌘N Create New Playlist, ⌘E Export to USB Device, ⌘I Property, ⌘F search, ⌘A select all, ⌘Z / ⇧⌘Z Undo / Redo.</p>");
     for cat in crate::prefs_ext::ACTION_CATEGORIES {
@@ -195,7 +201,8 @@ pub fn open(prefs: &Prefs) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let p = dir.join("index.html");
     std::fs::write(&p, html(prefs))?;
-    std::process::Command::new("/usr/bin/open").arg(&p).spawn()?;
+    let opener = if cfg!(windows) { "explorer.exe" } else if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+    std::process::Command::new(opener).arg(std::path::absolute(&p)?).spawn()?;
     Ok(p)
 }
 
@@ -217,5 +224,7 @@ mod tests {
             assert!(h.contains(name), "{name}");
         }
         assert!(h.contains("<kbd>Space</kbd>"));
+        let cache = crate::db::data_dir_for_inspection().join("stems");
+        assert!(h.contains(&format!("<code>{}</code>", super::esc(&cache.to_string_lossy()))));
     }
 }

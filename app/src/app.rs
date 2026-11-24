@@ -1236,7 +1236,7 @@ pub struct Toast {
 #[derive(Default)]
 pub struct Dialogs {
     pub prefs_open: bool,
-    pub library_sync_review: Option<LibrarySyncReview>,
+    pub library_sync_review: Option<crate::ui_sync::Review>,
     pub prefs_tab: u8,
     /// Shortcuts window, backup/restore, reset confirmations (prefs_ext.rs).
     pub ext: crate::prefs_ext::DialogsExt,
@@ -1260,12 +1260,6 @@ pub struct Dialogs {
     pub player_edits: Option<PlayerEdits>,
     /// Unused files on a drive, waiting for confirmation: (root, device name, files with sizes).
     pub device_cleanup: Option<(String, String, Vec<(std::path::PathBuf, u64)>)>,
-}
-
-/// Capture detection when the review opens. Drawing the dialog never scans the source.
-pub struct LibrarySyncReview {
-    pub source: Option<std::path::PathBuf>,
-    pub found: bool,
 }
 
 pub struct PlayerEdits {
@@ -3049,18 +3043,21 @@ impl App {
         }
     }
 
+    pub fn can_review_library_sync(&self) -> bool {
+        self.rb_job.is_none() && self.dialogs.ext.restore_ask.is_none()
+            && !self.dialogs.ext.backup_job.as_ref().is_some_and(|job| job.restore)
+    }
+
     pub fn review_rekordbox_sync(&mut self) {
-        if self.rb_job.is_none() {
-            let source = crate::rbimport::default_library_dir().map(|dir| dir.join("master.db"));
-            let found = source.as_ref().is_some_and(|path| path.is_file());
-            self.dialogs.library_sync_review = Some(LibrarySyncReview { source, found });
+        if self.can_review_library_sync() && self.dialogs.library_sync_review.is_none() {
+            self.dialogs.library_sync_review = Some(crate::ui_sync::Review::new(&self.db));
         }
     }
 
     /// Copy rekordbox's library into Recordbox's data folder and read the copy, off the UI thread.
     /// rekordbox's own files are only read (byte copy), never opened by a database or written.
     pub fn start_rekordbox_sync(&mut self) {
-        if self.rb_job.is_some() {
+        if !self.can_review_library_sync() || self.dialogs.library_sync_review.is_some() {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);

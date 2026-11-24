@@ -102,6 +102,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS native_edit_baseline(
+                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, field TEXT NOT NULL,
+                source TEXT NOT NULL, native_id TEXT NOT NULL, uuid TEXT NOT NULL, path TEXT NOT NULL,
+                value TEXT NOT NULL, proof TEXT NOT NULL, PRIMARY KEY(track_id,field));
             CREATE TRIGGER IF NOT EXISTS forget_deleted_rekordbox_mirror AFTER DELETE ON playlists
             BEGIN DELETE FROM settings WHERE key='rb_folder_id' AND value=CAST(OLD.id AS TEXT); END;
             CREATE TABLE IF NOT EXISTS peaks(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, peak REAL NOT NULL);

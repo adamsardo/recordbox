@@ -275,11 +275,12 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
     let mut m = HashMap::new();
     for (id, _, _) in COMMANDS {
         let v = match id {
-            "backup" | "restore" => (!busy, false),
+            "backup" => (!busy, false),
+            "restore" => (!busy && app.dialogs.library_sync_review.is_none() && app.rb_job.is_none(), false),
             "relocate_missing" | "auto_relocate" => (any_missing, false),
             "export_xml" => (!app.tracks.is_empty(), false),
             "export_playlists_info" => (app.nodes.iter().any(|n| n.kind != NodeKind::Folder), false),
-            "sync_rekordbox" => (app.rb_job.is_none(), false),
+            "sync_rekordbox" => (app.can_review_library_sync(), false),
             "undo" => (!app.undo.is_empty(), false),
             "redo" => (!app.redo.is_empty(), false),
             "fullscreen" => (true, app.dialogs.ext.fullscreen),
@@ -416,7 +417,7 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "restore" => {
-            if app.dialogs.ext.backup_job.is_none() {
+            if app.dialogs.ext.backup_job.is_none() && app.dialogs.library_sync_review.is_none() && app.rb_job.is_none() {
                 if let Some(f) = rfd::FileDialog::new().set_title("Open backup file").add_filter("recordbox library backup", &["zip"]).pick_file() {
                     match crate::backup::read_manifest(&f) {
                         Ok(_) => app.dialogs.ext.restore_ask = Some(f),

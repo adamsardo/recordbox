@@ -54,6 +54,11 @@ pub(crate) fn apply(db: &Db, lib: &RbLibrary) -> Result<Summary> {
     db.set_setting_checked("rb_anlz", &serde_json::to_string(&rb_anlz)?)?;
     // Tracks the user removed from Recordbox stay removed.
     let removed: HashSet<String> = setting_json(db, "rb_removed_paths")?;
+    let mut unique = HashSet::new();
+    let duplicated: HashSet<_> = lib.tracks.iter().filter_map(|r| {
+        let path = r.xt.track.path.as_str();
+        (!unique.insert(path)).then_some(path)
+    }).collect();
     for rt in &lib.tracks {
         if removed.contains(&rt.xt.track.path) {
             continue;
@@ -171,6 +176,13 @@ pub(crate) fn apply(db: &Db, lib: &RbLibrary) -> Result<Summary> {
                 db.set_track_tag(id, *t, false)?;
             }
         }
+        if let Some(source) = &lib.source {
+            if duplicated.contains(rt.xt.track.path.as_str()) {
+                db.conn.execute("DELETE FROM native_edit_baseline WHERE track_id=?1", [id])?;
+            } else {
+                super::writeback::record_import(db, id, rt, source)?;
+            }
+        }
         seen.insert(rt.rb_id.clone(), rt.fingerprint.clone());
         idmap.insert(rt.rb_id.clone(), id);
     }
@@ -286,8 +298,10 @@ mod tests {
             extra: Default::default(),
         };
         RbLibrary {
+            source: None,
             tracks: vec![RbTrack {
                 rb_id: "7".into(),
+                native: None,
                 fingerprint: stamp.into(),
                 xt,
                 tags: vec![],
