@@ -1876,7 +1876,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             }
         } else {
             let ram = app.stem.hw.as_ref().map_or(0.0, |hw| hw.ram_gb);
-            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} requires GPU separation and {:.0} GB of memory. Detected {:.0} GB. STEMS backend: {}", quality.name, quality.min_ram_gb, ram, crate::stems::backend_status().1));
+            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} requires GPU separation and {:.0} GB of system RAM. Detected {:.0} GB of system RAM. STEMS backend: {}", quality.name, quality.min_ram_gb, ram, crate::stems::backend_status().1));
         }
         if radio(ui, cur != quality.id, "Prioritize speed") {
             pick = Some(speed);
@@ -1926,7 +1926,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
                     "{}{} CPU threads{} · STEMS backend: {}",
                     if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
                     hw.cores,
-                    if hw.ram_gb > 0.0 { format!(", {:.0} GB memory", hw.ram_gb) } else { String::new() },
+                    if hw.ram_gb > 0.0 { format!(", {:.0} GB system RAM", hw.ram_gb) } else { String::new() },
                     crate::stems::backend_status().1
                 ),
             );
@@ -1953,9 +1953,41 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             });
         });
         if automatic_available {
-            note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately. To separate a track manually, press a stem part button.");
+            note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately.");
         } else {
-            note(ui, "Automatic separation is paused. Cached parts still load. Choose Separate or Retry CPU to process one track.");
+            note(ui, "Automatic separation is paused. Cached parts still load. You can separate one loaded track on the CPU.");
+        }
+        if let Some(status) = app.stem.separation_status() {
+            kit::line(ui, &status);
+            if app.stem.separating.map(|(id, _)| id) == app.deck.track
+                && kit::block(ui, |ui| ui.add(btn("Stop separation")).clicked()) {
+                app.stop_separation();
+            }
+        } else if !app.prefs.show_stems {
+            note(ui, "Enable the STEMS Function above to separate a track from the active deck.");
+        } else if app.stem.downloading.is_none() {
+            if let Some(id) = app.deck.track {
+                if let Some(error) = app.stem.error_for(Some(id)) {
+                    note(ui, &error.detail);
+                }
+                if app.stem.loading == Some(id) {
+                    note(ui, "Loading saved parts for the active deck…");
+                } else if app.player.state.lock().stems.is_some() {
+                    note(ui, "Separated parts are ready on the active deck.");
+                } else if app.stem.model.is_some() {
+                    let action = if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu {
+                        "Separate on CPU"
+                    } else {
+                        "Separate"
+                    };
+                    let label = format!("{action} · Deck {}", app.px.active + 1);
+                    if kit::block(ui, |ui| ui.add(btn(label)).clicked()) {
+                        app.separate_loaded();
+                    }
+                }
+            } else {
+                note(ui, "Load a track on the active deck to separate it.");
+            }
         }
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         kit::block(ui, |ui| {

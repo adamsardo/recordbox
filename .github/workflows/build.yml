@@ -383,6 +383,8 @@ jobs:
           $dest = Join-Path $env:RUNNER_TEMP 'recordbox-directml-smoke'
           Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest
           $exe = Join-Path $dest "$($zip.BaseName)/recordbox.exe"
+          $status = & $exe --stems-status
+          if ($LASTEXITCODE -ne 0 -or "$status" -notmatch 'Windows DirectML build' -or "$status" -notmatch 'DirectML runtime files: present') { throw "Radeon archive diagnostics failed: $status" }
           $cpu = & $exe --stems-cpu --stems-device
           if ($LASTEXITCODE -ne 0 -or "$cpu" -notmatch 'CPU .*selected for this session') { throw "CPU selection failed: $cpu" }
           $device = & $exe --stems-device

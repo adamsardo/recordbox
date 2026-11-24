@@ -1388,9 +1388,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let retry_cpu = error.is_some_and(|e| e.retry_model.is_some());
     let status = if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
-    } else if let Some((_, pr)) = app.stem.separating {
-        let cpu = if app.stem.execution == crate::stems::SeparationDevice::Cpu { " on CPU" } else { "" };
-        format!("Separating with {model}{cpu}: {:.0}%", pr * 100.0)
+    } else if let Some(status) = app.stem.separation_status() {
+        status
     } else if app.stem.loading.is_some() {
         "Loading stems…".to_owned()
     } else if retry_cpu {
@@ -1401,6 +1400,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         String::new()
     } else if !loaded {
         "Load a track to separate it into parts.".to_owned()
+    } else if crate::stems::radeon_hold().is_some() {
+        format!("DirectML paused · {model} is available on CPU.")
     } else {
         format!("Not separated yet. Model: {model}.")
     };
@@ -1414,6 +1415,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             ui.ctx().copy_text(error.detail.clone());
             app.toast("Copied STEMS error details.");
         }
+    } else if let Some(reason) = crate::stems::radeon_hold() {
+        ui.interact(status_rect, ui.id().with("stem_driver_status"), Sense::hover()).on_hover_text(reason);
     } else if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
         ui.interact(status_rect, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
@@ -1421,11 +1424,12 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {
             app.stop_separation();
         }
-    } else if !have && loaded {
+    } else if !have && loaded && app.stem.loading != app.deck.track {
         let (label, help) = if retry_cpu { ("RETRY CPU", "Retry this track on the CPU with the same model") }
+            else if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu { ("SEPARATE ON CPU", "Separate this track on the CPU while DirectML is paused") }
             else { ("SEPARATE", "Split this track into vocal, instrument, bass and drum parts") };
         if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", label), app, help).clicked() {
-            if retry_cpu { app.separate_loaded_on(crate::stems::SeparationDevice::Cpu); } else { app.separate_loaded(); }
+            app.separate_loaded();
         }
     }
     if tip(seg_button(ui, at(1222.5, 40.0), "stems_back", "BACK", false), app, "Back to the cue and loop controls").clicked() {

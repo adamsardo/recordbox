@@ -31,6 +31,11 @@ pub(in crate::stems) struct Binding {
     pub(in crate::stems) shared_memory: bool,
 }
 
+fn use_shared_memory_profile(uma: Option<bool>) -> bool {
+    // The larger, single-pass model requires a confirmed discrete architecture.
+    uma.unwrap_or(true)
+}
+
 impl Binding {
     fn open_device(adapter: &IDXGIAdapter1) -> Result<ID3D12Device> {
         let mut d3d: Option<ID3D12Device> = None;
@@ -43,20 +48,20 @@ impl Binding {
         let d3d = Self::open_device(&adapter)?;
         let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
         // Query node zero of the same adapter that owns the execution queue.
-        let shared_memory = unsafe {
+        let uma = unsafe {
             d3d.CheckFeatureSupport(
                 D3D12_FEATURE_ARCHITECTURE,
                 std::ptr::from_mut(&mut arch).cast(),
                 std::mem::size_of_val(&arch) as u32,
             )
         }
-        .is_ok()
-            && arch.UMA.as_bool();
+        .ok()
+        .map(|()| arch.UMA.as_bool());
         Ok(Self {
             adapter,
             d3d: Some(d3d),
             name,
-            shared_memory,
+            shared_memory: use_shared_memory_profile(uma),
         })
     }
 
@@ -188,7 +193,12 @@ fn vega_driver_hold(name: &str, version: Option<u64>) -> Option<String> {
     if version.is_some_and(|v| v > REPORTED) {
         return None;
     }
-    let driver = version.filter(|&v| v != 0).map_or_else(
+    let driver = driver_version(version);
+    Some(format!("DirectML paused · {name} · driver {driver}. A device hang was reported on 26.20.14048.2. Use manual CPU separation or install a newer graphics driver."))
+}
+
+fn driver_version(version: Option<u64>) -> String {
+    version.filter(|&v| v != 0).map_or_else(
         || "unknown version".into(),
         |v| {
             format!(
@@ -199,15 +209,22 @@ fn vega_driver_hold(name: &str, version: Option<u64>) -> Option<String> {
                 v & 0xffff
             )
         },
-    );
-    Some(format!("DirectML paused · {name} · driver {driver}. A device hang was reported on 26.20.14048.2. Use manual CPU separation or install a newer graphics driver."))
+    )
+}
+
+struct Radeon {
+    index: u32,
+    adapter: IDXGIAdapter1,
+    name: String,
+    driver: Option<u64>,
+    dedicated_bytes: usize,
+    shared_bytes: usize,
 }
 
 // DXGI adapter descriptions are metadata. This path never creates a D3D12 device, queue or ORT session.
-fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
+fn adapters() -> Result<Vec<Radeon>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut adapters = Vec::new();
-    let mut held = None;
     for index in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
             Ok(a) => a,
@@ -227,12 +244,38 @@ fn candidates() -> Result<Vec<(u32, String, IDXGIAdapter1)>> {
         let version = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }
             .ok()
             .map(|v| v as u64);
-        if let Some(reason) = vega_driver_hold(&name, version) {
-            held = Some(reason);
-            continue;
-        }
-        adapters.push((index, name, adapter));
+        adapters.push(Radeon {
+            index, adapter, name, driver: version,
+            dedicated_bytes: desc.DedicatedVideoMemory,
+            shared_bytes: desc.SharedSystemMemory,
+        });
     }
+    Ok(adapters)
+}
+
+pub(in crate::stems) fn adapter_status() -> Result<String> {
+    let adapters = adapters()?;
+    ensure!(!adapters.is_empty(), "No physical AMD Radeon adapter found");
+    let mut lines = Vec::new();
+    for device in adapters {
+        let state = vega_driver_hold(&device.name, device.driver)
+            .unwrap_or_else(|| "Eligible for the DirectML device check".to_owned());
+        lines.push(format!(
+            "DXGI adapter {}: {} · driver {}\n  Reported dedicated video memory: {} MiB · shared system memory limit: {} MiB\n  {}",
+            device.index, device.name, driver_version(device.driver),
+            device.dedicated_bytes >> 20, device.shared_bytes >> 20, state
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn candidates() -> Result<Vec<Radeon>> {
+    let mut adapters = adapters()?;
+    let mut held = None;
+    adapters.retain(|device| match vega_driver_hold(&device.name, device.driver) {
+        Some(reason) => { held = Some(reason); false }
+        None => true,
+    });
     if adapters.is_empty() {
         if let Some(reason) = held {
             crate::stems::backend::hold_radeon(reason.clone());
@@ -246,7 +289,7 @@ pub(in crate::stems) fn available() -> Result<String> {
     candidates()?
         .into_iter()
         .next()
-        .map(|(_, name, _)| name)
+        .map(|device| device.name)
         .context("no hardware AMD Radeon adapter")
 }
 
@@ -261,7 +304,7 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
         .context("Loading the packaged ONNX Runtime")?
         .commit();
     let mut failures = Vec::new();
-    for (index, name, adapter) in eligible {
+    for Radeon { index, name, adapter, .. } in eligible {
         match Binding::new(adapter, name.clone()).and_then(|binding| {
             super::probe(Some(&binding))?;
             Ok(binding)
@@ -285,6 +328,13 @@ pub(in crate::stems) fn select() -> Result<(Binding, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_uma_uses_the_bounded_inference_profile() {
+        assert!(use_shared_memory_profile(None));
+        assert!(use_shared_memory_profile(Some(true)));
+        assert!(!use_shared_memory_profile(Some(false)));
+    }
 
     #[test]
     #[ignore = "run in a separate process with the software-only D3D12 WARP device"]
@@ -316,6 +366,18 @@ mod tests {
             assert!(error.is::<crate::stems::DirectMlFailure>());
         }
         assert!(SeparationDevice::Cpu.device()?.is_cpu());
+        // The deck must be able to finish an actual manual job after the driver stops.
+        let frames = 8192;
+        let samples: Vec<_> = (0..frames).flat_map(|i| {
+            let sample = (i as f32 * 0.03).sin() * 0.5;
+            [sample, sample]
+        }).collect();
+        let model = &crate::stems::CATALOG[1];
+        let stems = crate::stems::separate_with_device(model, &samples, 44_100, &mut |_| true, SeparationDevice::Cpu)?;
+        assert_eq!((stems.len, stems.data.len()), (frames, frames * 8));
+        assert!(stems.data.iter().all(|sample| sample.is_finite()));
+        assert!(stems.data.iter().any(|sample| sample.abs() > 1e-5));
+        assert!(crate::stems::radeon_hold().is_some());
         Ok(())
     }
 

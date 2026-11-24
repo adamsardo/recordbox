@@ -153,6 +153,11 @@ mod tests {
     #[ignore = "run in a fresh native test process before any inference"]
     fn idle_radeon_assessment_does_not_open_a_compute_backend() {
         assert!(super::BACKEND.get().is_none());
+        let report = crate::stems::status_report();
+        assert!(report.contains("Windows DirectML build"));
+        assert!(report.contains("System RAM:"));
+        assert!(report.contains("HTDemucs (recommended):"));
+        assert!(super::BACKEND.get().is_none(), "The passive CLI opened an inference device");
         let hardware = crate::stems::assess();
         let (detected, label) = super::status();
         assert_eq!(hardware.gpu, detected);
