@@ -599,6 +599,7 @@ impl egui::Widget for Btn {
         let g = ui.painter().layout_no_wrap(self.text, inter(self.size), if en { WHITE } else { OFF });
         let size = self.exact.unwrap_or(vec2((g.size().x + 24.0).max(self.min.x), self.min.y));
         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, en, g.text()));
         paint_button(ui.painter(), r, en && resp.hovered(), en && resp.is_pointer_button_down_on());
         ui.painter().galley(pos2(r.center().x - g.size().x / 2.0, r.center().y - g.size().y / 2.0), g, WHITE);
         resp

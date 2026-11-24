@@ -91,6 +91,37 @@ jobs:
         run: python -m unittest discover -s packaging -p 'test_*.py' -v
       - name: Application tests
         run: python packaging/run_tests.py --output reports
+      - name: Fetch public rekordbox 6 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/pyrekordbox
+          ref: 50b4604d98dfd52740aa9e76d80c3a32dfa451ba
+          path: fixtures/pyrekordbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.testdata/empty.mp3
+            /.testdata/rekordbox 6/master_locked.db
+            /.testdata/rekordbox 6/backup/share/
+            /.testdata/export/PIONEER/
+      - name: Fetch public rekordbox 7 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/rbox
+          ref: 9677e21448fe3a8462111b7df099b5608efcba90
+          path: fixtures/rbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.testdata/RBv7/demo/rekordbox/
+            /.testdata/RBv7/demo/export/PIONEER/
+      - name: Verify desktop write-back and USB compatibility on disposable v6 and v7 exports
+        env:
+          RECORDBOX_TEST_PYREKORDBOX: ${{ github.workspace }}/fixtures/pyrekordbox
+          RECORDBOX_TEST_RBOX: ${{ github.workspace }}/fixtures/rbox
+        run: |
+          cargo test --manifest-path app/Cargo.toml --locked rbimport::writeback:: -- --ignored --test-threads=1
+          cargo test --manifest-path app/Cargo.toml --locked export::public_device_tests:: -- --ignored --test-threads=1
       - name: Formatting report (existing formatting debt is advisory)
         shell: bash
         run: |
@@ -266,7 +297,8 @@ jobs:
         shell: bash
         run: |
           for test_filter in backup::tests db::sqlcipher_tests:: export::device_import::tests:: \
-            rbimport::snapshot_tests:: rbimport::schema_tests:: rbimport::merge::tests:: \
+            export::pdb::tests:: export::anlz::tests:: export::usb_target::tests:: \
+            rbimport::snapshot_tests:: rbimport::schema_tests:: rbimport::merge::tests:: rbimport::writeback:: \
             export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic \
             export::usb_fix_test::a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap; do
             cargo test --manifest-path app/Cargo.toml --release --locked "$test_filter" -- --test-threads=1

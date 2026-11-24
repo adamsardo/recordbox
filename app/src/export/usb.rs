@@ -2,10 +2,12 @@
 //! already there, copies audio into /Contents, writes analysis files and rewrites
 //! /PIONEER/rekordbox/export.pdb and exportExt.pdb.
 
+use super::usb_target as target;
+pub use target::{check_export_target, inspect_target, DeviceLayout};
 use super::anlz;
 use super::pdb::{self, dstr, dstr_ucs2, row_with_strings, Database, TableSpec};
 use crate::model::*;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -111,9 +113,9 @@ pub struct DeviceLibrary {
 }
 
 /// Export.pdb tables Recordbox keeps as they are (see [`DeviceLibrary::raw_tables`]).
-pub const KEPT_TABLES: [u32; 4] = [9, 10, 14, 15];
+pub const KEPT_TABLES: [u32; 5] = [9, 10, 14, 15, 16];
 /// exportExt.pdb tables kept as they are.
-pub const KEPT_EXT_TABLES: [u32; 6] = [0, 1, 2, 5, 6, 8];
+pub const KEPT_EXT_TABLES: [u32; 7] = [0, 1, 2, 5, 6, 7, 8];
 
 /// Active browse categories and sort options, in order, by COLUMNS id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,11 +194,11 @@ pub fn player_supported(ext: &str) -> bool {
 
 /// The drive carries rekordbox's newer OneLibrary catalogue (exportLibrary.db).
 pub fn has_onelibrary(root: &Path) -> bool {
-    root.join("PIONEER").join("rekordbox").join("exportLibrary.db").exists()
+    matches!(DeviceLayout::inspect(root), Ok(DeviceLayout::OneLibrary | DeviceLayout::Mixed))
 }
 
 pub fn pdb_path(root: &Path) -> PathBuf {
-    root.join("PIONEER").join("rekordbox").join("export.pdb")
+    target::Catalogs::inspect(root).ok().and_then(|c| c.main).unwrap_or_else(|| root.join("PIONEER/rekordbox/export.pdb"))
 }
 
 fn sidecar_path(root: &Path) -> PathBuf {
@@ -214,8 +216,25 @@ pub fn read_cue_record(root: &Path) -> HashMap<String, String> {
 
 /// Update the drive's cue record (Recordbox's own folder; players never read it).
 pub fn write_cue_record(root: &Path, record: &HashMap<String, String>) -> Result<()> {
+    write_private(root, "cues.json", &serde_json::to_vec_pretty(&record.iter().collect::<BTreeMap<_, _>>())?)
+}
+
+pub(super) fn check_preference_target(root: &Path) -> Result<DeviceLayout> {
+    let layout = check_export_target(root)?;
+    if layout != DeviceLayout::Empty {
+        read_device(root).context("reading the classic catalog before changing this device")?;
+    }
+    Ok(layout)
+}
+
+pub(super) fn write_private(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    check_preference_target(root)?;
+    let path = root.join(".Recordbox").join(name);
+    target::confined(root, &path)?;
+    target::confined(root, &tmp_for(&path))?;
+    anyhow::ensure!(target::managed_file(root, &path), "Unknown private USB record");
     std::fs::create_dir_all(root.join(".Recordbox"))?;
-    write_atomic(&cue_record_path(root), &serde_json::to_vec_pretty(&record.iter().collect::<BTreeMap<_, _>>())?)
+    write_atomic(&path, bytes)
 }
 
 /// A track whose cues on the drive differ from what Recordbox last wrote there: edited on a
@@ -266,41 +285,50 @@ pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> 
     out
 }
 
-/// Files in the drive's music, analysis and artwork folders that no track in its library uses
-/// (left behind by deleted playlists, other programs or copies made by hand), with sizes.
-/// Nothing is listed while an interrupted export's journal is still on the drive.
-pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
-    // A OneLibrary database (which Recordbox can't read) may use files export.pdb doesn't.
-    if journal_dir(root).join("journal.log").exists() || has_onelibrary(root) {
-        return vec![];
-    }
-    // Compared after Unicode normalisation and case folding: FAT/exFAT names are
-    // case-insensitive and macOS may hand back decomposed accents, so a name spelled
-    // differently in the database is still recognised as used.
-    fn norm(p: &Path) -> String {
-        use unicode_normalization::UnicodeNormalization;
-        p.to_string_lossy().nfc().collect::<String>().to_lowercase()
-    }
-    let mut used: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+fn asset_key(path: &Path) -> String {
+    // A PDB uses '/' even on Windows. Directory enumeration can return the
+    // same location with native separators, including an entirely different
+    // spelling of the path below the mount point.
+    #[cfg(windows)]
+    return path_key(&path.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(windows))]
+    path_key(&path.to_string_lossy())
+}
+
+/// Every named asset still owned by a classic track. Use the same comparison
+/// for manual cleanup and track removal on FAT and macOS volumes.
+fn referenced_files(root: &Path, lib: &DeviceLibrary) -> std::collections::HashSet<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in lib.tracks.values() {
         if !t.file_path.is_empty() {
-            used.insert(root.join(t.file_path.trim_start_matches('/')));
+            used.insert(asset_key(&root.join(t.file_path.trim_start_matches('/'))));
         }
         if let Some(b) = anlz_base(&t.analyze_path) {
             let b = root.join(b.trim_start_matches('/'));
             for e in ANLZ_EXTS {
-                used.insert(b.with_extension(e));
+                used.insert(asset_key(&b.with_extension(e)));
             }
         }
         if !t.artwork_path.is_empty() {
             let a = root.join(t.artwork_path.trim_start_matches('/'));
             if let (Some(stem), Some(ext)) = (a.file_stem().map(|x| x.to_string_lossy().to_string()), a.extension().map(|x| x.to_string_lossy().to_string())) {
-                used.insert(a.with_file_name(format!("{stem}_m.{ext}")));
+                used.insert(asset_key(&a.with_file_name(format!("{stem}_m.{ext}"))));
             }
-            used.insert(a);
+            used.insert(asset_key(&a));
         }
     }
-    let used_norm: std::collections::HashSet<String> = used.iter().map(|p| norm(p)).collect();
+    used
+}
+
+/// Files in the drive's music, analysis and artwork folders that no track in its library uses
+/// (left behind by deleted playlists, other programs or copies made by hand), with sizes.
+/// Nothing is listed while an interrupted export's journal is still on the drive.
+pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
+    // A OneLibrary database (which Recordbox can't read) may use files export.pdb doesn't.
+    if journal_dir(root).join("journal.log").exists() || !matches!(check_export_target(root), Ok(DeviceLayout::Classic)) {
+        return vec![];
+    }
+    let used = referenced_files(root, lib);
     let mut out = vec![];
     let mut stack: Vec<PathBuf> = [root.join("Contents"), root.join("PIONEER").join("USBANLZ"), root.join("PIONEER").join("Artwork")].into_iter().filter(|d| d.is_dir()).collect();
     while let Some(d) = stack.pop() {
@@ -310,7 +338,7 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
                 stack.push(p);
-            } else if ft.is_file() && !used_norm.contains(&norm(&p)) {
+            } else if ft.is_file() && !used.contains(&asset_key(&p)) {
                 let name = e.file_name().to_string_lossy().to_string();
                 // macOS bookkeeping files are not the library's concern.
                 if name == ".DS_Store" || name.starts_with("._") {
@@ -327,10 +355,12 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
 /// Delete the given unused files (re-checked against the drive's current library) and then
 /// any folders left empty. Returns how many files were deleted.
 pub fn delete_unused(root: &Path, files: &[PathBuf]) -> Result<usize> {
+    anyhow::ensure!(check_export_target(root)? == DeviceLayout::Classic, "Cleanup needs a classic-only device catalog");
     let lib = read_device(root)?;
     let still: std::collections::HashSet<PathBuf> = unused_files(root, &lib).into_iter().map(|f| f.0).collect();
     let mut n = 0;
     for f in files.iter().filter(|f| still.contains(*f)) {
+        target::confined(root, f)?;
         if std::fs::remove_file(f).is_ok() {
             n += 1;
             let mut dir = f.parent().map(Path::to_path_buf);
@@ -353,19 +383,19 @@ pub fn delete_unused(root: &Path, files: &[PathBuf]) -> Result<usize> {
 /// is read or written.
 pub fn migrate_app_dir(root: &Path) {
     let (old, new) = (root.join(".PrepDeck"), root.join(".Recordbox"));
-    if !new.exists() && old.is_dir() {
+    if !new.exists() && old.is_dir() && check_export_target(root).is_ok() {
         let _ = std::fs::rename(&old, &new);
         sync_dir(root);
     }
 }
 
 pub fn read_device(root: &Path) -> Result<DeviceLibrary> {
-    migrate_app_dir(root);
-    let p = pdb_path(root);
-    if !p.exists() {
+    let catalogs = target::Catalogs::inspect(root)?;
+    let Some(main) = catalogs.main.as_ref() else {
+        anyhow::ensure!(catalogs.layout() == DeviceLayout::Empty, "OneLibrary (Device Library Plus) is present without a readable classic catalog");
         return Ok(DeviceLibrary::default());
-    }
-    let mut lib = parse_pdb(std::fs::read(&p)?)?;
+    };
+    let mut lib = parse_pdb(std::fs::read(main)?)?;
     // Sources recorded by this app (so re-exports update instead of duplicating).
     if let Ok(s) = std::fs::read_to_string(sidecar_path(root)) {
         if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&s) {
@@ -376,15 +406,16 @@ pub fn read_device(root: &Path) -> Result<DeviceLibrary> {
             }
         }
     }
-    let ext = root.join("PIONEER").join("rekordbox").join("exportExt.pdb");
-    if let Ok(b) = std::fs::read(ext) {
-        let _ = read_ext_tags(b, &mut lib);
+    if let Some(ext) = catalogs.ext {
+        read_ext_tags(std::fs::read(ext)?, &mut lib).context("reading the extended classic USB catalog")?;
     }
     Ok(lib)
 }
 
 pub fn parse_pdb(bytes: Vec<u8>) -> Result<DeviceLibrary> {
     let db = Database::parse(bytes)?;
+    db.validate_table_set(0..20)?;
+    db.validate_track_rows()?;
     let mut names: HashMap<(u32, u32), String> = HashMap::new();
     // artists (2)
     for (h, o) in db.rows(2) {
@@ -518,7 +549,7 @@ pub fn parse_pdb(bytes: Vec<u8>) -> Result<DeviceLibrary> {
     // Tables Recordbox does not manage, kept page by page.
     for t in KEPT_TABLES.into_iter().chain([19]) {
         let pages = db.data_pages(t);
-        if !pages.is_empty() {
+        if t == 16 || !pages.is_empty() {
             lib.raw_tables.insert(t, pages);
         }
     }
@@ -543,9 +574,11 @@ fn dstr_len(data: &[u8], pos: usize) -> usize {
 
 fn read_ext_tags(bytes: Vec<u8>, lib: &mut DeviceLibrary) -> Result<()> {
     let db = Database::parse(bytes)?;
+    db.validate_table_set(0..9)?;
+    db.validate_ext_rows()?;
     for t in KEPT_EXT_TABLES {
         let pages = db.data_pages(t);
-        if !pages.is_empty() {
+        if t == 7 || !pages.is_empty() {
             lib.raw_ext_tables.insert(t, pages);
         }
     }
@@ -592,9 +625,9 @@ fn read_ext_tags(bytes: Vec<u8>, lib: &mut DeviceLibrary) -> Result<()> {
         let r = db.row_bytes(h, o);
         let track = pdb::rd_u32(r, 4);
         let tag = pdb::rd_u32(r, 8);
-        if let (Some(t), Some(n)) = (lib.tracks.get_mut(&track), by_id.get(&tag)) {
-            t.tags.push(n.clone());
-        }
+        let t = lib.tracks.get_mut(&track).with_context(|| format!("Unknown track {track} in extended USB tag memberships"))?;
+        let name = by_id.get(&tag).with_context(|| format!("Unknown tag {tag} in extended USB tag memberships"))?;
+        t.tags.push(name.clone());
     }
     Ok(())
 }
@@ -811,6 +844,7 @@ struct Created {
     replaced: Vec<(PathBuf, PathBuf)>,
     publishing: bool,
     committed: bool,
+    mixed: bool,
     /// Files to delete after publication ("D" lines).
     doomed: Vec<PathBuf>,
 }
@@ -820,6 +854,10 @@ fn remove_file_and_empty_dirs(root: &Path, f: &Path) {
     if !f.starts_with(root) || std::fs::remove_file(f).is_err() {
         return;
     }
+    prune_empty_parents(root, f);
+}
+
+fn prune_empty_parents(root: &Path, f: &Path) {
     let keep = [root.to_path_buf(), root.join("Contents"), root.join("PIONEER"), root.join(".PIONEER"), root.join("PIONEER").join("USBANLZ"), root.join("PIONEER").join("Artwork"), root.join(".Recordbox")];
     let mut dir = f.parent().map(Path::to_path_buf);
     while let Some(d) = dir {
@@ -859,12 +897,15 @@ fn fault_point() -> Result<()> {
 
 impl Created {
     fn begin(root: &Path) -> Result<Created> {
+        let mixed = check_export_target(root)? == DeviceLayout::Mixed;
         let dir = journal_dir(root);
-        let _ = std::fs::remove_dir_all(&dir);
+        target::confined(root, &dir)?;
+        anyhow::ensure!(!dir.join("journal.log").exists(), "An earlier USB export needs recovery before writing");
+
         std::fs::create_dir_all(&dir)?;
-        let log = std::fs::File::create(dir.join("journal.log"))?;
-        let mut c = Created { root: root.to_path_buf(), dir, log: Some(log), files: vec![], replaced: vec![], publishing: false, committed: false, doomed: vec![] };
-        c.line("B", true)?;
+        let log = std::fs::File::create_new(dir.join("journal.log"))?;
+        let mut c = Created { root: root.to_path_buf(), dir, log: Some(log), files: vec![], replaced: vec![], publishing: false, committed: false, mixed, doomed: vec![] };
+        c.line(if mixed { "B\tmixed" } else { "B" }, true)?;
         Ok(c)
     }
     fn rel(&self, p: &Path) -> String {
@@ -883,6 +924,8 @@ impl Created {
     }
     /// A new file this export is about to write.
     fn note_created(&mut self, p: &Path) -> Result<()> {
+        target::confined(&self.root, p)?;
+        anyhow::ensure!(target::managed_file(&self.root, p) && !p.exists(), "Expected an unused USB filename: {}", p.display());
         self.files.push(p.to_path_buf());
         let l = format!("C\t{}", self.rel(p));
         // Durable before the file exists, so a crash can't leave an unlisted file.
@@ -890,10 +933,17 @@ impl Created {
     }
     /// About to write `p`: keep a durable copy of what is there now, or note it as new.
     fn will_replace(&mut self, p: &Path) -> Result<()> {
+        target::confined(&self.root, p)?;
+        target::confined(&self.root, &tmp_for(p))?;
+        anyhow::ensure!(target::managed_file(&self.root, p), "Cannot replace an unmanaged USB file: {}", p.display());
+        anyhow::ensure!(!self.mixed || p.starts_with(self.root.join(".Recordbox")) || !p.exists(),
+            "Existing file {} may be shared with OneLibrary. Choose a classic-only drive to replace it.", p.display());
         if !p.is_file() {
             return self.note_created(p);
         }
         let backup = self.dir.join(format!("r{}", self.replaced.len()));
+        target::confined(&self.root, &backup)?;
+        anyhow::ensure!(!backup.exists(), "USB journal backup already exists");
         std::fs::copy(p, &backup)?;
         std::fs::File::options().write(true).open(&backup)?.sync_all()?;
         let l = format!("R\t{}\t{}", self.rel(p), backup.file_name().unwrap_or_default().to_string_lossy());
@@ -904,6 +954,8 @@ impl Created {
     /// A file to delete once the new databases are published (a removed track's audio,
     /// analysis and artwork). Listed durably first, so the deletion is finished after a crash.
     fn will_delete(&mut self, p: &Path) -> Result<()> {
+        target::confined(&self.root, p)?;
+        anyhow::ensure!(!self.mixed && target::managed_file(&self.root, p), "File deletion requires a managed file on a classic-only drive");
         let l = format!("D\t{}", self.rel(p));
         self.doomed.push(p.to_path_buf());
         self.line(&l, true)
@@ -941,58 +993,101 @@ impl Drop for Created {
 /// Finish or undo an export that did not complete, from the drive's journal. Returns what was
 /// done, or None when there was nothing to recover.
 pub fn recover_device(root: &Path) -> Option<String> {
+    match recover_checked(root) {
+        Ok(result) => result.map(str::to_owned),
+        Err(e) => Some(format!("USB recovery paused: {e:#}")),
+    }
+}
+
+fn recover_before_write(root: &Path) -> Result<()> {
+    recover_checked(root).map(|_| ())
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn recover_checked(root: &Path) -> Result<Option<&'static str>> {
+    let layout = check_export_target(root)?;
     migrate_app_dir(root);
     let dir = journal_dir(root);
-    let text = std::fs::read_to_string(dir.join("journal.log")).ok()?;
-    let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
-    let rb = root.join("PIONEER").join("rekordbox");
-    let msg = if lines.iter().any(|l| l[0] == "P") {
-        for f in ["export.pdb", "exportExt.pdb"] {
-            if tmp_for(&rb.join(f)).exists() {
-                let _ = publish_tmp(&rb.join(f));
-            }
-        }
-        // Deletions the change had listed (files of removed tracks) are carried out.
-        for l in &lines {
-            if let ["D", path] = l.as_slice() {
-                remove_file_and_empty_dirs(root, &root.join(path));
-            }
-        }
-        "An export to this device that was interrupted has been completed."
-    } else {
-        for l in lines.iter().rev() {
-            match l.as_slice() {
-                ["R", path, backup] => {
-                    if let Ok(b) = std::fs::read(dir.join(backup)) {
-                        let _ = write_atomic(&root.join(path), &b);
-                    }
-                }
-                ["C", path] => {
-                    let p = root.join(path);
-                    let _ = std::fs::remove_file(&p);
-                    // Folders this export created and left empty go too (never the top ones).
-                    let mut dir = p.parent().map(Path::to_path_buf);
-                    while let Some(d) = dir {
-                        if d == root || d == root.join("Contents") || d == root.join("PIONEER") || d == root.join(".Recordbox") || !d.starts_with(root) || std::fs::remove_dir(&d).is_err() {
-                            break;
-                        }
-                        dir = d.parent().map(Path::to_path_buf);
-                    }
-                }
-                _ => {}
-            }
-            // Half-written replacements of any listed file.
-            if let Some(path) = l.get(1) {
-                let _ = std::fs::remove_file(tmp_for(&root.join(path)));
-            }
-        }
-        for f in ["export.pdb", "exportExt.pdb"] {
-            let _ = std::fs::remove_file(tmp_for(&rb.join(f)));
-        }
-        "An export to this device that was interrupted has been undone; the device is as it was before."
+    let log = dir.join("journal.log");
+    target::confined(root, &log)?;
+    let metadata = match std::fs::metadata(&log) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
-    let _ = std::fs::remove_dir_all(&dir);
-    Some(msg.to_string())
+    anyhow::ensure!(metadata.len() <= 32 * 1024 * 1024, "USB recovery journal is too large");
+    let text = std::fs::read_to_string(log)?;
+    let mut records = vec![];
+    let mut published = false;
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or("");
+    // An interrupted creation can leave the journal empty before any file is touched.
+    anyhow::ensure!(matches!(header, "" | "B" | "B\tmixed"), "Unknown USB recovery journal format");
+    for line in lines {
+        let parts: Vec<_> = line.split('\t').collect();
+        if parts.as_slice() == ["P"] {
+            anyhow::ensure!(!published, "Duplicate USB publication marker");
+            published = true;
+            continue;
+        }
+        anyhow::ensure!(!published, "Unexpected record after USB publication");
+        let (kind, raw, backup) = match parts.as_slice() {
+            [kind @ ("C" | "D"), path] => (*kind, *path, None),
+            ["R", path, backup] => {
+                anyhow::ensure!(backup.strip_prefix('r').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|d| d.is_ascii_digit())), "Unknown USB journal backup");
+                let copy = dir.join(backup);
+                target::confined(root, &copy)?;
+                anyhow::ensure!(copy.is_file(), "Missing USB recovery backup {}", copy.display());
+                ("R", *path, Some(copy))
+            }
+            _ => anyhow::bail!("Incomplete or unrecognized USB recovery record"),
+        };
+        let path = root.join(raw.replace('\\', "/"));
+        target::confined(root, &path)?;
+        target::confined(root, &tmp_for(&path))?;
+        anyhow::ensure!(target::managed_file(root, &path), "Unrecognized USB recovery destination");
+        anyhow::ensure!(layout != DeviceLayout::Mixed || path.starts_with(root.join(".Recordbox")) || (header == "B\tmixed" && kind == "C"),
+            "The interrupted operation touched files which may now be shared with OneLibrary; its journal is retained");
+        records.push((kind, path, backup));
+    }
+    let rb = root.join("PIONEER/rekordbox");
+    let catalogs = [rb.join("export.pdb"), rb.join("exportExt.pdb")];
+    for path in &catalogs {
+        target::confined(root, path)?;
+        target::confined(root, &tmp_for(path))?;
+    }
+    if published {
+        for path in &catalogs {
+            if tmp_for(path).exists() { publish_tmp(path)?; }
+        }
+        for (kind, path, _) in records {
+            if kind == "D" {
+                remove_if_present(&path)?;
+                prune_empty_parents(root, &path);
+            }
+        }
+    } else {
+        for (kind, path, backup) in records.into_iter().rev() {
+            if let Some(backup) = backup {
+                write_atomic(&path, &std::fs::read(backup)?)?;
+            } else if kind == "C" {
+                remove_if_present(&path)?;
+                prune_empty_parents(root, &path);
+            }
+            remove_if_present(&tmp_for(&path))?;
+        }
+        for path in &catalogs { remove_if_present(&tmp_for(path))?; }
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(Some(if published { "An interrupted export to this device has been completed." }
+        else { "An interrupted export to this device has been undone." }))
 }
 
 pub(crate) fn sha256_file(p: &Path) -> Result<[u8; 32]> {
@@ -1030,7 +1125,7 @@ fn next_anlz_name(dir: &Path, reserved: Option<&i32>) -> String {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.len() >= 4 && name[..4].eq_ignore_ascii_case("ANLZ") {
+            if name.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("ANLZ")) {
                 let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let v = parse_anlz_suffix(stem.get(4..).unwrap_or(""));
                 max = max.max(v);
@@ -1045,12 +1140,15 @@ fn next_anlz_name(dir: &Path, reserved: Option<&i32>) -> String {
 
 /// "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT" -> "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000".
 pub fn anlz_base(analyze_path: &str) -> Option<String> {
-    let p = analyze_path.strip_suffix(".DAT").or_else(|| analyze_path.strip_suffix(".dat"))?;
-    if p.starts_with("/PIONEER/USBANLZ/") || p.starts_with("/.PIONEER/USBANLZ/") {
-        Some(p.to_string())
-    } else {
-        None
-    }
+    if !pdb::device_relative_path(analyze_path) { return None; }
+    let (base, extension) = analyze_path.rsplit_once('.')?;
+    let mut segments = base.strip_prefix('/')?.split('/');
+    let pioneer = segments.next()?;
+    let directory = segments.next()?;
+    (extension.eq_ignore_ascii_case("dat")
+        && (pioneer.eq_ignore_ascii_case("PIONEER") || pioneer.eq_ignore_ascii_case(".PIONEER"))
+        && directory.eq_ignore_ascii_case("USBANLZ")
+        && segments.next().is_some()).then(|| base.to_owned())
 }
 
 /// Copy the drive's current databases to /.Recordbox/backup before they are replaced,
@@ -1061,13 +1159,16 @@ fn backup_device_db(root: &Path) {
         return;
     }
     let dir = root.join(".Recordbox").join("backup");
-    if std::fs::create_dir_all(&dir).is_err() {
+    if target::confined(root, &dir).is_err() || std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     for f in ["export.pdb", "exportExt.pdb"] {
         if src.join(f).exists() {
-            let _ = std::fs::copy(src.join(f), dir.join(format!("{stamp}-{f}")));
+            let destination = dir.join(format!("{stamp}-{f}"));
+            if target::confined(root, &destination).is_ok() {
+                let _ = std::fs::copy(src.join(f), destination);
+            }
         }
     }
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1092,6 +1193,8 @@ fn sync_dir(dir: &Path) {
 /// Copy a media file to the drive via a temporary name, flush it to the device and check
 /// that the full length arrived before giving it its final name.
 fn copy_durable(src: &Path, dest: &Path, created: &mut Created) -> Result<()> {
+    target::confined(&created.root, dest)?;
+    anyhow::ensure!(!created.mixed || !dest.exists(), "An existing audio file may be shared with OneLibrary. Choose a classic-only drive to replace it.");
     let tmp = dest.with_file_name(format!("{}.part", dest.file_name().unwrap_or_default().to_string_lossy()));
     created.note_created(&tmp)?;
     let n = std::fs::copy(src, &tmp)?;
@@ -1114,9 +1217,70 @@ fn copy_durable(src: &Path, dest: &Path, created: &mut Created) -> Result<()> {
     Ok(())
 }
 
-/// A rekordbox 7 `.3EX` file: a MessagePack map with the single key "embedding".
-pub fn is_3ex(b: &[u8]) -> bool {
-    b.len() > 11 && b[0] == 0x81 && b[1] == 0xa9 && &b[2..11] == b"embedding"
+/// Native v7 embeddings carry track-specific values. Enumerate once per analysis
+/// folder so a case-sensitive mount also sees alternative filename spellings.
+fn has_device_embedding(
+    root: &Path,
+    base: &Path,
+    folders: &mut HashMap<PathBuf, std::collections::HashSet<String>>,
+) -> Result<bool> {
+    let path = base.with_extension("3EX");
+    target::confined(root, &path)?;
+    let folder = path.parent().context("missing USB analysis folder")?;
+    if !folders.contains_key(folder) {
+        let mut names = std::collections::HashSet::new();
+        match std::fs::read_dir(folder) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if let Some(name) = name
+                        .to_str()
+                        .filter(|n| n.to_ascii_lowercase().ends_with(".3ex"))
+                    {
+                        names.insert(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        folders.insert(folder.to_owned(), names);
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid USB analysis filename")?;
+    Ok(folders[folder].contains(&name.to_ascii_lowercase()))
+}
+
+fn embedding_grid_unchanged(
+    original: &HashMap<&str, Vec<(String, Vec<u8>)>>,
+    files: &anlz::AnlzFiles,
+) -> bool {
+    fn grid_sections(list: &[(String, Vec<u8>)]) -> impl Iterator<Item = &[u8]> {
+        list.iter()
+            .filter(|(tag, _)| matches!(tag.as_str(), "PQTZ" | "PQT2"))
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+    for (extension, data) in [
+        ("DAT", &files.dat),
+        ("EXT", &files.ext),
+        ("2EX", &files.ex2),
+    ] {
+        let old = original
+            .get(extension)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if extension == "DAT" && old.iter().filter(|(tag, _)| tag == "PQTZ").count() != 1 {
+            return false;
+        }
+        let proposed = anlz::section_list(data);
+        if !grid_sections(old).eq(grid_sections(&proposed)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Run an export step so that a panic inside it becomes an error result instead of taking
@@ -1270,11 +1434,13 @@ fn short_list(items: &[String], n: usize) -> String {
 
 pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
     use std::sync::atomic::Ordering::Relaxed;
+    use sha2::Digest;
     let root = req.root.clone();
     if !root.is_dir() {
         return Err(anyhow!("The device is not available"));
     }
-    recover_device(&root);
+    let layout = check_export_target(&root)?;
+    recover_before_write(&root)?;
     let mut lib = match read_device(&root) {
         Ok(l) => l,
         Err(e) => return Err(anyhow!("Device library is corrupted ({e}). Nothing was changed.")),
@@ -1364,6 +1530,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     // Analysis numbers handed out during this export, per folder, so two new tracks that
     // share a folder get different numbers before either file exists.
     let mut reserved: HashMap<String, i32> = HashMap::new();
+    let mut embedding_folders = HashMap::new();
+    let mut duplicate_analysis_paths = None;
     let mut next_id = lib.tracks.keys().max().copied().unwrap_or(0) + 1;
     let fat32 = req.fs == "msdos";
     let decomposed = fs_decomposes(&req.fs);
@@ -1418,10 +1586,51 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             // A track rekordbox itself exported to this drive (no Recordbox record of it): the
             // row with this track's content path and file size is updated in place.
             .or_else(|| foreign_row(&lib, &root, t, src, src_len, &taken).map(|id| (id, lib.tracks[&id].file_path.clone())));
+        let mut protects_embedding = false;
+        if let Some((id, path)) = &existing {
+            let current = &lib.tracks[id];
+            if let Some(base) = anlz_base(&current.analyze_path) {
+                protects_embedding = has_device_embedding(
+                    &root, &root.join(base.trim_start_matches('/')), &mut embedding_folders,
+                )?;
+            }
+            if protects_embedding {
+                let dest = root.join(path.trim_start_matches('/'));
+                target::confined(&root, &dest)?;
+                anyhow::ensure!(
+                    dest.is_file() && std::fs::metadata(&dest)?.len() == src_len
+                        && sha256_file(src)? == sha256_file(&dest)?,
+                    "Track {id} has an existing USB .3EX embedding. Its source and device audio must match before updating it."
+                );
+                let duplicates = duplicate_analysis_paths.get_or_insert_with(|| {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut duplicate = std::collections::HashSet::new();
+                    for track in lib.tracks.values().filter(|t| !t.analyze_path.is_empty()) {
+                        let key = path_key(&track.analyze_path);
+                        if !seen.insert(key.clone()) {
+                            duplicate.insert(key);
+                        }
+                    }
+                    duplicate
+                });
+                anyhow::ensure!(
+                    !duplicates.contains(&path_key(&current.analyze_path)),
+                    "Track {id} shares its USB .3EX embedding with a second device track."
+                );
+            }
+        }
         let (dev_id, usb_path) = match existing {
             Some((id, p)) if root.join(p.trim_start_matches('/')).exists() => {
                 let dest = root.join(p.trim_start_matches('/'));
-                if req.recopy_changed && source_changed(src, &dest) {
+                target::confined(&root, &dest)?;
+                // An embedded track already had its complete audio checked above.
+                let recopy = !protects_embedding && req.recopy_changed && source_changed(src, &dest);
+                // FAT timestamps are coarse. A newer local copy with identical bytes
+                // can reuse the shared file even when OneLibrary is also on the drive.
+                let same_shared_file = recopy && layout == DeviceLayout::Mixed
+                    && std::fs::metadata(&dest)?.len() == src_len
+                    && sha256_file(src)? == sha256_file(&dest)?;
+                if recopy && !same_shared_file {
                     // The local file changed since it was copied: copy it again to the same place.
                     copy_durable(src, &dest, &mut created)?;
                     report.copied += 1;
@@ -1434,6 +1643,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                 // The file went missing from the drive: copy it back to the same place, keeping
                 // the track's ID, playlists and analysis path.
                 let dest = root.join(p.trim_start_matches('/'));
+                target::confined(&root, &dest)?;
+                anyhow::ensure!(target::managed_file(&root, &dest), "Cannot create audio outside the existing managed USB layout");
                 std::fs::create_dir_all(dest.parent().unwrap())?;
                 copy_durable(src, &dest, &mut created)?;
                 report.copied += 1;
@@ -1461,6 +1672,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                     }
                 }
                 let dest = root.join(usb.trim_start_matches('/'));
+                target::confined(&root, &dest)?;
+                anyhow::ensure!(target::managed_file(&root, &dest), "Cannot create audio outside the existing managed USB layout");
                 std::fs::create_dir_all(dest.parent().unwrap())?;
                 copy_durable(src, &dest, &mut created)?;
                 report.copied += 1;
@@ -1491,14 +1704,23 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         if let Some(b) = anlz_base(&prev.analyze_path) {
             let b = root.join(b.trim_start_matches('/'));
             for e in ["DAT", "EXT", "2EX"] {
-                device.insert(e, anlz::read_valid_section_list(&b.with_extension(e)));
+                if let Some(bytes) = anlz::device_companion(&b.with_extension(e), &prev.file_path)? {
+                    device.insert(e, anlz::section_list(&bytes));
+                }
             }
         }
         // Without "including cue points" a track that is already on the drive keeps its cues.
         let device_cues: Option<Vec<Cue>> = (req.keep_device_cues && lib.tracks.contains_key(&dev_id)).then(|| anlz::parse_cues(device.get("EXT").map(Vec::as_slice).unwrap_or(&[]), device.get("DAT").map(Vec::as_slice).unwrap_or(&[]))).filter(|_| device.values().any(|l| !l.is_empty()));
         let cues: &[Cue] = device_cues.as_deref().unwrap_or(&et.cues);
-        let ov = Some(anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device, pvdi: et.vocal.as_deref().map(anlz::pvdi) });
-        let files = anlz::build_with(&usb_path, &beats, &wave, cues, t.raw_samples, t.sample_rate, ov.as_ref());
+        let ov = anlz::Overrides { sections, grid_same: et.grid_same, pssi: phrases.get(&t.id).map(crate::phrase::pssi), device, pvdi: et.vocal.as_deref().map(anlz::pvdi) };
+        let files = anlz::build_with(&usb_path, &beats, &wave, cues, t.raw_samples, t.sample_rate, Some(&ov));
+        let bpm100 = row_tempo(et.grid.as_ref(), full_len.max(t.duration), t.bpm);
+        if protects_embedding {
+            anyhow::ensure!(
+                prev.bpm100 == bpm100 && embedding_grid_unchanged(&ov.device, &files),
+                "Track {dev_id} has an existing USB .3EX embedding. The native BPM or beat-grid timing would change; re-analyse it in Rekordbox."
+            );
+        }
         let base = match anlz_base(&prev.analyze_path) {
             Some(b) => b,
             None => {
@@ -1510,25 +1732,18 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             }
         };
         let base_fs = root.join(base.trim_start_matches('/'));
+        target::confined(&root, &base_fs)?;
+        anyhow::ensure!(target::managed_file(&root, &base_fs), "Cannot create analysis outside the existing managed USB layout");
         std::fs::create_dir_all(base_fs.parent().unwrap())?;
         for (ext_name, data) in [("DAT", &files.dat), ("EXT", &files.ext), ("2EX", &files.ex2)] {
             let path = base_fs.with_extension(ext_name);
+            target::confined(&root, &path)?;
+            if layout == DeviceLayout::Mixed && path.is_file() && sha256_file(&path)? == <[u8;32]>::from(sha2::Sha256::digest(data)) { continue; }
             created.will_replace(&path)?;
             write_atomic(&path, data)?;
         }
-        // rekordbox 7's fourth analysis file (.3EX: not a tagged-section file but a MessagePack
-        // map {"embedding": {...}} of floating-point vectors, see MECHANICS.md). Recordbox
-        // cannot compute it; for a track synced from the rekordbox library its own file goes
-        // along unchanged, next to the other three.
-        if let Some(src3) = et.rb_anlz.as_ref().map(|b| b.with_extension("3EX")).filter(|p| p.is_file()) {
-            if let Ok(bytes) = std::fs::read(&src3) {
-                if is_3ex(&bytes) {
-                    let path = base_fs.with_extension("3EX");
-                    created.will_replace(&path)?;
-                    write_atomic(&path, &bytes)?;
-                }
-            }
-        }
+        // A desktop .3EX belongs to its native track identity. No verified USB
+        // writer or cross-library ID mapping exists for that embedding.
         cue_record.insert(usb_path.clone(), anlz::cue_fingerprint(&anlz::parse_cues(&anlz::section_list(&files.ext), &anlz::section_list(&files.dat))));
         // Artwork: one file per distinct picture. Tracks showing the same picture (an album)
         // share one artwork row, as real exports do (num_rows: 2,178 artwork rows for 3,886
@@ -1544,7 +1759,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
                     // This track's own file is reused only when no other track shows it, else
                     // the next number is taken.
                     let shared = |p: &str| lib.tracks.values().any(|o| o.id != dev_id && o.artwork_path == p);
-                    let own = !prev.artwork_path.is_empty() && prev.artwork_path.starts_with("/PIONEER/Artwork/") && !shared(&prev.artwork_path);
+                    let own = layout != DeviceLayout::Mixed && !prev.artwork_path.is_empty() && prev.artwork_path.starts_with("/PIONEER/Artwork/") && !shared(&prev.artwork_path);
                     let rel = if own { prev.artwork_path.clone() } else { free_artwork_name(&root, &lib) };
                     let written = write_artwork(&root, &rel, &t.artwork, &mut created).unwrap_or_default();
                     if !written.is_empty() && !hash.is_empty() {
@@ -1581,7 +1796,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
             // lengths, 172.43 s -> 172 and 128.05 s -> 128, fit both; rekordbox's length is
             // the tag library's whole-second length, which truncates).
             duration: (row_duration + 1e-6).floor().clamp(0.0, 65535.0) as u16,
-            bpm100: row_tempo(et.grid.as_ref(), full_len.max(t.duration), t.bpm),
+            bpm100,
             rating: t.rating.min(5),
             color: t.color.min(8),
             bitrate: t.bitrate,
@@ -1651,26 +1866,28 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     // Sidecar with local sources and the cue record (Recordbox's own; never read by players).
     // Written first so a finished-after-interruption export has them too; entries for files
     // an undone export removed are simply never looked up.
-    let _ = std::fs::create_dir_all(root.join(".Recordbox"));
+    std::fs::create_dir_all(root.join(".Recordbox"))?;
     // Journaled, so an undone export also puts these back.
     created.will_replace(&sidecar_path(&root))?;
     // Sorted, so the same content always gives the same bytes.
-    let _ = write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources.iter().collect::<BTreeMap<_, _>>()).unwrap_or_default());
+    write_atomic(&sidecar_path(&root), &serde_json::to_vec_pretty(&sources.iter().collect::<BTreeMap<_, _>>())?)?;
     cue_record.retain(|path, _| lib.tracks.values().any(|t| &t.file_path == path));
     created.will_replace(&cue_record_path(&root))?;
-    let _ = write_cue_record(&root, &cue_record);
+    write_atomic(&cue_record_path(&root), &serde_json::to_vec_pretty(&cue_record.iter().collect::<BTreeMap<_, _>>())?)?;
     artwork_record.retain(|_, rel| lib.tracks.values().any(|t| &t.artwork_path == rel));
     created.will_replace(&artwork_record_path(&root))?;
-    let _ = write_atomic(&artwork_record_path(&root), &serde_json::to_vec_pretty(&artwork_record).unwrap_or_default());
+    write_atomic(&artwork_record_path(&root), &serde_json::to_vec_pretty(&artwork_record)?)?;
     created.will_replace(&node_record_path(&root))?;
-    let _ = write_atomic(&node_record_path(&root), &serde_json::to_vec_pretty(&node_ids.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<String, u32>>()).unwrap_or_default());
+    write_atomic(&node_record_path(&root), &serde_json::to_vec_pretty(&node_ids.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<String, u32>>())?)?;
     // Player settings, as rekordbox writes them with every export: part of the journaled
     // export, and a failure to write them fails it.
     std::fs::create_dir_all(root.join("PIONEER"))?;
-    for (name, bytes) in req.settings.merged_onto_drive(&root.join("PIONEER")).files() {
-        let p = root.join("PIONEER").join(name);
-        created.will_replace(&p)?;
-        write_atomic(&p, &bytes).map_err(|e| anyhow!("writing the player settings file {name}: {e}"))?;
+    if layout != DeviceLayout::Mixed {
+        for (name, bytes) in req.settings.merged_onto_drive(&root.join("PIONEER")).files() {
+            let p = root.join("PIONEER").join(name);
+            created.will_replace(&p)?;
+            write_atomic(&p, &bytes).map_err(|e| anyhow!("writing the player settings file {name}: {e}"))?;
+        }
     }
     backup_device_db(&root);
     for f in &doomed_files {
@@ -1684,8 +1901,8 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
     report.playlists_on_device = lib.nodes.iter().filter(|n| !n.folder).count();
     progress(Progress::Report(report));
     let mut msg = format!("Export completed: {} tracks, {} playlists on the device", lib.tracks.len(), lib.nodes.iter().filter(|n| !n.folder).count());
-    if has_onelibrary(&root) {
-        msg.push_str(". Note: this drive also has a OneLibrary database (written by rekordbox 7.2.11 or later), which recordbox does not update yet. Players that read OneLibrary will not show these changes; players that read the standard device library will.");
+    if layout == DeviceLayout::Mixed {
+        msg.push_str(". Note: this drive also has OneLibrary (Device Library Plus). These edits apply to its classic device catalog. Recordbox preserved existing shared files and player settings.");
     }
     if !skipped.is_empty() {
         msg.push_str(&format!(". {} track(s) were not exported: {}", skipped.len(), short_list(&skipped, 5)));
@@ -1828,16 +2045,15 @@ pub fn remove_tracks(lib: &mut DeviceLibrary, root: &Path, ids: &[u32]) -> Vec<P
             gone.push(p);
         }
     }
-    // A file another remaining row still points at stays.
-    let used: std::collections::HashSet<String> = lib.tracks.values().map(|t| path_key(&t.file_path)).collect();
-    gone.retain(|f| !used.contains(&path_key(&format!("/{}", f.strip_prefix(root).unwrap_or(f).to_string_lossy()))));
-    if has_onelibrary(root) {
-        gone.clear();
+    if !matches!(DeviceLayout::inspect(root), Ok(DeviceLayout::Classic)) {
+        return vec![];
     }
+    let used = referenced_files(root, lib);
+    gone.retain(|p| target::managed_file(root, p) && !used.contains(&asset_key(&p)));
     gone
 }
 
-/// Extensions of a track's analysis files (.3EX is rekordbox 7's, carried over when present).
+/// Analysis companions belonging to a device track, including native v7 embeddings.
 pub const ANLZ_EXTS: [&str; 4] = ["DAT", "EXT", "2EX", "3EX"];
 
 /// Change the device library in one journaled step: `change` edits the library read from the
@@ -1856,15 +2072,16 @@ pub fn change_device_with(root: &Path, change: impl FnOnce(&mut DeviceLibrary) -
     if !root.is_dir() {
         return Err(anyhow!("The device is not available"));
     }
-    recover_device(root);
+    let layout = check_export_target(root)?;
+    recover_before_write(root)?;
     let mut lib = read_device(root).map_err(|e| anyhow!("Device library is corrupted ({e}). Nothing was changed."))?;
     let (gone, write) = change(&mut lib)?;
+    anyhow::ensure!(layout != DeviceLayout::Mixed || (gone.is_empty() && write.is_empty()),
+        "This drive has both catalogs. Classic catalog edits are supported; shared files and player settings are protected.");
     let mut created = Created::begin(root)?;
     backup_device_db(root);
     for (p, bytes) in &write {
-        if !p.starts_with(root) {
-            return Err(anyhow!("{} is not on the device", p.display()));
-        }
+        target::confined(root, p)?;
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -1983,6 +2200,7 @@ fn write_artwork(root: &Path, rel: &str, src: &str, created: &mut Created) -> Re
     let small_p = root.join(rel.trim_start_matches('/'));
     let stem = small_p.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
     let big_p = small_p.with_file_name(format!("{stem}_m.jpg"));
+    target::confined(root, &small_p)?;
     std::fs::create_dir_all(small_p.parent().unwrap())?;
     created.will_replace(&small_p)?;
     created.will_replace(&big_p)?;
@@ -2211,22 +2429,24 @@ fn history_table(lib: &DeviceLibrary) -> TableSpec {
     TableSpec { page_type: 19, raw_pages: pages, ..Default::default() }
 }
 
-/// Text of a track-row string slot within the limits of a row: every slot is cut to
-/// [`pdb::MAX_STRING_CHARS`], and if the 21 strings together still exceed a page the longest
-/// free-text slots are halved until the row fits.
-fn track_row(fixed: &[u8], texts: &[String]) -> Vec<u8> {
+/// Protect player paths exactly. Shorten free-text fields when the row would exceed its page.
+fn track_row(fixed: &[u8], texts: &[String]) -> Result<Vec<u8>> {
     let mut limits = [pdb::MAX_STRING_CHARS; 21];
     loop {
-        let strings: Vec<Vec<u8>> = texts.iter().enumerate().map(|(i, t)| if i == 0 { pdb::dstr_isrc(t) } else { dstr(pdb::clip_chars(t, limits[i])) }).collect();
+        let strings: Vec<Vec<u8>> = texts.iter().enumerate().map(|(i, t)| match i {
+            0 => Ok(pdb::dstr_isrc(t)),
+            14 | 19 | 20 => pdb::dstr_path(t),
+            _ => Ok(dstr(pdb::clip_chars(t, limits[i]))),
+        }).collect::<Result<_>>()?;
         let row = row_with_strings(fixed, &strings, true);
         if row.len() <= pdb::MAX_ROW_BYTES {
-            return row;
+            return Ok(row);
         }
         // Never the paths (14 analysis, 19 file name, 20 file path): players open files by them.
-        let Some(longest) = (1..21).filter(|i| ![14, 19, 20].contains(i)).max_by_key(|&i| texts[i].chars().count().min(limits[i])) else { return row };
+        let Some(longest) = (1..21).filter(|i| ![14, 19, 20].contains(i)).max_by_key(|&i| texts[i].chars().count().min(limits[i])) else { anyhow::bail!("Track paths exceed a classic catalog page") };
         let now = texts[longest].chars().count().min(limits[longest]);
         if now == 0 {
-            return row;
+            anyhow::bail!("Track paths exceed a classic catalog page");
         }
         limits[longest] = now / 2;
     }
@@ -2332,7 +2552,7 @@ pub fn try_build_export_pdb(lib: &DeviceLibrary) -> Result<Vec<u8>> {
             fname,
             t.file_path.clone(),
         ];
-        track_rows.push(track_row(&f, &texts));
+        track_rows.push(track_row(&f, &texts)?);
     }
     let artist_rows: Vec<Vec<u8>> = artists
         .order
@@ -2382,7 +2602,11 @@ pub fn try_build_export_pdb(lib: &DeviceLibrary) -> Result<Vec<u8>> {
             r
         })
         .collect();
-    let artwork_rows = artwork.order.iter().enumerate().map(|(i, n)| simple_row(i as u32 + 1, n)).collect();
+    let artwork_rows = artwork.order.iter().enumerate().map(|(i, name)| {
+        let mut row = (i as u32 + 1).to_le_bytes().to_vec();
+        row.extend(pdb::dstr_path(name)?);
+        Ok(row)
+    }).collect::<Result<_>>()?;
     let tree_rows = lib
         .nodes
         .iter()
@@ -2450,7 +2674,7 @@ pub fn try_build_export_pdb(lib: &DeviceLibrary) -> Result<Vec<u8>> {
         t(13, artwork_rows),
         kept(14),
         kept(15),
-        t(16, col_rows),
+        if lib.raw_tables.contains_key(&16) { kept(16) } else { t(16, col_rows) },
         t(17, menu_rows),
         t(18, t18_rows),
         history_table(lib),
@@ -2541,7 +2765,7 @@ pub fn try_build_export_ext(lib: &DeviceLibrary) -> Result<Vec<u8>> {
         t(4, tt_rows),
         kept(5),
         kept(6),
-        t(7, vec![t7]),
+        if lib.raw_ext_tables.contains_key(&7) { kept(7) } else { t(7, vec![t7]) },
         kept(8),
     ];
     pdb::write_database(&tables, 5, 6)
@@ -2552,13 +2776,21 @@ pub fn try_build_export_ext(lib: &DeviceLibrary) -> Result<Vec<u8>> {
 /// then the two renames.
 fn write_device_journaled(root: &Path, lib: &DeviceLibrary, created: &mut Created) -> Result<()> {
     let dir = root.join("PIONEER").join("rekordbox");
+    for name in ["export.pdb", "exportExt.pdb"] {
+        target::confined(root, &dir.join(name))?;
+        target::confined(root, &tmp_for(&dir.join(name)))?;
+    }
     std::fs::create_dir_all(&dir)?;
     let main = try_build_export_pdb(lib)?;
     let check = parse_pdb(main.clone())?;
     if check.tracks.len() != lib.tracks.len() {
         return Err(anyhow!("internal check failed: wrote {} tracks, read back {}", lib.tracks.len(), check.tracks.len()));
     }
+    anyhow::ensure!(lib.tracks.iter().all(|(id, t)| check.tracks.get(id).is_some_and(|saved| saved.file_path == t.file_path && saved.analyze_path == t.analyze_path && saved.artwork_path == t.artwork_path)),
+        "USB track paths could not be represented exactly in the classic catalog");
     let ext = try_build_export_ext(lib)?;
+    let mut checked = check;
+    read_ext_tags(ext.clone(), &mut checked).context("invalid generated extended catalog")?;
     write_tmp(&dir.join("export.pdb"), &main)?;
     write_tmp(&dir.join("exportExt.pdb"), &ext)?;
     created.publishing()?;
@@ -2780,10 +3012,12 @@ mod tests {
         let mut lib = DeviceLibrary::default();
         lib.tracks.insert(2, DevTrack { id: 2, file_path: "/Contents/A/CAFÉ.mp3".into(), ..Default::default() });
         lib.tracks.insert(1, DevTrack { id: 1, file_path: "/Contents/A/kept.mp3".into(), analyze_path: "/PIONEER/USBANLZ/P001/0000AAAA/ANLZ0000.DAT".into(), artwork_path: "/PIONEER/Artwork/00001/a1.jpg".into(), ..Default::default() });
+        assert!(unused_files(&root, &lib).is_empty(), "no cleanup before a classic catalog is present");
+        std::fs::create_dir_all(root.join("PIONEER/rekordbox")).unwrap();
+        std::fs::write(root.join("PIONEER/rekordbox/export.pdb"), build_export_pdb(&lib)).unwrap();
         let found: Vec<PathBuf> = unused_files(&root, &lib).into_iter().map(|f| f.0).collect();
         assert_eq!(found, { let mut v = vec![orphan.clone(), orphan_anlz.clone()]; v.sort(); v });
-        // Deletion re-reads the drive's library: with no export.pdb there, every file is
-        // unused, so only the listed ones go.
+        // Deletion re-reads the drive catalog before removing the reviewed files.
         let n = delete_unused(&root, &found).unwrap();
         assert_eq!(n, 2);
         assert!(!root.join("Contents/B").exists() && !root.join("PIONEER/USBANLZ/P002").exists());

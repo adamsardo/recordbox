@@ -46,6 +46,7 @@ mod ui_kit;
 mod ui_library_ext;
 mod ui_player;
 mod ui_prefs;
+mod ui_sync;
 mod ui_fx;
 mod ui_perf;
 mod ui_player2;

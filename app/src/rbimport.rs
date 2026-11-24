@@ -5,7 +5,10 @@
 //! another attempt. SQLite reads the validated copy before Recordbox merges the result into
 //! its own collection.
 
+#[cfg(test)]
+mod grid_oracle;
 pub(crate) mod merge;
+pub(crate) mod writeback;
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -242,6 +245,7 @@ use std::collections::HashMap;
 /// One rekordbox track as Recordbox needs it, plus what is used to notice later changes.
 pub struct RbTrack {
     pub rb_id: String,
+    native: Option<writeback::ImportTrack>,
     /// Changes whenever rekordbox changes the track, its cues or its My Tags.
     pub fingerprint: String,
     pub xt: XmlTrack,
@@ -252,6 +256,7 @@ pub struct RbTrack {
 }
 
 pub struct RbLibrary {
+    source: Option<writeback::Source>,
     pub tracks: Vec<RbTrack>,
     /// Playlist tree; `track_keys` are rekordbox content IDs in playlist order.
     pub playlists: Vec<XmlNode>,
@@ -426,7 +431,7 @@ pub fn read_pqtz_grid(dat: &Path) -> Option<BeatGrid> {
     parse_pqtz_grid(&b)
 }
 
-fn parse_pqtz_grid(b: &[u8]) -> Option<BeatGrid> {
+pub(crate) fn parse_pqtz_grid(b: &[u8]) -> Option<BeatGrid> {
     let mut anchors = vec![];
     let mut last_tempo = None;
     for beat in pqtz_beats(b)? {
@@ -692,6 +697,20 @@ fn cue_slot(kind: i64) -> Option<i32> {
     }
 }
 
+/// Modern hot cues store a pad palette index separately. A memory cue's native
+/// colors 0..7 map to the eight nonzero color rows used by Recordbox.
+fn desktop_cue_color(slot: Option<i32>, looped: bool, color: Option<i64>, palette: Option<i64>, modern: bool) -> u8 {
+    if let Some(slot) = slot {
+        let index = if modern { palette } else { color };
+        return index.filter(|n| (1..=64).contains(n)).map_or_else(|| hotcue_default_color(slot, looped), |n| n as u8);
+    }
+    if modern {
+        color.filter(|n| (0..=7).contains(n)).map_or(0, |n| (n + 1) as u8)
+    } else {
+        color.filter(|n| (1..=8).contains(n)).unwrap_or(0) as u8
+    }
+}
+
 /// Read everything Recordbox imports from a snapshot opened with [`open_snapshot`].
 /// `share_dir` is rekordbox's "share" folder, where its analysis files and artwork live.
 pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibrary> {
@@ -708,23 +727,18 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
     // Cues per track, with their newest change time for the fingerprint.
     let mut cues: HashMap<String, Vec<Cue>> = HashMap::new();
     let mut cue_stamp: HashMap<String, String> = HashMap::new();
-    for r in rows(c, "SELECT ContentID, InMsec, OutMsec, Kind, Color, ActiveLoop, Comment, updated_at FROM djmdCue WHERE rb_local_deleted = 0 ORDER BY InMsec")? {
+    let modern_colors: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('djmdCue') WHERE name = 'ColorTableIndex')", [], |r| r.get(0))?;
+    let palette = if modern_colors { "ColorTableIndex" } else { "NULL" };
+    for r in rows(c, &format!("SELECT ContentID, InMsec, OutMsec, Kind, Color, {palette} AS palette, ActiveLoop, Comment, updated_at FROM djmdCue WHERE rb_local_deleted = 0 ORDER BY InMsec"))? {
         let cid = text(r["ContentID"].clone());
         let kind = int(&r["Kind"]);
         let start = int(&r["InMsec"]).max(0) as f64 / 1000.0;
         let out = int(&r["OutMsec"]);
         let end = (out > 0 && out as f64 / 1000.0 > start).then_some(out as f64 / 1000.0);
-        let color = int(&r["Color"]);
-        let (ck, slot) = match cue_slot(kind) {
-            Some(s) => (CueKind::Hot, s),
-            None => (CueKind::Memory, -1),
-        };
-        let color = match ck {
-            CueKind::Hot if (1..=64).contains(&color) => color as u8,
-            CueKind::Hot => hotcue_default_color(slot, end.is_some()),
-            _ if (1..=8).contains(&color) => color as u8,
-            _ => 0,
-        };
+        let hot_slot = cue_slot(kind);
+        let (ck, slot) = hot_slot.map_or((CueKind::Memory, -1), |slot| (CueKind::Hot, slot));
+        let optional_int = |v: &Value| (!matches!(v, Value::Null)).then(|| int(v));
+        let color = desktop_cue_color(hot_slot, end.is_some(), optional_int(&r["Color"]), optional_int(&r["palette"]), modern_colors);
         cues.entry(cid.clone()).or_default().push(Cue { id: 0, track_id: 0, kind: ck, slot, start, end, color, comment: text(r["Comment"].clone()), active_loop: int(&r["ActiveLoop"]) != 0 });
         let u = text(r["updated_at"].clone());
         let e = cue_stamp.entry(cid).or_default();
@@ -755,6 +769,8 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
         }
     }
 
+    // Optional native identity columns only affect reverse sync on older schemas.
+    let mut cue_identities = writeback::cues::identities(c).ok();
     let mut tracks = vec![];
     let mut not_local = 0;
     for r in rows(c, "SELECT * FROM djmdContent WHERE rb_local_deleted = 0")? {
@@ -806,14 +822,18 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
             ..Default::default()
         };
         let anlz = g("AnalysisDataPath");
-        let grid = if anlz.is_empty() { None } else { read_pqtz_grid(&share_dir.join(anlz.trim_start_matches('/'))) };
+        let grid_bytes = (!anlz.is_empty()).then(|| std::fs::read(share_dir.join(anlz.trim_start_matches('/'))).ok()).flatten();
+        let grid = grid_bytes.as_deref().and_then(parse_pqtz_grid);
+        let cue_identity = cue_identities.as_mut().map(|ids| ids.remove(&rb_id)
+            .unwrap_or_else(writeback::empty_cue_identity));
+        let native = writeback::ImportTrack::from_row(&r, cue_identity, &anlz, grid_bytes.as_deref().filter(|_| grid.is_some()));
         let anlz_base = (!anlz.is_empty()).then(|| share_dir.join(anlz.trim_start_matches('/')).with_extension("")).filter(|p| p.with_extension("DAT").is_file());
         let tags = song_tags.remove(&rb_id).unwrap_or_default();
         let mut tag_names: Vec<String> = tags.iter().map(|(c, t)| format!("{c}/{t}")).collect();
         tag_names.sort();
         let fingerprint = format!("{}|{}|{}|{}", g("updated_at"), cue_stamp.get(&rb_id).cloned().unwrap_or_default(), g("AnalysisUpdated"), tag_names.join(","));
         let xt = XmlTrack { xml_id: rb_id.clone(), track: t, grid, cues: cues.remove(&rb_id).unwrap_or_default(), extra: Default::default() };
-        tracks.push(RbTrack { rb_id, fingerprint, xt, tags, anlz_base });
+        tracks.push(RbTrack { rb_id, native, fingerprint, xt, tags, anlz_base });
     }
 
     // Playlist tree.
@@ -874,6 +894,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
     };
     smart_lists += cx.smart;
     Ok(RbLibrary {
+        source: None,
         tracks,
         playlists,
         tag_categories: tag_categories.into_iter().map(|(_, n, t)| (n, t)).collect(),
@@ -886,9 +907,17 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
 /// Snapshot the installed rekordbox library into `dest_dir` and read it.
 pub fn load_installed(dest_dir: &Path) -> Result<Option<RbLibrary>> {
     let Some(src) = library_dir() else { return Ok(None) };
-    let db = snapshot(&src, dest_dir)?;
+    Ok(Some(load_from(&src, dest_dir)?))
+}
+
+pub(super) fn load_from(src: &Path, dest_dir: &Path) -> Result<RbLibrary> {
+    anyhow::ensure!(!writeback::pending(src)?, "Recover the interrupted native write before importing this library");
+    let db = snapshot(src, dest_dir)?;
     let c = open_snapshot(&db.path().join("master.db"))?;
-    Ok(Some(read_library(&c, &src.join("share"))?))
+    let mut library = read_library(&c, &src.join("share"))?;
+    anyhow::ensure!(!writeback::pending(src)?, "Native recovery became pending during import; try again after recovery");
+    library.source = writeback::Source::read(&c, src).ok();
+    Ok(library)
 }
 
 #[cfg(test)]

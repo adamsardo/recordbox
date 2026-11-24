@@ -401,14 +401,17 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     // and their baseline 8 pt above the window's foot (0.169 pt per logo unit).
     crate::brand::paint_logo(ui, Rect::from_min_size(pos2(r.min.x + 9.66, r.max.y - 19.7), vec2(104.1, 14.0)), WHITE);
     // totals
-    let (n, secs, bytes) = if let View::Device { .. } = app.view {
-        (0usize, 0.0, 0u64)
-    } else {
-        app.list.iter().filter_map(|id| app.track(*id)).fold((0, 0.0, 0u64), |(n, s, b), t| (n + 1, s + t.duration, b + t.file_size))
+    let total = match &app.view {
+        View::Device { root, .. } | View::DeviceHistory { root, .. } => app.devices.iter().find(|d| d.root == *root).map(|d| {
+            if let Some(lib) = &d.lib { format!("Classic catalog · {} tracks", lib.tracks.len()) } else { d.catalog_label().to_string() }
+        }).unwrap_or_default(),
+        _ => {
+            let (n, secs, bytes) = app.list.iter().filter_map(|id| app.track(*id)).fold((0, 0.0, 0u64), |(n, s, b), t| (n + 1, s + t.duration, b + t.file_size));
+            let h = (secs / 3600.0).floor();
+            let m = ((secs - h * 3600.0) / 60.0).floor();
+            format!("{n} Tracks, {} hours {} minutes, {:.1} GB", h, m, bytes as f64 / 1e9)
+        }
     };
-    let h = (secs / 3600.0).floor();
-    let m = ((secs - h * 3600.0) / 60.0).floor();
-    let total = format!("{n} Tracks, {} hours {} minutes, {:.1} GB", h, m, bytes as f64 / 1e9);
     p.text(pos2(r.max.x - 34.5, r.center().y), Align2::RIGHT_CENTER, total, rb_bold(11.5), DIM);
     // status / messages
     let mid = Rect::from_min_max(pos2(r.min.x + 120.0, r.min.y + 3.0), pos2(r.max.x - 300.0, r.max.y - 3.0));
@@ -446,8 +449,10 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         p.text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
     } else if app.stem.loading.is_some() {
         p.text(mid.left_center(), Align2::LEFT_CENTER, "Reading cached stems…", rb(11.5), TEXT);
+    } else if let Some(status) = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status()) {
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, status, rb(11.5), TEXT);
     } else if app.rb_job.is_some() {
-        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the desktop rekordbox library…", rb(11.5), TEXT);
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the AlphaTheta Rekordbox library…", rb(11.5), TEXT);
     } else if mid.width() > 0.0 {
         let path = app.db.active_library_path();
         p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, format!("Active library · {path}"), rb(11.5), DIM);
@@ -763,16 +768,16 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
             }
         }
     }
-    // Bottom of the strip: review importing the installed library, lit while a
-    // sync is running. (rekordbox's link-status mark above it has no counterpart here.)
+    // Desktop library sync. USB devices have their own Sync Manager.
     let sr = Rect::from_center_size(pos2(r.min.x + 20.0, r.max.y - 20.0), vec2(18.0, 12.0));
-    let busy = app.rb_job.is_some();
+    let status = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status())
+        .or(app.rb_job.as_ref().map(|_| "Importing from the AlphaTheta Rekordbox library…"));
+    let busy = status.is_some();
     let resp = ui.interact(sr.expand(3.0), ui.id().with("strip_sync"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy && app.can_review_library_sync(), "Review desktop library sync"));
     src::sync_arrows(ui.painter(), sr, if busy { BLUE } else if resp.hovered() { WHITE } else { hex(0xDCDCDC) });
     let resp = if app.prefs.tooltips {
-        resp.on_hover_text(if busy { "Importing from the desktop rekordbox library…" } else {
-            "Review library sync. Read from the installed rekordbox library and import into Recordbox. Choose Import in the review to start."
-        })
+        resp.on_hover_text(status.unwrap_or("Choose a sync direction between AlphaTheta Rekordbox and recordbox."))
     } else { resp };
     if resp.clicked() && !busy {
         app.review_rekordbox_sync();
@@ -1246,7 +1251,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
     // Reference 05 shows only the "Devices" row; Recordbox's extras live in its context menu.
     let dr = if app.prefs.tooltips && app.devices.is_empty() { dr.on_hover_text("Connect a USB drive or SD card (FAT32, exFAT or HFS+). Right-click for more.") } else { dr };
     dr.context_menu(|ui| {
-        if ui.button("Add a folder as a device…").on_hover_text("Export into any folder, for example to prepare a drive image or test an export.").clicked() {
+        if ui.button("Add a folder as a device…").on_hover_text("Choose the drive root containing PIONEER, or a folder for a new classic export.").clicked() {
             ui.close_menu();
             if let Some(d) = rfd::FileDialog::new().pick_folder() {
                 let s = d.to_string_lossy().to_string();
@@ -1262,14 +1267,18 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
             open_export(app, vec![], vec![]);
         }
     });
-    let devs: Vec<(String, String, String, Option<Vec<crate::export::usb::DevNode>>, Option<String>, usize)> = app
-        .devices
-        .iter()
-        .map(|d| (d.root.clone(), d.name.clone(), d.fs.clone(), d.lib.as_ref().map(|l| l.nodes.clone()), d.error.clone(), d.lib.as_ref().map(|l| l.tracks.len()).unwrap_or(0)))
-        .collect();
-    for (root, name, fs, nodes, err, ntracks) in devs {
+    let roots: Vec<_> = app.devices.iter().map(|d| d.root.clone()).collect();
+    for root in roots {
+        let Some(dev) = app.devices.iter().find(|d| d.root == root) else { continue };
+        let (name, fs) = (dev.name.clone(), dev.fs.clone());
+        let nodes = dev.lib.as_ref().map(|lib| lib.nodes.clone());
+        let count = dev.lib.as_ref().filter(|_| fs == "folder").map(|lib| lib.tracks.len());
+        let catalog = dev.catalog_label();
+        let export_blocker = dev.write_blocker.clone();
+        let catalog_blocker = export_blocker.clone().or_else(|| nodes.is_none().then(|| "This action needs a classic Device Library.".to_owned()));
+        let mixed = dev.layout == Some(crate::export::usb::DeviceLayout::Mixed);
         let sel = app.view == View::Device { root: root.clone(), node: None };
-        let resp = tree_row(ui, 1, &format!("{name}  ({})", App::fs_label(&fs)), if fs == "folder" { Some(ntracks) } else { None }, sel, TreeIcon::Device, 15.0);
+        let resp = tree_row(ui, 1, &format!("{name}  ({})", App::fs_label(&fs)), count, sel, TreeIcon::Device, 15.0);
         // Eject button at the right end of a removable device's row (as in the original).
         let mut ejected = false;
         if fs != "folder" {
@@ -1320,23 +1329,21 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         }
         let r2 = root.clone();
         resp.context_menu(|ui| {
-            if ui.button("Export to this device…").clicked() {
+            if ui.add_enabled(export_blocker.is_none(), egui::Button::new("Export to this device…")).on_disabled_hover_text(export_blocker.as_deref().unwrap_or_default()).clicked() {
                 app.dialogs.export_root = Some(r2.clone());
                 open_export(app, vec![], vec![]);
                 app.dialogs.export_root = Some(r2.clone());
                 ui.close_menu();
             }
-            if ui.button("Update Playlists on This Device").on_hover_text("Export again the playlists that are both on this device and in your library (same folder and name), so the device has your latest edits.").clicked() {
+            if ui.add_enabled(catalog_blocker.is_none(), egui::Button::new("Update Playlists on This Device")).on_disabled_hover_text(catalog_blocker.as_deref().unwrap_or_default()).on_hover_text("Export again the playlists that are both on this device and in your library (same folder and name), so the device has your latest edits.").clicked() {
                 app.update_device_playlists(&r2);
                 ui.close_menu();
             }
             crate::device_ext::device_row_menu(app, ui, &r2);
-            if ui.button("Clean Up Unused Files…").on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
+            let cleanup_blocker = catalog_blocker.as_deref().or(mixed.then_some("OneLibrary can reference files outside the classic catalog. Shared files are kept."));
+            if ui.add_enabled(cleanup_blocker.is_none(), egui::Button::new("Clean Up Unused Files…")).on_disabled_hover_text(cleanup_blocker.unwrap_or_default()).on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
-                    Some((name, _)) if crate::export::usb::has_onelibrary(std::path::Path::new(&r2)) => {
-                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which recordbox can't read yet, so it can't tell which files are unused."));
-                    }
                     Some((name, Some(lib))) => {
                         let files = crate::export::usb::unused_files(std::path::Path::new(&r2), &lib);
                         if files.is_empty() {
@@ -1349,7 +1356,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 }
                 ui.close_menu();
             }
-            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from recordbox.").clicked() {
+            if ui.add_enabled(nodes.is_some(), egui::Button::new("Import Cue Changes from Players…")).on_disabled_hover_text(catalog_blocker.as_deref().unwrap_or_default()).on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from recordbox.").clicked() {
                 app.check_player_cue_edits(&r2, true);
                 ui.close_menu();
             }
@@ -1380,11 +1387,11 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 ui.close_menu();
             }
         });
-        if let Some(e) = err {
-            ui.label(RichText::new(e).size(10.5).color(CAUTION_TX));
-        }
-        if fs != "folder" && crate::export::usb::has_onelibrary(std::path::Path::new(&root)) {
-            ui.label(RichText::new("Has a OneLibrary database that recordbox does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by recordbox.");
+        let format_row = ui.label(RichText::new(catalog).size(10.5).color(if export_blocker.is_some() { CAUTION_TX } else { DIM }));
+        if let Some(reason) = &export_blocker {
+            format_row.on_hover_text(reason);
+        } else if mixed {
+            format_row.on_hover_text("Only the classic catalog is shown here. Both catalogs can reference the audio and analysis.");
         }
         if let Some(nodes) = nodes {
             fn rows(app: &mut App, ui: &mut Ui, root: &str, nodes: &[crate::export::usb::DevNode], parent: u32, depth: usize) {
@@ -1607,7 +1614,9 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let title = match (node, history, &dev.lib) {
         (_, Some(h), Some(l)) => l.histories.iter().find(|x| x.id == h).map(|x| x.name.clone()).unwrap_or_default(),
         (Some(n), _, Some(l)) => l.nodes.iter().find(|x| x.id == n).map(|x| x.name.clone()).unwrap_or_default(),
-        _ => format!("{} — All Tracks", dev.name),
+        _ if dev.layout == Some(crate::export::usb::DeviceLayout::Mixed) && dev.lib.is_some() => format!("{} — Classic Device Library", dev.name),
+        _ if dev.lib.is_some() => format!("{} — All Tracks", dev.name),
+        _ => dev.name.clone(),
     };
     let tracks: Vec<crate::export::usb::DevTrack> = match &dev.lib {
         None => vec![],
@@ -1620,7 +1629,7 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let r = ui.max_rect();
     let bar = Rect::from_min_size(r.min, vec2(r.width(), 26.0));
     ui.painter().rect_filled(bar, 0.0, BG2);
-    ui.painter().text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, format!("{title} ({} Tracks)", tracks.len()), rb(TITLE_FONT), WHITE);
+    ui.painter().text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, if dev.lib.is_some() { format!("{title} ({} Tracks)", tracks.len()) } else { title }, rb(TITLE_FONT), WHITE);
     let space = match (dev.free, dev.total) {
         (Some(f), Some(t)) => format!("Available Space {:.1} GB / Total Space {:.1} GB", f as f64 / 1e9, t as f64 / 1e9),
         _ => String::new(),
@@ -1629,8 +1638,16 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let mut body = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(r.min.x, r.min.y + 27.0), r.max)));
     if dev.lib.is_none() {
         body.add_space(30.0);
+        let catalog = dev.catalog_label();
+        let blocker = dev.write_blocker.clone();
         body.vertical_centered(|ui| {
-            ui.label(RichText::new("This device has no DJ library yet.").color(DIM));
+            ui.strong(catalog);
+            ui.label(RichText::new(root).size(11.0).color(DIM));
+            if let Some(reason) = blocker {
+                ui.label(RichText::new(reason).color(CAUTION_TX));
+                return;
+            }
+            ui.label("Export a playlist or track to create a classic Device Library here.");
             ui.add_space(6.0);
             if ui.button("Export playlists to this device…").clicked() {
                 let r = root.to_string();
