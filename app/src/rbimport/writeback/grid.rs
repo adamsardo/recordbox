@@ -333,12 +333,17 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
             extended.len() == 56 + count * 2 && extended[4..8] == 56u32.to_be_bytes(),
             "PQT2 count or header differs from the DAT grid"
         );
+        let revision = u32::from_be_bytes(extended[16..20].try_into()?);
+        ensure!(
+            revision == 0x0100_0002,
+            "Unsupported PQT2 revision 0x{revision:08X}. Use rekordbox to edit timing for this track"
+        );
         let fractions = anlz::pqt2_fractions(extended);
         ensure!(
             fractions.len() == count
                 && fractions.iter().all(|v| *v <= 999)
                 && extended == anlz::pqt2(&anlz::pqtz_entries(raw), &fractions),
-            "PQT2 revision, beat records, checksum or fractions disagree with the DAT grid"
+            "PQT2 header fields, beat records, checksum or fractions disagree with the DAT grid"
         );
     }
     let retime_frames = retime_evidence(&dat, ext.as_deref(), ex2.as_deref(), &extra)
@@ -769,6 +774,27 @@ mod tests {
         }
         assert!(inspect(&share, "/PIONEER/USBANLZ/../../ANLZ0000.DAT").is_err());
         assert!(inspect(&share, "//PIONEER/USBANLZ/P001/ANLZ0000.DAT").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unrecognized_pqt2_revision_is_reported_without_regenerating_its_data() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let snap = inspect(&share, LOCATION)?;
+        let mut desired = snap.grid.clone();
+        desired.anchors[0].beat = 2;
+        let ext = dat.with_extension("EXT");
+        let mut bytes = fs::read(&ext)?;
+        let offset = grid_section(&bytes, b"PQT2")?.unwrap().start + 16;
+        for revision in [0x0200_0002u32, 0x1234_abcd] {
+            bytes[offset..offset + 4].copy_from_slice(&revision.to_be_bytes());
+            fs::write(&ext, &bytes)?;
+            let error = plan(&share, LOCATION, &snap, &desired).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("Unsupported PQT2 revision 0x{revision:08X}")));
+            assert_eq!(fs::read(&ext)?, bytes);
+        }
         Ok(())
     }
 

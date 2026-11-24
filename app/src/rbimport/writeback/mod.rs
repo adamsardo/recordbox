@@ -611,8 +611,13 @@ fn checked_current(
                 bail!("Native file registrations exist without a recorded analysis path");
             }
             let patch = cues::plan(&now, cue_view)?;
-            registration::check_inventory(c, &baseline.id, &share, &analysis)?;
-            cues::check_sidecars(&share, &analysis, &baseline.id, &patch)?;
+            let mut registered_embedding = registration::check_inventory(c, &baseline.id, &share, &analysis)?;
+            if registered_embedding.is_some() && owners.shared_analysis.contains(
+                &analysis.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()
+            ) {
+                registered_embedding = None;
+            }
+            cues::check_sidecars(&share, &analysis, &baseline.id, registered_embedding, &patch)?;
             Current {
                 value: Edit::Cues(view),
                 proof: now.identity().to_owned(),

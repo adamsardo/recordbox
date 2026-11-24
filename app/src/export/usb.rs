@@ -285,6 +285,41 @@ pub fn player_cue_edits(root: &Path, lib: &DeviceLibrary) -> Vec<PlayerCueEdit> 
     out
 }
 
+fn asset_key(path: &Path) -> String {
+    // A PDB uses '/' even on Windows. Directory enumeration can return the
+    // same location with native separators, including an entirely different
+    // spelling of the path below the mount point.
+    #[cfg(windows)]
+    return path_key(&path.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(windows))]
+    path_key(&path.to_string_lossy())
+}
+
+/// Every named asset still owned by a classic track. Use the same comparison
+/// for manual cleanup and track removal on FAT and macOS volumes.
+fn referenced_files(root: &Path, lib: &DeviceLibrary) -> std::collections::HashSet<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in lib.tracks.values() {
+        if !t.file_path.is_empty() {
+            used.insert(asset_key(&root.join(t.file_path.trim_start_matches('/'))));
+        }
+        if let Some(b) = anlz_base(&t.analyze_path) {
+            let b = root.join(b.trim_start_matches('/'));
+            for e in ANLZ_EXTS {
+                used.insert(asset_key(&b.with_extension(e)));
+            }
+        }
+        if !t.artwork_path.is_empty() {
+            let a = root.join(t.artwork_path.trim_start_matches('/'));
+            if let (Some(stem), Some(ext)) = (a.file_stem().map(|x| x.to_string_lossy().to_string()), a.extension().map(|x| x.to_string_lossy().to_string())) {
+                used.insert(asset_key(&a.with_file_name(format!("{stem}_m.{ext}"))));
+            }
+            used.insert(asset_key(&a));
+        }
+    }
+    used
+}
+
 /// Files in the drive's music, analysis and artwork folders that no track in its library uses
 /// (left behind by deleted playlists, other programs or copies made by hand), with sizes.
 /// Nothing is listed while an interrupted export's journal is still on the drive.
@@ -293,33 +328,7 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
     if journal_dir(root).join("journal.log").exists() || !matches!(check_export_target(root), Ok(DeviceLayout::Classic)) {
         return vec![];
     }
-    // Compared after Unicode normalisation and case folding: FAT/exFAT names are
-    // case-insensitive and macOS may hand back decomposed accents, so a name spelled
-    // differently in the database is still recognised as used.
-    fn norm(p: &Path) -> String {
-        use unicode_normalization::UnicodeNormalization;
-        p.to_string_lossy().nfc().collect::<String>().to_lowercase()
-    }
-    let mut used: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for t in lib.tracks.values() {
-        if !t.file_path.is_empty() {
-            used.insert(root.join(t.file_path.trim_start_matches('/')));
-        }
-        if let Some(b) = anlz_base(&t.analyze_path) {
-            let b = root.join(b.trim_start_matches('/'));
-            for e in ANLZ_EXTS {
-                used.insert(b.with_extension(e));
-            }
-        }
-        if !t.artwork_path.is_empty() {
-            let a = root.join(t.artwork_path.trim_start_matches('/'));
-            if let (Some(stem), Some(ext)) = (a.file_stem().map(|x| x.to_string_lossy().to_string()), a.extension().map(|x| x.to_string_lossy().to_string())) {
-                used.insert(a.with_file_name(format!("{stem}_m.{ext}")));
-            }
-            used.insert(a);
-        }
-    }
-    let used_norm: std::collections::HashSet<String> = used.iter().map(|p| norm(p)).collect();
+    let used = referenced_files(root, lib);
     let mut out = vec![];
     let mut stack: Vec<PathBuf> = [root.join("Contents"), root.join("PIONEER").join("USBANLZ"), root.join("PIONEER").join("Artwork")].into_iter().filter(|d| d.is_dir()).collect();
     while let Some(d) = stack.pop() {
@@ -329,7 +338,7 @@ pub fn unused_files(root: &Path, lib: &DeviceLibrary) -> Vec<(PathBuf, u64)> {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
                 stack.push(p);
-            } else if ft.is_file() && !used_norm.contains(&norm(&p)) {
+            } else if ft.is_file() && !used.contains(&asset_key(&p)) {
                 let name = e.file_name().to_string_lossy().to_string();
                 // macOS bookkeeping files are not the library's concern.
                 if name == ".DS_Store" || name.starts_with("._") {
@@ -2036,14 +2045,11 @@ pub fn remove_tracks(lib: &mut DeviceLibrary, root: &Path, ids: &[u32]) -> Vec<P
             gone.push(p);
         }
     }
-    // A file another remaining row still points at stays.
-    let used: std::collections::HashSet<String> = lib.tracks.values().map(|t| path_key(&t.file_path)).collect();
-    gone.retain(|f| !used.contains(&path_key(&format!("/{}", f.strip_prefix(root).unwrap_or(f).to_string_lossy()))));
-    // Only delete assets within the managed directories on a classic-only device.
-    gone.retain(|p| target::managed_file(root, p));
     if !matches!(DeviceLayout::inspect(root), Ok(DeviceLayout::Classic)) {
-        gone.clear();
+        return vec![];
     }
+    let used = referenced_files(root, lib);
+    gone.retain(|p| target::managed_file(root, p) && !used.contains(&asset_key(&p)));
     gone
 }
 

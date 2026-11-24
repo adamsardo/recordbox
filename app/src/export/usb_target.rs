@@ -475,6 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn removing_one_classic_row_keeps_all_assets_referenced_by_another() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let mut lib = usb::DeviceLibrary::default();
+        let mut track = usb::DevTrack {
+            id: 1,
+            file_path: "/Contents/Café.mp3".into(),
+            analyze_path: "/PIONEER/USBANLZ/P000/00000001/ANLZ0000.DAT".into(),
+            artwork_path: "/PIONEER/Artwork/00001/a1.jpg".into(),
+            ..Default::default()
+        };
+        lib.tracks.insert(1, track.clone());
+        track.id = 2;
+        track.file_path = "/Contents/Cafe\u{301}.MP3".into();
+        track.analyze_path = "/PIONEER/USBANLZ/P000/00000001/anlz0000.dat".into();
+        track.artwork_path = "/PIONEER/Artwork/00001/A1.jpg".into();
+        lib.tracks.insert(2, track);
+        write(
+            root,
+            "PIONEER/rekordbox/export.pdb",
+            &usb::build_export_pdb(&lib),
+        )?;
+        assert!(usb::remove_tracks(&mut lib, root, &[1]).is_empty());
+        assert_eq!(lib.tracks.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn recovery_keeps_a_shared_file_and_old_classic_journal_on_a_mixed_drive() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();

@@ -32,15 +32,16 @@ fn ensure_idle(db: &Connection, id: &str, path: &str) -> Result<()> {
 
 /// A missing optional disk sibling is meaningful only if the native file registry
 /// also has no record of it. Check the entire registered set before editing native
-/// cues or a grid. Never open a path supplied by the registration.
+/// cues or a grid. Return a digest only for a .3EX that has one native registered
+/// owner. Never open a path supplied by the registration.
 pub(super) fn check_inventory(
     db: &Connection,
     owner: &str,
     share: &Path,
     analysis_path: &str,
-) -> Result<()> {
+) -> Result<Option<[u8; 32]>> {
     if !super::registered_files(db, owner)? {
-        return Ok(());
+        return Ok(None);
     }
     let relative = super::grid::analysis_relative_path(analysis_path)?;
     let base = relative
@@ -53,6 +54,7 @@ pub(super) fn check_inventory(
     let mut records = stmt.query([owner])?;
     let mut extensions = std::collections::HashSet::new();
     let mut checked = 0usize;
+    let mut embedding_hash = None;
     while let Some(r) = records.next()? {
         let id: String = r.get(0)?;
         let recorded: String = r.get(1)?;
@@ -95,8 +97,21 @@ pub(super) fn check_inventory(
                 && hash.eq_ignore_ascii_case(&format!("{:x}", Md5::digest(&bytes))),
             "Native registration size or checksum is stale for {recorded}"
         );
+        if ext.eq_ignore_ascii_case("3EX")
+            && super::embedding::owner(&bytes) == Some(super::embedding::Owner::Unassigned)
+        {
+            // The verified row above owns this path. A second track claiming the
+            // same path makes the row unsuitable as independent evidence of ownership.
+            let shared: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM contentFile
+                 WHERE ID!=?1 AND rb_local_deleted=0 AND ltrim(replace(Path,char(92),'/'),'/')=?2 COLLATE NOCASE)",
+                params![id, normalized.trim_start_matches('/')], |r| r.get(0))?;
+            if !shared {
+                embedding_hash = Some(Sha256::digest(&bytes).into());
+            }
+        }
     }
-    Ok(())
+    Ok(embedding_hash)
 }
 
 fn registrations(
@@ -261,6 +276,28 @@ mod tests {
         assert!(check_inventory(&db, "1", &share, source).is_err());
         db.execute(
             "UPDATE contentFile SET rb_local_deleted=1 WHERE ID='missing'",
+            [],
+        )?;
+        let embedding = super::super::embedding::test_embedding(b"0");
+        std::fs::write(target.with_extension("3EX"), &embedding)?;
+        let recorded = "/PIONEER/USBANLZ/P001/ANLZ0000.3EX";
+        db.execute(
+            "INSERT INTO contentFile(ID,ContentID,Path,Hash,Size,rb_local_deleted,rb_local_synced)
+                    VALUES('embedding','1',?1,?2,?3,0,0)",
+            params![
+                recorded,
+                format!("{:x}", Md5::digest(&embedding)),
+                embedding.len()
+            ],
+        )?;
+        assert_eq!(
+            check_inventory(&db, "1", &share, source)?,
+            Some(Sha256::digest(&embedding).into())
+        );
+        db.execute("INSERT INTO contentFile(ID,ContentID,Path,rb_local_deleted) VALUES('other owner','2',?1,0)",[recorded])?;
+        assert_eq!(check_inventory(&db, "1", &share, source)?, None);
+        db.execute(
+            "UPDATE contentFile SET rb_local_deleted=1 WHERE ID IN ('embedding','other owner')",
             [],
         )?;
         let changes = [FileChange {

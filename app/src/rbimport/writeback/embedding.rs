@@ -1,5 +1,5 @@
 //! The observed v7 .3EX is a MessagePack map containing audio features. Only this
-//! complete, bounded shape is recognized. Its d2 identifies the track; d11
+//! complete, bounded shape is recognized. Its d2 can identify the track; d11
 //! matches native tempo in the public samples that have a beat grid.
 struct Input<'a>(&'a [u8]);
 
@@ -98,13 +98,61 @@ impl<'a> Input<'a> {
     }
 }
 
-pub(super) fn content_id(bytes: &[u8]) -> Option<&[u8]> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Owner<'a> {
+    Unassigned,
+    Track(&'a [u8]),
+}
+
+/// None indicates an unrecognized payload; the zero sentinel is a valid
+/// embedding whose producer did not assign a track ID.
+pub(super) fn owner(bytes: &[u8]) -> Option<Owner<'_>> {
     (bytes.len() <= 1024 * 1024).then_some(())?;
-    Input(bytes).embedding_owner()
+    Some(match Input(bytes).embedding_owner()? {
+        b"0" => Owner::Unassigned,
+        id if id[0] != b'0' => Owner::Track(id),
+        _ => return None,
+    })
 }
 
 pub(super) fn is_known(bytes: &[u8]) -> bool {
-    content_id(bytes).is_some()
+    owner(bytes).is_some()
+}
+
+#[cfg(test)]
+pub(super) fn test_embedding(id: &[u8]) -> Vec<u8> {
+    let mut b = b"\x81\xa9embedding\x8b".to_vec();
+    b.extend(b"\xa2d2");
+    assert!(id.len() < 32);
+    b.push(0xa0 + id.len() as u8);
+    b.extend(id);
+    b.extend(b"\xa2d3\xd9\x20");
+    b.extend([b'0'; 32]);
+    let float = [0xca, 0, 0, 0, 0];
+    for n in [4, 5, 6, 7, 8, 9, 10, 11, 12] {
+        let key = format!("d{n}");
+        b.push(0xa0 + key.len() as u8);
+        b.extend(key.bytes());
+        match n {
+            5 | 6 => {
+                if n == 5 {
+                    b.push(0x91);
+                }
+                b.extend([0xdc, 0, 64]);
+                for _ in 0..64 {
+                    b.extend(float);
+                }
+            }
+            7 => {
+                b.push(0x92);
+                b.extend(float);
+                b.extend(float);
+            }
+            9 | 10 => b.push(0),
+            _ => b.extend(float),
+        }
+    }
+    b
 }
 
 #[cfg(test)]
@@ -113,34 +161,10 @@ mod tests {
 
     #[test]
     fn only_a_complete_single_embedding_without_extra_keys_is_accepted() {
-        let mut b = b"\x81\xa9embedding\x8b".to_vec();
-        b.extend(b"\xa2d2\xa3123\xa2d3\xd9\x20");
-        b.extend([b'0'; 32]);
-        let float = [0xca, 0, 0, 0, 0];
-        for n in [4, 5, 6, 7, 8, 9, 10, 11, 12] {
-            let key = format!("d{n}");
-            b.push(0xa0 + key.len() as u8);
-            b.extend(key.bytes());
-            match n {
-                5 | 6 => {
-                    if n == 5 {
-                        b.push(0x91);
-                    }
-                    b.extend([0xdc, 0, 64]);
-                    for _ in 0..64 {
-                        b.extend(float);
-                    }
-                }
-                7 => {
-                    b.push(0x92);
-                    b.extend(float);
-                    b.extend(float);
-                }
-                9 | 10 => b.push(0),
-                _ => b.extend(float),
-            }
-        }
-        assert_eq!(content_id(&b), Some(b"123".as_slice()));
+        let mut b = test_embedding(b"123");
+        assert_eq!(owner(&b), Some(Owner::Track(b"123")));
+        assert_eq!(owner(&test_embedding(b"0")), Some(Owner::Unassigned));
+        assert!(!is_known(&test_embedding(b"00")));
         assert!(!is_known(&b[..b.len() - 1]));
         let mut duplicate = b.clone();
         let key = duplicate.windows(3).position(|w| w == b"d12").unwrap();

@@ -620,6 +620,7 @@ pub(crate) fn check_sidecars(
     share: &Path,
     analysis_path: &str,
     owner: &str,
+    registered_embedding: Option<[u8; 32]>,
     patch: &CuePatch,
 ) -> Result<()> {
     if patch.edits.is_empty() || analysis_path.is_empty() {
@@ -637,10 +638,19 @@ pub(crate) fn check_sidecars(
     }
     for companion in super::grid::additional_sidecars(share, analysis_path)? {
         if companion.is_embedding {
-            ensure!(
-                super::embedding::content_id(&companion.bytes) == Some(owner.as_bytes()),
-                "Native .3EX embedding belongs to another track"
-            );
+            match super::embedding::owner(&companion.bytes) {
+                Some(super::embedding::Owner::Track(id)) => ensure!(
+                    id == owner.as_bytes(),
+                    "Native .3EX embedding belongs to another track"
+                ),
+                Some(super::embedding::Owner::Unassigned) => {
+                    ensure!(registered_embedding == Some(Sha256::digest(&companion.bytes).into()),
+                        "The .3EX embedding has no track ID; cue edits need a uniquely owned native registration with matching file size and checksum");
+                    ensure!(patch.edits.iter().all(|e| !e.remove && e.kind.is_none()),
+                        "An unassigned .3EX embedding with a verified registration supports cue labels and colors only");
+                }
+                None => bail!("Unrecognized .3EX embedding"),
+            }
         } else {
             check_cue_sections(&companion.bytes, &companion.extension, patch)?;
         }
@@ -1035,7 +1045,7 @@ mod tests {
             if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "3EX") {
                 let b = std::fs::read(entry.path())?;
                 ensure!(
-                    super::super::embedding::content_id(&b).is_some(),
+                    super::super::embedding::is_known(&b),
                     "Unrecognized public v7 embedding at {}",
                     entry.path().display()
                 );
@@ -1125,7 +1135,7 @@ mod tests {
         drop(local);
         let patch = plan(&baseline, &super::local(&changed)?)?;
         assert!(
-            check_sidecars(&source.join("share"), &dat, "another-track", &patch)
+            check_sidecars(&source.join("share"), &dat, "another-track", None, &patch)
                 .unwrap_err()
                 .to_string()
                 .contains("belongs to another track")
@@ -1134,7 +1144,7 @@ mod tests {
         // A desktop catalog pointing into those files must not silently diverge.
         let export = checkout.join(".testdata/RBv7/demo/export");
         let mirrored = "PIONEER/USBANLZ/P053/0001D21F/ANLZ0000.DAT";
-        assert!(check_sidecars(&export, mirrored, &content, &patch)
+        assert!(check_sidecars(&export, mirrored, &content, None, &patch)
             .unwrap_err()
             .to_string()
             .contains("EXT already mirrors"));
@@ -1230,10 +1240,17 @@ mod tests {
         legacy[6..8].copy_from_slice(&1u16.to_be_bytes());
         let third = dat.with_extension("3EX");
         std::fs::write(&third, tagged(b"PCOB", &legacy, &mem))?;
-        check_sidecars(root.path(), source, "song", &labels)?;
+        check_sidecars(root.path(), source, "song", None, &labels)?;
         let mut structural = base.view();
         structural.0.remove(0); // remove native memory cue
-        assert!(check_sidecars(root.path(), source, "song", &plan(&base, &structural)?).is_err());
+        assert!(check_sidecars(
+            root.path(),
+            source,
+            "song",
+            None,
+            &plan(&base, &structural)?
+        )
+        .is_err());
         let mut extended = [0u8; 8];
         extended[4..6].copy_from_slice(&1u16.to_be_bytes());
         let mut pcp = [0u8; 88];
@@ -1242,20 +1259,52 @@ mod tests {
         pcp[8..12].copy_from_slice(&88u32.to_be_bytes());
         pcp[16] = 1;
         std::fs::write(&third, tagged(b"PCO2", &extended, &pcp))?;
-        check_sidecars(root.path(), source, "song", &labels)?; // only memory cues mirrored
+        check_sidecars(root.path(), source, "song", None, &labels)?; // only memory cues mirrored
         extended[3] = 1;
         pcp[15] = 1;
         std::fs::write(&third, tagged(b"PCO2", &extended, &pcp))?;
-        assert!(check_sidecars(root.path(), source, "song", &labels).is_err());
+        assert!(check_sidecars(root.path(), source, "song", None, &labels).is_err());
+        let generic = super::super::embedding::test_embedding(b"0");
+        std::fs::write(&third, &generic)?;
+        let proof = Some(Sha256::digest(&generic).into());
+        check_sidecars(root.path(), source, "song", proof, &labels)?;
+        for missing_or_stale in [None, Some([0; 32])] {
+            assert!(
+                check_sidecars(root.path(), source, "song", missing_or_stale, &labels)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("has no track ID")
+            );
+        }
+        assert!(check_sidecars(
+            root.path(),
+            source,
+            "song",
+            proof,
+            &plan(&base, &structural)?
+        )
+        .is_err());
+        let foreign = super::super::embedding::test_embedding(b"123");
+        std::fs::write(&third, &foreign)?;
+        assert!(check_sidecars(
+            root.path(),
+            source,
+            "456",
+            Some(Sha256::digest(&foreign).into()),
+            &labels
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("another track"));
         std::fs::write(&third, tagged(b"PVB2", &[], &[]))?;
-        check_sidecars(root.path(), source, "song", &labels)?;
+        check_sidecars(root.path(), source, "song", None, &labels)?;
         std::fs::write(dat.with_extension("4EX"), tagged(b"PCO3", &[], &[]))?;
-        assert!(check_sidecars(root.path(), source, "song", &labels)
+        assert!(check_sidecars(root.path(), source, "song", None, &labels)
             .unwrap_err()
             .to_string()
             .contains("PCO3"));
         std::fs::write(&third, b"\x81\xa9embedding\x80")?;
-        assert!(check_sidecars(root.path(), source, "song", &labels).is_err());
+        assert!(check_sidecars(root.path(), source, "song", None, &labels).is_err());
         Ok(())
     }
 
@@ -1274,9 +1323,9 @@ mod tests {
         let mut desired = base.view();
         desired.0[1].1.color = 42;
         let patch = plan(&base, &desired)?;
-        assert!(check_sidecars(root.path(), source, "song", &patch).is_err());
+        assert!(check_sidecars(root.path(), source, "song", None, &patch).is_err());
         std::fs::write(&dat, &pmai)?;
-        check_sidecars(root.path(), source, "song", &patch)?;
+        check_sidecars(root.path(), source, "song", None, &patch)?;
         let mut ext = pmai;
         ext.extend_from_slice(b"PCO2");
         ext.extend_from_slice(&20u32.to_be_bytes());
@@ -1284,7 +1333,7 @@ mod tests {
         ext.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 0]);
         ext[8..12].copy_from_slice(&48u32.to_be_bytes());
         std::fs::write(dat.with_extension("EXT"), ext)?;
-        assert!(check_sidecars(root.path(), source, "song", &patch).is_err());
+        assert!(check_sidecars(root.path(), source, "song", None, &patch).is_err());
         Ok(())
     }
 }
