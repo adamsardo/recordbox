@@ -460,6 +460,10 @@ jobs:
 
           cargo_args=(--manifest-path app/Cargo.toml --release --locked --features vulkan)
           for test_name in stems::vulkan::tests::projection_limits_bound_every_submission_and_buffer \
+                           stems::vulkan::tests::initialization_deadline_pauses_vulkan \
+                           stems::vulkan::tests::nonfinite_readback_pauses_vulkan \
+                           app::prefs_tests::vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model \
+                           app::prefs_tests::legacy_preferences_require_opt_in_for_automatic_cpu_separation \
                            stems::vulkan::tests::software_vulkan_linear_matches_reference \
                            stems::htdemucs::vulkan_transformer_projections_match_cpu \
                            stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override \

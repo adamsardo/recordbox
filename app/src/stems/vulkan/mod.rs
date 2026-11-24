@@ -437,6 +437,32 @@ mod tests {
         assert!(ready().is_err());
     }
 
+    #[test]
+    #[ignore = "sets the process-wide Vulkan hold; run in a fresh process"]
+    fn initialization_deadline_pauses_vulkan() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let first = initialize(Duration::from_millis(10), move || {
+            blocked.recv()?;
+            Ok(())
+        });
+        // The worker cannot finish before the deadline, independent of scheduling.
+        drop(release);
+        assert!(first.unwrap_err().to_string().contains("did not finish"));
+        let reason = backend_hold().unwrap();
+        assert!(reason.contains("did not finish"));
+
+        let (attempt, called) = mpsc::channel();
+        let next = initialize(STARTUP_TIMEOUT, move || {
+            attempt.send(())?;
+            Ok(())
+        });
+        assert_eq!(next.unwrap_err().to_string(), reason);
+        assert!(matches!(
+            called.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
     // Run explicitly with Mesa Lavapipe. Production never selects a software Vulkan adapter.
     #[test]
     #[ignore]
