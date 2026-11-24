@@ -5,6 +5,9 @@ pub mod pdb;
 pub mod settings;
 pub mod settings_fields;
 pub mod usb;
+mod usb_target;
+#[cfg(test)]
+mod public_device_tests;
 #[cfg(test)]
 mod usb_test;
 #[cfg(test)]

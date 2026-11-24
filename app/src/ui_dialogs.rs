@@ -338,22 +338,28 @@ fn export_window(app: &mut App, ctx: &Context) {
         if app.devices.is_empty() {
             ui.label(RichText::new("No USB drive or SD card found. Connect one, or add a folder as a device in the Devices view.").color(CAUTION_TX));
         }
-        if let Some(d) = app.devices.iter().find(|d| Some(&d.root) == app.dialogs.export_root.as_ref()) {
+        let target = app.devices.iter().find(|d| Some(&d.root) == app.dialogs.export_root.as_ref());
+        let blocker = target.map(|d| d.write_blocker.as_deref()).unwrap_or(Some("Select a connected device.")).map(str::to_owned);
+        if let Some(d) = target {
+            ui.label(format!("{} · {}", d.catalog_label(), d.root));
             if let (Some(f), Some(t)) = (d.free, d.total) {
                 ui.label(RichText::new(format!("Available Space {:.1} GB of {:.1} GB", f as f64 / 1e9, t as f64 / 1e9)).size(11.0).color(DIM));
             }
             if d.fs == "apfs" {
                 ui.label(RichText::new("This drive is formatted as APFS, which DJ players cannot read. Use FAT32 or exFAT.").color(CAUTION_TX));
             }
-            if crate::export::usb::has_onelibrary(std::path::Path::new(&d.root)) {
-                ui.label(RichText::new("This drive also has a OneLibrary database (from rekordbox 7.2.11 or later). recordbox updates only the standard device library, so players that read OneLibrary will not show this export.").size(11.0).color(CAUTION_TX));
+            if let Some(reason) = &blocker {
+                ui.label(RichText::new(reason).color(CAUTION_TX));
+            } else if d.layout == Some(crate::export::usb::DeviceLayout::Mixed) {
+                ui.label(RichText::new("Only the classic catalog is updated. Existing shared audio, artwork, analysis and player settings are preserved. OneLibrary players use their own catalog.").size(11.0).color(CAUTION_TX));
+            } else if d.lib.is_none() {
+                ui.label("Export creates a classic Device Library in this folder.");
             }
             if let Some(l) = &d.lib {
-                ui.label(RichText::new(format!("Already on the device: {} tracks, {} playlists. New items are added; existing ones are updated.", l.tracks.len(), l.nodes.iter().filter(|n| !n.folder).count())).size(11.0).color(DIM));
+                ui.label(RichText::new(format!("Classic catalog: {} tracks, {} playlists.", l.tracks.len(), l.nodes.iter().filter(|n| !n.folder).count())).size(11.0).color(DIM));
             }
-            if let Some(e) = &d.error {
-                ui.label(RichText::new(e).color(CAUTION_TX));
-            }
+        } else if app.dialogs.export_root.is_some() {
+            ui.label(RichText::new("The selected device is no longer connected.").color(CAUTION_TX));
         }
         ui.separator();
         ui.horizontal(|ui| {
@@ -407,8 +413,8 @@ fn export_window(app: &mut App, ctx: &Context) {
         ui.add_space(6.0);
         ui.label(RichText::new("Music files are copied to the device; your originals are only read. Tracks that are not analysed yet are analysed first.").size(10.5).color(DIM));
         ui.horizontal(|ui| {
-            let can = app.dialogs.export_root.is_some() && (!app.dialogs.export_sel.is_empty() || !app.dialogs.export_tracks.is_empty());
-            if ui.add_enabled(can, btn("Export").min_size(vec2(96.0, 24.0))).on_disabled_hover_text("Choose a device and at least one playlist or track to export.").clicked() {
+            let can = blocker.is_none() && (!app.dialogs.export_sel.is_empty() || !app.dialogs.export_tracks.is_empty());
+            if ui.add_enabled(can, btn("Export").min_size(vec2(96.0, 24.0))).on_disabled_hover_text(blocker.as_deref().unwrap_or("Choose at least one playlist or track to export.")).clicked() {
                 let root = app.dialogs.export_root.clone().unwrap();
                 let sel: Vec<i64> = app.dialogs.export_sel.iter().copied().collect();
                 let tracks = app.dialogs.export_tracks.clone();
@@ -466,11 +472,12 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     if let Some((root, id, name)) = app.dialogs.device_remove.clone() {
         let mut answer = None;
         let del = app.prefs.delete_device_tracks;
+        let mixed = app.devices.iter().find(|d| d.root == root).is_some_and(|d| d.layout == Some(crate::export::usb::DeviceLayout::Mixed));
         kit::dialog(ctx, "Delete Playlist").id(egui::Id::new("Delete from device")).resizable(false).anchor(center, vec2(0.0, 0.0)).show(ctx, |ui| {
             kit::apply_style(ui);
             ui.set_width(400.0);
             kit::message(ui, "Are you sure you want to delete this playlist?");
-            kit::message_note(ui, &format!("\"{name}\" on the device. {}", if del { "Its tracks that are in no other playlist are also deleted from the device." } else { "Tracks stay on the device (change this in Preferences > DJ System > Device)." }));
+            kit::message_note(ui, &format!("\"{name}\" on the device. {}", if mixed && del { "Tracks used by no other classic playlist are removed from the classic catalog. Their files remain on the drive for OneLibrary." } else if del { "Its tracks that are in no other playlist are also deleted from the device." } else { "Tracks stay on the device (change this in Preferences > DJ System > Device)." }));
             answer = kit::dialog_buttons(ui, &["OK", "Cancel"]);
         });
         if answer == Some(0) {

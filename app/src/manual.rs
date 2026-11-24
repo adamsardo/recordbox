@@ -117,7 +117,8 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li>Choose <i>Playlist &gt; Export to USB Device…</i>, or select a playlist and <i>Playlist &gt; Export Playlist</i>, or select tracks and <i>Track &gt; Export Track</i>; or drag tracks or playlists onto the device.</li>
 <li>Pick the device and the playlists, then Export. Progress is shown in the footer; it can be cancelled.</li>
 </ol>
-<p>The export writes the music into <code>/Contents</code>, the device library (<code>export.pdb</code>, <code>exportExt.pdb</code>), analysis files with waveforms, grids, cues, phrases and vocal positions, artwork, and your player settings. An export that is interrupted is rolled back or completed the next time the drive is seen.</p>
+<p>A classic export writes music into <code>/Contents</code>, the catalogs <code>export.pdb</code> and <code>exportExt.pdb</code>, analysis files, artwork and player settings. Select the drive root that contains <code>PIONEER</code>. An interrupted export is rolled back or completed the next time the drive is seen.</p>
+<p>If the drive has both classic Device Library and OneLibrary, recordbox updates the classic catalog and protects existing audio, artwork, analysis files and player settings. Players that read OneLibrary continue to show that catalog's contents. For a OneLibrary-only drive, use AlphaTheta Rekordbox.</p>
 <h3>On the device</h3>
 <ul>
 <li>Under Devices you can browse a drive's playlists and tracks, delete playlists from it, update its playlists from the library, and clean up files nothing refers to.</li>
@@ -125,7 +126,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li>If cues were changed on the players, recordbox offers to take the changes back into the library the next time the drive is connected.</li>
 </ul>
 <h3>What the players show</h3>
-<p>Preferences &gt; DJ System decides the waveform colour, current position and divisions (General), the browse categories and sort options (Category, Sort), and your player settings such as Quantize, Auto Cue, Time Mode, Jog Mode and brightness (My Settings). They are written to every drive you export.</p>
+<p>Preferences &gt; DJ System sets the waveform colour, current position and divisions (General), the browse categories and sort options (Category, Sort), and player settings such as Quantize, Auto Cue, Time Mode, Jog Mode and brightness (My Settings). A classic-only drive can receive those player settings. A drive with both catalogs keeps its existing player settings.</p>
 "#),
     ("xml", "rekordbox xml", r#"
 <p><i>File &gt; Export Collection in xml format</i> writes the whole collection (tracks, cues, grids, playlists) as a rekordbox xml file that rekordbox and other DJ software can import. <i>File &gt; Import Collection from rekordbox xml…</i> reads one. The path remembered as "Imported Library" is in Preferences &gt; Advanced &gt; Browse.</p>

@@ -512,6 +512,40 @@ pub fn read_valid_section_list(path: &std::path::Path) -> Vec<(String, Vec<u8>)>
     }
 }
 
+/// A USB catalog's analysis reference and the PPTH stored inside each classic file
+/// must identify the same device track before its cues or grid can be reused.
+pub(super) fn device_companion(path: &std::path::Path, media: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::{ensure, Context};
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Inspecting {}", path.display())),
+    };
+    ensure!(metadata.is_file(), "Expected a regular analysis file at {}", path.display());
+    let bytes = std::fs::read(path)?;
+    // Native .3EX embeddings have a different encoding. Preserve their bytes along
+    // with their verified DAT. If a future .3EX is PMAI, check its path as well.
+    if !bytes.starts_with(b"PMAI") && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("3EX")) {
+        return Ok(Some(bytes));
+    }
+    validate(&bytes).map_err(anyhow::Error::msg).with_context(|| format!("Invalid analysis file {}", path.display()))?;
+    let mut offset = 28;
+    let mut matched = false;
+    while offset < bytes.len() {
+        // validate() checked the complete section directory and its bounds.
+        let length = u32::from_be_bytes(bytes[offset + 8..offset + 12].try_into()?) as usize;
+        if &bytes[offset..offset + 4] == b"PPTH" {
+            let recorded = parse_ppth(&bytes[offset..offset + length]).context("Unreadable USB analysis track path")?;
+            ensure!(!matched && super::usb::path_key(&recorded) == super::usb::path_key(media),
+                "{} has a conflicting track path ({recorded}). The USB catalog references {media}", path.display());
+            matched = true;
+        }
+        offset += length;
+    }
+    ensure!(matched, "{} lacks the USB track path required to match {media}", path.display());
+    Ok(Some(bytes))
+}
+
 /// Check an ANLZ file's framing: the PMAI header (28 bytes, declared total = file length) and
 /// every section's header and total lengths lying inside the file and tiling it exactly.
 pub fn validate(b: &[u8]) -> Result<(), String> {
@@ -534,8 +568,16 @@ pub fn validate(b: &[u8]) -> Result<(), String> {
         }
     }
     let mut i = hl;
+    let mut sections = 0;
     while i < b.len() {
         let (Some(shl), Some(st)) = (be32(i + 4), be32(i + 8)) else { return Err(format!("section at {i} is cut short")) };
+        sections += 1;
+        if sections > 1024 {
+            return Err("analysis file exceeds the supported 1024 top-level sections".into());
+        }
+        if !b[i..i + 4].iter().all(|c| matches!(c, 32..=126)) {
+            return Err(format!("invalid analysis section identifier at {i}"));
+        }
         if st < 12 || shl < 12 || shl > st || i + st > b.len() {
             return Err(format!("section {} at {i} has header {shl} / total {st} outside the file", String::from_utf8_lossy(&b[i..(i + 4).min(b.len())])));
         }
@@ -759,6 +801,15 @@ pub fn anlz_folder(usb_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_printable_sections_survive_but_invalid_identifiers_are_rejected() {
+        let mut bytes = file(vec![section(b"PNEW", &[], &[])]);
+        assert!(validate(&bytes).is_ok());
+        bytes[29] = 0;
+        assert!(validate(&bytes).is_err());
+        assert!(validate(&file(vec![section(b"PNEW", &[], &[]); 1025])).is_err());
+    }
     /// Unknown sections already on the drive survive a rewrite; audio sections are reused.
     #[test]
     fn rewrite_keeps_device_sections() {

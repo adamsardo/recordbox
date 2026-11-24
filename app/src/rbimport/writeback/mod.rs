@@ -1,6 +1,7 @@
 //! Reviewed native edits. Evidence is recorded only where a local field and a
 //! specific native record agreed during a desktop import.
 pub(crate) mod cues;
+mod embedding;
 mod grid;
 #[cfg(test)]
 mod integration_tests;
@@ -557,10 +558,18 @@ fn checked_current(
                 raw,
                 Mutation::Column("BPM", Value::Integer(*v)),
             );
-            if !analysis.is_empty() && n != *v {
-                let g = grid::inspect(&share, &analysis)?.grid;
-                if g.anchors.len() == 1 && (g.first_bpm() * 100.0).round() as i64 == n {
-                    current.companion = Some(Field::Grid);
+            if n != *v {
+                if analysis.is_empty() {
+                    ensure!(!registered_files(c, &baseline.id)?, "Native file registrations exist without a recorded analysis path. Cannot verify BPM mirrors");
+                } else {
+                    registration::check_inventory(c, &baseline.id, &share, &analysis)?;
+                    let snap = grid::inspect(&share, &analysis)?;
+                    snap.ensure_timing_editable()?;
+                    if snap.grid.anchors.len() == 1
+                        && (snap.grid.first_bpm() * 100.0).round() as i64 == n
+                    {
+                        current.companion = Some(Field::Grid);
+                    }
                 }
             }
             current
@@ -602,7 +611,8 @@ fn checked_current(
                 bail!("Native file registrations exist without a recorded analysis path");
             }
             let patch = cues::plan(&now, cue_view)?;
-            cues::check_sidecars(&share, &analysis, &patch)?;
+            registration::check_inventory(c, &baseline.id, &share, &analysis)?;
+            cues::check_sidecars(&share, &analysis, &baseline.id, &patch)?;
             Current {
                 value: Edit::Cues(view),
                 proof: now.identity().to_owned(),
@@ -632,6 +642,8 @@ fn checked_current(
             {
                 return Ok(guard(Edit::Grid(snap.grid), proof, Mutation::ObserveOnly));
             }
+            snap.ensure_timing_editable()?;
+            registration::check_inventory(c, &baseline.id, &share, &analysis)?;
             let revision =
                 next_grid_revision(r.get::<_, Option<String>>("AnalysisUpdated")?.as_deref())?;
             let mut companion = None;
@@ -1088,6 +1100,41 @@ mod provenance_tests {
             .shared_analysis
             .contains("pioneer/usbanlz/a/anlz0000.dat"));
         assert!(!owners.duplicate_ids.contains("b"));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_bpm_rechecks_native_registrations_with_no_analysis_path() -> Result<()> {
+        let fixture = integration_tests::Libraries::new()?;
+        let local = Db::open(&fixture.local)?;
+        let mut track = local.track_at_path(&fixture.audio)?.unwrap();
+        track.bpm = 125.;
+        local.update_track(&track)?;
+        drop(local);
+        let p = preview(&fixture.local, &fixture.source)?;
+        let row = p
+            .rows
+            .iter()
+            .position(|r| r.field == Field::Bpm && r.reason.is_none())
+            .unwrap();
+        let native = Connection::open(fixture.source.join("master.db"))?;
+        native.pragma_update(None, "key", super::super::MASTER_DB_KEY)?;
+        native.execute("INSERT INTO contentFile(ID,ContentID,Path,rb_local_deleted) VALUES ('new','10','/PIONEER/USBANLZ/n/ANLZ0000.3EX',0)", [])?;
+        drop(native);
+        let fresh = preview(&fixture.local, &fixture.source)?;
+        assert!(fresh.rows.iter().any(|r| r.field == Field::Bpm
+            && r.reason
+                .as_deref()
+                .is_some_and(|reason| reason
+                    .contains("registrations exist without a recorded analysis path"))));
+        assert!(apply(&fixture.local, &fixture.source, &p, &[row]).is_err());
+        let native = Connection::open(fixture.source.join("master.db"))?;
+        native.pragma_update(None, "key", super::super::MASTER_DB_KEY)?;
+        assert_eq!(
+            native.query_row("SELECT BPM FROM djmdContent WHERE ID='10'", [], |r| r
+                .get::<_, i64>(0))?,
+            12000
+        );
         Ok(())
     }
 

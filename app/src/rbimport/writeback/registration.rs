@@ -14,6 +14,91 @@ struct Registration {
     size: i64,
 }
 
+fn ensure_idle(db: &Connection, id: &str, path: &str) -> Result<()> {
+    let idle: bool = db.query_row(
+            "SELECT rb_local_synced=0 AND coalesce(rb_file_hash_dirty,0)=0 AND coalesce(rb_file_size_dirty,0)=0
+             AND coalesce(rb_in_progress,0)=0 AND coalesce(rb_local_file_status,0)=0 AND coalesce(rb_process_type,0)=0
+             AND coalesce(rb_temp_path,'')='' AND coalesce(rb_insync_hash,'')='' AND coalesce(rb_insync_local_usn,0)=0
+             AND coalesce(rb_data_status,0)=0 AND coalesce(rb_local_data_status,0)=0 AND coalesce(usn,0)=0
+             FROM contentFile WHERE ID=? AND rb_local_deleted=0",
+            [id], |r| r.get(0),
+        ).context("Unrecognized or incomplete native file-registration state")?;
+    ensure!(
+        idle,
+        "{path} has cloud, dirty or pending file-registration state"
+    );
+    Ok(())
+}
+
+/// A missing optional disk sibling is meaningful only if the native file registry
+/// also has no record of it. Check the entire registered set before editing native
+/// cues or a grid. Never open a path supplied by the registration.
+pub(super) fn check_inventory(
+    db: &Connection,
+    owner: &str,
+    share: &Path,
+    analysis_path: &str,
+) -> Result<()> {
+    if !super::registered_files(db, owner)? {
+        return Ok(());
+    }
+    let relative = super::grid::analysis_relative_path(analysis_path)?;
+    let base = relative
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut stmt = db.prepare(
+        "SELECT ID,Path,Hash,Size FROM contentFile WHERE ContentID=? AND rb_local_deleted=0",
+    )?;
+    let mut records = stmt.query([owner])?;
+    let mut extensions = std::collections::HashSet::new();
+    let mut checked = 0usize;
+    while let Some(r) = records.next()? {
+        let id: String = r.get(0)?;
+        let recorded: String = r.get(1)?;
+        let normalized = recorded.replace('\\', "/");
+        let (stem, ext) = normalized
+            .strip_prefix('/')
+            .unwrap_or(&normalized)
+            .rsplit_once('.')
+            .context("Registered analysis path has no extension")?;
+        ensure!(
+            stem == base,
+            "Native file registration {recorded} lies outside this track's known analysis set"
+        );
+        ensure!(
+            extensions.insert(ext.to_ascii_uppercase()),
+            "Duplicate native analysis registration for {recorded}"
+        );
+        ensure!(
+            extensions.len() <= 64,
+            "Too many registered analysis companions"
+        );
+        ensure_idle(db, &id, &recorded)?;
+        let hash: String = r.get(2)?;
+        let size: i64 = r.get(3)?;
+        ensure!(
+            hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Unsupported native file checksum for {recorded}"
+        );
+        let bytes = super::grid::read_companion(share, analysis_path, ext)?
+            .with_context(|| format!("Registered analysis companion {recorded} is missing"))?;
+        checked = checked
+            .checked_add(bytes.len())
+            .context("Analysis size overflow")?;
+        ensure!(
+            checked <= 256 * 1024 * 1024,
+            "Registered analysis set exceeds the read limit"
+        );
+        ensure!(
+            i64::try_from(bytes.len())? == size
+                && hash.eq_ignore_ascii_case(&format!("{:x}", Md5::digest(&bytes))),
+            "Native registration size or checksum is stale for {recorded}"
+        );
+    }
+    Ok(())
+}
+
 fn registrations(
     db: &Connection,
     owner: &str,
@@ -66,18 +151,7 @@ fn registrations(
                 && registered_path.replace('\\', "/") == path,
             "Ambiguous native file registration for {path}"
         );
-        let idle: bool = db.query_row(
-            "SELECT rb_local_synced=0 AND coalesce(rb_file_hash_dirty,0)=0 AND coalesce(rb_file_size_dirty,0)=0
-             AND coalesce(rb_in_progress,0)=0 AND coalesce(rb_local_file_status,0)=0 AND coalesce(rb_process_type,0)=0
-             AND coalesce(rb_temp_path,'')='' AND coalesce(rb_insync_hash,'')='' AND coalesce(rb_insync_local_usn,0)=0
-             AND coalesce(rb_data_status,0)=0 AND coalesce(rb_local_data_status,0)=0 AND coalesce(usn,0)=0
-             FROM contentFile WHERE ID=? AND rb_local_deleted=0",
-            [&id], |r| r.get(0),
-        ).context("Unrecognized or incomplete native file-registration state")?;
-        ensure!(
-            idle,
-            "{path} has cloud, dirty or pending file-registration state"
-        );
+        ensure_idle(db, &id, &path)?;
         let target = source.join(&file.relative_path);
         if let Some(registered) = local.filter(|s| !s.is_empty()) {
             ensure!(
@@ -166,7 +240,28 @@ mod tests {
         db.execute(
             "INSERT INTO contentFile(ID,ContentID,Path,Hash,Size,rb_local_deleted,rb_local_synced)
                     VALUES('f','1','/PIONEER/USBANLZ/P001/ANLZ0000.DAT',?1,?2,0,0)",
-            params![format!("{:x}", Md5::digest(original)), original.len() as i64],
+            params![
+                format!("{:x}", Md5::digest(original)),
+                original.len() as i64
+            ],
+        )?;
+        let source = "/PIONEER/USBANLZ/P001/ANLZ0000.DAT";
+        let share = dir.path().join("share");
+        check_inventory(&db, "1", &share, source)?;
+        db.execute("INSERT INTO contentFile(ID,ContentID,Path,Hash,Size,rb_local_deleted,rb_local_synced)
+              SELECT 'missing',ContentID,replace(Path,'.DAT','.3EX'),Hash,Size,0,0 FROM contentFile WHERE ID='f'", [])?;
+        assert!(check_inventory(&db, "1", &share, source)
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
+        db.execute(
+            "UPDATE contentFile SET Path=replace(Path,'ANLZ0000','ANLZ0001') WHERE ID='missing'",
+            [],
+        )?;
+        assert!(check_inventory(&db, "1", &share, source).is_err());
+        db.execute(
+            "UPDATE contentFile SET rb_local_deleted=1 WHERE ID='missing'",
+            [],
         )?;
         let changes = [FileChange {
             relative_path: rel.into(),

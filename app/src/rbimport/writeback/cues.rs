@@ -434,6 +434,7 @@ pub(crate) fn read(c: &Connection, id: &str) -> Result<NativeCues> {
 #[derive(Debug)]
 struct Edit {
     id: String,
+    hot: bool,
     comment: Option<String>,
     memory_color: Option<i64>,
     hot_palette: Option<i64>,
@@ -459,6 +460,7 @@ pub(crate) fn plan(current: &NativeCues, desired: &CueView) -> Result<CuePatch> 
     for cue in &current.cues {
         let mut edit = Edit {
             id: cue.id.clone(),
+            hot: cue.position.slot >= 0,
             comment: None,
             memory_color: None,
             hot_palette: None,
@@ -536,40 +538,111 @@ pub(crate) fn plan(current: &NativeCues, desired: &CueView) -> Result<CuePatch> 
     })
 }
 
-pub(crate) fn check_sidecars(share: &Path, analysis_path: &str, patch: &CuePatch) -> Result<()> {
+/// Framing and section extents are checked by the shared bounded reader. Inspect
+/// every cue list, including repeated lists and cue data under newer suffixes.
+fn check_cue_sections(bytes: &[u8], ext: &str, patch: &CuePatch) -> Result<()> {
+    let mut pos = 28;
+    while pos < bytes.len() {
+        let rest = &bytes[pos..];
+        let header = u32::from_be_bytes(rest[4..8].try_into()?) as usize;
+        let total = u32::from_be_bytes(rest[8..12].try_into()?) as usize;
+        let section = &rest[..total];
+        match &section[..4] {
+            b"PCO2" | b"PCOB" => {
+                let extended = &section[..4] == b"PCO2";
+                let expected = if extended { 20 } else { 24 };
+                ensure!(header == expected, "Unrecognized cue-list header in {ext}");
+                let group = u32::from_be_bytes(section[12..16].try_into()?);
+                ensure!(group <= 1, "Unrecognized cue group in {ext}");
+                let hot = group == 1;
+                let count_at = if extended { 16 } else { 18 };
+                let count =
+                    u16::from_be_bytes(section[count_at..count_at + 2].try_into()?) as usize;
+                let affected = patch.edits.iter().any(|edit| {
+                    edit.hot == hot && (extended || edit.remove || edit.kind.is_some())
+                });
+                ensure!(count == 0 || !affected, "{ext} already mirrors this group's cue data; this change requires coordinated cue-list writes");
+                let mut entries = &section[header..];
+                for _ in 0..count {
+                    ensure!(entries.len() >= 12, "Truncated cue entry in {ext}");
+                    let len = u32::from_be_bytes(entries[8..12].try_into()?) as usize;
+                    let head = u32::from_be_bytes(entries[4..8].try_into()?);
+                    ensure!(len <= entries.len(), "Truncated cue data in {ext}");
+                    let e = &entries[..len];
+                    if extended {
+                        ensure!(
+                            len >= 44 && &e[..4] == b"PCP2" && head == 16 && matches!(e[16], 1 | 2),
+                            "Unrecognized extended cue revision in {ext}"
+                        );
+                        let n = u32::from_be_bytes(e[40..44].try_into()?) as usize;
+                        ensure!(
+                            n % 2 == 0
+                                && n <= len - 44
+                                && matches!(len - n, 44 | 48 | 88)
+                                && (n == 0 || e[44 + n - 2..44 + n] == [0, 0]),
+                            "Unsupported extended cue payload in {ext}"
+                        );
+                    } else {
+                        ensure!(
+                            len == 56 && &e[..4] == b"PCPT" && head == 28 && matches!(e[28], 1 | 2),
+                            "Unrecognized legacy cue revision in {ext}"
+                        );
+                    }
+                    let pad = u32::from_be_bytes(e[12..16].try_into()?);
+                    ensure!(
+                        if hot {
+                            (1..=16).contains(&pad)
+                        } else {
+                            pad == 0
+                        },
+                        "Cue entry disagrees with its group in {ext}"
+                    );
+                    entries = &entries[len..];
+                }
+                ensure!(
+                    entries.is_empty(),
+                    "Declared cue count disagrees with {ext} contents"
+                );
+            }
+            b"PPTH" | b"PVBR" | b"PVB2" | b"PQTZ" | b"PQT2" | b"PWAV" | b"PWV2" | b"PWV3"
+            | b"PWV4" | b"PWV5" | b"PWV6" | b"PWV7" | b"PWVC" | b"PVDI" | b"PSSI" => {}
+            tag => bail!(
+                "Unrecognized analysis section {} in {ext}; cue dependencies are unknown",
+                String::from_utf8_lossy(tag)
+            ),
+        }
+        pos += total;
+    }
+    Ok(())
+}
+
+pub(crate) fn check_sidecars(
+    share: &Path,
+    analysis_path: &str,
+    owner: &str,
+    patch: &CuePatch,
+) -> Result<()> {
     if patch.edits.is_empty() || analysis_path.is_empty() {
         return Ok(());
     }
-    let position_changes = patch
-        .edits
-        .iter()
-        .any(|edit| edit.remove || edit.kind.is_some());
     for ext in ["DAT", "EXT", "2EX"] {
-        let Some(data) = super::grid::read_sidecar(share, analysis_path, ext)? else {
+        if let Some(data) = super::grid::read_sidecar(share, analysis_path, ext)? {
+            check_cue_sections(&data, ext, patch)?;
+        } else {
             ensure!(
                 ext != "DAT",
                 "The registered desktop analysis file is missing"
             );
-            continue;
-        };
-        // read_sidecar has validated the PMAI container and all section extents.
-        let mut pos = 28;
-        while pos < data.len() {
-            let section = &data[pos..];
-            let header = u32::from_be_bytes(section[4..8].try_into()?) as usize;
-            let total = u32::from_be_bytes(section[8..12].try_into()?) as usize;
-            match &section[..4] {
-                b"PCO2" => {
-                    ensure!(header == 20 && total == header && section[16..18] == [0,0],
-                        "An analysis file contains extended cue data; this pilot cannot synchronize its cue mirror");
-                }
-                b"PCOB" if position_changes => {
-                    ensure!(header == 24 && total == header && section[18..20] == [0,0],
-                        "An analysis file contains cue positions; this change would leave an inconsistent mirror");
-                }
-                _ => {}
-            }
-            pos += total;
+        }
+    }
+    for companion in super::grid::additional_sidecars(share, analysis_path)? {
+        if companion.is_embedding {
+            ensure!(
+                super::embedding::content_id(&companion.bytes) == Some(owner.as_bytes()),
+                "Native .3EX embedding belongs to another track"
+            );
+        } else {
+            check_cue_sections(&companion.bytes, &companion.extension, patch)?;
         }
     }
     Ok(())
@@ -956,6 +1029,20 @@ mod tests {
             std::env::var_os("RECORDBOX_TEST_RBOX").context("rbox fixture checkout missing")?,
         );
         let public = checkout.join(".testdata/RBv7/demo/rekordbox");
+        let mut embeddings = 0usize;
+        for file in walkdir::WalkDir::new(public.join("share")) {
+            let entry = file?;
+            if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "3EX") {
+                let b = std::fs::read(entry.path())?;
+                ensure!(
+                    super::super::embedding::content_id(&b).is_some(),
+                    "Unrecognized public v7 embedding at {}",
+                    entry.path().display()
+                );
+                embeddings += 1;
+            }
+        }
+        ensure!(embeddings > 0, "Public v7 fixture has no 3EX files");
         let original = public.join("master.db");
         let pristine = Sha256::digest(std::fs::read(&original)?);
         let root = tempfile::tempdir()?;
@@ -1025,6 +1112,7 @@ mod tests {
             .context("missing imported demo track")?;
         let new_rating = (old_rating + 1) % 6;
         track.rating = new_rating as u8;
+        track.bpm += 1.0;
         local.update_track(&track)?;
         let mut changed = local.cues(track.id)?;
         let pad = changed
@@ -1035,7 +1123,30 @@ mod tests {
         pad.comment = "Pilot · 入".into();
         local.replace_cues(track.id, &changed)?;
         drop(local);
+        let patch = plan(&baseline, &super::local(&changed)?)?;
+        assert!(
+            check_sidecars(&source.join("share"), &dat, "another-track", &patch)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another track")
+        );
+        // The same public fixture's USB export contains populated hot-cue mirrors.
+        // A desktop catalog pointing into those files must not silently diverge.
+        let export = checkout.join(".testdata/RBv7/demo/export");
+        let mirrored = "PIONEER/USBANLZ/P053/0001D21F/ANLZ0000.DAT";
+        assert!(check_sidecars(&export, mirrored, &content, &patch)
+            .unwrap_err()
+            .to_string()
+            .contains("EXT already mirrors"));
         let reviewed = writeback::preview(&dest, &source)?;
+        assert!(
+            reviewed.rows.iter().any(|r| r.field == Field::Bpm
+                && r.reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(".3EX embedding"))),
+            "{:#?}",
+            reviewed.rows
+        );
         let selected: Vec<_> = reviewed
             .rows
             .iter()
@@ -1085,6 +1196,70 @@ mod tests {
     }
 
     #[test]
+    fn cue_pilot_inspects_new_companions_and_separates_hot_and_memory_groups() -> Result<()> {
+        fn tagged(tag: &[u8; 4], header: &[u8], records: &[u8]) -> Vec<u8> {
+            let h = 12 + header.len();
+            let tag_size = h + records.len();
+            let mut pmai = vec![0; 28];
+            pmai[..4].copy_from_slice(b"PMAI");
+            pmai[4..8].copy_from_slice(&28u32.to_be_bytes());
+            pmai[8..12].copy_from_slice(&((28 + tag_size) as u32).to_be_bytes());
+            pmai.extend(tag);
+            pmai.extend((h as u32).to_be_bytes());
+            pmai.extend((tag_size as u32).to_be_bytes());
+            pmai.extend(header);
+            pmai.extend(records);
+            pmai
+        }
+        let c = fixture()?;
+        let root = tempfile::tempdir()?;
+        let source = "PIONEER/USBANLZ/ANLZ0000.DAT";
+        let dat = root.path().join(source);
+        std::fs::create_dir_all(dat.parent().unwrap())?;
+        std::fs::write(&dat, tagged(b"PVBR", &[], &[]))?;
+        let base = read(&c, "song")?;
+        let mut desired = base.view();
+        desired.0[1].1.comment = "Updated hot cue".into();
+        let labels = plan(&base, &desired)?;
+        let mut mem = [0u8; 56];
+        mem[..4].copy_from_slice(b"PCPT");
+        mem[4..8].copy_from_slice(&28u32.to_be_bytes());
+        mem[8..12].copy_from_slice(&56u32.to_be_bytes());
+        mem[28] = 1;
+        let mut legacy = [0u8; 12];
+        legacy[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let third = dat.with_extension("3EX");
+        std::fs::write(&third, tagged(b"PCOB", &legacy, &mem))?;
+        check_sidecars(root.path(), source, "song", &labels)?;
+        let mut structural = base.view();
+        structural.0.remove(0); // remove native memory cue
+        assert!(check_sidecars(root.path(), source, "song", &plan(&base, &structural)?).is_err());
+        let mut extended = [0u8; 8];
+        extended[4..6].copy_from_slice(&1u16.to_be_bytes());
+        let mut pcp = [0u8; 88];
+        pcp[..4].copy_from_slice(b"PCP2");
+        pcp[4..8].copy_from_slice(&16u32.to_be_bytes());
+        pcp[8..12].copy_from_slice(&88u32.to_be_bytes());
+        pcp[16] = 1;
+        std::fs::write(&third, tagged(b"PCO2", &extended, &pcp))?;
+        check_sidecars(root.path(), source, "song", &labels)?; // only memory cues mirrored
+        extended[3] = 1;
+        pcp[15] = 1;
+        std::fs::write(&third, tagged(b"PCO2", &extended, &pcp))?;
+        assert!(check_sidecars(root.path(), source, "song", &labels).is_err());
+        std::fs::write(&third, tagged(b"PVB2", &[], &[]))?;
+        check_sidecars(root.path(), source, "song", &labels)?;
+        std::fs::write(dat.with_extension("4EX"), tagged(b"PCO3", &[], &[]))?;
+        assert!(check_sidecars(root.path(), source, "song", &labels)
+            .unwrap_err()
+            .to_string()
+            .contains("PCO3"));
+        std::fs::write(&third, b"\x81\xa9embedding\x80")?;
+        assert!(check_sidecars(root.path(), source, "song", &labels).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn cue_sidecar_checks_refuse_inconsistent_device_mirrors() -> Result<()> {
         let c = fixture()?;
         let root = tempfile::tempdir()?;
@@ -1099,9 +1274,9 @@ mod tests {
         let mut desired = base.view();
         desired.0[1].1.color = 42;
         let patch = plan(&base, &desired)?;
-        assert!(check_sidecars(root.path(), source, &patch).is_err());
+        assert!(check_sidecars(root.path(), source, "song", &patch).is_err());
         std::fs::write(&dat, &pmai)?;
-        check_sidecars(root.path(), source, &patch)?;
+        check_sidecars(root.path(), source, "song", &patch)?;
         let mut ext = pmai;
         ext.extend_from_slice(b"PCO2");
         ext.extend_from_slice(&20u32.to_be_bytes());
@@ -1109,7 +1284,7 @@ mod tests {
         ext.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 0]);
         ext[8..12].copy_from_slice(&48u32.to_be_bytes());
         std::fs::write(dat.with_extension("EXT"), ext)?;
-        assert!(check_sidecars(root.path(), source, &patch).is_err());
+        assert!(check_sidecars(root.path(), source, "song", &patch).is_err());
         Ok(())
     }
 }

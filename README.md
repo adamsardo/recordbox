@@ -13,7 +13,7 @@
 </p>
 <!-- project-badges:end -->
 
-Recordbox is an unofficial, open-source DJ preparation app for macOS and Windows, with an experimental Linux build. Organise your music library, analyse tracks, set cues and build playlists, then export them to a USB drive for Pioneer CDJ/XDJ players.
+Recordbox is an unofficial, open-source DJ preparation app for macOS and Windows, with an experimental Linux build. Organise your music library, analyse tracks, set cues and build playlists, then export them to USB for players that read the classic Device Library format.
 
 > **Not affiliated with AlphaTheta or Pioneer DJ.** rekordbox is a trademark of AlphaTheta Corporation. This is an independent project that uses rekordbox's preparation workflow as the reference for how things should behave.
 
@@ -43,7 +43,7 @@ The upstream project is being built in the open with an AI coding agent (Claude 
 - **Library:** import, browse, search and organise your tracks
 - **Analysis:** tempo, optional high-precision beat grids for steady and changing tempos, key and waveforms
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
-- **USB export:** drives that CDJ/XDJ players can read, the same way rekordbox does
+- **USB export** for CDJ/XDJ models that read the classic Device Library.
 
 Import integrity checks include signed PQTZ beatgrid shifts and known PSSI
 phrase versions, with generated parser regressions. See
@@ -71,7 +71,7 @@ The lower-left sync arrows offer two directions.
 - **Import · AlphaTheta Rekordbox → recordbox** reads the installed AlphaTheta library and imports tracks into your active recordbox collection.
 - **Write back · recordbox → AlphaTheta Rekordbox** reviews selected edits and saves a recovery copy before updating the original desktop library.
 
-**Device Sync Manager** handles USB drives separately. [Library sync and supported formats](docs/LIBRARY-SYNC.md)
+**Device Sync Manager** handles classic USB exports. Check your player model and the catalogs already on the drive before exporting. [Desktop library sync](docs/LIBRARY-SYNC.md) · [USB formats and player compatibility](docs/USB-COMPATIBILITY.md)
 
 ## Running it
 

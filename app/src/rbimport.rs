@@ -429,7 +429,7 @@ pub fn read_pqtz_grid(dat: &Path) -> Option<BeatGrid> {
     parse_pqtz_grid(&b)
 }
 
-fn parse_pqtz_grid(b: &[u8]) -> Option<BeatGrid> {
+pub(crate) fn parse_pqtz_grid(b: &[u8]) -> Option<BeatGrid> {
     let mut anchors = vec![];
     let mut last_tempo = None;
     for beat in pqtz_beats(b)? {

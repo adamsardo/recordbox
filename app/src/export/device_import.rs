@@ -122,12 +122,39 @@ fn copy_audio_no_replace(source: &Path, destination: &Path, expected_size: u64) 
     Ok(())
 }
 
+/// Publish a complete set together. A subsequent import with fewer companions must
+/// never pick up an obsolete file from the previous analysis of the same track.
+fn cache_device_analysis(data_dir: &Path, files: &[(&str, Vec<u8>)]) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut key = Sha256::new();
+    for (extension, bytes) in files {
+        key.update(extension.as_bytes());
+        key.update(Sha256::digest(bytes));
+    }
+    let cache = data_dir.join("device-anlz");
+    let dir = cache.join(format!("{:x}", key.finalize()));
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&cache)?;
+        let staged = tempfile::tempdir_in(&cache)?;
+        for (extension, bytes) in files {
+            std::fs::write(staged.path().join(format!("ANLZ0000.{extension}")), bytes)?;
+        }
+        match std::fs::rename(staged.path(), &dir) {
+            Ok(()) => {}
+            Err(_) if dir.is_dir() => {} // A concurrent import published this same complete set.
+            Err(e) => return Err(e).context("Publishing imported device analysis"),
+        }
+    }
+    Ok(dir.join("ANLZ0000"))
+}
+
 /// Copy one device track into `music_dir` and read everything the device knows about it.
 /// Nothing on the device is changed. `data_dir` receives the copy of its analysis files and
 /// `artwork_dir` its artwork when the audio file has none embedded.
 pub fn import_track(root: &Path, lib: &DeviceLibrary, id: u32, music_dir: &Path, data_dir: &Path, artwork_dir: &Path) -> Result<ImportedTrack> {
     let dt = lib.tracks.get(&id).ok_or_else(|| anyhow!("the track is no longer on the device"))?;
     let src = root.join(dt.file_path.trim_start_matches('/'));
+    super::usb_target::confined(root, &src)?;
     let size = match std::fs::metadata(&src) {
         Ok(metadata) => metadata.len(),
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -135,6 +162,18 @@ pub fn import_track(root: &Path, lib: &DeviceLibrary, id: u32, music_dir: &Path,
         }
         Err(e) => return Err(e).context("could not inspect the device file"),
     };
+    let mut analysis = Vec::new();
+    if !dt.analyze_path.is_empty() {
+        let base = usb::anlz_base(&dt.analyze_path).context("Invalid device analysis path in the USB catalog")?;
+        let base = root.join(base.trim_start_matches('/'));
+        for extension in usb::ANLZ_EXTS {
+            let path = base.with_extension(extension);
+            super::usb_target::confined(root, &path)?;
+            if let Some(bytes) = anlz::device_companion(&path, &dt.file_path)? {
+                analysis.push((extension, bytes));
+            }
+        }
+    }
     let (dest, reused_file) = import_destination(music_dir, dt, &src)?;
     if !reused_file {
         std::fs::create_dir_all(dest.parent().unwrap())?;
@@ -190,36 +229,20 @@ pub fn import_track(root: &Path, lib: &DeviceLibrary, id: u32, music_dir: &Path,
     if dt.date_added.len() == 10 {
         t.date_added = dt.date_added.clone();
     }
-    // Analysis files: cues and grid are read, and the files are copied next to the library.
-    let mut cues = vec![];
-    let mut grid = None;
-    let mut anlz_base = None;
-    if let Some(base) = usb::anlz_base(&dt.analyze_path) {
-        let b = root.join(base.trim_start_matches('/'));
-        let (ext, dat) = (anlz::read_valid_section_list(&b.with_extension("EXT")), anlz::read_valid_section_list(&b.with_extension("DAT")));
-        cues = anlz::parse_cues(&ext, &dat);
-        grid = crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).filter(|g| !g.is_empty());
-        if !dat.is_empty() {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for byte in dest.to_string_lossy().bytes() {
-                h = (h ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
-            }
-            let dir = data_dir.join("device-anlz").join(format!("{h:016x}"));
-            std::fs::create_dir_all(&dir)?;
-            for e in usb::ANLZ_EXTS {
-                let from = b.with_extension(e);
-                if from.is_file() {
-                    std::fs::copy(&from, dir.join(format!("ANLZ0000.{e}")))?;
-                }
-            }
-            anlz_base = Some(dir.join("ANLZ0000"));
-        }
-    }
+    let companion = |wanted| analysis.iter().find(|(ext, _)| *ext == wanted).map(|(_, bytes)| bytes.as_slice());
+    let dat = companion("DAT");
+    let dat_sections = dat.map(anlz::section_list).unwrap_or_default();
+    let ext_sections = companion("EXT").map(anlz::section_list).unwrap_or_default();
+    let cues = anlz::parse_cues(&ext_sections, &dat_sections);
+    let grid = dat.and_then(crate::rbimport::parse_pqtz_grid);
+    let anlz_base = if dat.is_some() { Some(cache_device_analysis(data_dir, &analysis)?) } else { None };
     // Artwork: the file's embedded picture when it has one, else the device's (the larger
     // "_m" version when it exists).
     if t.artwork.is_empty() && !dt.artwork_path.is_empty() {
         let small = root.join(dt.artwork_path.trim_start_matches('/'));
         let big = small.with_file_name(format!("{}_m.jpg", small.file_stem().unwrap_or_default().to_string_lossy()));
+        super::usb_target::confined(root, &small)?;
+        super::usb_target::confined(root, &big)?;
         if let Some(from) = [big, small].into_iter().find(|p| p.is_file()) {
             if let Ok(hash) = usb::sha256_file(&from) {
                 let _ = std::fs::create_dir_all(artwork_dir);
@@ -289,16 +312,21 @@ pub fn has_my_settings(root: &Path) -> bool {
 
 /// "Delete My Settings": remove the players' and mixers' settings files from the drive.
 /// Returns how many files were deleted.
-pub fn delete_my_settings(root: &Path) -> usize {
+pub fn delete_my_settings(root: &Path) -> Result<usize> {
+    anyhow::ensure!(matches!(usb::check_preference_target(root)?, usb::DeviceLayout::Classic | usb::DeviceLayout::Empty), "Shared player settings on a mixed-format drive are protected");
     let mut n = 0;
     for dir in ["PIONEER", ".PIONEER"] {
         for f in MY_SETTING_FILES {
-            if std::fs::remove_file(root.join(dir).join(f)).is_ok() {
-                n += 1;
+            let path = root.join(dir).join(f);
+            super::usb_target::confined(root, &path)?;
+            match std::fs::remove_file(path) {
+                Ok(()) => n += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
             }
         }
     }
-    n
+    Ok(n)
 }
 
 /// Recordbox's own per-device properties (`/.Recordbox/props.json`).
@@ -317,8 +345,7 @@ pub fn read_props(root: &Path) -> DeviceProps {
 }
 
 pub fn write_props(root: &Path, p: &DeviceProps) -> Result<()> {
-    std::fs::create_dir_all(root.join(".Recordbox"))?;
-    usb::write_atomic(&root.join(".Recordbox").join("props.json"), &serde_json::to_vec_pretty(p)?)
+    usb::write_private(root, "props.json", &serde_json::to_vec_pretty(p)?)
 }
 
 /// Which library playlists a device is kept in sync with (`/.Recordbox/sync.json`).
@@ -348,8 +375,7 @@ pub fn read_sync(root: &Path) -> Option<SyncConfig> {
 }
 
 pub fn write_sync(root: &Path, c: &SyncConfig) -> Result<()> {
-    std::fs::create_dir_all(root.join(".Recordbox"))?;
-    usb::write_atomic(&root.join(".Recordbox").join("sync.json"), &serde_json::to_vec_pretty(c)?)
+    usb::write_private(root, "sync.json", &serde_json::to_vec_pretty(c)?)
 }
 
 #[cfg(test)]
@@ -390,6 +416,42 @@ mod tests {
             file_path: "/song.mp3".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn usb_analysis_cannot_attach_another_tracks_cues_or_leave_stale_companions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let device = dir.path().join("usb");
+        let music = dir.path().join("music");
+        let data = dir.path().join("data");
+        let art = dir.path().join("art");
+        let mut track = device_track();
+        track.analyze_path = "/PIONEER/USBANLZ/P001/00000001/ANLZ0000.DAT".into();
+        let audio = device.join(track.file_path.trim_start_matches('/'));
+        let dat = device.join(track.analyze_path.trim_start_matches('/'));
+        std::fs::create_dir_all(audio.parent().unwrap())?;
+        std::fs::create_dir_all(dat.parent().unwrap())?;
+        std::fs::write(&audio, b"disposable test audio")?;
+        let generate = |path| anlz::build(path, &[], &Waveform::default(), &[], 0, 0);
+        let native = generate(&track.file_path);
+        std::fs::write(&dat, &native.dat)?;
+        std::fs::write(dat.with_extension("EXT"), generate("/Contents/other.mp3").ext)?;
+        let mut lib = DeviceLibrary::default();
+        lib.tracks.insert(1, track);
+        let import = || import_track(&device, &lib, 1, &music, &data, &art);
+        let error = import().err().context("A mismatched companion was imported")?;
+        assert!(error.to_string().contains("conflicting track path"));
+        assert!(!music.exists() && !data.exists());
+
+        std::fs::write(dat.with_extension("EXT"), native.ext)?;
+        let first = import()?.anlz_base.context("Missing device analysis")?;
+        assert!(first.with_extension("EXT").is_file());
+        std::fs::remove_file(dat.with_extension("EXT"))?;
+        let second = import()?.anlz_base.context("Missing updated device analysis")?;
+        assert_ne!(first, second);
+        assert!(!second.with_extension("EXT").exists());
+        assert_eq!(std::fs::read(second.with_extension("DAT"))?, native.dat);
+        Ok(())
     }
 
     #[test]

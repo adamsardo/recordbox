@@ -24,20 +24,34 @@ pub struct GridSnapshot {
     dat_sha256: [u8; 32],
     ext_sha256: Option<[u8; 32]>,
     ex2_sha256: Option<[u8; 32]>,
+    additional_sha256: Vec<(String, [u8; 32])>,
+    has_embedding: bool,
 }
 
 impl GridSnapshot {
+    /// Exact-profile .3EX records native tempo in d11; the relation between d12 and
+    /// grid phase is not decoded. Preserve this timing data alongside its source.
+    pub(super) fn ensure_timing_editable(&self) -> Result<()> {
+        ensure!(
+            !self.has_embedding,
+            "The native .3EX embedding contains timing metadata. Use rekordbox to edit BPM or the beat grid for this track"
+        );
+        Ok(())
+    }
+
     pub fn dat_sha256(&self) -> [u8; 32] {
         self.dat_sha256
     }
 }
 
-fn analysis_relative_path(input: &str) -> Result<PathBuf> {
+pub(super) fn analysis_relative_path(input: &str) -> Result<PathBuf> {
     ensure!(input.len() <= 32_768, "Native analysis path is too long");
     let path = input.strip_prefix('/').unwrap_or(input);
     let parts: Vec<_> = path.split('/').collect();
     ensure!(
-        parts.len() >= 3 && parts[0].eq_ignore_ascii_case("PIONEER") && parts[1].eq_ignore_ascii_case("USBANLZ"),
+        parts.len() >= 3
+            && parts[0].eq_ignore_ascii_case("PIONEER")
+            && parts[1].eq_ignore_ascii_case("USBANLZ"),
         "Expected a PIONEER/USBANLZ desktop analysis path"
     );
     for part in &parts[..parts.len() - 1] {
@@ -50,7 +64,9 @@ fn analysis_relative_path(input: &str) -> Result<PathBuf> {
         );
     }
     let name = parts.last().unwrap();
-    let stem = name.strip_suffix(".DAT").and_then(|s| s.strip_prefix("ANLZ"));
+    let stem = name
+        .strip_suffix(".DAT")
+        .and_then(|s| s.strip_prefix("ANLZ"));
     ensure!(
         stem.is_some_and(|s| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit())),
         "Expected an ANLZxxxx.DAT analysis file"
@@ -71,11 +87,7 @@ fn link(meta: &fs::Metadata) -> bool {
     }
 }
 
-/// Read bounded PMAI bytes. Missing companions are optional, permission errors and
-/// links (including dangling links) must never be mistaken for missing evidence.
-pub fn read_sidecar(share: &Path, analysis_path: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-    ensure!(matches!(extension, "DAT" | "EXT" | "2EX"), "Unknown analysis companion");
-    let relative = analysis_relative_path(analysis_path)?.with_extension(extension);
+fn analysis_directory(share: &Path, relative: &Path) -> Result<PathBuf> {
     let share_meta = fs::symlink_metadata(share)?;
     ensure!(
         share_meta.is_dir() && !link(&share_meta),
@@ -90,6 +102,40 @@ pub fn read_sidecar(share: &Path, analysis_path: &str, extension: &str) -> Resul
             "Linked or unavailable analysis directory"
         );
     }
+    Ok(path)
+}
+
+fn checked_bytes(path: &Path, meta: fs::Metadata, limit: u64) -> Result<Vec<u8>> {
+    ensure!(
+        meta.is_file() && !link(&meta) && meta.len() <= limit,
+        "Linked, oversized or irregular analysis file"
+    );
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == meta.len(),
+        "Analysis file changed while reading"
+    );
+    Ok(bytes)
+}
+
+/// Read bounded PMAI bytes. Missing companions are optional; unreadable files
+/// and links (including dangling links) never count as missing evidence.
+pub(super) fn read_companion(
+    share: &Path,
+    analysis_path: &str,
+    extension: &str,
+) -> Result<Option<Vec<u8>>> {
+    ensure!(
+        !extension.is_empty()
+            && extension.len() <= 32
+            && extension.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "Invalid analysis companion extension"
+    );
+    let relative = analysis_relative_path(analysis_path)?.with_extension(extension);
+    let mut path = analysis_directory(share, &relative)?;
     // Windows generally ignores extension case, Linux distinguishes it. An equally
     // named differently cased file must never be mistaken for an absent companion.
     let name = relative.file_name().unwrap();
@@ -100,22 +146,90 @@ pub fn read_sidecar(share: &Path, analysis_path: &str, extension: &str) -> Resul
             candidates += 1;
         }
     }
-    ensure!(candidates <= 1, "Ambiguous analysis filenames differing only in case");
+    ensure!(
+        candidates <= 1,
+        "Ambiguous analysis filenames differing only in case"
+    );
     path.push(name);
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == ErrorKind::NotFound && candidates == 0 => return Ok(None),
         Err(error) => return Err(error).context("Opening analysis file with its recorded name"),
     };
+    checked_bytes(&path, meta, MAX_BYTES).map(Some)
+}
+
+pub fn read_sidecar(share: &Path, analysis_path: &str, extension: &str) -> Result<Option<Vec<u8>>> {
     ensure!(
-        meta.is_file() && !link(&meta) && meta.len() <= MAX_BYTES,
-        "Linked, oversized or irregular analysis file"
+        matches!(extension, "DAT" | "EXT" | "2EX"),
+        "Unknown standard analysis companion"
     );
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    fs::File::open(&path)?.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 == meta.len(), "Analysis file changed while reading");
-    anlz::validate(&bytes).map_err(|reason| anyhow!("Invalid {extension} analysis file: {reason}"))?;
+    let Some(bytes) = read_companion(share, analysis_path, extension)? else {
+        return Ok(None);
+    };
+    anlz::validate(&bytes)
+        .map_err(|reason| anyhow!("Invalid {extension} analysis file: {reason}"))?;
     Ok(Some(bytes))
+}
+
+pub(super) struct AdditionalSidecar {
+    pub extension: String,
+    pub bytes: Vec<u8>,
+    pub is_embedding: bool,
+}
+
+/// Inspect all same-stem sibling analysis files using their contents. A .3EX
+/// can itself be PMAI. Exact-profile MessagePack embeddings are recognized
+/// separately because they also carry native timing metadata.
+pub(super) fn additional_sidecars(
+    share: &Path,
+    analysis_path: &str,
+) -> Result<Vec<AdditionalSidecar>> {
+    let relative = analysis_relative_path(analysis_path)?;
+    let stem = relative.file_stem().context("Missing analysis stem")?;
+    let directory = analysis_directory(share, &relative)?;
+    let mut result: Vec<AdditionalSidecar> = Vec::new();
+    let mut budget = MAX_BYTES;
+    for (i, entry) in fs::read_dir(directory)?.enumerate() {
+        ensure!(i < 4096, "Too many files in the analysis directory");
+        let path = entry?.path();
+        if !path
+            .file_stem()
+            .is_some_and(|s| s.eq_ignore_ascii_case(stem))
+        {
+            continue;
+        }
+        let Some(extension) = path.extension() else {
+            continue;
+        };
+        let extension = extension
+            .to_str()
+            .context("Non-Unicode analysis file extension")?
+            .to_ascii_uppercase();
+        if matches!(extension.as_str(), "DAT" | "EXT" | "2EX") {
+            continue;
+        }
+        ensure!(
+            result.len() < 32 && !result.iter().any(|s| s.extension == extension),
+            "Too many or ambiguous additional analysis companions"
+        );
+        let bytes = checked_bytes(&path, fs::symlink_metadata(&path)?, budget)?;
+        budget -= bytes.len() as u64;
+        let is_embedding =
+            extension == "3EX" && !bytes.starts_with(b"PMAI") && super::embedding::is_known(&bytes);
+        if !is_embedding {
+            anlz::validate(&bytes).map_err(|reason| {
+                anyhow!("Unsupported or invalid .{extension} companion: {reason}")
+            })?;
+        }
+        result.push(AdditionalSidecar {
+            extension,
+            bytes,
+            is_embedding,
+        });
+    }
+    result.sort_by(|a, b| a.extension.cmp(&b.extension));
+    Ok(result)
 }
 
 struct NativeGrid {
@@ -181,7 +295,13 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
         raw.len() <= 24 + 1_000_000 * 8,
         "Native beat grid exceeds the pilot limit"
     );
-    let grid = crate::rbimport::parse_pqtz_grid(&dat).context("Invalid native PQTZ beat records")?;
+    // Empty, explicitly counted PQTZ sections are common in both desktop
+    // catalogs (samples, for example). They hold no tempo to couple to BPM.
+    let grid = if raw.len() == 24 && raw[20..24] == [0; 4] {
+        BeatGrid::default()
+    } else {
+        crate::rbimport::parse_pqtz_grid(&dat).context("Invalid native PQTZ beat records")?
+    };
     let ext = read_sidecar(share, analysis_path, "EXT")?;
     let ex2 = read_sidecar(share, analysis_path, "2EX")?;
     let path = path_section(&dat)?.context("The DAT file has no recorded media path")?;
@@ -193,6 +313,14 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
     }
     if let Some(bytes) = &ex2 {
         grid_section(bytes, b"")?;
+    }
+    let extra = additional_sidecars(share, analysis_path)?;
+    for other in extra.iter().filter(|s| !s.is_embedding) {
+        ensure!(
+            path_section(&other.bytes)?.is_none_or(|p| p == path),
+            "Additional analysis companion refers to a different track"
+        );
+        grid_section(&other.bytes, b"")?;
     }
     let pqt2 = match &ext {
         Some(bytes) => grid_section(bytes, b"PQT2")?,
@@ -213,19 +341,19 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
             "PQT2 revision, beat records, checksum or fractions disagree with the DAT grid"
         );
     }
-    let retime_frames = retime_evidence(
-        &dat,
-        ext.as_deref(),
-        ex2.as_deref(),
-        &share.join(analysis_relative_path(analysis_path)?),
-    )
-    .map_err(|err| err.to_string());
+    let retime_frames = retime_evidence(&dat, ext.as_deref(), ex2.as_deref(), &extra)
+        .map_err(|err| err.to_string());
     let state = GridSnapshot {
         grid,
         dat_path: analysis_relative_path(analysis_path)?,
         dat_sha256: Sha256::digest(&dat).into(),
         ext_sha256: ext.as_ref().map(|b| Sha256::digest(b).into()),
         ex2_sha256: ex2.as_ref().map(|b| Sha256::digest(b).into()),
+        has_embedding: extra.iter().any(|s| s.is_embedding),
+        additional_sha256: extra
+            .into_iter()
+            .map(|s| (s.extension, Sha256::digest(s.bytes).into()))
+            .collect(),
     };
     Ok(NativeGrid {
         state,
@@ -240,14 +368,39 @@ fn native_grid(share: &Path, analysis_path: &str) -> Result<NativeGrid> {
 // Detailed waveforms have one frame per 1/150 s. Only use that evidence when
 // the file revision and shape agree, and both possible endpoints produce the
 // same beat count. This avoids inventing a duration from rounded DB seconds.
-fn retime_evidence(dat: &[u8], ext: Option<&[u8]>, ex2: Option<&[u8]>, path: &Path) -> Result<u32> {
+fn retime_evidence(
+    dat: &[u8],
+    ext: Option<&[u8]>,
+    ex2: Option<&[u8]>,
+    other: &[AdditionalSidecar],
+) -> Result<u32> {
     let ext = ext.context("Retiming requires a paired EXT with a detailed waveform")?;
     let mut frames = None;
-    for bytes in [Some(dat), Some(ext), ex2].into_iter().flatten() {
+    let pmai = other
+        .iter()
+        .filter(|s| !s.is_embedding)
+        .map(|s| s.bytes.as_slice());
+    for bytes in [Some(dat), Some(ext), ex2]
+        .into_iter()
+        .flatten()
+        .chain(pmai)
+    {
         for range in sections(bytes) {
             let tag = &bytes[range.clone()];
             match &tag[..4] {
                 b"PPTH" | b"PVBR" | b"PWAV" | b"PWV2" | b"PWV4" | b"PWV6" | b"PWV7" | b"PWVC" | b"PQTZ" | b"PQT2" => {}
+                b"PVDI" => {
+                    // Fixed audio-time hops carry no beat indices. Permit the
+                    // measured layout only, including its exact payload length.
+                    ensure!(
+                        tag.len() >= 24
+                            && tag[4..8] == 24u32.to_be_bytes()
+                            && tag[12..20] == [0, 0, 4, 0, 0x56, 0x22, 0, 1]
+                            && u32::from_be_bytes(tag[20..24].try_into()?) as usize == tag.len() - 24
+                            && tag[24..].iter().all(|v| *v <= 4),
+                        "Unrecognized native vocal activity layout"
+                    );
+                }
                 b"PWV3" | b"PWV5" => {
                     let (width, revision): (usize, u32) = if &tag[..4] == b"PWV3" {
                         (1, 0x0096_0000)
@@ -283,26 +436,15 @@ fn retime_evidence(dat: &[u8], ext: Option<&[u8]>, ex2: Option<&[u8]>, path: &Pa
             }
         }
     }
-    let stem = path.file_stem().unwrap().to_string_lossy();
-    for entry in fs::read_dir(path.parent().unwrap())? {
-        let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        if let Some((prefix, extension)) = name.split_once('.') {
-            ensure!(
-                !prefix.eq_ignore_ascii_case(&stem)
-                    || ["DAT", "EXT", "2EX"]
-                        .iter()
-                        .any(|allowed| extension.eq_ignore_ascii_case(allowed)),
-                "Retiming analysis with an unverified companion ({extension}) needs review in rekordbox"
-            );
-        }
-    }
     frames.context("Retiming requires a validated 150 Hz detailed waveform")
 }
 
 fn replace_section(file: &mut Vec<u8>, range: Range<usize>, section: &[u8]) -> Result<()> {
     let new_len = file.len() - range.len() + section.len();
-    ensure!(new_len as u64 <= MAX_BYTES, "Updated analysis file exceeds size limit");
+    ensure!(
+        new_len as u64 <= MAX_BYTES,
+        "Updated analysis file exceeds size limit"
+    );
     file.splice(range, section.iter().copied());
     file[8..12].copy_from_slice(&(new_len as u32).to_be_bytes());
     Ok(())
@@ -310,19 +452,19 @@ fn replace_section(file: &mut Vec<u8>, range: Range<usize>, section: &[u8]) -> R
 
 fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>> {
     let frames = native.retime_frames.map_err(anyhow::Error::msg)?;
-    let ext = native.ext.as_mut().context("Missing extended timing file")?;
-    let range = native
+    let old_fractions = native
         .pqt2
-        .context("Retiming requires verified PQT2 fractional timing")?;
-    let old_fractions = anlz::pqt2_fractions(&ext[range.clone()]);
+        .as_ref()
+        .map(|r| anlz::pqt2_fractions(&native.ext.as_ref().unwrap()[r.clone()]));
+    let fraction = |i: usize| old_fractions.as_ref().map_or(0, |fs| fs[i]);
     let raw = &native.dat[native.pqtz.clone()];
     let native_shift = i16::from_be_bytes(raw[18..20].try_into()?) as i64;
     let entries = anlz::pqtz_entries(raw);
     let first = entries.first().context("Empty original grid")?;
-    let old_first_us = (i64::from(first.2) + native_shift) * 1000 + i64::from(old_fractions[0]);
+    let old_first_us = (i64::from(first.2) + native_shift) * 1000 + i64::from(fraction(0));
     let old_period_us = 6_000_000_000.0 / f64::from(first.1);
-    for (index, (entry, frac)) in entries.iter().zip(&old_fractions).enumerate() {
-        let adjusted = (i64::from(entry.2) + native_shift) * 1000 + i64::from(*frac);
+    for (index, entry) in entries.iter().enumerate() {
+        let adjusted = (i64::from(entry.2) + native_shift) * 1000 + i64::from(fraction(index));
         let expected = old_first_us as f64 + index as f64 * old_period_us;
         ensure!(
             entry.1 == first.1
@@ -334,12 +476,14 @@ fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>>
     let end_lower = u64::from(frames - 1) * 1_000_000 / 150;
     let end_upper = (u64::from(frames) * 1_000_000).div_ceil(150);
     let old_last = entries.last().unwrap();
-    let old_last_us =
-        ((i64::from(old_last.2) + native_shift) * 1000 + i64::from(*old_fractions.last().unwrap())) as f64;
+    // A recorded beat at the track endpoint is valid (common for loop samples).
+    // Its millisecond timestamp can round up from the final waveform frame.
+    let old_last_us = ((i64::from(old_last.2) + native_shift) * 1000
+        + i64::from(fraction(entries.len() - 1))) as f64;
     ensure!(
         old_first_us >= 0
             && (old_first_us as f64) < old_period_us
-            && old_last_us < end_lower as f64
+            && old_last_us <= end_upper as f64 + 1000.
             && old_last_us + old_period_us > end_upper as f64,
         "Original grid does not unambiguously cover the waveform"
     );
@@ -358,7 +502,7 @@ fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>>
         anchor.time < 60. / anchor.bpm && (anchor.time * 1000. - first_ms).abs() < 1e-6,
         "Set the tempo at the track's first beat with millisecond precision to write this grid"
     );
-    let first_us = first_ms as u64 * 1000 + u64::from(old_fractions[0]);
+    let first_us = first_ms as u64 * 1000 + u64::from(fraction(0));
     ensure!(
         (first_us as f64) < 60_000_000. / anchor.bpm,
         "Fractional timing crosses the first beat boundary"
@@ -387,7 +531,10 @@ fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>>
         ));
         fractions.push((us % 1000) as u16);
     }
-    ensure!(!beats.is_empty(), "Updated grid has no beats within the track");
+    ensure!(
+        !beats.is_empty(),
+        "Updated grid has no beats within the track"
+    );
     let mut pqtz = raw[..24].to_vec();
     pqtz[8..12].copy_from_slice(&((24 + beats.len() * 8) as u32).to_be_bytes());
     pqtz[18..20].copy_from_slice(&0i16.to_be_bytes());
@@ -398,25 +545,30 @@ fn retime(mut native: NativeGrid, desired: &BeatGrid) -> Result<Vec<FileChange>>
         pqtz.extend_from_slice(&time.to_be_bytes());
     }
     replace_section(&mut native.dat, native.pqtz, &pqtz)?;
-    replace_section(ext, range, &anlz::pqt2(&beats, &fractions))?;
-    let reread = crate::rbimport::parse_pqtz_grid(&native.dat).context("Rebuilt grid is unreadable")?;
+
+    let reread =
+        crate::rbimport::parse_pqtz_grid(&native.dat).context("Rebuilt grid is unreadable")?;
     ensure!(
         crate::app::grids_match(&reread, desired),
         "Rebuilt grid differs from requested anchors"
     );
     let path = Path::new("share").join(&native.state.dat_path);
-    Ok(vec![
-        FileChange {
+    let mut changes = Vec::new();
+    if let Some(range) = native.pqt2 {
+        let mut ext = native.ext.context("Missing file for paired PQT2")?;
+        replace_section(&mut ext, range, &anlz::pqt2(&beats, &fractions))?;
+        changes.push(FileChange {
             relative_path: path.with_extension("EXT"),
             expected_sha256: native.state.ext_sha256.unwrap(),
-            contents: native.ext.unwrap(),
-        },
-        FileChange {
-            relative_path: path,
-            expected_sha256: native.state.dat_sha256,
-            contents: native.dat,
-        },
-    ])
+            contents: ext,
+        });
+    }
+    changes.push(FileChange {
+        relative_path: path,
+        expected_sha256: native.state.dat_sha256,
+        contents: native.dat,
+    });
+    Ok(changes)
 }
 
 pub fn inspect(share: &Path, analysis_path: &str) -> Result<GridSnapshot> {
@@ -425,13 +577,22 @@ pub fn inspect(share: &Path, analysis_path: &str) -> Result<GridSnapshot> {
 
 /// Returns complete replacement bytes for the transaction's verified backup and
 /// recovery journal. Nothing is written by this function.
-pub fn plan(share: &Path, analysis_path: &str, baseline: &GridSnapshot, desired: &BeatGrid) -> Result<Vec<FileChange>> {
+pub fn plan(
+    share: &Path,
+    analysis_path: &str,
+    baseline: &GridSnapshot,
+    desired: &BeatGrid,
+) -> Result<Vec<FileChange>> {
     let mut native = native_grid(share, analysis_path)?;
     ensure!(
         &native.state == baseline,
         "Analysis files changed since the grid preview"
     );
     let source = &baseline.grid;
+    if source == desired {
+        return Ok(Vec::new());
+    }
+    baseline.ensure_timing_editable()?;
     ensure!(
         !desired.anchors.is_empty() && desired.anchors.len() == source.anchors.len(),
         "Grid segment insertion or removal requires native reanalysis"
@@ -440,10 +601,14 @@ pub fn plan(share: &Path, analysis_path: &str, baseline: &GridSnapshot, desired:
         return retime(native, desired);
     }
     let shift = (desired.anchors[0].time - source.anchors[0].time) * 1000.;
-    let rotation = (i32::from(desired.anchors[0].beat) - i32::from(source.anchors[0].beat)).rem_euclid(4);
+    let rotation =
+        (i32::from(desired.anchors[0].beat) - i32::from(source.anchors[0].beat)).rem_euclid(4);
     for (from, to) in source.anchors.iter().zip(&desired.anchors) {
         ensure!(
-            to.time.is_finite() && to.time >= 0. && (1..=4).contains(&to.beat) && (to.bpm - from.bpm).abs() <= 1e-9,
+            to.time.is_finite()
+                && to.time >= 0.
+                && (1..=4).contains(&to.beat)
+                && (to.bpm - from.bpm).abs() <= 1e-9,
             "Native multi-tempo grids support whole-grid timing and bar-phase edits"
         );
         ensure!(
@@ -479,7 +644,9 @@ pub fn plan(share: &Path, analysis_path: &str, baseline: &GridSnapshot, desired:
     let dat_path = Path::new("share").join(&native.state.dat_path);
     let mut changes = vec![];
     if rotation != 0 {
-        if let (Some(mut ext), Some(range), Some(digest)) = (native.ext, native.pqt2, native.state.ext_sha256) {
+        if let (Some(mut ext), Some(range), Some(digest)) =
+            (native.ext, native.pqt2, native.state.ext_sha256)
+        {
             let entries = anlz::pqtz_entries(&native.dat[native.pqtz]);
             let fractions = anlz::pqt2_fractions(&ext[range.clone()]);
             ext[range].copy_from_slice(&anlz::pqt2(&entries, &fractions));
@@ -540,7 +707,10 @@ mod tests {
         assert_eq!(changes.len(), 1);
         let edit = &changes[0];
         let offset = grid_section(&before, b"PQTZ")?.unwrap().start + 18;
-        assert_eq!(edit.expected_sha256, <[u8; 32]>::from(Sha256::digest(&before)));
+        assert_eq!(
+            edit.expected_sha256,
+            <[u8; 32]>::from(Sha256::digest(&before))
+        );
         assert_eq!(edit.contents[..offset], before[..offset]);
         assert_eq!(edit.contents[offset..offset + 2], (-21i16).to_be_bytes());
         assert_eq!(edit.contents[offset + 2..], before[offset + 2..]);
@@ -565,7 +735,10 @@ mod tests {
         for patch in changes {
             if patch.relative_path.extension().unwrap() == "EXT" {
                 assert_eq!(before[..section.start], patch.contents[..section.start]);
-                assert_eq!(before[section.start + 56..], patch.contents[section.start + 56..]);
+                assert_eq!(
+                    before[section.start + 56..],
+                    patch.contents[section.start + 56..]
+                );
             }
             fs::write(root.path().join(patch.relative_path), patch.contents)?;
         }
@@ -629,7 +802,8 @@ mod tests {
         let native_beats = anlz::pqtz_entries(&bytes[grid_section(&bytes, b"PQTZ")?.unwrap()]);
         for (i, (&(bar, bpm, ms), fraction)) in native_beats.iter().zip(fractions).enumerate() {
             assert_eq!((bar, bpm), ((i % 4 + 1) as u16, 12700));
-            let expected_us = 100000. + f64::from(original_first_fraction) + i as f64 * 60_000_000. / 127.;
+            let expected_us =
+                100000. + f64::from(original_first_fraction) + i as f64 * 60_000_000. / 127.;
             assert!((f64::from(ms) * 1000. + f64::from(fraction) - expected_us).abs() <= 0.5);
         }
         Ok(())
@@ -640,10 +814,9 @@ mod tests {
         let (_root, share, dat) = fixture();
         let third = dat.with_extension("3EX");
         fs::write(&third, b"unknown analysis")?;
-        let before = inspect(&share, LOCATION)?;
-        let desired = BeatGrid::constant(before.grid.anchors[0].time, 127., 1);
-        assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        assert!(inspect(&share, LOCATION).is_err());
         fs::remove_file(third)?;
+        let desired = BeatGrid::constant(0.100, 127., 1);
         let ext = dat.with_extension("EXT");
         let mut bytes = fs::read(&ext)?;
         bytes.extend_from_slice(b"PSSI");
@@ -654,6 +827,198 @@ mod tests {
         fs::write(&ext, bytes)?;
         let before = inspect(&share, LOCATION)?;
         assert!(plan(&share, LOCATION, &before, &desired).is_err());
+        Ok(())
+    }
+
+    fn graft(path: &Path, section: &[u8]) -> Result<()> {
+        let mut data = fs::read(path)?;
+        let end = data.len();
+        replace_section(&mut data, end..end, section)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extended_grid_is_optional_and_empty_native_grid_is_not_corrupt() -> Result<()> {
+        let (root, share, dat) = fixture();
+        let ext = dat.with_extension("EXT");
+        let mut bytes = fs::read(&ext)?;
+        let mirror = grid_section(&bytes, b"PQT2")?.unwrap();
+        replace_section(&mut bytes, mirror, &[])?;
+        fs::write(&ext, &bytes)?;
+        let before = inspect(&share, LOCATION)?;
+        let wanted = BeatGrid::constant(0.1, 127., 1);
+        let mut changes = plan(&share, LOCATION, &before, &wanted)?;
+        assert_eq!(changes.len(), 1);
+        let change = changes.pop().unwrap();
+        assert_eq!(root.path().join(change.relative_path), dat);
+        fs::write(&dat, change.contents)?;
+        assert_eq!(inspect(&share, LOCATION)?.grid, wanted);
+        assert_eq!(
+            fs::read(&ext)?,
+            bytes,
+            "Rekordbox stored no extended grid for this track"
+        );
+        let mut data = fs::read(&dat)?;
+        let section = grid_section(&data, b"PQTZ")?.unwrap();
+        let mut header = data[section.start..section.start + 24].to_vec();
+        header[8..12].copy_from_slice(&24u32.to_be_bytes());
+        header[20..24].copy_from_slice(&0u32.to_be_bytes());
+        replace_section(&mut data, section.clone(), &header)?;
+        fs::write(&dat, &data)?;
+        let empty = inspect(&share, LOCATION)?;
+        assert!(empty.grid.is_empty());
+        assert!(plan(&share, LOCATION, &empty, &wanted).is_err());
+        data[section.start + 23] = 1;
+        fs::write(dat, data)?;
+        assert!(inspect(&share, LOCATION).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn extra_containers_and_fixed_audio_time_vocals_follow_their_contents() -> Result<()> {
+        let (_root, share, dat) = fixture();
+        let third = dat.with_extension("3EX");
+        let mut bytes = fs::read(dat.with_extension("2EX"))?;
+        let known = anlz::pvdi(&[0, 1, 4, 1]);
+        let end = bytes.len();
+        replace_section(&mut bytes, end..end, &known)?;
+        fs::write(&third, &bytes)?;
+        let start = inspect(&share, LOCATION)?;
+        let wanted = BeatGrid::constant(0.1, 127., 1);
+        assert_eq!(plan(&share, LOCATION, &start, &wanted)?.len(), 2);
+        assert_eq!(fs::read(&third)?, bytes);
+        let unknown = [
+            b"PNEW".as_slice(),
+            &12u32.to_be_bytes(),
+            &12u32.to_be_bytes(),
+        ]
+        .concat();
+        graft(&third, &unknown)?;
+        assert!(
+            plan(&share, LOCATION, &start, &wanted).is_err(),
+            "New companion contents invalidate an existing review"
+        );
+        let changed = inspect(&share, LOCATION)?;
+        assert!(
+            plan(&share, LOCATION, &changed, &wanted).is_err(),
+            "Unknown semantic tags exclude beat reindexing"
+        );
+        let shifted = BeatGrid::constant(0.101, 120., 1);
+        let opaque = fs::read(&third)?;
+        let offset = plan(&share, LOCATION, &changed, &shifted)?;
+        assert_eq!(offset.len(), 1);
+        assert_eq!(fs::read(&third)?, opaque);
+        let duplicate = [
+            b"PQT9".as_slice(),
+            &12u32.to_be_bytes(),
+            &12u32.to_be_bytes(),
+        ]
+        .concat();
+        graft(&third, &duplicate)?;
+        assert!(
+            inspect(&share, LOCATION).is_err(),
+            "A future duplicate grid requires a coordinated writer"
+        );
+        fs::write(&third, b"PMAI...")?;
+        assert!(inspect(&share, LOCATION).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "set RECORDBOX_TEST_PYREKORDBOX and RECORDBOX_TEST_RBOX to the pinned public fixtures"]
+    fn published_v6_and_v7_analysis_companions_are_checked_and_preserved() -> Result<()> {
+        let env = |key| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .context("Missing public fixture checkout")
+        };
+        let v6 = env("RECORDBOX_TEST_PYREKORDBOX")?.join(".testdata/rekordbox 6/backup/share");
+        let v7 = env("RECORDBOX_TEST_RBOX")?.join(".testdata/RBv7/demo/rekordbox/share");
+        for (share, version) in [(v6, 6), (v7, 7)] {
+            let mut grids = 0;
+            let mut empty = 0;
+            let mut embeddings = 0;
+            let mut editable_grids = 0;
+            let mut protected_grids = 0;
+            for f in walkdir::WalkDir::new(&share) {
+                let entry = f?;
+                let path = entry.path();
+                if path.file_name().is_none_or(|name| name != "ANLZ0000.DAT") {
+                    continue;
+                }
+                let native_path = path
+                    .strip_prefix(&share)?
+                    .to_str()
+                    .context("Invalid public path")?
+                    .replace('\\', "/");
+                let originals = ["DAT", "EXT", "2EX", "3EX"]
+                    .into_iter()
+                    .map(|ext| {
+                        let file = path.with_extension(ext);
+                        if !file.exists() {
+                            return Ok(None);
+                        }
+                        let bytes = fs::read(&file)?;
+                        Ok(Some((file, <[u8; 32]>::from(Sha256::digest(bytes)))))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let snap = inspect(&share, &native_path)?;
+                embeddings += usize::from(snap.has_embedding);
+                assert!(plan(&share, &native_path, &snap, &snap.grid)?.is_empty());
+                if snap.has_embedding {
+                    assert!(
+                        snap.ensure_timing_editable().is_err(),
+                        "Even scalar BPM needs its mirror"
+                    );
+                }
+                if snap.grid.is_empty() {
+                    empty += 1;
+                } else {
+                    grids += 1;
+                    let mut shift = snap.grid.clone();
+                    for a in &mut shift.anchors {
+                        a.time += 0.001;
+                    }
+                    if snap.has_embedding {
+                        let mut rotate = snap.grid.clone();
+                        for a in &mut rotate.anchors {
+                            a.beat = a.beat % 4 + 1;
+                        }
+                        let mut tempo = snap.grid.clone();
+                        tempo.anchors[0].bpm += 1.;
+                        for requested in [&shift, &rotate, &tempo] {
+                            let failure = plan(&share, &native_path, &snap, requested)
+                                .err()
+                                .context("timing edit escaped .3EX guard")?;
+                            assert!(failure.to_string().contains(".3EX embedding"));
+                        }
+                        protected_grids += 1;
+                    } else {
+                        let files = plan(&share, &native_path, &snap, &shift)?;
+                        assert_eq!(files.len(), 1);
+                        let before = fs::read(path)?;
+                        let offset = grid_section(&before, b"PQTZ")?.unwrap().start + 18;
+                        assert_eq!(&files[0].contents[..offset], &before[..offset]);
+                        assert_eq!(&files[0].contents[offset + 2..], &before[offset + 2..]);
+                        editable_grids += 1;
+                    }
+                }
+                for (file, hash) in originals.into_iter().flatten() {
+                    assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(fs::read(file)?)));
+                }
+            }
+            eprintln!("Public v{version}: {grids} populated grids, {empty} empty, {embeddings} embeddings, {protected_grids} populated grids protected, {editable_grids} phase edits");
+            let expected = if version == 6 {
+                (2, 4, 0, 0, 2)
+            } else {
+                (10, 22, 29, 10, 0)
+            };
+            assert_eq!(
+                (grids, empty, embeddings, protected_grids, editable_grids),
+                expected
+            );
+        }
         Ok(())
     }
 

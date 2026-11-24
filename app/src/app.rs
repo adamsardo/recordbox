@@ -1280,10 +1280,24 @@ pub struct DeviceInfo {
     pub root: String,
     pub name: String,
     pub fs: String,
+    pub layout: Option<crate::export::usb::DeviceLayout>,
     pub lib: Option<crate::export::usb::DeviceLibrary>,
-    pub error: Option<String>,
+    pub write_blocker: Option<String>,
     pub total: Option<u64>,
     pub free: Option<u64>,
+}
+
+impl DeviceInfo {
+    pub fn catalog_label(&self) -> &'static str {
+        use crate::export::usb::DeviceLayout::*;
+        match self.layout {
+            Some(Classic) => "Classic Device Library",
+            Some(Mixed) => "Classic Device Library + OneLibrary",
+            Some(OneLibrary) => "OneLibrary / Device Library Plus",
+            Some(Empty) => "No device catalog",
+            None => "Unrecognized device folder",
+        }
+    }
 }
 
 /// Immutable Collection rows, prepared only for the categories the user opens.
@@ -4423,22 +4437,31 @@ impl App {
         let mut devices = vec![];
         for (root, name, fs) in found {
             let p = std::path::Path::new(&root);
-            // An export that was cut short (crash, power loss, drive pulled) is finished or
-            // undone from the drive's journal before anything reads the drive.
-            if self.export_job.is_none() {
-                if let Some(msg) = crate::export::usb::recover_device(p) {
-                    self.toast(format!("{name}: {msg}"));
+            use crate::export::usb::{self, DeviceLayout};
+            let mut target = usb::inspect_target(p);
+            // A different catalog may now occupy a previously connected mount point.
+            // Resolve any unfinished write before displaying the catalog as usable.
+            let mut recovery_error = None;
+            if self.export_job.is_none() && matches!(target, Ok((_, None))) {
+                match usb::recover_checked(p) {
+                    Ok(Some(msg)) => {
+                        self.toast(format!("{name}: {msg}"));
+                        target = usb::inspect_target(p);
+                    }
+                    Ok(None) => {}
+                    Err(e) => recovery_error = Some(format!("USB recovery paused: {e:#}")),
                 }
             }
-            let (lib, error) = if crate::export::usb::pdb_path(p).exists() {
-                match crate::export::usb::read_device(p) {
-                    Ok(l) => (Some(l), None),
-                    Err(e) => (None, Some(format!("Device library is corrupted. ({e})"))),
-                }
-            } else {
-                (None, None)
+            let (layout, lib, write_blocker) = match target {
+                Ok((layout, _)) if recovery_error.is_some() => (Some(layout), None, recovery_error),
+                Ok((layout @ (DeviceLayout::Classic | DeviceLayout::Mixed), blocker)) => match usb::read_device(p) {
+                    Ok(lib) => (Some(layout), Some(lib), blocker),
+                    Err(e) => (Some(layout), None, Some(format!("Could not read the classic device catalog: {e}"))),
+                },
+                Ok((layout, blocker)) => (Some(layout), None, blocker),
+                Err(e) => (None, None, Some(format!("{e}"))),
             };
-            devices.push(DeviceInfo { total: crate::export::usb::total_space(p), free: crate::export::usb::free_space(p), root, name, fs, lib, error });
+            devices.push(DeviceInfo { total: usb::total_space(p), free: usb::free_space(p), root, name, fs, layout, lib, write_blocker });
         }
         self.devices = devices;
         self.devices_scanned = Some(Instant::now());
@@ -4446,8 +4469,14 @@ impl App {
             self.import_device_histories();
             // "Delete from the device after importing the play history".
             if self.delete_imported_histories() > 0 {
-                for d in self.devices.iter_mut() {
-                    d.lib = crate::export::usb::read_device(std::path::Path::new(&d.root)).ok().filter(|_| crate::export::usb::pdb_path(std::path::Path::new(&d.root)).exists());
+                for d in self.devices.iter_mut().filter(|d| d.lib.is_some()) {
+                    match crate::export::usb::read_device(std::path::Path::new(&d.root)) {
+                        Ok(lib) => d.lib = Some(lib),
+                        Err(e) => {
+                            d.lib = None;
+                            d.write_blocker = Some(e.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -4516,7 +4545,9 @@ impl App {
                 n += 1;
             }
         }
-        let _ = crate::export::usb::write_cue_record(root, &record);
+        if crate::export::usb::check_export_target(root).is_ok() {
+            let _ = crate::export::usb::write_cue_record(root, &record);
+        }
         self.dismiss_player_edits(pe, false);
         self.cue_counts = self.db.tracks_with_cues().unwrap_or_default();
         self.hot_positions = self.db.hot_positions().unwrap_or_default();
@@ -4800,6 +4831,11 @@ impl App {
     pub fn start_export_nodes(&mut self, root: &str, nodes: Vec<crate::export::usb::ExportNode>, extra_tracks: &[i64]) {
         if self.export_job.is_some() {
             self.toast_err("An export is already running.");
+            return;
+        }
+        if let Err(e) = crate::export::usb::check_export_target(std::path::Path::new(root)) {
+            self.device_ui.pending = None;
+            self.toast_err(format!("Cannot export to {root}: {e}"));
             return;
         }
         let mut track_ids: HashSet<i64> = extra_tracks.iter().copied().collect();
