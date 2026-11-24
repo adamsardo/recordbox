@@ -312,9 +312,15 @@ fn linux_reviews_real_mixed_collection_without_probing_foreign_volumes_or_author
                 .all(|r| r.candidate.is_none() && r.protected())
     );
     assert!(report.verify_selection(&report, &[1]).is_err());
+    let db = Db::open(&library).unwrap();
+    let selected = review_selected(&db, &report, &[1]).unwrap();
+    assert_eq!(selected.rows.len(), 1);
+    assert_eq!(selected.rows[0].id, 1);
+    assert!(review_selected(&db, &report, &[999_999]).is_err());
+    drop(db);
     // Even a fabricated UI report must not bypass the actual host gate.
     let backup_parent = library.parent().unwrap();
-    let before: Vec<_> = std::fs::read_dir(backup_parent)
+    let before: BTreeSet<_> = std::fs::read_dir(backup_parent)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
@@ -327,7 +333,7 @@ fn linux_reviews_real_mixed_collection_without_probing_foreign_volumes_or_author
             .to_string()
             .contains("review only")
     );
-    let after: Vec<_> = std::fs::read_dir(backup_parent)
+    let after: BTreeSet<_> = std::fs::read_dir(backup_parent)
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();

@@ -16,6 +16,8 @@ The report classifies recorded paths as Windows, macOS or unclassified. A drive 
 
 Recordbox looks for evidence that the reference was added by direct file import. Older records without that evidence, and records associated with other libraries, stay available for inspection. Preparation and library relationships such as cues, beat grids, ratings, playlists and play history also protect a record. This matters even when two files contain identical audio.
 
+Opening an existing schema 3 collection for the first time creates a dated database backup before upgrading it to schema 4. Restoring a portable Recordbox backup also clears the restored tracks’ eligibility for automatic cleanup, since the backup may have come from another computer.
+
 Cloud software can sync folders with ordinary names. Confirm that the Music folder is always local and outside any custom sync setup before requesting a content comparison or applying a selection. Start with the default review if you are unsure. A content comparison reads eligible files of matching size, up to 8 GiB per scan. Files left unverified by the scan cannot qualify based on their contents.
 
 ### Review, apply and recover

@@ -402,19 +402,22 @@ mod tests {
         assert_eq!(fs::read(&audio).unwrap(), b"unchanged audio");
         assert_eq!(backup::read_manifest(&archive).unwrap().tracks, 2);
         verify_backup(&archive, dir.path(), 2).unwrap();
-        let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
-        let mut restored = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-        io::copy(
-            &mut zip.by_name("library.db").unwrap(),
-            restored.as_file_mut(),
+        let restored = backup::stage_restore(
+            &archive,
+            &dir.path().join("staging"),
+            &dir.path().join("artwork"),
+            true,
+            &|_, _, _| {},
+            &AtomicBool::new(false),
         )
         .unwrap();
         let recovery = Db {
-            conn: Connection::open_with_flags(restored.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            conn: Connection::open_with_flags(restored.db, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap(),
         };
         assert_eq!(recovery.track(id).unwrap().path, metadata.path);
         assert!(recovery.trash_list().unwrap().is_empty());
+        assert!(protections(&recovery).unwrap().native.contains(&id));
         assert!(db.track(id).is_none());
         assert!(db.track(other).is_some());
         let trash = db.trash_list().unwrap();
