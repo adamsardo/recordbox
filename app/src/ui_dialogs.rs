@@ -12,10 +12,48 @@ use egui::{vec2, Context, RichText, Ui};
 pub fn dialogs(app: &mut App, ctx: &Context) {
     crate::ui_prefs::prefs_window(app, ctx);
     crate::ui_prefs::extra_windows(app, ctx);
+    library_sync_review(app, ctx);
     info_window(app, ctx);
     smart_window(app, ctx);
     export_window(app, ctx);
     confirm_windows(app, ctx);
+}
+
+fn library_sync_review(app: &mut App, ctx: &Context) {
+    let Some(review) = &app.dialogs.library_sync_review else { return };
+    let mut open = true;
+    let mut cancel = false;
+    let mut import = false;
+    egui::Window::new("Review rekordbox library sync").id(egui::Id::new("library_sync_review"))
+        .open(&mut open).collapsible(false).default_width(480.0).show(ctx, |ui| {
+            kit::apply_style(ui);
+            ui.label(RichText::new("Read from · desktop rekordbox library").strong());
+            if let Some(path) = &review.source {
+                ui.add(egui::Label::new(path.to_string_lossy().as_ref()).selectable(true).wrap());
+            }
+            if !review.found {
+                ui.colored_label(CAUTION_TX, "Desktop master.db could not be found at the default location.");
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("Write to · active Recordbox library").strong());
+            ui.add(egui::Label::new(app.db.active_library_path()).selectable(true).wrap());
+            ui.separator();
+            ui.label("Recordbox reads a private snapshot of master.db and its SQLite write-ahead log, and reads available analysis files. The desktop database and audio files are used read-only.");
+            ui.label("Source changes can replace local metadata, cues, grids and My Tags. Import rebuilds the managed rekordbox playlist folder and its histories. Tracks on an offline drive or at an unavailable path are omitted from the refreshed playlists. Keep your own playlists outside that folder.");
+            if app.prefs.auto_analysis {
+                ui.label("Auto Analysis is enabled. Adding tracks can queue analysis in Recordbox.");
+            }
+            ui.horizontal(|ui| {
+                import = ui.add_enabled(review.found && app.rb_job.is_none(), btn("Import into Recordbox")).clicked();
+                cancel = ui.add(btn(if review.found { "Cancel" } else { "Close" })).clicked();
+            });
+        });
+    if import || cancel || !open {
+        app.dialogs.library_sync_review = None;
+    }
+    if import {
+        app.start_rekordbox_sync();
+    }
 }
 
 fn info_window(app: &mut App, ctx: &Context) {

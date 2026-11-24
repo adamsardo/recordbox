@@ -266,6 +266,7 @@ jobs:
         shell: bash
         run: |
           for test_filter in backup::tests db::sqlcipher_tests:: export::device_import::tests:: \
+            rbimport::snapshot_tests:: rbimport::schema_tests:: rbimport::merge::tests:: \
             export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic \
             export::usb_fix_test::a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap; do
             cargo test --manifest-path app/Cargo.toml --release --locked "$test_filter" -- --test-threads=1
@@ -421,6 +422,47 @@ jobs:
           --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin"
           --runtime-dir "$env:RECORDBOX_VC_CRT"
           --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
+      - name: Validate and package the experimental Linux Vulkan build
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          test -f "${icds[0]}"
+          export VK_ICD_FILENAMES="${icds[0]}"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/vulkan-runtime"
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+
+          cargo_args=(--manifest-path app/Cargo.toml --release --locked --features vulkan)
+          for test_name in stems::vulkan::tests::projection_limits_bound_every_submission_and_buffer \
+                           stems::vulkan::tests::initialization_deadline_pauses_vulkan \
+                           stems::vulkan::tests::nonfinite_readback_pauses_vulkan \
+                           app::prefs_tests::vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model \
+                           app::prefs_tests::legacy_preferences_require_opt_in_for_automatic_cpu_separation \
+                           stems::vulkan::tests::software_vulkan_linear_matches_reference \
+                           stems::htdemucs::vulkan_transformer_projections_match_cpu \
+                           stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override \
+                           stems::backend::vulkan_tests::vulkan_loss_stops_gpu_requests_and_keeps_explicit_cpu_available; do
+            cargo test "${cargo_args[@]}" "$test_name" -- --exact --include-ignored | tee "$RUNNER_TEMP/vulkan-test.log"
+            grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/vulkan-test.log"
+          done
+
+          cargo build "${cargo_args[@]}"
+          python packaging/build_archive.py --binary app/target/release/recordbox --vulkan \
+            --platform linux --arch x86_64 --source-commit "$GITHUB_SHA" --output dist \
+            --runtime-notice /usr/share/doc/libssl3/copyright --runtime-notice /usr/share/doc/libasound2/copyright
+          (cd dist && sha256sum --check *-linux-x86_64-vulkan.tar.gz.sha256)
+          archive=(dist/*-linux-x86_64-vulkan.tar.gz)
+          dest="$RUNNER_TEMP/vulkan-smoke"
+          mkdir "$dest"
+          tar -xzf "${archive[0]}" -C "$dest"
+          launcher=("$dest"/*/recordbox)
+          "${launcher[0]}" --stems-status | tee "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'Linux Vulkan' "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'no physical Vulkan compute adapter detected' "$RUNNER_TEMP/vulkan-status.log"
+          "${launcher[0]}" --stems-device | grep -F 'STEMS backend: CPU ·'
+          "${launcher[0]}" --stems-cpu --stems-device | grep -F 'CPU · selected for this session'
       - name: Upload archives and checksums
         if: ${{ !cancelled() && hashFiles('dist/*.sha256') != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -443,6 +485,17 @@ jobs:
             smoke/*.log
             smoke/*.json
           if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+      - name: Upload the Linux Vulkan preview
+        if: runner.os == 'Linux' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vulkan-preview-linux-x86_64-${{ github.sha }}
+          path: |
+            dist/*-vulkan.tar.gz
+            dist/*-vulkan.tar.gz.sha256
+          if-no-files-found: error
           overwrite: true
           retention-days: 14
 

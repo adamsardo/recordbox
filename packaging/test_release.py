@@ -47,6 +47,20 @@ class DownloadNotesTests(unittest.TestCase):
         self.assertIn("https://github.com/test/recordbox/releases/download/v0.5.6/Recordbox-0.5.6-windows-x86_64-directml.zip", body)
         self.assertEqual(len(list(package.release_archives("0.5.6"))), 7)
 
+    def test_linux_vulkan_download_starts_with_0_6_0(self):
+        for version, expected_count in (("0.5.8", 7), ("0.6.0", 8), ("0.6.1", 8)):
+            with self.subTest(version=version):
+                archives = list(package.release_archives(version))
+                body = release.render_release_downloads(self.notes, "test/recordbox", f"v{version}")
+                self.assertEqual(len(archives), expected_count)
+                name = f"Recordbox-{version}-linux-x86_64-vulkan.tar.gz"
+                if version == "0.5.8":
+                    self.assertNotIn(name, body)
+                else:
+                    self.assertIn(("linux", "x86_64", "vulkan", name), archives)
+                    self.assertIn(f"| Linux x64, experimental, Vulkan + CPU STEMS | [`{name}`]"
+                                  f"(https://github.com/test/recordbox/releases/download/v{version}/{name}) |", body)
+
     def test_radeon_runtime_verification_rejects_a_missing_or_modified_file(self):
         from unittest.mock import patch
         from hashlib import sha256
@@ -248,6 +262,29 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn(self.log.rstrip(), body)
         for name in set(self.names.values()) | {"COMMIT-LOG.txt", "SHA256SUMS"}:
             self.assertIn(f"[`{name}`](https://github.com/fixture-owner/recordbox/releases/download/v0.5.0/{name})", body)
+
+    def test_verify_linux_vulkan_archive_against_tagged_shader_and_guide(self):
+        shader = self.source / "app/src/stems/vulkan/linear.wgsl"
+        shader.parent.mkdir(parents=True)
+        shader.write_text("test projection shader")
+        guide = self.source / "docs/VULKAN.md"
+        guide.write_text("Vulkan setup guide")
+        binary = self.root / "vulkan-binary"
+        binary.write_bytes(executable("linux", "x86_64") + shader.read_bytes())
+        with patch.object(package, "inspect_binary", return_value=package.BinaryInfo("x86_64")):
+            result = package.build_archive(binary, self.source, self.root / "vulkan-bundle",
+                                           "linux", "x86_64", self.commit, vulkan=True)
+        def verify(directory):
+            return release.verify_package(Path(result["archive"]), self.root / directory, self.source,
+                                          "0.5.0", self.commit, "linux", "x86_64", "vulkan")
+
+        self.assertEqual(verify("valid")["target"]["stems"], "vulkan")
+        guide.write_text("changed guide")
+        with self.assertRaisesRegex(package.PackageError, "Wrong Vulkan setup guide"):
+            verify("changed-guide")
+        shader.write_text("changed shader")
+        with self.assertRaisesRegex(package.PackageError, "projection shader"):
+            verify("changed-shader")
 
     def test_tag_mismatch_or_existing_output_is_refused(self):
         with self.assertRaisesRegex(package.PackageError, "Tag"): self.stage("v0.5.1")

@@ -170,9 +170,12 @@ impl Col {
     }
 }
 
+/// The experimental hybrid backend is exercised by an explicit separation request.
+pub(crate) const MANUAL_STEMS_PREVIEW: bool = cfg!(all(target_os = "linux", feature = "vulkan"));
+
 impl Prefs {
     pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
-        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::radeon_hold().is_none()
+        !MANUAL_STEMS_PREVIEW && self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::backend_hold().is_none()
     }
 }
 
@@ -203,7 +206,8 @@ pub struct Prefs {
     pub widths: HashMap<String, f32>,
     pub browser_only: bool,
     /// Copy and sync the installed rekordbox library (master.db) every time Recordbox starts.
-    pub rekordbox_sync: bool,
+    // Before 0.6 startup sync was enabled even without a deliberate opt-in.
+    pub import_rekordbox_at_startup: bool,
     /// Player settings written to every exported USB (Preferences > DJ System).
     pub usb_settings: crate::export::settings::UsbSettings,
     /// Which field the track-list search looks in (0 = all; see SEARCH_SCOPES).
@@ -523,6 +527,19 @@ mod reanalysis_tests {
 #[cfg(test)]
 mod prefs_tests {
     #[test]
+    fn startup_import_requires_an_opt_in_after_upgrading() {
+        for legacy in [r#"{}"#, r#"{"rekordbox_sync":true}"#, r#"{"rekordbox_sync":false}"#] {
+            let prefs: super::Prefs = serde_json::from_str(legacy).unwrap();
+            assert!(!prefs.import_rekordbox_at_startup);
+        }
+        let mut prefs = super::Prefs::default();
+        assert!(!prefs.import_rekordbox_at_startup);
+        prefs.import_rekordbox_at_startup = true;
+        let saved = serde_json::to_string(&prefs).unwrap();
+        assert!(serde_json::from_str::<super::Prefs>(&saved).unwrap().import_rekordbox_at_startup);
+    }
+
+    #[test]
     fn the_old_inactive_precision_switch_does_not_opt_users_into_new_work() {
         let old: super::Prefs = serde_json::from_str(r#"{"high_precision_grid":true}"#).unwrap();
         assert!(!old.refine_beatgrid_transients);
@@ -557,6 +574,16 @@ mod prefs_tests {
         assert!(state.error_for(Some(8)).is_some());
     }
 
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    #[test]
+    fn vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model() {
+        let failure = anyhow::Error::new(crate::stems::VulkanFailure("Vulkan dispatch timed out".into()))
+            .context("Separation segment 1 of 2");
+        let error = super::StemError::separation(Some("htdemucs"), failure);
+        assert_eq!(error.retry_model, Some("htdemucs"));
+        assert!(error.detail.contains("Vulkan dispatch timed out"));
+    }
+
     #[test]
     fn manual_cpu_progress_identifies_startup_before_any_segment_finishes() {
         let mut state = super::StemState::new();
@@ -583,9 +610,9 @@ mod prefs_tests {
     fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
         let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
         assert!(!p.auto_stems_on_load(false));
-        assert!(p.auto_stems_on_load(true));
+        assert_eq!(p.auto_stems_on_load(true), !super::MANUAL_STEMS_PREVIEW);
         p.stems_auto_cpu = true;
-        assert!(p.auto_stems_on_load(false));
+        assert_eq!(p.auto_stems_on_load(false), !super::MANUAL_STEMS_PREVIEW);
         p.stems_auto_separate = false;
         assert!(!p.auto_stems_on_load(false));
         assert!(!p.auto_stems_on_load(true));
@@ -850,7 +877,7 @@ impl Default for Prefs {
             columns: vec![Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Album, Col::Genre, Col::Bpm, Col::Rating, Col::Time, Col::Key, Col::DateAdded],
             sort_col: Col::DateAdded,
             sort_asc: false,
-            rekordbox_sync: true,
+            import_rekordbox_at_startup: false,
             usb_settings: Default::default(),
             search_scope: 0,
             related: Default::default(),
@@ -974,7 +1001,10 @@ pub struct StemError {
 
 impl StemError {
     fn separation(model: Option<&'static str>, error: anyhow::Error) -> Self {
-        Self { retry_model: model.filter(|_| error.is::<crate::stems::DirectMlFailure>()),
+        let provider_failure = error.is::<crate::stems::DirectMlFailure>();
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let provider_failure = provider_failure || error.is::<crate::stems::VulkanFailure>();
+        Self { retry_model: model.filter(|_| provider_failure),
             detail: format!("Stem separation failed: {error:#}") }
     }
 }
@@ -1017,8 +1047,8 @@ impl StemState {
         self.errors.get(&track).or_else(|| self.errors.get(&None))
     }
 
-    fn manual_device(&self, track: Option<i64>, radeon_paused: bool) -> crate::stems::SeparationDevice {
-        if radeon_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
+    fn manual_device(&self, track: Option<i64>, gpu_paused: bool) -> crate::stems::SeparationDevice {
+        if gpu_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
             crate::stems::SeparationDevice::Cpu
         } else {
             crate::stems::SeparationDevice::Selected
@@ -1032,11 +1062,17 @@ impl StemState {
     pub fn separation_status(&self) -> Option<String> {
         let (_, progress) = self.separating?;
         let model = self.status_model()?.name;
-        let cpu = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() { " on CPU" } else { "" };
-        Some(if progress == 0.0 {
-            format!("Starting {model}{cpu} · waiting for the first segment")
+        let backend = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() {
+            " on CPU"
+        } else if MANUAL_STEMS_PREVIEW {
+            " with Vulkan + CPU"
         } else {
-            format!("Separating with {model}{cpu}: {:.0}%", progress * 100.0)
+            ""
+        };
+        Some(if progress == 0.0 {
+            format!("Starting {model}{backend} · waiting for the first segment")
+        } else {
+            format!("Separating with {model}{backend}: {:.0}%", progress * 100.0)
         })
     }
 
@@ -1200,6 +1236,7 @@ pub struct Toast {
 #[derive(Default)]
 pub struct Dialogs {
     pub prefs_open: bool,
+    pub library_sync_review: Option<LibrarySyncReview>,
     pub prefs_tab: u8,
     /// Shortcuts window, backup/restore, reset confirmations (prefs_ext.rs).
     pub ext: crate::prefs_ext::DialogsExt,
@@ -1223,6 +1260,12 @@ pub struct Dialogs {
     pub player_edits: Option<PlayerEdits>,
     /// Unused files on a drive, waiting for confirmation: (root, device name, files with sizes).
     pub device_cleanup: Option<(String, String, Vec<(std::path::PathBuf, u64)>)>,
+}
+
+/// Capture detection when the review opens. Drawing the dialog never scans the source.
+pub struct LibrarySyncReview {
+    pub source: Option<std::path::PathBuf>,
+    pub found: bool,
 }
 
 pub struct PlayerEdits {
@@ -1559,7 +1602,7 @@ impl App {
             app.toast_err(format!("Audio output unavailable: {e}"));
         }
         // First start: add original demo loops (like the bundled demo tracks of the original).
-        let rb_library = app.prefs.rekordbox_sync && crate::rbimport::library_dir().is_some();
+        let rb_library = app.prefs.import_rekordbox_at_startup && crate::rbimport::library_dir().is_some();
         if app.tracks.is_empty() && app.db.setting("demo_added").is_none() && (!rb_library || (app.screenshot.is_some() && std::env::var("PREPDECK_SHOT_SYNC").is_err())) {
             app.db.set_setting("demo_added", "1");
             let files = crate::demo::ensure_demo_files();
@@ -1591,7 +1634,7 @@ impl App {
         if std::env::var("PREPDECK_OPEN_PREFS").is_ok() {
             app.dialogs.prefs_open = true;
         }
-        if app.prefs.rekordbox_sync && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
+        if rb_library && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
             app.start_rekordbox_sync();
         }
         if app.screenshot.is_some() {
@@ -2459,7 +2502,7 @@ impl App {
 /// Vocal detection for the loaded track when neither rekordbox nor an earlier run has it:
     /// the vocal stem of an already-downloaded separation model, in the background.
     fn start_deck_vocal(&mut self, a: Arc<Decoded>) {
-        if !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
+        if MANUAL_STEMS_PREVIEW || !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
             return;
         }
         // Only with a downloaded model and a GPU (about a minute per track there; much slower on
@@ -2488,7 +2531,7 @@ impl App {
     /// mix without its drums (the drums stem subtracted), which agrees with rekordbox more
     /// often; otherwise with the ordinary analysis.
     pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
-        let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.gpu_available();
+        let stems_ok = !MANUAL_STEMS_PREVIEW && crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.gpu_available();
         // Locked tracks keep their key (Analysis Lock).
         let ids: Vec<i64> = ids.iter().copied().filter(|id| self.track(*id).map(|t| !(t.grid_locked && t.analyzed == 1)).unwrap_or(false)).collect();
         let ids = &ids[..];
@@ -2513,7 +2556,7 @@ impl App {
                     if !crate::stems::gpu_active() { return Some(crate::key::detect_key(&mono, 44100.0)); }
                     let drums = match crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true) {
                         Ok(drums) => drums,
-                        Err(_) if crate::stems::radeon_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
+                        Err(_) if crate::stems::backend_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
                         Err(_) => return None,
                     };
                     let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
@@ -2803,7 +2846,7 @@ impl App {
 
     fn resume_pending_stems(&mut self) {
         if let Some((id, execution)) = self.stem.pending.take() {
-            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::radeon_hold().is_some() { return; }
+            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::backend_hold().is_some() { return; }
             if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
                 self.with_deck(deck, |app| app.separate_loaded_on(execution));
             }
@@ -2830,7 +2873,7 @@ impl App {
     }
 
     pub fn manual_stem_device(&self) -> crate::stems::SeparationDevice {
-        self.stem.manual_device(self.deck.track, crate::stems::radeon_hold().is_some())
+        self.stem.manual_device(self.deck.track, crate::stems::backend_hold().is_some())
     }
 
     /// Separate the loaded track (downloading the model first if it is missing).
@@ -3006,6 +3049,14 @@ impl App {
         }
     }
 
+    pub fn review_rekordbox_sync(&mut self) {
+        if self.rb_job.is_none() {
+            let source = crate::rbimport::default_library_dir().map(|dir| dir.join("master.db"));
+            let found = source.as_ref().is_some_and(|path| path.is_file());
+            self.dialogs.library_sync_review = Some(LibrarySyncReview { source, found });
+        }
+    }
+
     /// Copy rekordbox's library into Recordbox's data folder and read the copy, off the UI thread.
     /// rekordbox's own files are only read (byte copy), never opened by a database or written.
     pub fn start_rekordbox_sync(&mut self) {
@@ -3015,21 +3066,31 @@ impl App {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         let dest = crate::db::data_dir().join("rekordbox-copy");
-        std::thread::spawn(move || {
+        match std::thread::Builder::new().name("rb-library-sync".into()).spawn(move || {
             let _ = tx.send(crate::rbimport::load_installed(&dest));
             ctx.request_repaint();
-        });
-        self.rb_job = Some(rx);
+        }) {
+            Ok(_) => self.rb_job = Some(rx),
+            Err(e) => self.toast_err(format!("Could not start desktop library sync: {e}")),
+        }
     }
 
     pub fn poll_rekordbox_sync(&mut self) {
         let Some(rx) = &self.rb_job else { return };
-        let Ok(r) = rx.try_recv() else { return };
+        let r = match rx.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.rb_job = None;
+                self.toast_err("Desktop library sync stopped before the source snapshot could be imported.");
+                return;
+            }
+        };
         self.rb_job = None;
         match r {
             Ok(Some(lib)) => self.apply_rekordbox(lib),
-            Ok(None) => {}
-            Err(e) => self.toast_err(format!("Could not read the rekordbox library: {e}. It was not changed.")),
+            Ok(None) => self.toast_err("The rekordbox source database could not be found."),
+            Err(e) => self.toast_err(format!("Could not import the desktop rekordbox library: {e:#}")),
         }
     }
 
@@ -3038,196 +3099,14 @@ impl App {
     /// one it did not change keeps any edits made in Recordbox. The playlist tree is mirrored
     /// into the "rekordbox" folder, which is rebuilt on every sync.
     pub fn apply_rekordbox(&mut self, lib: crate::rbimport::RbLibrary) {
-        // One transaction for the whole sync (much faster, and all-or-nothing).
-        let _ = self.db.conn.execute_batch("BEGIN");
-        let mut seen: HashMap<String, String> = self.db.setting("rb_sync_fingerprints").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let first = seen.is_empty();
-        // My Tag categories and tags, matched by name.
-        let mut tag_id: HashMap<(String, String), i64> = HashMap::new();
-        let mut rb_tag_ids: HashSet<i64> = HashSet::new();
-        let existing = self.db.mytags().unwrap_or_default();
-        for (cat, tags) in &lib.tag_categories {
-            let cid = match existing.iter().find(|t| t.parent == 0 && &t.name == cat) {
-                Some(t) => t.id,
-                None => self.db.add_mytag(0, cat).unwrap_or(0),
-            };
-            for tg in tags {
-                let tid = match existing.iter().find(|t| t.parent == cid && &t.name == tg) {
-                    Some(t) => t.id,
-                    None => self.db.add_mytag(cid, tg).unwrap_or(0),
-                };
-                tag_id.insert((cat.clone(), tg.clone()), tid);
-                rb_tag_ids.insert(tid);
+        let result = match crate::rbimport::merge::apply(&self.db, &lib) {
+            Ok(summary) => summary,
+            Err(e) => {
+                self.toast_err(format!("Could not sync the Recordbox collection: {e:#}"));
+                return;
             }
-        }
-        let (mut added, mut updated) = (0, 0);
-        let mut idmap: HashMap<String, i64> = HashMap::new();
-        // Where rekordbox's own analysis of each audio file lives (used by the USB export).
-        let mut rb_anlz: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        for rt in lib.tracks.iter() {
-            if let Some(b) = &rt.anlz_base {
-                rb_anlz.insert(rt.xt.track.path.clone(), b.to_string_lossy().to_string());
-            }
-        }
-        self.db.set_setting("rb_anlz", &serde_json::to_string(&rb_anlz).unwrap_or_default());
-        // Tracks the user removed from Recordbox stay removed.
-        let removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let mut failed: Option<String> = None;
-        for rt in lib.tracks {
-            if removed.contains(&rt.xt.track.path) {
-                continue;
-            }
-            // known: synced before; changed: rekordbox edited it since the last sync.
-            let known = seen.contains_key(&rt.rb_id);
-            let changed = known && seen.get(&rt.rb_id) != Some(&rt.fingerprint);
-            let existing = self.db.track_by_path(&rt.xt.track.path);
-            // Libraries synced before the key's spelling was kept: fill it in once, where the
-            // stored key is still rekordbox's own (not analysed over or chosen by the user).
-            if let Some(mut t) = existing.and_then(|id| self.db.track(id)) {
-                let rb = &rt.xt.track;
-                if t.key_text.is_empty() && !rb.key_text.is_empty() && !t.key_manual && t.key == rb.key {
-                    t.key_text = rb.key_text.clone();
-                    let _ = self.db.update_track(&t);
-                    if let Some(m) = self.track_mut(t.id) {
-                        m.key_text = t.key_text.clone();
-                    }
-                }
-            }
-            let (id, fresh) = match existing {
-                None => {
-                    let mut t = rt.xt.track.clone();
-                    if t.sample_rate == 0 || t.duration <= 0.0 {
-                        let real = crate::importer::read_track(std::path::Path::new(&t.path));
-                        t.sample_rate = real.sample_rate;
-                        t.bit_depth = real.bit_depth;
-                        if t.duration <= 0.0 {
-                            t.duration = real.duration;
-                        }
-                        if t.artwork.is_empty() {
-                            t.artwork = real.artwork;
-                        }
-                    }
-                    match self.db.insert_track(&t) {
-                        Ok(id) => {
-                            added += 1;
-                            (id, true)
-                        }
-                        Err(e) => {
-                            failed.get_or_insert(e.to_string());
-                            continue;
-                        }
-                    }
-                }
-                Some(id) => (id, false),
-            };
-            let cur = self.track(id).cloned();
-            let locked = cur.as_ref().map(|t| t.grid_locked).unwrap_or(false);
-            if changed {
-                if let Some(cur) = &cur {
-                    let r = &rt.xt.track;
-                    let t = Track {
-                        id,
-                        analyzed: cur.analyzed,
-                        grid_locked: cur.grid_locked,
-                        gain_db: cur.gain_db,
-                        raw_samples: cur.raw_samples,
-                        missing: cur.missing,
-                        artwork: if r.artwork.is_empty() { cur.artwork.clone() } else { r.artwork.clone() },
-                        sample_rate: if r.sample_rate > 0 { r.sample_rate } else { cur.sample_rate },
-                        bit_depth: if r.bit_depth > 0 { r.bit_depth } else { cur.bit_depth },
-                        duration: if r.duration > 0.0 { r.duration } else { cur.duration },
-                        // A locked grid keeps its tempo.
-                        bpm: if locked { cur.bpm } else { r.bpm },
-                        ..r.clone()
-                    };
-                    if let Err(e) = self.db.update_track(&t) {
-                        failed.get_or_insert(e.to_string());
-                    }
-                    updated += 1;
-                }
-            }
-            let my_cues = if fresh { vec![] } else { self.db.cues(id).unwrap_or_default() };
-            let my_grid = if fresh { None } else { self.db.grid(id).filter(|g| !g.is_empty()) };
-            // Grid: new tracks and tracks without one get rekordbox's; a changed track gets it
-            // unless the grid is locked.
-            if let Some(g) = &rt.xt.grid {
-                if fresh || my_grid.is_none() || (changed && !locked) {
-                    if let Err(e) = self.db.save_grid(id, g) {
-                        failed.get_or_insert(e.to_string());
-                    }
-                }
-            }
-            // Cues: new tracks and tracks without cues get rekordbox's; a changed track gets
-            // them only when rekordbox has some (Recordbox's are never wiped by an empty list).
-            if (fresh || my_cues.is_empty() || changed) && !(rt.xt.cues.is_empty() && !my_cues.is_empty()) {
-                if let Err(e) = self.db.replace_cues(id, &rt.xt.cues) {
-                    failed.get_or_insert(e.to_string());
-                }
-            }
-            // My Tags: rekordbox's are added; on a change in rekordbox, ones it removed are too.
-            let mine: HashSet<i64> = rt.tags.iter().filter_map(|k| tag_id.get(k).copied()).collect();
-            for t in &rb_tag_ids {
-                if mine.contains(t) {
-                    let _ = self.db.set_track_tag(id, *t, true);
-                } else if changed {
-                    let _ = self.db.set_track_tag(id, *t, false);
-                }
-            }
-            seen.insert(rt.rb_id.clone(), rt.fingerprint.clone());
-            idmap.insert(rt.rb_id, id);
-        }
-        self.db.set_setting("rb_sync_fingerprints", &serde_json::to_string(&seen).unwrap_or_default());
-        // Playlists: rebuild the mirrored folder.
-        if let Some(old) = self.db.setting("rb_folder_id").and_then(|s| s.parse::<i64>().ok()) {
-            if self.db.playlists().map(|v| v.iter().any(|n| n.id == old)).unwrap_or(false) {
-                let _ = self.db.delete_node(old);
-            }
-        }
-        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>, tag_id: &HashMap<(String, String), i64>) {
-            for n in nodes {
-                if n.folder {
-                    let id = app.db.create_node(parent, &n.name, NodeKind::Folder, None).unwrap_or(0);
-                    add_nodes(app, id, &n.children, idmap, tag_id);
-                } else if let Some(rule) = &n.smart {
-                    // Intelligent playlist: My Tag conditions name their tag until now.
-                    let mut rule = rule.clone();
-                    let mut ok = true;
-                    for c in rule.conditions.iter_mut().filter(|c| c.field == crate::smart::Field::MyTag) {
-                        let found = c.value.strip_prefix('\u{1}').and_then(|v| v.split_once('\u{1f}')).and_then(|(cat, t)| tag_id.get(&(cat.to_string(), t.to_string())));
-                        match found {
-                            Some(id) => c.value = id.to_string(),
-                            None => ok = false,
-                        }
-                    }
-                    if ok {
-                        let _ = app.db.create_node(parent, &n.name, NodeKind::Smart, Some(&rule));
-                    }
-                } else {
-                    let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
-                    let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| idmap.get(k).copied()).collect();
-                    let _ = app.db.set_playlist_tracks(id, &tr);
-                }
-            }
-        }
-        if !lib.playlists.is_empty() || !lib.histories.is_empty() {
-            let root = self.db.create_node(0, "rekordbox", NodeKind::Folder, None).unwrap_or(0);
-            self.db.set_setting("rb_folder_id", &root.to_string());
-            add_nodes(self, root, &lib.playlists, &idmap, &tag_id);
-            if !lib.histories.is_empty() {
-                let h = self.db.create_node(root, "Histories", NodeKind::Folder, None).unwrap_or(0);
-                add_nodes(self, h, &lib.histories, &idmap, &tag_id);
-            }
-        }
-        if let Some(e) = failed {
-            let _ = self.db.conn.execute_batch("ROLLBACK");
-            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
-            return;
-        }
-        if let Err(e) = self.db.conn.execute_batch("COMMIT") {
-            let _ = self.db.conn.execute_batch("ROLLBACK");
-            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
-            return;
-        }
+        };
+        let (added, updated, first) = (result.added, result.updated, result.first);
         self.reload_all();
         // The loaded track may have new cues or a new grid now.
         if let Some(t) = self.deck.track {
@@ -3242,17 +3121,15 @@ impl App {
         } else if added + updated > 0 {
             format!("Synced from rekordbox: {added} new, {updated} updated.")
         } else {
-            String::new()
+            "Sync complete. No new or updated tracks.".to_string()
         };
-        if first && lib.not_local > 0 {
-            msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
+        if lib.not_local > 0 {
+            msg.push_str(&format!(" {} track(s) without an accessible local file were left out.", lib.not_local));
         }
         if first && lib.smart_lists > 0 {
             msg.push_str(&format!(" {} intelligent playlist(s) use a condition recordbox doesn't have and were not copied.", lib.smart_lists));
         }
-        if !msg.is_empty() {
-            self.toast(msg);
-        }
+        self.toast(msg);
         if added > 0 && self.prefs.auto_analysis {
             // Waveforms and loudness are Recordbox's own; grids and keys from rekordbox are kept.
             let todo: Vec<i64> = self.tracks.iter().filter(|t| t.analyzed == 0 && !t.missing).map(|t| t.id).collect();

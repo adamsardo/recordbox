@@ -107,12 +107,10 @@ def source_hashes(path, platform):
     return hashes
 
 
-def verify_package(archive, destination, source, version, commit, platform, architecture, cuda12=False, directml=False):
+def verify_package(archive, destination, source, version, commit, platform, architecture, variant=""):
     root = "Recordbox.app" if platform == "macos" else f"Recordbox-{version}-{platform}-{architecture}"
-    if cuda12:
-        root += "-cuda12"
-    elif directml:
-        root += "-directml"
+    if variant:
+        root += "-" + variant
     preflight_archive(archive, root)
     bundle = extract_archive(archive, destination)
     resource = bundle / "Contents/Resources" if platform == "macos" else bundle
@@ -144,13 +142,17 @@ def verify_package(archive, destination, source, version, commit, platform, arch
     require(manifest.get("entrypoint") == ("recordbox" if platform == "linux" else executable), "Wrong product entrypoint")
     require(stat.S_IMODE((bundle / executable).stat().st_mode) == 0o755, "Executable permission is missing")
     verify_machine(bundle / executable, platform, architecture)
-    require(target.get("stems") == ("cuda12-sm61" if cuda12 else "directml-radeon" if directml else None), "Wrong STEMS build variant")
-    if directml:
+    backends = {"": None, "cuda12": "cuda12-sm61", "directml": "directml-radeon", "vulkan": "vulkan"}
+    require(variant in backends and target.get("stems") == backends[variant], "Wrong STEMS build variant")
+    if variant == "vulkan":
+        build_archive.check_vulkan_binary(bundle / executable, source)
+        require(sha256(resource / "VULKAN.md") in source_hashes(source / "docs/VULKAN.md", platform), "Wrong Vulkan setup guide")
+    elif variant == "directml":
         build_archive.check_directml_binary(bundle / executable)
         build_archive.directml_runtime.verify(bundle, packaged=True)
         require(set(build_archive.directml_runtime.LIBRARIES) <= set(manifest["runtime"]["bundled_libraries"]), "Missing DirectML libraries")
         require(sha256(resource / "DIRECTML.md") in source_hashes(source / "docs/DIRECTML.md", platform), "Wrong DirectML setup guide")
-    if cuda12:
+    elif variant == "cuda12":
         build_archive.check_cuda_binary(bundle / executable, manifest["runtime"]["system_dependencies"], platform)
         require(sha256(resource / "CUDA12.md") in source_hashes(source / "docs/CUDA12.md", platform), "Wrong CUDA setup guide")
     for packaged, original in (("LICENSE.txt", "LICENSE"), ("Inter-OFL.txt", "packaging/Inter-OFL.txt"), ("Inter-NOTICE.txt", "app/assets/fonts/README.txt")):
@@ -222,6 +224,8 @@ def render_release_downloads(notes, repository, tag):
             label = f"{label}, CUDA 12 STEMS preview"
         elif variant == "directml":
             label = f"{label}, Radeon DirectML STEMS preview"
+        elif variant == "vulkan":
+            label = f"{label}, Vulkan + CPU STEMS"
         rows.append(f"| {label} | {link(name)} |")
     rows.extend(["", f"Download {link('SHA256SUMS')} to verify the release archives and {link('COMMIT-LOG.txt')}",
                  "for the complete source history. See the",
@@ -256,7 +260,7 @@ def prepare_release(input_root, output, source, commit, tag, repository):
         for platform, arch, variant, name in archives:
             archive = packages / name; checksum = sha256(archive)
             require((packages / (name + ".sha256")).read_text(encoding="utf-8") == f"{checksum}  {name}\n", "Native archive checksum sidecar mismatch")
-            manifest = verify_package(archive, Path(temporary) / name, source, version, commit, platform, arch, variant == "cuda12", variant == "directml")
+            manifest = verify_package(archive, Path(temporary) / name, source, version, commit, platform, arch, variant)
             if not variant:
                 verify_smoke(smoke / f"smoke-{platform}-{arch}-{commit}", archive, manifest, commit, platform)
             verified[name] = checksum

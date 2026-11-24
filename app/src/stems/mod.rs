@@ -9,8 +9,10 @@ pub mod htdemucs;
 mod backend;
 #[cfg(feature = "directml")]
 mod directml;
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+mod vulkan;
 mod compare;
-pub use backend::{backend_label, force_cpu, gpu_active, radeon_hold, status as backend_status};
+pub use backend::{backend_hold, backend_label, force_cpu, gpu_active, radeon_hold, status as backend_status};
 pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,7 +28,7 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: f64,
     pub apple_silicon: bool,
-    /// A GPU is available for STEMS. Windows Radeon detection is passive until first use.
+    /// A GPU is available for STEMS. DirectML and Vulkan detection is passive until first use.
     pub gpu: bool,
 }
 
@@ -59,6 +61,7 @@ pub fn status_report() -> String {
     let hw = system_hardware(false);
     let build = if cfg!(all(windows, feature = "directml")) { "Windows DirectML" }
         else if cfg!(target_os = "macos") { "Apple Metal" }
+        else if cfg!(all(target_os = "linux", feature = "vulkan")) { "experimental Linux Vulkan + CPU" }
         else if cfg!(feature = "cuda12") { "CUDA 12" }
         else { "standard CPU" };
     let ram = if hw.ram_gb > 0.0 { format!("{:.1} GB", hw.ram_gb) } else { "unknown".into() };
@@ -66,6 +69,8 @@ pub fn status_report() -> String {
         format!("Recordbox {} · {build} build", env!("CARGO_PKG_VERSION")),
         format!("System RAM: {ram}"),
     ];
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    lines.push(backend::vulkan_detection().1.to_owned());
     #[cfg(all(windows, feature = "directml"))]
     {
         lines.push(directml::adapter_status().unwrap_or_else(|e| format!("DXGI adapter status: {e:#}")));
@@ -115,18 +120,38 @@ impl std::fmt::Display for DirectMlFailure {
 }
 impl std::error::Error for DirectMlFailure {}
 
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+#[derive(Debug)]
+pub(crate) struct VulkanFailure(pub(super) String);
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+impl std::fmt::Display for VulkanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+impl std::error::Error for VulkanFailure {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeparationDevice { Selected, GpuOnly, Cpu }
 
 impl SeparationDevice {
+    fn check_hold(self) -> Result<()> {
+        if self == Self::Cpu { return Ok(()); }
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        if let Some(reason) = backend::vulkan_hold() { return Err(VulkanFailure(reason.to_owned()).into()); }
+        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
+        Ok(())
+    }
+
     fn device(self) -> Result<candle_core::Device> {
         if self == Self::Cpu { return Ok(candle_core::Device::Cpu); }
         let selected = device();
-        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
+        self.check_hold()?;
         if self == Self::GpuOnly && !backend::gpu_active() {
             #[cfg(all(windows, feature = "directml"))]
             return Err(DirectMlFailure(format!("Checking the DirectML device\n{}", backend_label())).into());
-            #[cfg(not(all(windows, feature = "directml")))]
+            #[cfg(all(target_os = "linux", feature = "vulkan"))]
+            return Err(VulkanFailure(format!("Checking the Vulkan device\n{}", backend_label())).into());
+            #[cfg(not(any(all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan"))))]
             anyhow::bail!("GPU separation unavailable: {}", backend_label());
         }
         Ok(selected)
@@ -137,6 +162,19 @@ impl SeparationDevice {
             Self::Selected | Self::GpuOnly => htdemucs::Graph::load_selected(path),
             Self::Cpu => Ok(htdemucs::Graph::load(path, &candle_core::Device::Cpu)?),
         }
+    }
+
+    fn reserve_gpu(self, progress: &mut dyn FnMut(f32) -> bool) -> Result<Option<parking_lot::MutexGuard<'static, ()>>> {
+        if self == Self::Cpu { return Ok(None); }
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let serialize = backend::vulkan_device().is_some();
+        #[cfg(not(all(target_os = "linux", feature = "vulkan")))]
+        let serialize = backend::gpu_uses_shared_memory();
+        if serialize {
+            let guard = wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?;
+            self.check_hold()?;
+            Ok(Some(guard))
+        } else { Ok(None) }
     }
 }
 
@@ -157,9 +195,7 @@ fn wait_for_shared_gpu<'a>(slot: &'a parking_lot::Mutex<()>, progress: &mut dyn 
 fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
     static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
     // A preceding job may have lost the GPU while this job waited for its turn.
-    if execution != SeparationDevice::Cpu {
-        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
-    }
+    execution.check_hold()?;
     let execution = if execution == SeparationDevice::GpuOnly { SeparationDevice::Selected } else { execution };
     let file_path = models_dir().join(file);
     let load = || execution.load(&file_path).map(std::sync::Arc::new).with_context(|| format!("Loading {file}"));
@@ -420,9 +456,7 @@ pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMu
 pub fn separate_with_device(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool, execution: SeparationDevice) -> Result<Stems> {
     if !progress(0.0) { anyhow::bail!("stopped"); }
     let device = execution.device()?;
-    let _job = if execution != SeparationDevice::Cpu && backend::gpu_uses_shared_memory() {
-        Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?)
-    } else { None };
+    let _job = execution.reserve_gpu(progress)?;
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
@@ -460,8 +494,8 @@ pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn 
     if !progress(0.0) { anyhow::bail!("stopped"); }
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
-    let device = device();
-    let _job = if backend::gpu_uses_shared_memory() { Some(wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?) } else { None };
+    let device = SeparationDevice::Selected.device()?;
+    let _job = SeparationDevice::Selected.reserve_gpu(progress)?;
     let (planar, len) = planar_44k(samples, sr);
     let g = graph(file, SeparationDevice::Selected)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);

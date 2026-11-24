@@ -299,9 +299,9 @@ fn menus(app: &mut App, ui: &mut Ui) {
             app.toast(format!("{} missing file(s) in the collection", missing.len()));
             app.selected = missing.into_iter().collect();
         }
-        if ui.button("Show library folder in Finder").clicked() {
+        if ui.button("Show library folder").clicked() {
             ui.close_menu();
-            let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+            crate::menus::handle(app, "library_folder");
         }
         if ui.button("Backup Library…").clicked() {
             ui.close_menu();
@@ -446,6 +446,14 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         p.text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
     } else if app.stem.loading.is_some() {
         p.text(mid.left_center(), Align2::LEFT_CENTER, "Reading cached stems…", rb(11.5), TEXT);
+    } else if app.rb_job.is_some() {
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the desktop rekordbox library…", rb(11.5), TEXT);
+    } else if mid.width() > 0.0 {
+        let path = app.db.active_library_path();
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, format!("Active library · {path}"), rb(11.5), DIM);
+        if app.prefs.tooltips {
+            ui.interact(mid, ui.id().with("active_library_path"), Sense::hover()).on_hover_text(path);
+        }
     }
 }
 
@@ -755,15 +763,19 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
             }
         }
     }
-    // Bottom of the strip: the library sync mark ("Sync rekordbox Library Now"), lit while a
+    // Bottom of the strip: review importing the installed library, lit while a
     // sync is running. (rekordbox's link-status mark above it has no counterpart here.)
     let sr = Rect::from_center_size(pos2(r.min.x + 20.0, r.max.y - 20.0), vec2(18.0, 12.0));
     let busy = app.rb_job.is_some();
     let resp = ui.interact(sr.expand(3.0), ui.id().with("strip_sync"), Sense::click());
     src::sync_arrows(ui.painter(), sr, if busy { BLUE } else if resp.hovered() { WHITE } else { hex(0xDCDCDC) });
-    let resp = if app.prefs.tooltips { resp.on_hover_text("Sync rekordbox Library Now") } else { resp };
+    let resp = if app.prefs.tooltips {
+        resp.on_hover_text(if busy { "Importing from the desktop rekordbox library…" } else {
+            "Review library sync. Read from the installed rekordbox library and import into Recordbox. Choose Import in the review to start."
+        })
+    } else { resp };
     if resp.clicked() && !busy {
-        app.start_rekordbox_sync();
+        app.review_rekordbox_sync();
     }
 }
 
