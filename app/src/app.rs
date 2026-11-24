@@ -538,6 +538,10 @@ mod prefs_tests {
         let problem = state.error_for(Some(7)).unwrap();
         assert_eq!(problem.retry_model, Some("htdemucs_ft"));
         state.model = Some("htdemucs".into());
+        use crate::stems::SeparationDevice::{Cpu, Selected};
+        assert_eq!(state.manual_device(Some(7), false), Cpu);
+        assert_eq!(state.manual_device(Some(8), false), Selected);
+        assert_eq!(state.manual_device(Some(8), true), Cpu);
         assert_eq!(state.model_for(Some(7), crate::stems::SeparationDevice::Cpu).unwrap().id, "htdemucs_ft");
         assert_eq!(state.model_for(Some(7), crate::stems::SeparationDevice::Selected).unwrap().id, "htdemucs");
         let problem = state.error_for(Some(7)).unwrap();
@@ -551,6 +555,28 @@ mod prefs_tests {
         state.retain_deck_tracks([Some(8), None, None, None]);
         assert!(state.error_for(Some(7)).is_none());
         assert!(state.error_for(Some(8)).is_some());
+    }
+
+    #[test]
+    fn manual_cpu_progress_identifies_startup_before_any_segment_finishes() {
+        let mut state = super::StemState::new();
+        state.execution = crate::stems::SeparationDevice::Cpu;
+        state.active_model = Some("htdemucs");
+        assert!(state.separation_status().is_none());
+        state.separating = Some((7, 0.0));
+        assert_eq!(state.separation_status().as_deref(), Some("Starting HTDemucs on CPU · waiting for the first segment"));
+        state.separating = Some((7, 0.25));
+        assert_eq!(state.separation_status().as_deref(), Some("Separating with HTDemucs on CPU: 25%"));
+    }
+
+    #[test]
+    fn model_details_follow_the_running_job_when_the_preference_changes() {
+        let mut state = super::StemState::new();
+        state.active_model = Some("htdemucs");
+        state.model = Some("htdemucs_ft".into());
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs");
+        state.active_model = None;
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs fine-tuned");
     }
 
     #[test]
@@ -989,6 +1015,29 @@ impl StemState {
 
     pub fn error_for(&self, track: Option<i64>) -> Option<&StemError> {
         self.errors.get(&track).or_else(|| self.errors.get(&None))
+    }
+
+    fn manual_device(&self, track: Option<i64>, radeon_paused: bool) -> crate::stems::SeparationDevice {
+        if radeon_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
+            crate::stems::SeparationDevice::Cpu
+        } else {
+            crate::stems::SeparationDevice::Selected
+        }
+    }
+
+    pub fn status_model(&self) -> Option<&'static crate::stems::ModelSpec> {
+        self.active_model.or(self.model.as_deref()).and_then(crate::stems::spec)
+    }
+
+    pub fn separation_status(&self) -> Option<String> {
+        let (_, progress) = self.separating?;
+        let model = self.status_model()?.name;
+        let cpu = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() { " on CPU" } else { "" };
+        Some(if progress == 0.0 {
+            format!("Starting {model}{cpu} · waiting for the first segment")
+        } else {
+            format!("Separating with {model}{cpu}: {:.0}%", progress * 100.0)
+        })
     }
 
     fn model_for(&self, track: Option<i64>, execution: crate::stems::SeparationDevice) -> Option<&'static crate::stems::ModelSpec> {
@@ -2690,27 +2739,11 @@ impl App {
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
         let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
-        let auto = self.prefs.stems_auto_download;
-        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let hw = crate::stems::assess();
             let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
             let _ = tx.send(StemMsg::Hardware(hw, m.id.to_string()));
             ctx.request_repaint();
-            if auto && !crate::stems::model_ready(m) {
-                let tx2 = tx.clone();
-                let ctx2 = ctx.clone();
-                let mut last = std::time::Instant::now();
-                let r = crate::stems::download(m, &mut |d, t, _| {
-                    if last.elapsed().as_millis() > 200 {
-                        let _ = tx2.send(StemMsg::Download(d, t));
-                        ctx2.request_repaint();
-                        last = std::time::Instant::now();
-                    }
-                }, &cancel);
-                let _ = tx.send(StemMsg::DownloadDone(r.map_err(|e| e.to_string())));
-                ctx.request_repaint();
-            }
         });
     }
 
@@ -2796,10 +2829,13 @@ impl App {
         true
     }
 
+    pub fn manual_stem_device(&self) -> crate::stems::SeparationDevice {
+        self.stem.manual_device(self.deck.track, crate::stems::radeon_hold().is_some())
+    }
+
     /// Separate the loaded track (downloading the model first if it is missing).
     pub fn separate_loaded(&mut self) {
-        let mode = if crate::stems::radeon_hold().is_some() { crate::stems::SeparationDevice::Cpu } else { crate::stems::SeparationDevice::Selected };
-        self.separate_loaded_on(mode);
+        self.separate_loaded_on(self.manual_stem_device());
     }
 
     pub fn separate_loaded_on(&mut self, execution: crate::stems::SeparationDevice) {
@@ -2898,7 +2934,7 @@ impl App {
                     self.stem.model = Some(model);
                     self.stem.hw = Some(hw);
                     if !self.stem.model_ready && self.prefs.stems_auto_download {
-                        self.stem.downloading = Some((0, 0));
+                        self.stems_download();
                     }
                     if let Some(id) = self.deck.track {
                         self.stems_for_loaded(id);

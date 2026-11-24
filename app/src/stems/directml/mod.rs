@@ -5,7 +5,7 @@ mod device;
 mod diagnostics;
 mod network;
 #[cfg(windows)]
-pub(super) use device::{available, select, Binding};
+pub(super) use device::{adapter_status, available, select, Binding};
 #[cfg(not(windows))]
 #[derive(Clone)]
 pub(super) enum Binding {}

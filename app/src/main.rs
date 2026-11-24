@@ -480,7 +480,11 @@ mod launch_tests {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().skip(1).any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: recordbox [--disable-load] [--disable-play] [--screenshot FILE] [--stems-cpu] [--stems-device | --compare-stems FILE]\n\n  --disable-load  Disable loading tracks into decks for this session.\n  --disable-play  Disable audio playback and previews for this session.\n  --screenshot    Save a picture of the window to FILE and exit.\n  --stems-cpu     Use CPU separation for this session.\n  --stems-device  Report the selected separation device and exit.\n  --compare-stems FILE  Compare GPU and CPU separation of one local track and exit.");
+        println!("Usage: recordbox [--disable-load] [--disable-play] [--screenshot FILE] [--stems-cpu] [--stems-status | --stems-device | --compare-stems FILE]\n\n  --disable-load  Disable loading tracks into decks for this session.\n  --disable-play  Disable audio playback and previews for this session.\n  --screenshot    Save a picture of the window to FILE and exit.\n  --stems-cpu     Use CPU separation for this session.\n  --stems-status  Show build, system memory and local model status without starting inference.\n  --stems-device  Check the selected separation device and exit.\n  --compare-stems FILE  Compare GPU and CPU separation of one local track and exit.");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--stems-status") {
+        println!("{}", stems::status_report());
         return Ok(());
     }
     if args.iter().any(|a| a == "--stems-cpu") {

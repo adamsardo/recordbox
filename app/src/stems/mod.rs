@@ -36,6 +36,10 @@ fn sysctl(name: &str) -> Option<String> {
 }
 
 pub fn assess() -> Hardware {
+    system_hardware(backend_status().0)
+}
+
+fn system_hardware(gpu: bool) -> Hardware {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let (cpu, ram_gb) = if cfg!(target_os = "macos") {
         (sysctl("machdep.cpu.brand_string").unwrap_or_default(), sysctl("hw.memsize").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1e9)
@@ -43,11 +47,44 @@ pub fn assess() -> Hardware {
         (String::new(), windows_ram_gb())
     } else {
         let mem = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("MemTotal")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())).unwrap_or(0.0);
-        (String::new(), mem / 1e6)
+        (String::new(), mem * 1024.0 / 1e9)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = backend_status().0;
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
+}
+
+/// Passive support report. In particular, do not call assess()/backend_status() here:
+/// a CUDA or Metal build would initialize its compute backend.
+pub fn status_report() -> String {
+    let hw = system_hardware(false);
+    let build = if cfg!(all(windows, feature = "directml")) { "Windows DirectML" }
+        else if cfg!(target_os = "macos") { "Apple Metal" }
+        else if cfg!(feature = "cuda12") { "CUDA 12" }
+        else { "standard CPU" };
+    let ram = if hw.ram_gb > 0.0 { format!("{:.1} GB", hw.ram_gb) } else { "unknown".into() };
+    let mut lines = vec![
+        format!("Recordbox {} · {build} build", env!("CARGO_PKG_VERSION")),
+        format!("System RAM: {ram}"),
+    ];
+    #[cfg(all(windows, feature = "directml"))]
+    {
+        lines.push(directml::adapter_status().unwrap_or_else(|e| format!("DXGI adapter status: {e:#}")));
+        if let Ok(executable) = std::env::current_exe() {
+            let missing: Vec<_> = ["onnxruntime.dll", "onnxruntime_providers_shared.dll", "directml.dll"]
+                .into_iter().filter(|dll| !executable.with_file_name(dll).is_file()).collect();
+            lines.push(if missing.is_empty() { "DirectML runtime files: present".into() }
+                else { format!("Missing packaged runtime files: {}", missing.join(", ")) });
+        }
+    }
+    let models = crate::db::data_dir_for_inspection().join("models");
+    let recommended = choose(&hw);
+    for model in &CATALOG {
+        let count = model.files.iter().filter(|file|
+            checkpoint_ready(&models.join(file), model.checkpoint_bytes).unwrap_or(false)).count();
+        let recommendation = if model.id == recommended.id { " (recommended)" } else { "" };
+        lines.push(format!("{}{recommendation}: {count}/{} checkpoint files at expected size", model.name, model.files.len()));
+    }
+    lines.join("\n")
 }
 
 #[cfg(windows)]
@@ -174,6 +211,8 @@ pub struct ModelSpec {
     pub files: &'static [&'static str],
     /// true: one specialised model per source (file i provides source i).
     pub per_source: bool,
+    /// Byte length of each published checkpoint in this model.
+    pub checkpoint_bytes: u64,
     pub min_ram_gb: f64,
     pub needs_gpu: bool,
     pub about: &'static str,
@@ -194,6 +233,7 @@ pub const CATALOG: [ModelSpec; 2] = [
         name: "HTDemucs fine-tuned",
         files: &["f7e0c4bc-ba3fe64a.th", "d12395a8-e57c48e6.th", "92cfc3b6-ef3bcb9c.th", "04573f0d-f3cf25b2.th"],
         per_source: true,
+        checkpoint_bytes: 84_141_271,
         min_ram_gb: 15.0,
         needs_gpu: true,
         about: "Four models, each fine-tuned for one stem: a little better on benchmark music, 4× the time.",
@@ -212,10 +252,11 @@ pub const CATALOG: [ModelSpec; 2] = [
         name: "HTDemucs",
         files: &["955717e8-8726e21a.th"],
         per_source: false,
+        checkpoint_bytes: 84_141_911,
         min_ram_gb: 4.0,
         needs_gpu: false,
         about: "One model for all four stems: recommended. Four times faster, and the parts add back up to the track more exactly.",
-        sha256: &[None],
+        sha256: &[Some("8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4")],
         licence: "MIT",
         source: "facebookresearch/demucs (Hybrid Transformer Demucs)",
     },
@@ -253,7 +294,19 @@ pub fn stems_dir() -> PathBuf {
 }
 
 pub fn model_ready(m: &ModelSpec) -> bool {
-    m.files.iter().all(|f| models_dir().join(f).metadata().map(|x| x.len() > 1_000_000).unwrap_or(false))
+    let dir = models_dir();
+    m.files.iter().all(|f| checkpoint_ready(&dir.join(f), m.checkpoint_bytes).unwrap_or(false))
+}
+
+fn checkpoint_ready(path: &Path, expected_bytes: u64) -> Result<bool> {
+    match path.metadata() {
+        Ok(info) => {
+            anyhow::ensure!(info.is_file(), "Expected a model file at {}", path.display());
+            Ok(info.len() == expected_bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Checking {}", path.display())),
+    }
 }
 
 fn sha_prefix_ok(path: &Path, file_name: &str) -> Result<bool> {
@@ -279,44 +332,48 @@ fn sha_hex(path: &Path) -> Result<String> {
 /// Download any missing checkpoint of `m` into the models folder. Each file is written to a
 /// temporary name, checked against its SHA-256 prefix and only then renamed into place.
 pub fn download(m: &ModelSpec, progress: &mut dyn FnMut(u64, u64, &str), cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+    download_to(m, &models_dir(), progress, cancel, |file| {
+        let url = format!("{ROOT_URL}{file}");
+        ureq::get(&url).call().with_context(|| format!("downloading {url}"))
+    })
+}
+
+fn download_to(m: &ModelSpec, dir: &Path, progress: &mut dyn FnMut(u64, u64, &str),
+               cancel: &std::sync::atomic::AtomicBool, fetch: impl Fn(&str) -> Result<ureq::Response>) -> Result<()> {
     for (k, f) in m.files.iter().enumerate() {
-        let dest = models_dir().join(f);
-        if dest.exists() {
+        let dest = dir.join(f);
+        if checkpoint_ready(&dest, m.checkpoint_bytes)? {
             continue;
         }
-        let url = format!("{ROOT_URL}{f}");
-        let resp = ureq::get(&url).call().with_context(|| format!("downloading {url}"))?;
-        let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let tmp = dest.with_extension("part");
-        let mut out = std::fs::File::create(&tmp)?;
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { anyhow::bail!("stopped"); }
+        let resp = fetch(f)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         let mut reader = resp.into_reader();
         let mut buf = vec![0u8; 1 << 16];
         let mut done = 0u64;
         loop {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                drop(out);
-                let _ = std::fs::remove_file(&tmp);
                 return Err(anyhow!("stopped"));
             }
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            out.write_all(&buf[..n])?;
             done += n as u64;
-            progress(done, total, f);
+            anyhow::ensure!(done <= m.checkpoint_bytes, "{f} exceeds its expected model size");
+            tmp.write_all(&buf[..n])?;
+            progress(done, m.checkpoint_bytes, f);
         }
-        out.sync_all()?;
-        drop(out);
+        anyhow::ensure!(done == m.checkpoint_bytes, "Incomplete model {f}: received {done} of {} bytes", m.checkpoint_bytes);
+        tmp.as_file().sync_all()?;
         let ok = match m.sha256.get(k).copied().flatten() {
-            Some(full) => sha_hex(&tmp)? == full,
-            None => sha_prefix_ok(&tmp, f)?,
+            Some(full) => sha_hex(tmp.path())? == full,
+            None => sha_prefix_ok(tmp.path(), f)?,
         };
         if !ok {
-            let _ = std::fs::remove_file(&tmp);
             return Err(anyhow!("{f} did not match its published checksum; it was not used"));
         }
-        std::fs::rename(&tmp, &dest)?;
+        tmp.persist(&dest).with_context(|| format!("Installing model {f}"))?;
     }
     Ok(())
 }
@@ -645,6 +702,31 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_checkpoint_is_replaced_only_after_a_verified_download() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let m = ModelSpec {
+            files: &["test-ba7816bf.th"], sha256: &[None], checkpoint_bytes: 3,
+            ..CATALOG[1]
+        };
+        let dest = dir.path().join(m.files[0]);
+        std::fs::write(&dest, b"a")?;
+        let cancel = Default::default();
+        for (bytes, error) in [("a", "Incomplete model"), ("xyz", "checksum"), ("abcd", "exceeds")] {
+            let err = download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel,
+                |_| Ok(ureq::Response::new(200, "OK", bytes)?)).unwrap_err();
+            assert!(err.to_string().contains(error), "{err}");
+            assert_eq!(std::fs::read(&dest)?, b"a");
+            assert_eq!(dir.path().read_dir()?.count(), 1);
+        }
+        download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel,
+            |_| Ok(ureq::Response::new(200, "OK", "abc")?))?;
+        assert!(checkpoint_ready(&dest, m.checkpoint_bytes)?);
+        assert_eq!(std::fs::read(&dest)?, b"abc");
+        download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel, |_| panic!("already complete"))?;
+        Ok(())
+    }
 
     #[test]
     fn waiting_for_a_shared_gpu_can_be_cancelled_and_the_next_job_can_run() {

@@ -7,21 +7,28 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
-pub fn data_dir() -> PathBuf {
+fn data_locations() -> (PathBuf, Option<PathBuf>) {
     if let Ok(d) = std::env::var("PREPDECK_DATA") {
-        let p = PathBuf::from(d);
-        let _ = std::fs::create_dir_all(&p);
-        return p;
+        return (PathBuf::from(d), None);
     }
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let p = base.join("Recordbox");
+    (base.join("Recordbox"), Some(base.join("PrepDeck")))
+}
+
+/// Locate existing files without creating or migrating the application's data directory.
+pub fn data_dir_for_inspection() -> PathBuf {
+    let (path, legacy) = data_locations();
+    legacy.filter(|old| !path.exists() && old.is_dir()).unwrap_or(path)
+}
+
+pub fn data_dir() -> PathBuf {
+    let (path, legacy) = data_locations();
     // The app was called PrepDeck before: its library folder moves over once, unchanged.
-    let old = base.join("PrepDeck");
-    if !p.exists() && old.is_dir() {
-        let _ = std::fs::rename(&old, &p);
+    if let Some(old) = legacy.filter(|old| !path.exists() && old.is_dir()) {
+        let _ = std::fs::rename(old, &path);
     }
-    let _ = std::fs::create_dir_all(&p);
-    p
+    let _ = std::fs::create_dir_all(&path);
+    path
 }
 
 pub fn artwork_dir() -> PathBuf {
