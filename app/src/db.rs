@@ -48,6 +48,11 @@ const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,re
 pub const SCHEMA_VERSION: i64 = 3;
 
 impl Db {
+    /// The main database attached to this connection (including a custom library directory).
+    pub fn active_library_path(&self) -> &str {
+        self.conn.path().filter(|path| !path.is_empty()).unwrap_or("Path unavailable")
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Db> {
         // Refuse a library from a newer Recordbox; back up an older one before upgrading it.
         let existed = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
@@ -97,6 +102,8 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS forget_deleted_rekordbox_mirror AFTER DELETE ON playlists
+            BEGIN DELETE FROM settings WHERE key='rb_folder_id' AND value=CAST(OLD.id AS TEXT); END;
             CREATE TABLE IF NOT EXISTS peaks(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, peak REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS media_stamps(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, size INTEGER NOT NULL, mtime INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
@@ -166,10 +173,16 @@ impl Db {
     }
 
     pub fn setting(&self, key: &str) -> Option<String> {
-        self.conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional().ok().flatten()
+        self.setting_checked(key).ok().flatten()
+    }
+    pub fn setting_checked(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()
     }
     pub fn set_setting(&self, key: &str, value: &str) {
-        let _ = self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)", params![key, value]);
+        let _ = self.set_setting_checked(key, value);
+    }
+    pub fn set_setting_checked(&self, key: &str, value: &str) -> rusqlite::Result<usize> {
+        self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)", params![key, value])
     }
 
     fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<Track> {
@@ -231,6 +244,10 @@ impl Db {
 
     pub fn track_by_path(&self, path: &str) -> Option<i64> {
         self.conn.query_row("SELECT id FROM tracks WHERE path=?1", [path], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn track_at_path(&self, path: &str) -> rusqlite::Result<Option<Track>> {
+        self.conn.query_row(&format!("SELECT {TRACK_COLS} FROM tracks WHERE path=?1"), [path], Self::row_to_track).optional()
     }
 
     pub fn set_track_path(&self, id: i64, path: &str) -> Result<()> {
@@ -482,8 +499,11 @@ impl Db {
 
     // ---- grid & waveform
     pub fn grid(&self, track: i64) -> Option<BeatGrid> {
-        let s: Option<String> = self.conn.query_row("SELECT json FROM grids WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten();
-        s.and_then(|s| serde_json::from_str(&s).ok())
+        self.grid_checked(track).ok().flatten()
+    }
+    pub fn grid_checked(&self, track: i64) -> Result<Option<BeatGrid>> {
+        let s: Option<String> = self.conn.query_row("SELECT json FROM grids WHERE track_id=?1", [track], |r| r.get(0)).optional()?;
+        Ok(s.map(|s| serde_json::from_str(&s)).transpose()?)
     }
     pub fn save_grid(&self, track: i64, g: &BeatGrid) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO grids(track_id,json) VALUES(?1,?2)", params![track, serde_json::to_string(g)?])?;
@@ -556,7 +576,7 @@ impl Db {
     pub fn delete_node(&self, id: i64) -> Result<()> {
         let kids: Vec<i64> = {
             let mut st = self.conn.prepare("SELECT id FROM playlists WHERE parent=?1")?;
-            let v = st.query_map([id], |r| r.get(0))?.flatten().collect();
+            let v = st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             v
         };
         for k in kids {

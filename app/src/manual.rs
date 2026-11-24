@@ -14,8 +14,8 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <p>recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
 <ul>
 <li><b>Your music files are only read.</b> Tags, cues, grids and everything else you edit are kept in recordbox's own library, never written into the audio files.</li>
-<li><b>rekordbox is never changed.</b> If rekordbox is installed, recordbox copies its library and reads the copy (Preferences &gt; Advanced &gt; Others).</li>
-<li>The library lives in one folder: <i>File &gt; Show Library Folder in Finder</i>.</li>
+<li>The collection footer shows your active Recordbox library. Use the lower-left arrows to <a href='#desktop-library-sync'>review an import from desktop rekordbox</a>.</li>
+<li>Choose <i>File &gt; Show Library Folder</i> to open the active Recordbox data folder in your file manager.</li>
 </ul>
 <h3>The window</h3>
 <p>Top: the player (waveforms, transport, cues, grid). Below: the browser with the Tree View on the left (Collection, Playlists, Related Tracks, Explorer, Devices, Histories) and the track list on the right. <i>View</i> switches between <b>1 Player</b>, <b>2 Players</b>, <b>Simple Player</b> and <b>Full Browser</b>.</p>
@@ -25,10 +25,14 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li><i>File &gt; Import &gt; Import Track</i> adds files; <i>Import Folder</i> adds a folder and everything inside it. You can also drag files or folders from Finder onto the track list or a playlist.</li>
 <li><i>File &gt; Import &gt; Import Playlist</i> reads an M3U/M3U8 playlist and creates a playlist with its tracks.</li>
 <li><i>File &gt; Import Collection from rekordbox xml…</i> reads a collection exported from rekordbox (tracks, cues, grids, playlists).</li>
-<li><i>File &gt; Sync rekordbox Library Now</i> refreshes the copy of your rekordbox library.</li>
+<li><i>File &gt; Review rekordbox library sync…</i> shows the installed desktop source and active Recordbox destination.</li>
 <li>The <b>Explorer</b> source browses folders on disk; tracks there can be loaded or imported.</li>
 </ul>
 <p>Supported files: MP3, AAC/M4A, WAV, AIFF, FLAC, ALAC. With <b>Auto Analysis</b> on (Track &gt; Auto Analysis, or Preferences &gt; Analysis) new tracks are analysed as they arrive.</p>
+<h3 id="desktop-library-sync">Desktop library sync</h3>
+<p>The two arrows at the bottom left open a review. Check the source <code>master.db</code> and the destination <code>library.db</code>. Close the review to leave your collection as it is, or choose <b>Import into Recordbox</b> to continue.</p>
+<p>Recordbox reads a private copy of the desktop database and its write-ahead log. It can also read analysis files, tags and artwork for local audio. It adds tracks and can apply rekordbox changes to metadata, cues, grids and My Tags in the destination. The imported <b>rekordbox</b> playlist folder is rebuilt each time. Keep playlists you edit outside that folder.</p>
+<p>For a first test, use <i>File &gt; Library &gt; Backup Library</i> to save your current Recordbox work. To import at each launch, enable <b>Import the installed rekordbox library at startup</b> in <i>Preferences &gt; Advanced &gt; Others</i>. Device Sync Manager is a separate action that can write playlists and media to a selected USB drive.</p>
 "#),
     ("analysis", "Track analysis", r#"
 <p>Analysis finds the BPM and beat grid, the key, the waveforms, the loudness (for Auto Gain), phrases and vocal positions.</p>

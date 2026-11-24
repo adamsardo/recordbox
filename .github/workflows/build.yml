@@ -266,6 +266,7 @@ jobs:
         shell: bash
         run: |
           for test_filter in backup::tests db::sqlcipher_tests:: export::device_import::tests:: \
+            rbimport::snapshot_tests:: rbimport::schema_tests:: rbimport::merge::tests:: \
             export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic \
             export::usb_fix_test::a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap; do
             cargo test --manifest-path app/Cargo.toml --release --locked "$test_filter" -- --test-threads=1

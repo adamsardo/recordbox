@@ -43,10 +43,10 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("missing", "Display All Missing Files", false),
     ("export_xml", "Export Collection in xml format", false),
     ("export_playlists_info", "Export Playlists Information", false),
-    ("sync_rekordbox", "Sync rekordbox Library Now", false),
+    ("sync_rekordbox", "Review rekordbox library sync…", false),
     ("import_xml", "Import Collection from rekordbox xml…", false),
     ("relocate_missing", "Relocate Missing Files…", false),
-    ("library_folder", "Show Library Folder in Finder", false),
+    ("library_folder", "Show Library Folder", false),
     ("undo", "Undo", false),
     ("redo", "Redo", false),
     ("fullscreen", "Full screen", true),
@@ -451,13 +451,7 @@ pub fn handle(app: &mut App, id: &str) {
                 }
             }
         }
-        "sync_rekordbox" => {
-            if crate::rbimport::library_dir().is_some() {
-                app.start_rekordbox_sync();
-            } else {
-                app.toast_err("No rekordbox library was found on this computer.");
-            }
-        }
+        "sync_rekordbox" => app.review_rekordbox_sync(),
         "import_xml" => {
             let mut d = rfd::FileDialog::new().add_filter("XML", &["xml"]);
             if let Some(p) = app.prefs.rekordbox_xml_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).filter(|p| p.is_dir()) {
@@ -478,7 +472,14 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "library_folder" => {
-            let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+            let Some(folder) = app.db.conn.path().and_then(|path| std::path::Path::new(path).parent()) else {
+                app.toast_err("The active library has no folder to show.");
+                return;
+            };
+            let opener = if cfg!(windows) { "explorer.exe" } else if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+            if let Err(e) = std::process::Command::new(opener).arg(folder).spawn() {
+                app.toast_err(format!("Could not show the library folder: {e}"));
+            }
         }
         "fullscreen" => app.dialogs.ext.toggle_fullscreen = true,
         "layout_player" => app.set_player_layout(0),

@@ -1,9 +1,11 @@
 //! Reading the user's existing rekordbox library (master.db).
 //!
-//! rekordbox's own files are never opened by a database engine and never written. On every
-//! launch the database and its write-ahead log are copied into Recordbox's data folder (and the
-//! copy is checked against the source so a write by a running rekordbox mid-copy is detected and
-//! retried). Only that copy is opened, read-only, and synced into Recordbox's own library.
+//! During desktop sync, Recordbox copies the main database and its write-ahead log into
+//! a private temporary directory. A change to either source file during capture triggers
+//! another attempt. SQLite reads the validated copy before Recordbox merges the result into
+//! its own collection.
+
+pub(crate) mod merge;
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,47 +15,56 @@ use std::time::SystemTime;
 /// has been public for years (pyrekordbox and other library tools use it).
 const MASTER_DB_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 
-/// Where rekordbox keeps its library on this machine, if it is installed.
-pub fn library_dir() -> Option<PathBuf> {
+/// Default desktop source shown in the review, including when rekordbox is absent.
+pub fn default_library_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     let d = dirs::home_dir()?.join("Library/Pioneer/rekordbox");
     #[cfg(target_os = "windows")]
     let d = dirs::data_dir()?.join("Pioneer/rekordbox");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let d = dirs::data_dir()?.join("Pioneer/rekordbox");
-    d.join("master.db").is_file().then_some(d)
+    Some(d)
 }
 
-fn stamp(p: &Path) -> Option<(u64, SystemTime)> {
-    let m = std::fs::metadata(p).ok()?;
-    Some((m.len(), m.modified().ok()?))
+/// Where rekordbox keeps its library on this machine, if it is installed.
+pub fn library_dir() -> Option<PathBuf> {
+    default_library_dir().filter(|dir| dir.join("master.db").is_file())
 }
 
-/// Copy master.db and its -wal into `dest_dir`. The copy is only accepted when the source's
-/// size and modification time were the same before and after copying (rekordbox may be running
-/// and writing). Retries a few times. Returns the path of the copied master.db.
-pub fn snapshot(src_dir: &Path, dest_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir)?;
-    let names = ["master.db", "master.db-wal"];
+fn stamp(path: &Path) -> std::io::Result<Option<(u64, SystemTime)>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.len(), metadata.modified()?))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Capture the main file and WAL in a unique directory kept alive by the caller.
+fn snapshot(src_dir: &Path, dest_dir: &Path) -> Result<tempfile::TempDir> {
+    let src = src_dir.canonicalize()?;
+    let parent = std::path::absolute(dest_dir)?;
+    let existing = parent.ancestors().find(|p| p.exists()).context("finding the snapshot directory")?;
+    anyhow::ensure!(!existing.canonicalize()?.starts_with(&src), "the snapshot directory must be outside the source library");
+    std::fs::create_dir_all(&parent)?;
+    let versions = || -> Result<_> {
+        anyhow::ensure!(!stamp(&src.join("master.db-journal"))?.is_some_and(|(len, _)| len > 0),
+            "the source has a nonempty rollback journal; close rekordbox cleanly before syncing");
+        Ok((stamp(&src.join("master.db"))?.context("source master.db is missing")?,
+            stamp(&src.join("master.db-wal"))?))
+    };
     for attempt in 0..5 {
-        let before: Vec<_> = names.iter().map(|n| stamp(&src_dir.join(n))).collect();
-        let mut ok = true;
-        for n in names {
-            let s = src_dir.join(n);
-            let d = dest_dir.join(n);
-            let _ = std::fs::remove_file(&d);
-            if s.exists() {
-                // A plain byte copy: the source is opened read-only and nothing else touches it.
-                if std::fs::copy(&s, &d).is_err() {
-                    ok = false;
-                }
+        let copy = tempfile::Builder::new().prefix("sync-").tempdir_in(&parent)?;
+        let before = versions()?;
+        let result = (|| -> std::io::Result<()> {
+            std::fs::copy(src.join("master.db"), copy.path().join("master.db"))?;
+            if before.1.is_some_and(|(len, _)| len > 0) {
+                std::fs::copy(src.join("master.db-wal"), copy.path().join("master.db-wal"))?;
             }
-        }
-        // The -shm index is rebuilt from the WAL by SQLite; a stale copy must not be used.
-        let _ = std::fs::remove_file(dest_dir.join("master.db-shm"));
-        let after: Vec<_> = names.iter().map(|n| stamp(&src_dir.join(n))).collect();
-        if ok && before == after {
-            return Ok(dest_dir.join("master.db"));
+            Ok(())
+        })();
+        if before == versions()? {
+            result.context("copying the source library into Recordbox's snapshot directory")?;
+            return Ok(copy);
         }
         std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
     }
@@ -120,7 +131,94 @@ pub fn check_schema(c: &rusqlite::Connection) -> Result<()> {
 }
 
 #[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_sync_reads_committed_encrypted_wal_without_changing_source_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        std::fs::create_dir(&source)?;
+        let db = rusqlite::Connection::open(source.join("master.db"))?;
+        db.pragma_update(None, "key", MASTER_DB_KEY)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+        for (table, cols) in REQUIRED_SCHEMA {
+            db.execute(&format!("CREATE TABLE {table} ({})", cols.join(", ")), [])?;
+        }
+        for table in ["djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel"] {
+            db.execute(&format!("CREATE TABLE {table} (ID, Name, rb_local_deleted)"), [])?;
+        }
+        db.execute_batch("ALTER TABLE djmdContent ADD COLUMN Title; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let song = root.path().join("fixture.wav");
+        std::fs::write(&song, b"fixture")?;
+        db.execute("INSERT INTO djmdContent(ID,FolderPath,Title,rb_local_deleted) VALUES('1',?1,'In the WAL',0)", [song.to_string_lossy().as_ref()])?;
+        let bytes = || ["master.db", "master.db-wal", "master.db-shm"].map(|name| std::fs::read(source.join(name)).unwrap());
+        let before = bytes();
+        assert!(!before[1].is_empty());
+        let snapshot_root = root.path().join("copies");
+        let first = snapshot(&source, &snapshot_root)?;
+        let second = snapshot(&source, &snapshot_root)?;
+        assert_ne!(first.path(), second.path());
+        let copy = open_snapshot(&first.path().join("master.db"))?;
+        let lib = read_library(&copy, &source.join("share"))?;
+        assert_eq!(lib.tracks.len(), 1);
+        assert_eq!(lib.tracks[0].xt.track.title, "In the WAL");
+        assert_eq!(before, bytes());
+        drop(copy);
+        drop((first, second));
+        assert_eq!(std::fs::read_dir(snapshot_root)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_snapshot_rejects_source_dest_overlap_and_nonempty_rollback_journal() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let src = root.path().join("source");
+        std::fs::create_dir(&src)?;
+        std::fs::write(src.join("master.db"), b"source bytes")?;
+        assert!(snapshot(&src, &src).is_err());
+        assert!(snapshot(&src, &src.join("copy")).is_err());
+        assert!(!src.join("copy").exists());
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&src, &alias)?;
+            assert!(snapshot(&src, &alias).is_err());
+        }
+        std::fs::write(src.join("master.db-journal"), b"pending rollback")?;
+        assert!(snapshot(&src, &root.path().join("copy")).unwrap_err().to_string().contains("rollback journal"));
+        assert_eq!(std::fs::read(src.join("master.db"))?, b"source bytes");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod schema_tests {
+    #[test]
+    fn optional_histories_distinguish_absent_from_unreadable() -> anyhow::Result<()> {
+        let db = rusqlite::Connection::open_in_memory()?;
+        for (table, columns) in super::REQUIRED_SCHEMA {
+            db.execute(&format!("CREATE TABLE {table} ({})", columns.join(", ")), [])?;
+        }
+        for table in ["djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel"] {
+            db.execute(&format!("CREATE TABLE {table}(ID, Name, rb_local_deleted)"), [])?;
+        }
+        let share = std::path::Path::new(".");
+        assert!(super::read_library(&db, share)?.histories.is_empty());
+        db.execute_batch("CREATE TABLE djmdHistory(ID, Seq, Name, Attribute, ParentID, rb_local_deleted);
+                          INSERT INTO djmdHistory VALUES('night', 1, 'Club', 0, 'root', 0);")?;
+        let partial = super::read_library(&db, share).err().expect("history membership table is missing");
+        assert!(format!("{partial:#}").contains("djmdSongHistory"));
+        db.execute_batch("CREATE TABLE djmdSongHistory(HistoryID, ContentID, TrackNo, rb_local_deleted);
+                          INSERT INTO djmdSongHistory VALUES('night', 'b', 2, 0), ('night', 'a', 1, 0);")?;
+        let library = super::read_library(&db, share)?;
+        assert_eq!(library.histories.len(), 1);
+        assert_eq!(library.histories[0].track_keys, ["a", "b"]);
+        db.execute("ALTER TABLE djmdSongHistory RENAME COLUMN TrackNo TO Other", [])?;
+        assert!(super::read_library(&db, share).is_err());
+        Ok(())
+    }
+
     #[test]
     fn schema_check_names_what_is_missing() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
@@ -756,12 +854,24 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
     let mut cx = Ctx { tag_of: &tag_of, keys: &keys, smart: 0 };
     let playlists = build("root", &pl, &mut members, &mut cx);
     // Histories: the same tree shape (year and month folders, one list per day).
-    let hist = rows(c, "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdHistory WHERE rb_local_deleted = 0 ORDER BY Seq").unwrap_or_default();
-    let mut hmembers: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-    for r in rows(c, "SELECT HistoryID, ContentID, TrackNo FROM djmdSongHistory WHERE rb_local_deleted = 0").unwrap_or_default() {
-        hmembers.entry(text(r["HistoryID"].clone())).or_default().push((int(&r["TrackNo"]), text(r["ContentID"].clone())));
-    }
-    let histories = build("root", &hist, &mut hmembers, &mut cx);
+    let has_history: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name COLLATE NOCASE IN ('djmdHistory', 'djmdSongHistory'))",
+        [],
+        |row| row.get(0),
+    )?;
+    let histories = if has_history {
+        // A failed query must not turn an existing history mirror into an empty tree.
+        let hist = rows(c, "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdHistory WHERE rb_local_deleted = 0 ORDER BY Seq")
+            .context("reading rekordbox history folders")?;
+        let mut hmembers: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for r in rows(c, "SELECT HistoryID, ContentID, TrackNo FROM djmdSongHistory WHERE rb_local_deleted = 0")
+            .context("reading rekordbox history tracks")? {
+            hmembers.entry(text(r["HistoryID"].clone())).or_default().push((int(&r["TrackNo"]), text(r["ContentID"].clone())));
+        }
+        build("root", &hist, &mut hmembers, &mut cx)
+    } else {
+        Vec::new()
+    };
     smart_lists += cx.smart;
     Ok(RbLibrary {
         tracks,
@@ -777,7 +887,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
 pub fn load_installed(dest_dir: &Path) -> Result<Option<RbLibrary>> {
     let Some(src) = library_dir() else { return Ok(None) };
     let db = snapshot(&src, dest_dir)?;
-    let c = open_snapshot(&db)?;
+    let c = open_snapshot(&db.path().join("master.db"))?;
     Ok(Some(read_library(&c, &src.join("share"))?))
 }
 
@@ -791,9 +901,9 @@ mod tests {
     fn reads_local_library_snapshot() {
         let Some(src) = library_dir() else { return };
         let dest = std::env::temp_dir().join(format!("recordbox_rb_snapshot_{}", std::process::id()));
-        let before = stamp(&src.join("master.db"));
+        let before = stamp(&src.join("master.db")).unwrap();
         let db = snapshot(&src, &dest).unwrap();
-        let c = open_snapshot(&db).unwrap();
+        let c = open_snapshot(&db.path().join("master.db")).unwrap();
         for t in ["djmdContent", "djmdPlaylist", "djmdSongPlaylist", "djmdCue", "djmdMyTag"] {
             let n: i64 = c.query_row(&format!("SELECT count(*) FROM {t} WHERE rb_local_deleted = 0"), [], |r| r.get(0)).unwrap();
             println!("{t}: {n}");
@@ -812,7 +922,7 @@ mod tests {
             }
         }
         walk(&lib.histories, 0);
-        assert_eq!(before, stamp(&src.join("master.db")), "the original must not change");
+        assert_eq!(before, stamp(&src.join("master.db")).unwrap(), "the original must not change");
         let mut st = c.prepare("SELECT Name, SmartList FROM djmdPlaylist WHERE rb_local_deleted=0 AND SmartList IS NOT NULL AND SmartList != ''").unwrap();
         for r in st.query_map([], |r| Ok(format!("{} => {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap().flatten() {
             println!("smartlist: {r}");
@@ -865,7 +975,8 @@ mod schema_dump {
     fn dump_columns() {
         let Some(src) = super::library_dir() else { return };
         let dest = std::env::temp_dir().join(format!("recordbox_rb_schema_{}", std::process::id()));
-        let c = super::open_snapshot(&super::snapshot(&src, &dest).unwrap()).unwrap();
+        let snapshot = super::snapshot(&src, &dest).unwrap();
+        let c = super::open_snapshot(&snapshot.path().join("master.db")).unwrap();
         for t in ["djmdContent", "djmdCue", "djmdPlaylist", "djmdSongPlaylist", "djmdKey", "djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel", "djmdColor", "djmdMyTag", "djmdSongMyTag"] {
             let mut st = c.prepare(&format!("PRAGMA table_info({t})")).unwrap();
             let cols: Vec<String> = st.query_map([], |r| r.get::<_, String>(1)).unwrap().flatten().collect();
@@ -952,7 +1063,8 @@ mod cue_origin_probe {
     fn cue_creation_times() {
         let Some(src) = super::library_dir() else { return };
         let dest = std::env::temp_dir().join(format!("recordbox_cue_origin_{}", std::process::id()));
-        let c = super::open_snapshot(&super::snapshot(&src, &dest).unwrap()).unwrap();
+        let snapshot = super::snapshot(&src, &dest).unwrap();
+        let c = super::open_snapshot(&snapshot.path().join("master.db")).unwrap();
         let mut st = c.prepare("SELECT k.Kind, k.Comment, k.ColorTableIndex, k.created_at, c.created_at, c.updated_at, c.AnalysisUpdated FROM djmdCue k JOIN djmdContent c ON c.ID = k.ContentID WHERE k.rb_local_deleted = 0 LIMIT 12").unwrap();
         for r in st.query_map([], |r| Ok((0..7).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default()).collect::<Vec<_>>().join(" | "))).unwrap().flatten() {
             println!("cue: {r}");

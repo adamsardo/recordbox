@@ -353,7 +353,7 @@ fn prefs_embedded(app: &mut App, ctx: &Context) {
     let frame = egui::Frame::window(&ctx.style()).fill(BG).inner_margin(0.0);
     let h = (ctx.screen_rect().height() - 90.0).clamp(480.0, WIN.y);
     egui::Window::new("Preferences").open(&mut open).default_size(vec2(WIN.x, h)).collapsible(false).resizable(false).frame(frame).show(ctx, |ui| prefs_body(app, ui, h));
-    app.dialogs.prefs_open = open;
+    app.dialogs.prefs_open &= open;
 }
 
 fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
@@ -1517,12 +1517,12 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
             card(ui, "Database management", |ui| {
-                sub(ui, "Location");
-                kit::block(ui, |ui| path_row(ui, &Some(crate::db::data_dir().display().to_string()), ""));
+                sub(ui, "Active Recordbox library");
+                ui.add(egui::Label::new(app.db.active_library_path()).selectable(true).wrap());
                 note(ui, "Your music files are only read. Edits (tags, cues, grids) are kept in this private library.");
                 kit::block(ui, |ui| {
-                    if ui.add(btn("Show in Finder")).clicked() {
-                        let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+                    if ui.add(btn("Show library folder")).clicked() {
+                        crate::menus::handle(app, "library_folder");
                     }
                 });
                 separator(ui);
@@ -1644,11 +1644,14 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         }
         _ => {
             card(ui, "rekordbox Library", |ui| {
-                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when recordbox starts");
-                note(ui, "recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.");
+                kit::line(ui, "Active Recordbox library");
+                ui.label(app.db.active_library_path());
+                toggle(ui, &mut app.prefs.import_rekordbox_at_startup, "Import the installed rekordbox library at startup");
+                note(ui, "Startup import applies changes to this library automatically. For a manual import, review the source and destination using the sync arrows at the bottom left.");
                 kit::block(ui, |ui| {
-                    if ui.add_enabled(app.rb_job.is_none(), btn("Sync now")).clicked() {
-                        crate::menus::handle(app, "sync_rekordbox");
+                    if ui.add_enabled(app.rb_job.is_none(), btn("Review library sync…")).clicked() {
+                        app.dialogs.prefs_open = false;
+                        app.review_rekordbox_sync();
                     }
                 });
             });
