@@ -66,11 +66,12 @@ If there's something you'd use, [open an issue](https://github.com/adamsardo/rec
 - Library preparation and STEMS processing run locally on your computer. You can use both without an account.
 - Audio files are read-only during library sync. Routine edits and analysis are saved in Recordbox’s own library.
 
-The lower-left sync arrows let you choose **rekordbox → Recordbox** to import from
-the installed AlphaTheta library, or **Recordbox → rekordbox** to review edits for
-write-back. The pilot shows the target and selected changes, then saves a recovery
-copy before updating the original desktop library. **Device Sync Manager** handles
-USB drives separately. [Library sync and supported formats](docs/LIBRARY-SYNC.md)
+The lower-left sync arrows offer two directions.
+
+- **Import · AlphaTheta Rekordbox → recordbox** reads the installed AlphaTheta library and imports tracks into your active recordbox collection.
+- **Write back · recordbox → AlphaTheta Rekordbox** reviews selected edits and saves a recovery copy before updating the original desktop library.
+
+**Device Sync Manager** handles USB drives separately. [Library sync and supported formats](docs/LIBRARY-SYNC.md)
 
 ## Running it
 

@@ -18,6 +18,9 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem as winfs;
+
 use crate::export::usb::sha256_file;
 use crate::rbimport::{check_schema, MASTER_DB_KEY};
 
@@ -132,8 +135,11 @@ fn local_volume(path: &Path) -> Result<()> {
     for part in path.components() {
         let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
         ensure!(
-            !name.contains("dropbox")
-                && !name.starts_with("onedrive")
+            name != "dropbox"
+                && !name.ends_with(" dropbox")
+                && !name.starts_with("dropbox (")
+                && name != "onedrive"
+                && !name.starts_with("onedrive - ")
                 && name != "mobile documents"
                 && name != "cloudstorage"
                 && name != "google drive"
@@ -174,10 +180,6 @@ fn local_volume(path: &Path) -> Result<()> {
     #[cfg(windows)]
     let local = {
         use std::path::Prefix;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetDriveTypeW(root: *const u16) -> u32;
-        }
         let drive = match path.components().next() {
             Some(Component::Prefix(p)) => match p.kind() {
                 Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d),
@@ -187,7 +189,7 @@ fn local_volume(path: &Path) -> Result<()> {
         };
         drive.is_some_and(|d| {
             let root = [d as u16, b':' as u16, b'\\' as u16, 0];
-            unsafe { GetDriveTypeW(root.as_ptr()) == 3 } // DRIVE_FIXED
+            unsafe { winfs::GetDriveTypeW(root.as_ptr()) == 3 } // DRIVE_FIXED
         })
     };
     ensure!(
@@ -221,7 +223,7 @@ fn linked(m: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if m.file_attributes() & 0x400 != 0 {
+        if m.file_attributes() & winfs::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return true;
         } // junction or other reparse point
     }
@@ -265,7 +267,7 @@ fn grid_target(source: &Path, relative: &Path) -> Result<PathBuf> {
 
 // Also bind the operation to this particular master.db. A backup restored at
 // the same path or an externally replaced library needs a fresh review.
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash)]
 struct NativeFileId {
     volume: u64,
     file: [u8; 16],
@@ -287,42 +289,33 @@ fn native_id(path: &Path) -> Result<NativeFileId> {
     }
     #[cfg(windows)]
     {
-        use std::{ffi::c_void, os::windows::io::AsRawHandle};
-        #[repr(C)]
-        struct FileIdInfo {
-            volume: u64,
-            file: [u8; 16],
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetFileInformationByHandleEx(
-                handle: *mut c_void,
-                class: i32,
-                buffer: *mut c_void,
-                bytes: u32,
-            ) -> i32;
+        use std::os::windows::io::AsRawHandle;
+        fn query<T: Default>(f: &File, class: winfs::FILE_INFO_BY_HANDLE_CLASS) -> Result<T> {
+            let mut value = T::default();
+            let ok = unsafe {
+                winfs::GetFileInformationByHandleEx(
+                    f.as_raw_handle(),
+                    class,
+                    (&mut value as *mut T).cast(),
+                    std::mem::size_of::<T>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error()).context("identifying native file");
+            }
+            Ok(value)
         }
         regular(path)?;
         let f = File::open(path)?;
-        let mut info = FileIdInfo {
-            volume: 0,
-            file: [0; 16],
-        };
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                f.as_raw_handle(),
-                18,
-                (&mut info as *mut FileIdInfo).cast(),
-                std::mem::size_of::<FileIdInfo>() as u32,
-            )
-        }; // FileIdInfo
+        let id: winfs::FILE_ID_INFO = query(&f, winfs::FileIdInfo)?;
+        let info: winfs::FILE_STANDARD_INFO = query(&f, winfs::FileStandardInfo)?;
         ensure!(
-            ok != 0,
-            "cannot identify the native library file on this volume"
+            info.NumberOfLinks == 1 && !info.DeletePending,
+            "native file is linked or pending deletion"
         );
         Ok(NativeFileId {
-            volume: info.volume,
-            file: info.file,
+            volume: id.VolumeSerialNumber,
+            file: id.FileId.Identifier,
         })
     }
 }
@@ -388,10 +381,6 @@ fn publish(temp: NamedTempFile, target: &Path, replace: bool) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn MoveFileExW(old: *const u16, new: *const u16, flags: u32) -> i32;
-        }
         // All parents are canonical absolute paths (including verbatim/long paths).
         let old = temp
             .path()
@@ -404,8 +393,38 @@ fn publish(temp: NamedTempFile, target: &Path, replace: bool) -> Result<()> {
             .encode_wide()
             .chain([0])
             .collect::<Vec<_>>();
-        let flag = if replace { 1 } else { 0 };
-        if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), 8 | flag) } == 0 {
+        // NamedTempFile uses FILE_ATTRIBUTE_TEMPORARY on Windows. Clear just
+        // that hint and flush before making a persistent marker or sidecar.
+        let attributes = unsafe { winfs::GetFileAttributesW(old.as_ptr()) };
+        if attributes == winfs::INVALID_FILE_ATTRIBUTES {
+            return Err(std::io::Error::last_os_error()).context("checking staged file attributes");
+        }
+        if attributes & winfs::FILE_ATTRIBUTE_TEMPORARY != 0 {
+            let persistent = attributes & !winfs::FILE_ATTRIBUTE_TEMPORARY;
+            let persistent = if persistent == 0 {
+                winfs::FILE_ATTRIBUTE_NORMAL
+            } else {
+                persistent
+            };
+            if unsafe { winfs::SetFileAttributesW(old.as_ptr(), persistent) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("making staged file persistent");
+            }
+            temp.as_file().sync_all()?;
+        }
+        let flag = if replace {
+            winfs::MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+        if unsafe {
+            winfs::MoveFileExW(
+                old.as_ptr(),
+                new.as_ptr(),
+                winfs::MOVEFILE_WRITE_THROUGH | flag,
+            )
+        } == 0
+        {
             return Err(std::io::Error::last_os_error()).context("publishing write-back file");
         }
     }
@@ -499,10 +518,16 @@ fn logical_digest(db: &Connection) -> Result<[u8; 32]> {
         "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name",
         &mut hash,
     )?;
-    let mut stmt = db.prepare("SELECT name,type FROM pragma_table_list WHERE schema='main' AND name <> 'sqlite_schema' ORDER BY name")?;
-    let tables = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut stmt = db.prepare("SELECT name,type,wr FROM pragma_table_list WHERE schema='main' AND name <> 'sqlite_schema' ORDER BY name")?;
+    let tables = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+        ))
+    })?;
     for table in tables {
-        let (name, kind) = table?;
+        let (name, kind, without_rowid) = table?;
         ensure!(
             kind != "virtual" && kind != "shadow",
             "virtual tables are outside the grid recovery pilot"
@@ -513,9 +538,23 @@ fn logical_digest(db: &Connection) -> Result<[u8; 32]> {
         feed(&mut hash, name.as_bytes());
         // A table scan yields rowid order or primary-key order for WITHOUT ROWID.
         let quoted = name.replace('"', "\"\"");
+        let columns = if without_rowid {
+            "*"
+        } else {
+            let shadowed: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo(?1) WHERE lower(name)='_rowid_')",
+                [&name],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                !shadowed,
+                "cannot uniquely identify the rows of {name} for grid recovery"
+            );
+            "_rowid_,*"
+        };
         rows(
             db,
-            &format!("SELECT * FROM main.\"{quoted}\" NOT INDEXED"),
+            &format!("SELECT {columns} FROM main.\"{quoted}\" NOT INDEXED"),
             &mut hash,
         )?;
     }
@@ -555,7 +594,7 @@ fn stage_grids(
     for (i, change) in changes.into_iter().enumerate() {
         let path = grid_target(source, &change.relative_path)?;
         ensure!(
-            seen.insert(path.canonicalize()?),
+            seen.insert(native_id(&path)?),
             "duplicate native analysis file in selection"
         );
         let before = sha256_file(&path)?;
@@ -627,17 +666,28 @@ fn copy_grids(journal: &GridJournal, directory: &Path, forward: bool) -> Result<
         }
         let saved = directory.join(format!("{i}.{side}"));
         regular(&saved)?;
+        ensure!(
+            sha256_file(&saved)? == want,
+            "recovery grid checksum mismatch"
+        );
+        ensure!(
+            !regular(&target)?.permissions().readonly(),
+            "native analysis file is read-only: {}",
+            target.display()
+        );
+        staged.push((saved, entry, old, want));
+    }
+    // Only one replacement file descriptor and one extra same-volume file are
+    // needed at once, including on systems with a small open-file limit.
+    for (saved, entry, old, want) in staged {
+        let target = grid_target(&journal.source, &entry.path)?;
         let mut temp = NamedTempFile::new_in(target.parent().context("missing analysis folder")?)?;
         std::io::copy(&mut File::open(saved)?, temp.as_file_mut())?;
         ensure!(
             sha256_file(temp.path())? == want,
-            "recovery grid checksum mismatch"
+            "staged grid checksum mismatch"
         );
         fs::set_permissions(temp.path(), regular(&target)?.permissions())?;
-        staged.push((temp, entry, old, want));
-    }
-    for (temp, entry, old, want) in staged {
-        let target = grid_target(&journal.source, &entry.path)?;
         ensure!(
             sha256_file(&target)? == old,
             "native analysis changed during publication"
@@ -682,7 +732,9 @@ fn operation_lock(source: &Path, recovering: bool) -> Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(3).custom_flags(0x00200000); // share read/write, open the reparse point itself.
+        options
+            .share_mode(winfs::FILE_SHARE_READ | winfs::FILE_SHARE_WRITE)
+            .custom_flags(winfs::FILE_FLAG_OPEN_REPARSE_POINT); // share read/write, open the reparse point itself.
     }
     let lock = options
         .open(&path)
@@ -737,15 +789,45 @@ pub fn apply<T>(
         "previous write-back needs recovery; use Recover interrupted write-back first"
     );
     integrity(&tx)?;
+    // A trigger can propagate a single reviewed field edit to unrelated rows.
+    // Native triggers need schema-specific validation before this writer can use them.
+    let mut triggers = tx.prepare("SELECT name,tbl_name FROM main.sqlite_schema WHERE type='trigger' AND lower(tbl_name) IN ('djmdcontent','djmdcue','contentcue','contentfile','agentregistry') ORDER BY name LIMIT 1")?;
+    let trigger = triggers.query_row([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+    match trigger {
+        Ok((name, table)) => {
+            bail!("unverified database trigger {name} on {table}; no write-back was applied")
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => (),
+        Err(error) => return Err(error.into()),
+    }
+    drop(triggers);
     let root = backup_parent(&source, backup_root)?;
-    let backup = tempfile::Builder::new()
-        .prefix("rekordbox-")
-        .tempdir_in(&root)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rekordbox-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let backup = builder.tempdir_in(&root)?;
     backup_database(&source, backup.path())?;
     ensure!(
         native_id(&source.join("master.db"))? == identity,
         "native library file changed during backup"
     );
+    let receipt = serde_json::json!({
+        "format": "recordbox-native-recovery-v1",
+        "captured_unix_seconds": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        "source": source.join("master.db"),
+        "source_file_identity": &identity,
+        "recovery_database": "master.db",
+        "sha256": sha256_file(&backup.path().join("master.db"))?.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "includes_committed_wal": true,
+    });
+    save_new(
+        &backup.path().join("backup.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
     let (result, grids) = under_lock(&tx)?;
     check_native_files(&source, true)?;
     ensure!(
@@ -880,7 +962,7 @@ mod tests {
     use super::*;
 
     struct Fixture {
-        _root: tempfile::TempDir,
+        _root: Option<tempfile::TempDir>,
         source: PathBuf,
         backups: PathBuf,
         relative: PathBuf,
@@ -903,7 +985,7 @@ mod tests {
             }
             db.execute_batch("INSERT INTO djmdContent(ID,Rating) VALUES('track',1)")?;
             Ok(Self {
-                _root: root,
+                _root: Some(root),
                 source,
                 backups: base.join("backups"),
                 relative,
@@ -927,13 +1009,17 @@ mod tests {
         }
         // Simulate either side of a crash at the SQLite commit boundary, with
         // the ANLZ rename either already visible or still at its old contents.
-        fn interrupted(&self, committed: bool, published: bool) -> Result<PathBuf> {
+        fn interrupted(&self, committed: bool, published: bool, crash: bool) -> Result<PathBuf> {
             let mut db = self.db()?;
+            db.pragma_update(None, "cache_size", 4)?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let directory = self.backups.join("fixture");
             fs::create_dir_all(&directory)?;
             backup_database(&self.source, &directory)?;
             tx.execute("UPDATE djmdContent SET rating=3", [])?;
+            if crash {
+                tx.execute("UPDATE spill SET chunk=zeroblob(8192)", [])?;
+            }
             let journal = stage_grids(&self.source, &directory, &tx, vec![self.change()])?;
             let manifest = serde_json::to_vec(&journal)?;
             save_new(&directory.join(MANIFEST), &manifest)?;
@@ -944,6 +1030,9 @@ mod tests {
             save_new(&self.source.join(MARKER), &serde_json::to_vec(&marker)?)?;
             if published {
                 copy_grids(&journal, &directory, true)?;
+            }
+            if crash {
+                std::process::exit(83);
             }
             if committed {
                 tx.commit()?;
@@ -1033,6 +1122,24 @@ mod tests {
     }
 
     #[test]
+    fn native_table_triggers_require_separate_validation() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let db = fixture.db()?;
+        db.execute_batch("CREATE TRIGGER secondary_changes AFTER UPDATE ON djmdContent BEGIN UPDATE djmdContent SET Rating=0; END;")?;
+        let error = apply::<()>(&fixture.source, &fixture.backups, |_| {
+            panic!("unreviewed trigger must stop all writes")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("secondary_changes"));
+        assert_eq!(
+            db.query_row("SELECT Rating FROM djmdContent", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        assert!(!fixture.backups.exists());
+        Ok(())
+    }
+
+    #[test]
     fn backups_include_wal_and_grid_replacements() -> Result<()> {
         let fixture = Fixture::new()?;
         let other = fixture.db()?;
@@ -1061,7 +1168,7 @@ mod tests {
     fn interrupted_grids_follow_the_state_that_committed() -> Result<()> {
         for (committed, installed) in [(false, true), (true, false), (true, true)] {
             let fixture = Fixture::new()?;
-            let backup = fixture.interrupted(committed, installed)?;
+            let backup = fixture.interrupted(committed, installed, false)?;
             assert!(apply::<()>(&fixture.source, &fixture.backups, |_| panic!(
                 "pending transaction must stop new writes"
             ))
@@ -1079,9 +1186,53 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_with_a_hot_rollback_journal_restores_matching_grids() -> Result<()> {
+        const CHILD_FIXTURE: &str = "RECORDBOX_TEST_HOT_JOURNAL_FIXTURE";
+        if let Some(folder) = std::env::var_os(CHILD_FIXTURE) {
+            let base = PathBuf::from(folder);
+            let child = Fixture {
+                _root: None,
+                source: base.join("desktop"),
+                backups: base.join("backups"),
+                relative: "share/PIONEER/USBANLZ/ANLZ0000.DAT".into(),
+            };
+            child.interrupted(false, true, true)?;
+            bail!("child should have exited with the transaction still open");
+        }
+        let fixture = Fixture::new()?;
+        fixture.db()?.execute_batch("CREATE TABLE spill(chunk BLOB); WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO spill SELECT randomblob(8192) FROM n;")?;
+        let module = module_path!().split_once("::").unwrap().1;
+        let test =
+            format!("{module}::process_exit_with_a_hot_rollback_journal_restores_matching_grids");
+        let child = Command::new(std::env::current_exe()?)
+            .args(["--exact", &test])
+            .env(CHILD_FIXTURE, fixture.source.parent().unwrap())
+            .output()?;
+        assert_eq!(
+            child.status.code(),
+            Some(83),
+            "{} {}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(fs::metadata(fixture.source.join("master.db-journal"))?.len() > 0);
+        assert!(pending(&fixture.source));
+        assert_eq!(fixture.bytes()?, b"reviewed beats");
+        recover(&fixture.source, &fixture.backups)?;
+        assert_eq!(fixture.bytes()?, b"original beats");
+        assert_eq!(
+            fixture
+                .db()?
+                .query_row("SELECT rating FROM djmdContent", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn recovery_preserves_subsequent_untouched_work() -> Result<()> {
         let fixture = Fixture::new()?;
-        fixture.interrupted(false, true)?;
+        fixture.interrupted(false, true, false)?;
         fs::write(fixture.source.join(&fixture.relative), b"later file")?;
         assert!(recover(&fixture.source, &fixture.backups).is_err());
         assert_eq!(fixture.bytes()?, b"later file");

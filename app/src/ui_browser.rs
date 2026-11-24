@@ -449,7 +449,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     } else if let Some(status) = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status()) {
         p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, status, rb(11.5), TEXT);
     } else if app.rb_job.is_some() {
-        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the desktop rekordbox library…", rb(11.5), TEXT);
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the AlphaTheta Rekordbox library…", rb(11.5), TEXT);
     } else if mid.width() > 0.0 {
         let path = app.db.active_library_path();
         p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, format!("Active library · {path}"), rb(11.5), DIM);
@@ -768,12 +768,13 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
     // Desktop library sync. USB devices have their own Sync Manager.
     let sr = Rect::from_center_size(pos2(r.min.x + 20.0, r.max.y - 20.0), vec2(18.0, 12.0));
     let status = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status())
-        .or(app.rb_job.as_ref().map(|_| "Importing from the desktop rekordbox library…"));
+        .or(app.rb_job.as_ref().map(|_| "Importing from the AlphaTheta Rekordbox library…"));
     let busy = status.is_some();
     let resp = ui.interact(sr.expand(3.0), ui.id().with("strip_sync"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy && app.can_review_library_sync(), "Review desktop library sync"));
     src::sync_arrows(ui.painter(), sr, if busy { BLUE } else if resp.hovered() { WHITE } else { hex(0xDCDCDC) });
     let resp = if app.prefs.tooltips {
-        resp.on_hover_text(status.unwrap_or("Choose a sync direction. Import the desktop library or review Recordbox changes to write back to rekordbox."))
+        resp.on_hover_text(status.unwrap_or("Choose a sync direction between AlphaTheta Rekordbox and recordbox."))
     } else { resp };
     if resp.clicked() && !busy {
         app.review_rekordbox_sync();

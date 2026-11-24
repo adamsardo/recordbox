@@ -43,7 +43,7 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("missing", "Display All Missing Files", false),
     ("export_xml", "Export Collection in xml format", false),
     ("export_playlists_info", "Export Playlists Information", false),
-    ("sync_rekordbox", "Review rekordbox library sync…", false),
+    ("sync_rekordbox", "Review desktop library sync…", false),
     ("import_xml", "Import Collection from rekordbox xml…", false),
     ("relocate_missing", "Relocate Missing Files…", false),
     ("library_folder", "Show Library Folder", false),

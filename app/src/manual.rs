@@ -14,8 +14,8 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <p>recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
 <ul>
 <li><b>Your music files are read-only during desktop sync.</b> Editing a track saves your work in Recordbox's library.</li>
-<li>The collection footer shows your active Recordbox library. Use the lower-left arrows to <a href='#desktop-library-sync'>choose the direction of desktop library sync</a>.</li>
-<li>Choose <i>File &gt; Show Library Folder</i> to open the active Recordbox data folder in your file manager.</li>
+<li>The collection footer shows your active recordbox library. Use the lower-left arrows to <a href='#desktop-library-sync'>choose the direction of desktop library sync</a>.</li>
+<li>Choose <i>File &gt; Show Library Folder</i> to open the active recordbox data folder in your file manager.</li>
 </ul>
 <h3>The window</h3>
 <p>Top: the player (waveforms, transport, cues, grid). Below: the browser with the Tree View on the left (Collection, Playlists, Related Tracks, Explorer, Devices, Histories) and the track list on the right. <i>View</i> switches between <b>1 Player</b>, <b>2 Players</b>, <b>Simple Player</b> and <b>Full Browser</b>.</p>
@@ -25,15 +25,16 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <li><i>File &gt; Import &gt; Import Track</i> adds files; <i>Import Folder</i> adds a folder and everything inside it. You can also drag files or folders from Finder onto the track list or a playlist.</li>
 <li><i>File &gt; Import &gt; Import Playlist</i> reads an M3U/M3U8 playlist and creates a playlist with its tracks.</li>
 <li><i>File &gt; Import Collection from rekordbox xml…</i> reads a collection exported from rekordbox (tracks, cues, grids, playlists).</li>
-<li><i>File &gt; Review rekordbox library sync…</i> opens the direction chooser for the installed AlphaTheta library and the active Recordbox library.</li>
+<li><i>File &gt; Review desktop library sync…</i> opens the direction chooser for the installed AlphaTheta library and the active recordbox library.</li>
 <li>The <b>Explorer</b> source browses folders on disk; tracks there can be loaded or imported.</li>
 </ul>
 <p>Supported files: MP3, AAC/M4A, WAV, AIFF, FLAC, ALAC. With <b>Auto Analysis</b> on (Track &gt; Auto Analysis, or Preferences &gt; Analysis) new tracks are analysed as they arrive.</p>
 <h3 id="desktop-library-sync">Desktop library sync</h3>
-<p>Open the arrows at the bottom left and check the two paths. <code>master.db</code> belongs to AlphaTheta rekordbox. <code>library.db</code> is your active Recordbox collection.</p>
-<p><b>rekordbox → Recordbox</b> imports from a private snapshot of the desktop database and its write-ahead log. Recordbox can read analysis files, tags and artwork for local audio. Confirming imports metadata, cues, grids and My Tags into Recordbox. The imported <b>rekordbox</b> playlist folder is rebuilt each time. Keep playlists you edit outside that folder.</p>
-<p><b>Recordbox → rekordbox</b> opens the write-back pilot. Preview the changes, check the destination, select eligible edits and review them before applying. Quit AlphaTheta rekordbox and its background agent before writing. The confirmed operation saves a verified recovery copy and applies the selected changes to the original desktop library. Start with a disposable AlphaTheta profile for the version you use.</p>
-<p><i>File &gt; Library &gt; Backup Library</i> saves your Recordbox collection. To import from rekordbox at launch, enable <b>Import the installed rekordbox library at startup</b> in <i>Preferences &gt; Advanced &gt; Others</i>. Writing back always requires a manual review. Device Sync Manager can write playlists and media to a selected USB drive.</p>
+<p>Open the arrows at the bottom left and check the two paths. <code>master.db</code> belongs to AlphaTheta Rekordbox. <code>library.db</code> is your active recordbox collection.</p>
+<p><b>Import · AlphaTheta Rekordbox → recordbox</b> imports from a private snapshot of the desktop database and its write-ahead log. The import can read analysis files, tags and artwork for local audio. Confirming imports metadata, cues, grids and My Tags into recordbox. The imported <b>rekordbox</b> playlist folder is rebuilt each time. Keep playlists you edit outside that folder.</p>
+<p><b>Write back · recordbox → AlphaTheta Rekordbox</b> opens the write-back pilot. Preview the changes, check the destination, select eligible edits and review them before applying. Quit AlphaTheta Rekordbox and its background agent before writing. The confirmed operation saves a verified recovery copy and applies the selected changes to the original desktop library. Start with a disposable AlphaTheta profile for the version you use.</p>
+<p>For new cue points, cue timing edits and more complex tempo maps, use <i>File &gt; Export Collection in xml format</i> and review a manual XML import in a disposable AlphaTheta profile.</p>
+<p><i>File &gt; Library &gt; Backup Library</i> saves your recordbox collection. To import from AlphaTheta Rekordbox at launch, enable <b>Import the installed AlphaTheta Rekordbox library at startup</b> in <i>Preferences &gt; Advanced &gt; Others</i>. Writing back always requires a manual review. Device Sync Manager can write playlists and media to a selected USB drive.</p>
 "#),
     ("analysis", "Track analysis", r#"
 <p>Analysis finds the BPM and beat grid, the key, the waveforms, the loudness (for Auto Gain), phrases and vocal positions.</p>
@@ -176,7 +177,7 @@ pub fn html(prefs: &Prefs) -> String {
         s.push_str(&format!("<h2 id=\"{a}\">{}</h2>{body}", esc(t)));
         if a == "stems" {
             let folder = crate::db::data_dir_for_inspection().join("stems");
-            s.push_str(&format!("<p>Recordbox STEMS cache on this computer<br><code>{}</code></p>", esc(&folder.to_string_lossy())));
+            s.push_str(&format!("<p>recordbox STEMS cache on this computer<br><code>{}</code></p>", esc(&folder.to_string_lossy())));
         }
     }
     s.push_str("<h2 id=\"keys\">Keyboard shortcuts</h2><p>Change them in Preferences &gt; Keyboard. Fixed menu shortcuts: ⌘N Create New Playlist, ⌘E Export to USB Device, ⌘I Property, ⌘F search, ⌘A select all, ⌘Z / ⇧⌘Z Undo / Redo.</p>");

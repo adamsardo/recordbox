@@ -23,18 +23,6 @@ fn registrations(
     if files.is_empty() {
         return Ok(vec![]);
     }
-    let shared: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM djmdContent owner JOIN djmdContent other ON
-         ltrim(replace(other.AnalysisDataPath,char(92),'/'),'/') =
-         ltrim(replace(owner.AnalysisDataPath,char(92),'/'),'/') COLLATE NOCASE
-         WHERE owner.ID=? AND other.ID!=owner.ID AND other.rb_local_deleted=0)",
-        [owner],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        !shared,
-        "Another native track references the same beat-grid files"
-    );
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='contentFile' COLLATE NOCASE)",
         [], |r| r.get(0),
@@ -153,4 +141,50 @@ pub(super) fn update(
         )? == 1, "Native analysis registration changed during write-back");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mismatched_owner_digest_or_cloud_registration_blocks_the_grid() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rel = Path::new("share/PIONEER/USBANLZ/P001/ANLZ0000.DAT");
+        let target = dir.path().join(rel);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        let mut original = [0u8; 28];
+        original[..4].copy_from_slice(b"PMAI");
+        original[4..8].copy_from_slice(&28u32.to_be_bytes());
+        original[8..12].copy_from_slice(&28u32.to_be_bytes());
+        std::fs::write(&target, original)?;
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE contentFile(ID PRIMARY KEY, ContentID, Path, Hash, Size, rb_local_path,
+           rb_insync_hash, rb_insync_local_usn, rb_file_hash_dirty, rb_local_file_status, rb_in_progress,
+           rb_process_type, rb_temp_path, rb_file_size_dirty, rb_data_status, rb_local_data_status,
+           rb_local_deleted, rb_local_synced, usn, rb_local_usn, updated_at);")?;
+        db.execute(
+            "INSERT INTO contentFile(ID,ContentID,Path,Hash,Size,rb_local_deleted,rb_local_synced)
+                    VALUES('f','1','/PIONEER/USBANLZ/P001/ANLZ0000.DAT',?1,?2,0,0)",
+            params![format!("{:x}", Md5::digest(original)), original.len() as i64],
+        )?;
+        let changes = [FileChange {
+            relative_path: rel.into(),
+            expected_sha256: Sha256::digest(original).into(),
+            contents: b"changed".to_vec(),
+        }];
+        check(&db, "1", dir.path(), &changes)?;
+        assert!(check(&db, "other", dir.path(), &changes).is_err());
+        db.execute("UPDATE contentFile SET rb_in_progress=1", [])?;
+        assert!(check(&db, "1", dir.path(), &changes).is_err());
+        db.execute(
+            "UPDATE contentFile SET rb_in_progress=0, Hash='outdated'",
+            [],
+        )?;
+        let mut usn = 1;
+        assert!(update(&db, "1", dir.path(), &changes, &mut usn, "now").is_err());
+        assert_eq!(usn, 1);
+        assert_eq!(std::fs::read(&target)?, original);
+        Ok(())
+    }
 }

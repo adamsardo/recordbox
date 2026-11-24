@@ -40,15 +40,32 @@ impl CueView {
                 } else {
                     format!("Hot {}", (b'A' + p.slot as u8) as char)
                 };
-                format!(
-                    "{kind} at {:.3}s · {} · color {}",
-                    p.start as f64 / 1000.0,
-                    label.comment,
-                    label.color
-                )
+                let mut time = format!("{:.3}", p.start as f64 / 1000.0);
+                if let Some(end) = p.end {
+                    time.push_str(&format!("–{:.3}", end as f64 / 1000.0));
+                }
+                let color = if p.slot < 0 {
+                    crate::model::COLOR_NAMES
+                        .get(label.color as usize)
+                        .unwrap_or(&"Unknown color")
+                        .to_string()
+                } else {
+                    format!("pad color {}", label.color)
+                };
+                let active = if label.active_loop {
+                    " · active loop"
+                } else {
+                    ""
+                };
+                let name = if label.comment.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", label.comment)
+                };
+                format!("{kind} at {time} s{name} · {color}{active}")
             })
             .collect::<Vec<_>>()
-            .join("; ")
+            .join("\n")
     }
 }
 
@@ -126,6 +143,13 @@ impl NativeCues {
     }
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+    pub(crate) fn guard(&self) -> String {
+        let cache_revision = self
+            .mirror
+            .as_ref()
+            .map_or("none", |cache| cache.stamp.as_str());
+        format!("{}/{}", self.identity, cache_revision)
     }
 }
 
@@ -214,10 +238,27 @@ pub(crate) fn read(c: &Connection, id: &str) -> Result<NativeCues> {
     check_hot_cue_banks(c, id)?;
     let mut caches =
         c.prepare("SELECT * FROM contentCue WHERE ContentID=? AND rb_local_deleted=0")?;
+    for field in ["rb_local_usn", "rb_local_synced", "updated_at"] {
+        caches
+            .column_index(field)
+            .with_context(|| format!("Unsupported contentCue schema: missing {field}"))?;
+    }
     let mut cache_rows = caches.query([id])?;
     let mirror = if let Some(row) = cache_rows.next()? {
-        let entries: Vec<Value> = serde_json::from_str(&row.get::<_, String>("Cues")?)
-            .context("Unsupported native contentCue JSON")?;
+        let encoded: String = row.get("Cues")?;
+        let entries: Vec<Value> =
+            serde_json::from_str(&encoded).context("Unsupported native contentCue JSON")?;
+        let duplicate_keys: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM json_tree(?) WHERE typeof(key)='text'
+             GROUP BY parent,key HAVING count(*)>1)",
+            [&encoded],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !duplicate_keys,
+            "The native cue mirror contains duplicate JSON keys"
+        );
+
         ensure!(
             row.get::<_, i64>("rb_cue_count")? == entries.len() as i64,
             "Native cue mirror count differs"
@@ -229,6 +270,7 @@ pub(crate) fn read(c: &Connection, id: &str) -> Result<NativeCues> {
             stamp: format!("{:x}", stamp.finalize()),
             entries,
         };
+        ensure!(!cache.id.is_empty(), "Missing native cue mirror identity");
         ensure!(
             cache_rows.next()?.is_none(),
             "Multiple active contentCue mirrors for the track"
@@ -252,12 +294,33 @@ pub(crate) fn read(c: &Connection, id: &str) -> Result<NativeCues> {
     }
     let mut q =
         c.prepare("SELECT * FROM djmdCue WHERE ContentID=? AND rb_local_deleted=0 ORDER BY ID")?;
+    for field in ["rb_local_usn", "rb_local_synced", "updated_at"] {
+        q.column_index(field)
+            .with_context(|| format!("Unsupported djmdCue schema: missing {field}"))?;
+    }
+    let owner: Option<String> = if q.column_index("ContentUUID").is_ok() {
+        c.query_row(
+            "SELECT UUID FROM djmdContent WHERE ID=? AND rb_local_deleted=0",
+            [id],
+            |r| r.get(0),
+        )?
+    } else {
+        None
+    };
     let mut rows = q.query([id])?;
     let mut cues = Vec::new();
     let mut digest = Sha256::new();
     while let Some(row) = rows.next()? {
         hash_row(&mut digest, row)?;
         let cue_id: String = row.get("ID")?;
+        if let Some(owner) = &owner {
+            if let Some(uuid) = row.get::<_, Option<String>>("ContentUUID")? {
+                ensure!(
+                    uuid == *owner,
+                    "Cue belongs to a different native track UUID"
+                );
+            }
+        }
         let entry = cached
             .remove(cue_id.as_str())
             .context("Native cue has no matching active contentCue mirror entry")?;
@@ -274,10 +337,19 @@ pub(crate) fn read(c: &Connection, id: &str) -> Result<NativeCues> {
             "Color",
             "ColorTableIndex",
         ] {
-            ensure!(
-                entry.get(field) == Some(&json_column(row, field)?),
-                "Cue mirror differs for {field}"
-            );
+            let native = json_column(row, field)?;
+            let agrees = match entry.get(field) {
+                Some(cached) => cached == &native,
+                // Genuine rekordbox 7 omits unassigned cue properties from the cache.
+                None => match field {
+                    "Comment" => native.is_null() || native.as_str() == Some(""),
+                    "ActiveLoop" | "ColorTableIndex" => {
+                        native.is_null() || native.as_i64() == Some(0)
+                    }
+                    _ => false,
+                },
+            };
+            ensure!(agrees, "Cue mirror differs for {field}");
         }
         for field in [
             "ContentUUID",
@@ -530,7 +602,12 @@ pub(crate) fn apply(
         return Ok(());
     }
     let mirror = baseline.mirror.as_ref().context("No native cue mirror")?;
-    let mut entries = mirror.entries.clone();
+    let mut entries: Vec<_> = mirror.entries.iter().collect();
+    let mut encoded: String = c.query_row(
+        "SELECT Cues FROM contentCue WHERE ID=? AND ContentID=?",
+        params![mirror.id, id],
+        |r| r.get(0),
+    )?;
     for edit in &patch.edits {
         let revision = next(usn)?;
         let n = c.execute("UPDATE djmdCue SET Comment=coalesce(?1,Comment), Color=coalesce(?2,Color),
@@ -542,37 +619,60 @@ pub(crate) fn apply(
             .iter()
             .position(|e| e["ID"].as_str() == Some(edit.id.as_str()))
             .context("Native cue mirror identity disappeared")?;
+        let pointer = format!("$[{i}]");
         if edit.remove {
+            encoded = c.query_row(
+                "SELECT json_remove(?1, ?2)",
+                params![encoded, pointer],
+                |r| r.get(0),
+            )?;
             entries.remove(i);
         } else {
-            let obj: &mut Map<String, Value> =
-                entries[i].as_object_mut().context("Invalid cue mirror")?;
+            // Patch only known properties of the stored object. SQLite keeps untouched
+            // JSON number tokens (including vendor values outside Rust's u64 range).
+            let mut fields = Map::new();
             if let Some(v) = &edit.comment {
-                obj.insert("Comment".into(), v.as_str().into());
+                fields.insert("Comment".into(), v.as_str().into());
             }
             if let Some(v) = edit.memory_color {
-                obj.insert("Color".into(), v.into());
+                fields.insert("Color".into(), v.into());
             }
             if let Some(v) = edit.kind {
-                obj.insert("Kind".into(), v.into());
+                fields.insert("Kind".into(), v.into());
             }
             if let Some(v) = edit.hot_palette {
-                obj.insert("ColorTableIndex".into(), v.into());
+                fields.insert("ColorTableIndex".into(), v.into());
             }
-            for (field, value) in [
-                ("rb_local_usn", revision.into()),
-                ("updated_at", timestamp.into()),
-                ("rb_local_synced", 0.into()),
-            ] {
-                if obj.contains_key(field) {
-                    obj.insert(field.into(), value);
-                }
+            let original = entries[i];
+            if original.get("rb_local_usn").is_some() {
+                fields.insert("rb_local_usn".into(), revision.into());
             }
+            if original.get("rb_local_synced").is_some() {
+                fields.insert("rb_local_synced".into(), 0.into());
+            }
+            if let Some(previous) = original.get("updated_at") {
+                // Native v7 serializes ISO 8601 in JSON, while its DB column includes spaces.
+                let value = if previous
+                    .as_str()
+                    .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+                {
+                    chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f %:z")?
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+                } else {
+                    timestamp.to_owned()
+                };
+                fields.insert("updated_at".into(), value.into());
+            }
+            encoded = c.query_row(
+                "SELECT json_set(?1,?2,json_patch(json_extract(?1,?2),?3))",
+                params![encoded, pointer, serde_json::to_string(&fields)?],
+                |r| r.get(0),
+            )?;
         }
     }
     let n = c.execute("UPDATE contentCue SET Cues=?, rb_cue_count=?, rb_local_usn=?, updated_at=?, rb_local_synced=0
         WHERE ID=? AND ContentID=? AND rb_local_deleted=0",
-        params![serde_json::to_string(&entries)?, i64::try_from(entries.len())?, next(usn)?, timestamp, mirror.id, id])?;
+        params![encoded, i64::try_from(entries.len())?, next(usn)?, timestamp, mirror.id, id])?;
     ensure!(n == 1, "Native cue mirror disappeared");
     let n = c.execute("UPDATE djmdContent SET CueUpdated=1, rb_local_usn=?, updated_at=?, rb_local_synced=0 WHERE ID=? AND rb_local_deleted=0",
         params![next(usn)?, timestamp, id])?;
@@ -627,6 +727,12 @@ mod tests {
     #[test]
     fn reviewed_metadata_and_pad_reassignment_preserve_ids_and_native_data() -> Result<()> {
         let c = fixture()?;
+        let opaque = "123456789012345678901234567890";
+        c.execute(
+            "UPDATE contentCue SET Cues=json_set(Cues,'$[0].vendorNumber',json(?))",
+            [opaque],
+        )?;
+
         let base = read(&c, "song")?;
         assert_eq!(identities(&c)?["song"], base.identity());
         let mut target = base.view();
@@ -642,6 +748,12 @@ mod tests {
         let mut usn = 5;
         apply(&c, "song", &base, &patch, &mut usn, "now")?;
         assert_eq!(usn, 9);
+        let saved: String = c.query_row("SELECT Cues FROM contentCue", [], |r| r.get(0))?;
+        assert!(
+            saved.contains(opaque),
+            "native JSON numbers retain their exact digits"
+        );
+
         let attrs: (i64, i64, String, String) = c.query_row(
             "SELECT Kind,ColorTableIndex,InPointSeekInfo,UUID FROM djmdCue WHERE ID='pad'",
             [],
@@ -716,6 +828,21 @@ mod tests {
             [],
         )?;
         assert!(read(&c, "song").is_err());
+        c.execute(
+            "UPDATE contentCue SET Cues=replace(Cues,'Moved','Start')",
+            [],
+        )?;
+        let duplicate: String = c.query_row("SELECT Cues FROM contentCue", [], |r| r.get(0))?;
+        let duplicate = duplicate.replacen(
+            r#""Comment":"Start""#,
+            r#""Comment":"Bad","Comment":"Start""#,
+            1,
+        );
+        c.execute("UPDATE contentCue SET Cues=?", [duplicate])?;
+        assert!(read(&c, "song")
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate JSON"));
         Ok(())
     }
 
@@ -815,6 +942,145 @@ mod tests {
             json!([3])
         );
         assert!(select(&writeback::preview(&fixture.local, &fixture.source)?).is_empty());
+        Ok(())
+    }
+
+    /// rbox's v7 demo contains six authentic cue rows across two contentCue caches.
+    /// The test works on a fresh copy and gives one demo track a disposable local audio path.
+    #[test]
+    #[ignore = "set RECORDBOX_TEST_RBOX to the public dylanljones/rbox checkout"]
+    fn published_v7_sparse_cues_and_rating_survive_encrypted_round_trip() -> Result<()> {
+        use crate::rbimport::writeback::{self, Field};
+        use crate::{db::Db, rbimport};
+        let checkout = std::path::PathBuf::from(
+            std::env::var_os("RECORDBOX_TEST_RBOX").context("rbox fixture checkout missing")?,
+        );
+        let public = checkout.join(".testdata/RBv7/demo/rekordbox");
+        let original = public.join("master.db");
+        let pristine = Sha256::digest(std::fs::read(&original)?);
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("desktop");
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&profile)?;
+        let master = source.join("master.db");
+        std::fs::copy(&original, &master)?;
+        let native = |p: &Path| -> Result<Connection> {
+            let db = Connection::open(p)?;
+            db.pragma_update(None, "key", rbimport::MASTER_DB_KEY)?;
+            Ok(db)
+        };
+        let c = native(&master)?;
+        let (content, dat, old_rating): (String,String,i64) = c.query_row(
+            "SELECT d.ID,d.AnalysisDataPath,d.Rating FROM djmdContent d JOIN djmdCue k ON k.ContentID=d.ID
+             WHERE d.rb_local_deleted=0 AND k.rb_local_deleted=0 AND k.Kind=1 ORDER BY d.ID LIMIT 1",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let baseline = read(&c, &content)?;
+        let existing = baseline
+            .cues
+            .iter()
+            .find(|cue| cue.position.slot == 0)
+            .context("fixture lacks Hot A")?;
+        let cue_id = existing.id.clone();
+        let cache_entry = |s: &NativeCues| -> Value {
+            s.mirror
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .find(|v| v["ID"].as_str() == Some(&cue_id))
+                .unwrap()
+                .clone()
+        };
+        let native_entry = cache_entry(&baseline);
+        assert!(
+            native_entry.get("Comment").is_none() && native_entry.get("ColorTableIndex").is_none()
+        );
+        let public_dir = public.join("share").join(dat.trim_start_matches('/'));
+        let dest_dir = source.join("share").join(dat.trim_start_matches('/'));
+        std::fs::create_dir_all(dest_dir.parent().unwrap())?;
+        let mut sidecars = Vec::new();
+        for item in std::fs::read_dir(public_dir.parent().unwrap())? {
+            let entry = item?;
+            if entry.file_type()?.is_file() {
+                let bytes = std::fs::read(entry.path())?;
+                let target = dest_dir.with_file_name(entry.file_name());
+                std::fs::write(&target, &bytes)?;
+                sidecars.push((target, Sha256::digest(bytes)));
+            }
+        }
+        let media = root.path().join("demo.mp3");
+        std::fs::write(&media, b"disposable demo track placeholder")?;
+        c.execute(
+            "UPDATE djmdContent SET FolderPath=?1 WHERE ID=?2",
+            params![media.to_string_lossy().as_ref(), content],
+        )?;
+        drop(c);
+
+        let dest = profile.join("library.db");
+        let local = Db::open(&dest)?;
+        rbimport::merge::apply(&local, &rbimport::load_from(&source, &profile)?)?;
+        let mut track = local
+            .track_at_path(media.to_str().unwrap())?
+            .context("missing imported demo track")?;
+        let new_rating = (old_rating + 1) % 6;
+        track.rating = new_rating as u8;
+        local.update_track(&track)?;
+        let mut changed = local.cues(track.id)?;
+        let pad = changed
+            .iter_mut()
+            .find(|cue| cue.kind == CueKind::Hot && cue.slot == 0)
+            .unwrap();
+        pad.color = 41;
+        pad.comment = "Pilot · 入".into();
+        local.replace_cues(track.id, &changed)?;
+        drop(local);
+        let reviewed = writeback::preview(&dest, &source)?;
+        let selected: Vec<_> = reviewed
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(row.field, Field::Rating | Field::Cues) && row.reason.is_none()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(selected.len(), 2, "{:#?}", reviewed.rows);
+        let receipt = writeback::apply(&dest, &source, &reviewed, &selected)?;
+        let old = native(&receipt.backup.join("master.db"))?;
+        assert_eq!(read(&old, &content)?, baseline);
+        let rating = |db: &Connection| {
+            db.query_row(
+                "SELECT Rating FROM djmdContent WHERE ID=?",
+                [&content],
+                |r| r.get::<_, i64>(0),
+            )
+        };
+        assert_eq!(rating(&old)?, old_rating);
+        let written = native(&master)?;
+        assert_eq!(rating(&written)?, new_rating);
+        let edited = read(&written, &content)?;
+        let updated_entry = cache_entry(&edited);
+        assert_eq!(updated_entry["ColorTableIndex"], 41);
+        assert_eq!(updated_entry["Comment"], "Pilot · 入");
+        assert!(updated_entry.get("ActiveLoop").is_none());
+        assert!(chrono::DateTime::parse_from_rfc3339(
+            updated_entry["updated_at"].as_str().unwrap()
+        )
+        .is_ok());
+        for (key, value) in native_entry.as_object().unwrap() {
+            if key != "updated_at" {
+                assert_eq!(&updated_entry[key], value, "native field {key}");
+            }
+        }
+        assert_eq!(pristine, Sha256::digest(std::fs::read(&original)?));
+        for (path, digest) in sidecars {
+            assert_eq!(digest, Sha256::digest(std::fs::read(path)?));
+        }
+        assert!(writeback::preview(&dest, &source)?
+            .rows
+            .iter()
+            .all(|r| r.reason.is_some()));
         Ok(())
     }
 

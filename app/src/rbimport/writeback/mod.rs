@@ -4,13 +4,14 @@ pub(crate) mod cues;
 mod grid;
 #[cfg(test)]
 mod integration_tests;
+mod location;
 mod registration;
 mod storage;
 
 use super::RbTrack;
 use crate::db::Db;
 use crate::model::{key_name, parse_key, BeatGrid, Track};
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, types::Value, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,6 +110,10 @@ pub(super) struct ImportTrack {
     grid_proof: Option<String>,
 }
 
+pub(super) fn empty_cue_identity() -> String {
+    format!("{:x}", Sha256::digest([]))
+}
+
 fn grid_proof(path: &str, hash: &[u8; 32]) -> String {
     format!(
         "{}:{}",
@@ -136,7 +141,11 @@ impl ImportTrack {
             bpm: integer("BPM").filter(|(v, _)| (0..=65535).contains(v)),
             key_id: row.get("KeyID").cloned().map(super::text),
             cue_ids,
-            grid_proof: dat.map(|b| grid_proof(anlz, &Sha256::digest(b).into())),
+            grid_proof: if anlz.is_empty() {
+                Some("absent".into())
+            } else {
+                dat.map(|b| grid_proof(anlz, &Sha256::digest(b).into()))
+            },
         })
     }
 }
@@ -171,20 +180,32 @@ fn local_edit(db: &Db, t: &Track, field: Field) -> Result<Edit> {
     })
 }
 
-pub(super) fn record_import(db: &Db, id: i64, rt: &RbTrack, source: &Source) -> Result<()> {
+pub(super) fn record_import(
+    db: &Db,
+    id: i64,
+    rt: &RbTrack,
+    source: &str,
+    fresh: bool,
+) -> Result<()> {
     let Some(native) = &rt.native else {
         return Ok(());
     };
-    let source = serde_json::to_string(source)?;
     // A replaced native ID or a second library must never inherit the first association.
     db.conn.execute(
         "DELETE FROM native_edit_baseline WHERE track_id=?1 AND
         (source!=?2 OR native_id!=?3 OR uuid!=?4 OR path!=?5)",
         params![id, source, rt.rb_id, native.uuid, rt.xt.track.path],
     )?;
-    let local = db
-        .track_at_path(&rt.xt.track.path)?
-        .context("imported track is missing")?;
+    // Fresh rows have just received the native track, cues and grid in this
+    // transaction. Existing rows may have edits that the importer preserved.
+    let local = if fresh {
+        None
+    } else {
+        Some(
+            db.track_at_path(&rt.xt.track.path)?
+                .context("imported track is missing")?,
+        )
+    };
     let mut fields = Vec::with_capacity(5);
     if let Some((r, p)) = &native.rating {
         fields.push((Edit::Rating(*r), p.clone()));
@@ -202,8 +223,11 @@ pub(super) fn record_import(db: &Db, id: i64, rt: &RbTrack, source: &Source) -> 
             fields.push((Edit::Cues(view), ids.clone()));
         }
     }
-    if let (Some(g), Some(digest)) = (&rt.xt.grid, &native.grid_proof) {
-        fields.push((Edit::Grid(g.clone()), digest.clone()));
+    if let Some(digest) = &native.grid_proof {
+        fields.push((
+            Edit::Grid(rt.xt.grid.clone().unwrap_or_default()),
+            digest.clone(),
+        ));
     }
     let mut save = db.conn.prepare_cached(
         "INSERT INTO native_edit_baseline
@@ -212,14 +236,17 @@ pub(super) fn record_import(db: &Db, id: i64, rt: &RbTrack, source: &Source) -> 
         WHERE value!=excluded.value OR proof!=excluded.proof",
     )?;
     for (field, proof) in fields {
-        if local_edit(db, &local, field.field()).is_ok_and(|l| l == field) {
+        if local
+            .as_ref()
+            .is_none_or(|t| local_edit(db, t, field.field()).is_ok_and(|l| l == field))
+        {
             save.execute(params![
                 id,
                 field.field().label(),
                 source,
                 rt.rb_id,
                 native.uuid,
-                local.path,
+                rt.xt.track.path,
                 serde_json::to_string(&field)?,
                 proof
             ])?;
@@ -277,19 +304,25 @@ fn local_db(path: &Path, write: bool) -> Result<Db> {
     Ok(Db { conn })
 }
 
+const READ_BASELINES:&str="SELECT track_id,native_id,uuid,path,value,proof FROM native_edit_baseline WHERE source=? ORDER BY track_id,field";
+fn read_baseline(r: &rusqlite::Row<'_>) -> Result<Baseline> {
+    Ok(Baseline {
+        local_id: r.get(0)?,
+        id: r.get(1)?,
+        uuid: r.get(2)?,
+        path: r.get(3)?,
+        field: serde_json::from_str(&r.get::<_, String>(4)?)?,
+        proof: r.get(5)?,
+    })
+}
+
+#[cfg(test)]
 fn baselines(db: &Db, source: &Source) -> Result<Vec<Baseline>> {
-    let mut st = db.conn.prepare("SELECT track_id,native_id,uuid,path,value,proof FROM native_edit_baseline WHERE source=? ORDER BY track_id,field")?;
-    let mut cursor = st.query([serde_json::to_string(source)?])?;
-    let mut out = Vec::new();
-    while let Some(r) = cursor.next()? {
-        out.push(Baseline {
-            local_id: r.get(0)?,
-            id: r.get(1)?,
-            uuid: r.get(2)?,
-            path: r.get(3)?,
-            field: serde_json::from_str(&r.get::<_, String>(4)?)?,
-            proof: r.get(5)?,
-        });
+    let mut st = db.conn.prepare(READ_BASELINES)?;
+    let mut iter = st.query([serde_json::to_string(source)?])?;
+    let mut out = vec![];
+    while let Some(row) = iter.next()? {
+        out.push(read_baseline(row)?);
     }
     Ok(out)
 }
@@ -318,11 +351,14 @@ fn recognized_key(s: &str) -> Option<i32> {
     let mut chars = s.chars();
     let first = chars.next()?;
     if first.is_ascii_digit() {
-        return Some(idx);
+        // Open Key uses a different wheel numbering. Only Camelot A/B
+        // identifiers here have a validated native mapping.
+        return (s.len() <= 3 && s.ends_with(['A', 'B', 'a', 'b'])).then_some(idx);
     }
-    let rest = chars
-        .as_str()
-        .trim_start_matches(['#', '♯', 'b', '♭'])
+    let suffix = chars.as_str();
+    let rest = suffix
+        .strip_prefix(['#', '♯', 'b', '♭'])
+        .unwrap_or(suffix)
         .trim()
         .to_ascii_lowercase();
     matches!(rest.as_str(), "" | "m" | "min" | "minor" | "maj" | "major").then_some(idx)
@@ -462,7 +498,8 @@ fn checked_current(
             "Unsupported native update schema: missing {name}"
         );
     }
-    for col in ["ServiceID", "CloudID", "rb_file_id"] {
+    // rb_file_id also exists on ordinary local media in native v6 and v7 catalogs.
+    for col in ["ServiceID", "CloudID"] {
         if r.as_ref().column_index(col).is_err() {
             continue;
         }
@@ -569,7 +606,7 @@ fn checked_current(
             Current {
                 value: Edit::Cues(view),
                 proof: now.identity().to_owned(),
-                guard: serde_json::to_string(&now)?,
+                guard: now.guard(),
                 write: Mutation::Cues(now, patch),
                 companion: None,
             }
@@ -635,6 +672,7 @@ fn checked_current(
 }
 
 pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
+    location::verify(source_dir)?;
     ensure!(
         !storage::pending(source_dir),
         "A previous native write must be recovered before reviewing edits"
@@ -653,10 +691,12 @@ pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
         source: source.clone(),
         local_library,
     };
-    let entries = baselines(&local, &source)?;
+    let mut st = local.conn.prepare(READ_BASELINES)?;
+    let mut baselines = st.query([serde_json::to_string(&source)?])?;
     let mut track = None::<Track>;
     let mut owners = None;
-    for base in entries {
+    while let Some(record) = baselines.next()? {
+        let base = read_baseline(record)?;
         if track.as_ref().map(|t| t.id) != Some(base.local_id) {
             track = local
                 .track_at_path(&base.path)?
@@ -667,8 +707,14 @@ pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
         }
         let Some(t) = track.as_ref() else { continue };
         let field = base.field.field();
-        let desired = local_edit(&local, t, field)?;
-        if desired == base.field {
+        let (desired, problem) = match local_edit(&local, t, field) {
+            Ok(edit) => (edit, None),
+            Err(error) => (
+                base.field.clone(),
+                Some(format!("Unsupported local edit: {error:#}")),
+            ),
+        };
+        if problem.is_none() && desired == base.field {
             continue;
         }
         let mut row = Row {
@@ -688,6 +734,12 @@ pub(crate) fn preview(local_db_path: &Path, source_dir: &Path) -> Result<Plan> {
             baseline: base,
             desired,
         };
+        if let Some(problem) = problem {
+            row.reason = Some(problem);
+            row.proposed = "Unsupported local value".into();
+            plan.rows.push(row);
+            continue;
+        }
         if owners.is_none() {
             owners = Some(Owners::read(&remote)?);
         }
@@ -758,6 +810,7 @@ pub(crate) fn apply(
     plan: &Plan,
     selected: &[usize],
 ) -> Result<Receipt> {
+    location::verify(source_dir)?;
     ensure!(!selected.is_empty(), "Select at least one edit");
     ensure!(
         plan.local_library == local_db_path.canonicalize()?
@@ -783,26 +836,8 @@ pub(crate) fn apply(
         }
     }
     let db = local_db(local_db_path, true)?;
-    // This worker uses its own SQLite connection. Keep subsequent GUI edits/inbound
-    // imports from invalidating the local side while the native merge commits.
-    db.conn.execute_batch("BEGIN IMMEDIATE")?;
-    let saved = baselines(&db, &plan.source)?;
-    let saved: HashMap<_, _> = saved
-        .into_iter()
-        .map(|b| ((b.local_id, b.field.field()), b))
-        .collect();
-    for row in &rows {
-        let t = db
-            .track_at_path(&row.baseline.path)?
-            .context("Local track was removed since review")?;
-        ensure!(
-            t.id == row.local_id
-                && local_edit(&db, &t, row.field)? == row.desired
-                && saved.get(&(t.id, row.field)) == Some(&row.baseline),
-            "Local edit or import baseline changed; review again"
-        );
-    }
     let (proofs, backup) = storage::apply(source_dir, &backup_root(local_db_path)?, |remote| {
+        location::verify(source_dir)?;
         ensure!(
             Source::read(remote, source_dir)? == plan.source,
             "Target database changed since review"
@@ -834,6 +869,36 @@ pub(crate) fn apply(
                 );
             }
             validated.push(now.write);
+        }
+        // The encrypted backup is already verified and native patches are prepared.
+        // Hold the local writer slot only for final validation and commit. Individual
+        // lookups use (track_id,field), even in a collection with millions of records.
+        db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let source_json = serde_json::to_string(&plan.source)?;
+        let mut check=db.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM native_edit_baseline WHERE
+            track_id=?1 AND field=?2 AND source=?3 AND native_id=?4 AND uuid=?5 AND path=?6 AND value=?7 AND proof=?8)")?;
+        for row in &rows {
+            let base = &row.baseline;
+            let t = db
+                .track_at_path(&base.path)?
+                .context("Local track was removed since review")?;
+            let same: bool = check.query_row(
+                params![
+                    row.local_id,
+                    row.field.label(),
+                    source_json,
+                    base.id,
+                    base.uuid,
+                    base.path,
+                    serde_json::to_string(&base.field)?,
+                    base.proof
+                ],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                same && t.id == row.local_id && local_edit(&db, &t, row.field)? == row.desired,
+                "Local edit or import baseline changed; review again"
+            );
         }
         let stamp = chrono::Utc::now()
             .format("%Y-%m-%d %H:%M:%S%.3f +00:00")
@@ -937,4 +1002,106 @@ fn update_column(
         "Native track was not updated"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::importer::XmlTrack;
+
+    fn imported() -> RbTrack {
+        let track = Track {
+            path: "/music/edit.wav".into(),
+            rating: 2,
+            bpm: 120.0,
+            key: parse_key("Am"),
+            ..Default::default()
+        };
+        RbTrack {
+            rb_id: "77".into(),
+            fingerprint: "one".into(),
+            xt: XmlTrack {
+                xml_id: "77".into(),
+                track,
+                grid: None,
+                cues: Vec::new(),
+                extra: Default::default(),
+            },
+            tags: vec![],
+            anlz_base: None,
+            native: Some(ImportTrack {
+                uuid: "73ee646d-b7f2-4528-95ab-9d8e51301681".into(),
+                rating: Some((2, "2".into())),
+                bpm: Some((12000, "12000".into())),
+                key_id: Some("7".into()),
+                cue_ids: Some(empty_cue_identity()),
+                grid_proof: Some("absent".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn older_divergent_fields_require_an_agreed_import_before_enrollment() -> Result<()> {
+        let db = Db::open(Path::new(":memory:"))?;
+        let rt = imported();
+        let mut t = rt.xt.track.clone();
+        t.rating = 4;
+        let id = db.insert_track(&t)?;
+        let source = Source {
+            folder: "/fixture/source".into(),
+            salt: "synthetic".into(),
+        };
+        record_import(&db, id, &rt, &serde_json::to_string(&source)?, false)?;
+        let initial = baselines(&db, &source)?;
+        assert!(!initial.iter().any(|b| b.field.field() == Field::Rating));
+        assert!(initial.iter().any(|b| b.field == Edit::Bpm(12000)));
+        assert!(initial.iter().any(|b| b.field.field() == Field::Cues));
+        t.id = id;
+        t.rating = 2;
+        db.update_track(&t)?;
+        record_import(&db, id, &rt, &serde_json::to_string(&source)?, false)?;
+        t.rating = 5;
+        db.update_track(&t)?;
+        record_import(&db, id, &rt, &serde_json::to_string(&source)?, false)?;
+        let agreed = baselines(&db, &source)?;
+        assert!(agreed.iter().any(|b| b.field == Edit::Rating(2)));
+        assert!(!agreed.iter().any(|b| b.field == Edit::Rating(5)));
+        db.delete_track(id)?;
+        assert!(baselines(&db, &source)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_native_paths_and_uuids_are_collected_across_the_snapshot() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE djmdContent(UUID,FolderPath,AnalysisDataPath,rb_local_deleted);
+            INSERT INTO djmdContent VALUES
+            ('a','/music/one.wav','/PIONEER/USBANLZ/A/ANLZ0000.DAT',0),
+            ('A','/MUSIC/ONE.wav','PIONEER/USBANLZ/a/ANLZ0000.DAT',0),
+            ('b','/music/other.wav','',1);",
+        )?;
+        let owners = Owners::read(&db)?;
+        assert!(owners.duplicate_ids.contains("a"));
+        assert!(owners.duplicate_paths.contains("/music/one.wav"));
+        assert!(owners
+            .shared_analysis
+            .contains("pioneer/usbanlz/a/anlz0000.dat"));
+        assert!(!owners.duplicate_ids.contains("b"));
+        Ok(())
+    }
+
+    #[test]
+    fn key_names_and_native_revision_encoding_are_checked() {
+        assert_eq!(recognized_key("F# minor"), Some(parse_key("F#m")));
+        assert_eq!(recognized_key("Arbitrary"), None);
+        assert_eq!(recognized_key("F##"), None);
+        assert_eq!(recognized_key("1m"), None);
+        assert_eq!(next_grid_revision(Some("9")).unwrap(), ":");
+        assert!(next_grid_revision(Some("10")).is_err());
+        assert_ne!(
+            native_number(&Value::Null),
+            native_number(&Value::Integer(0))
+        );
+    }
 }

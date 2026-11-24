@@ -1131,7 +1131,7 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         }
     });
     card(ui, "Key Analysis", |ui| {
-        let why = "Track analysis saves the key in Recordbox. To review it for write-back to desktop rekordbox, open library sync.";
+        let why = "Track analysis saves the key in recordbox. To review it for write-back to AlphaTheta Rekordbox, open library sync.";
         if kit::toggle_off(ui, "Write the value to the ID3 tag", why) {
             app.toast(why);
         }
@@ -1517,9 +1517,9 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
             card(ui, "Database management", |ui| {
-                sub(ui, "Active Recordbox library");
+                sub(ui, "Active recordbox library");
                 ui.add(egui::Label::new(app.db.active_library_path()).selectable(true).wrap());
-                note(ui, "Edits are saved in this Recordbox library. Library sync lets you review supported changes for write-back to desktop rekordbox.");
+                note(ui, "Edits are saved in this recordbox library. Library sync lets you review supported changes for write-back to AlphaTheta Rekordbox.");
                 kit::block(ui, |ui| {
                     if ui.add(btn("Show library folder")).clicked() {
                         crate::menus::handle(app, "library_folder");
@@ -1644,10 +1644,10 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         }
         _ => {
             card(ui, "rekordbox Library", |ui| {
-                kit::line(ui, "Active Recordbox library");
+                kit::line(ui, "Active recordbox library");
                 ui.label(app.db.active_library_path());
-                toggle(ui, &mut app.prefs.import_rekordbox_at_startup, "Import the installed rekordbox library at startup");
-                note(ui, "Startup import reads the desktop rekordbox library into Recordbox. To write changes back, use the sync arrows, select changes and confirm the backup.");
+                toggle(ui, &mut app.prefs.import_rekordbox_at_startup, "Import the installed AlphaTheta Rekordbox library at startup");
+                note(ui, "Startup import reads the AlphaTheta Rekordbox library into recordbox. To write changes back, use the sync arrows, select changes and confirm the backup.");
                 kit::block(ui, |ui| {
                     if ui.add_enabled(app.can_review_library_sync(), btn("Review library sync…")).clicked() {
                         app.dialogs.prefs_open = false;
@@ -1996,7 +1996,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         }
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         let path = crate::db::data_dir_for_inspection().join("stems");
-        ui.add(egui::Label::new(format!("Recordbox STEMS cache · {}", path.display())).selectable(true).wrap());
+        ui.add(egui::Label::new(format!("recordbox STEMS cache · {}", path.display())).selectable(true).wrap());
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {
                 crate::stems::clear_cache();

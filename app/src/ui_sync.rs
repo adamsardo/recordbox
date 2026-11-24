@@ -145,11 +145,11 @@ pub fn show(app: &mut App, ctx: &Context) {
     let mut close = false;
     let mut import = false;
     let working = review.status().is_some();
-    let mut window = egui::Window::new("Review rekordbox library sync")
+    let mut window = egui::Window::new("Review desktop library sync")
         .id(egui::Id::new("library_sync_review"))
         .collapsible(false)
         .default_width(620.0)
-        .vscroll(true);
+        .vscroll(ctx.screen_rect().height() < 680.0);
     if !working {
         window = window.open(&mut open);
     }
@@ -158,11 +158,13 @@ pub fn show(app: &mut App, ctx: &Context) {
         ui.heading("Sync direction");
         let previous = review.direction;
         ui.add_enabled_ui(!working, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.radio_value(&mut review.direction, Some(Direction::Import), "Import · rekordbox → Recordbox");
-                ui.radio_value(&mut review.direction, Some(Direction::WriteBack), "Write back · Recordbox → rekordbox");
+            ui.vertical(|ui| {
+                ui.radio_value(&mut review.direction, Some(Direction::Import), "Import · AlphaTheta Rekordbox → recordbox");
+                ui.add_space(2.0);
+                ui.radio_value(&mut review.direction, Some(Direction::WriteBack), "Write back · recordbox → AlphaTheta Rekordbox");
             });
         });
+        ui.separator();
         if review.direction != previous {
             review.outbound = Outbound::Ready;
             review.confirm_recovery = false;
@@ -172,16 +174,16 @@ pub fn show(app: &mut App, ctx: &Context) {
         let local = review.local.as_deref();
         match review.direction {
             Some(Direction::Import) => {
-                library_path(ui, "Read from · desktop rekordbox library", source.as_deref());
-                library_path(ui, "Write to · active Recordbox library", local);
+                library_path(ui, "Read from · AlphaTheta Rekordbox library", source.as_deref());
+                library_path(ui, "Write to · active recordbox library", local);
             }
             Some(Direction::WriteBack) => {
-                library_path(ui, "Read from · active Recordbox library", local);
-                library_path(ui, "Write to · original desktop rekordbox library", source.as_deref());
+                library_path(ui, "Read from · active recordbox library", local);
+                library_path(ui, "Write to · original AlphaTheta Rekordbox library", source.as_deref());
             }
             None => {
-                library_path(ui, "Desktop rekordbox library", source.as_deref());
-                library_path(ui, "Active Recordbox library", local);
+                library_path(ui, "AlphaTheta Rekordbox library", source.as_deref());
+                library_path(ui, "Active recordbox library", local);
             }
         }
         if !review.found {
@@ -199,12 +201,12 @@ pub fn show(app: &mut App, ctx: &Context) {
                 ui.label("Import reads a private snapshot of the desktop database and its write-ahead log, plus available analysis and audio metadata.");
                 ui.label("Source changes can replace local metadata, cues, grids and My Tags. Import rebuilds the managed rekordbox playlists and histories using locally accessible tracks. Keep your own playlists outside that folder.");
                 if app.prefs.auto_analysis {
-                    ui.label("Auto Analysis is enabled. Adding tracks can queue analysis in Recordbox.");
+                    ui.label("Auto Analysis is enabled. Adding tracks can queue analysis in recordbox.");
                 }
                 if matches!(review.recovery, Ok(true)) {
                     ui.colored_label(CAUTION_TX, "An interrupted write-back needs review. Choose Write back to inspect recovery before importing.");
                 }
-                import = ui.add_enabled(review.found && matches!(review.recovery, Ok(false)), btn("Import into Recordbox")).clicked();
+                import = ui.add_enabled(review.found && matches!(review.recovery, Ok(false)), btn("Import into recordbox")).clicked();
             }
             Some(Direction::WriteBack) => writeback_view(review, ui),
             None => {}
@@ -253,7 +255,7 @@ fn writeback_view(review: &mut Review, ui: &mut Ui) {
     }
     if matches!(review.recovery, Ok(true)) {
         ui.label(
-            "An interrupted write-back has a recovery record. Close desktop rekordbox and its agents before resolving it.",
+            "An interrupted write-back has a recovery record. Close AlphaTheta Rekordbox and its agents before resolving it.",
         );
         if review.confirm_recovery {
             ui.label("Recovery keeps a verified database commit or restores the previous analysis files when the database did not commit. It stops if the files no longer match the saved recovery record.");
@@ -293,7 +295,7 @@ fn writeback_view(review: &mut Review, ui: &mut Ui) {
                 if let Some(path) = review.local.as_deref().and_then(|p| writeback::backup_root(p).ok()) {
                     library_path(ui, "Create recovery backup in", Some(&path));
                 }
-                ui.label("Recordbox rechecks the selected fields and creates a verified recovery copy of the database and affected analysis files before writing. Keep desktop rekordbox and its agents closed until the operation finishes.");
+                ui.label("recordbox rechecks the selected fields and creates a verified recovery copy of the database and affected analysis files before writing. Close AlphaTheta Rekordbox and its agents. Use a local library with Cloud Library Sync turned off on every linked computer.");
                 ui.horizontal_wrapped(|ui| {
                     apply = ui
                         .add_enabled(count > 0, btn(format!("Back up and apply {}", changes(count))))
@@ -316,7 +318,7 @@ fn writeback_view(review: &mut Review, ui: &mut Ui) {
         }
         Outbound::Applied(receipt) => {
             ui.label(format!(
-                "Applied {} to the desktop rekordbox library.",
+                "Applied {} to the AlphaTheta Rekordbox library.",
                 changes(receipt.applied)
             ));
             library_path(ui, "Recovery backup", Some(&receipt.backup));
@@ -326,7 +328,7 @@ fn writeback_view(review: &mut Review, ui: &mut Ui) {
             library_path(ui, "Recovery backup", Some(backup));
         }
         Outbound::Ready => {
-            ui.label("Compare imported ratings, cues, BPM, keys and beat grids. Select the changes to apply after reviewing their current values.");
+            ui.label("Compare imported ratings, cues, BPM, keys and beat grids. Use a local library with Cloud Library Sync turned off on every linked computer.");
         }
         Outbound::Failed(_) | Outbound::Working { .. } => {}
     }
@@ -354,7 +356,7 @@ fn writeback_view(review: &mut Review, ui: &mut Ui) {
     {
         review.start(
             ui.ctx(),
-            "Comparing Recordbox edits with the desktop library…",
+            "Comparing recordbox edits with the desktop library…",
             false,
             |local, desktop| writeback::preview(local, desktop).map(ResultView::Preview),
         );
@@ -399,7 +401,7 @@ fn select_row(selected: &mut BTreeSet<usize>, links: &[Option<usize>], index: us
 fn preview_rows(ui: &mut Ui, plan: &Plan, selected: &mut BTreeSet<usize>, links: &[Option<usize>], page: &mut usize) {
     const PAGE_SIZE: usize = 20;
     if plan.tracked == 0 {
-        ui.label("No tracks have an import baseline for this desktop library. Import it into Recordbox before editing tracks for write-back.");
+        ui.label("No tracks have an import baseline for this desktop library. Import it into recordbox before editing tracks for write-back.");
     } else if plan.rows.is_empty() {
         ui.label(format!("No changes to review across {} tracked tracks.", plan.tracked));
     }
@@ -422,7 +424,13 @@ fn preview_rows(ui: &mut Ui, plan: &Plan, selected: &mut BTreeSet<usize>, links:
                 .num_columns(5)
                 .max_col_width(135.0)
                 .show(ui, |ui| {
-                    for label in ["Track and field", "At import", "In rekordbox", "From Recordbox", "Status"] {
+                    for label in [
+                        "Track and field",
+                        "At import",
+                        "In AlphaTheta Rekordbox",
+                        "From recordbox",
+                        "Status",
+                    ] {
                         ui.strong(label);
                     }
                     ui.end_row();

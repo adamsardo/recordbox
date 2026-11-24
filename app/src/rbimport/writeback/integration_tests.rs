@@ -200,7 +200,12 @@ fn published_v6_catalog_keeps_native_anlz_registrations_in_sync() -> Result<()> 
         .map(|r| r.1.as_str())
         .find(|id| {
             let group = records.iter().filter(|r| r.1 == *id).collect::<Vec<_>>();
-            group.len() == 3 && group.iter().all(|r| by_md5.contains_key(&r.3))
+            group.len() == 3
+                && group.iter().all(|r| by_md5.contains_key(&r.3))
+                && group.iter().any(|r| {
+                    r.2.ends_with(".DAT")
+                        && rbimport::read_pqtz_grid(&by_md5[&r.3]).is_some_and(|g| !g.is_empty())
+                })
         })
         .context("fixture lacks a complete registered analysis set")?
         .to_owned();

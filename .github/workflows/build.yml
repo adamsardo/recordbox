@@ -91,6 +91,32 @@ jobs:
         run: python -m unittest discover -s packaging -p 'test_*.py' -v
       - name: Application tests
         run: python packaging/run_tests.py --output reports
+      - name: Fetch public rekordbox 6 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/pyrekordbox
+          ref: 50b4604d98dfd52740aa9e76d80c3a32dfa451ba
+          path: fixtures/pyrekordbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.testdata/empty.mp3
+            /.testdata/rekordbox 6/master_locked.db
+            /.testdata/rekordbox 6/backup/share/
+      - name: Fetch public rekordbox 7 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/rbox
+          ref: 9677e21448fe3a8462111b7df099b5608efcba90
+          path: fixtures/rbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: /.testdata/RBv7/demo/rekordbox/
+      - name: Verify native write-back on disposable v6 and v7 catalogs
+        env:
+          RECORDBOX_TEST_PYREKORDBOX: ${{ github.workspace }}/fixtures/pyrekordbox
+          RECORDBOX_TEST_RBOX: ${{ github.workspace }}/fixtures/rbox
+        run: cargo test --manifest-path app/Cargo.toml --locked rbimport::writeback:: -- --ignored --test-threads=1
       - name: Formatting report (existing formatting debt is advisory)
         shell: bash
         run: |

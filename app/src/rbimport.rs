@@ -243,7 +243,7 @@ use std::collections::HashMap;
 /// One rekordbox track as Recordbox needs it, plus what is used to notice later changes.
 pub struct RbTrack {
     pub rb_id: String,
-    pub native: Option<writeback::ImportTrack>,
+    native: Option<writeback::ImportTrack>,
     /// Changes whenever rekordbox changes the track, its cues or its My Tags.
     pub fingerprint: String,
     pub xt: XmlTrack,
@@ -254,7 +254,7 @@ pub struct RbTrack {
 }
 
 pub struct RbLibrary {
-    pub source: Option<writeback::Source>,
+    source: Option<writeback::Source>,
     pub tracks: Vec<RbTrack>,
     /// Playlist tree; `track_keys` are rekordbox content IDs in playlist order.
     pub playlists: Vec<XmlNode>,
@@ -768,7 +768,7 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
     }
 
     // Optional native identity columns only affect reverse sync on older schemas.
-    let mut cue_identities = writeback::cues::identities(c).unwrap_or_default();
+    let mut cue_identities = writeback::cues::identities(c).ok();
     let mut tracks = vec![];
     let mut not_local = 0;
     for r in rows(c, "SELECT * FROM djmdContent WHERE rb_local_deleted = 0")? {
@@ -822,7 +822,9 @@ pub fn read_library(c: &rusqlite::Connection, share_dir: &Path) -> Result<RbLibr
         let anlz = g("AnalysisDataPath");
         let grid_bytes = (!anlz.is_empty()).then(|| std::fs::read(share_dir.join(anlz.trim_start_matches('/'))).ok()).flatten();
         let grid = grid_bytes.as_deref().and_then(parse_pqtz_grid);
-        let native = writeback::ImportTrack::from_row(&r, cue_identities.remove(&rb_id), &anlz, grid_bytes.as_deref().filter(|_| grid.is_some()));
+        let cue_identity = cue_identities.as_mut().map(|ids| ids.remove(&rb_id)
+            .unwrap_or_else(writeback::empty_cue_identity));
+        let native = writeback::ImportTrack::from_row(&r, cue_identity, &anlz, grid_bytes.as_deref().filter(|_| grid.is_some()));
         let anlz_base = (!anlz.is_empty()).then(|| share_dir.join(anlz.trim_start_matches('/')).with_extension("")).filter(|p| p.with_extension("DAT").is_file());
         let tags = song_tags.remove(&rb_id).unwrap_or_default();
         let mut tag_names: Vec<String> = tags.iter().map(|(c, t)| format!("{c}/{t}")).collect();
