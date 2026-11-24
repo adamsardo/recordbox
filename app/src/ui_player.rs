@@ -1394,15 +1394,15 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     } else if app.stem.loading.is_some() {
         "Loading stems…".to_owned()
     } else if retry_cpu {
-        "Radeon separation failed · Click to copy details".to_owned()
+        "GPU separation failed · Click to copy details".to_owned()
     } else if error.is_some() {
         "STEMS failed · Click to copy details".to_owned()
     } else if have {
         String::new()
     } else if !loaded {
         "Load a track to separate it into parts.".to_owned()
-    } else if crate::stems::radeon_hold().is_some() {
-        format!("DirectML paused · {model} is available on CPU.")
+    } else if crate::stems::backend_hold().is_some() {
+        format!("GPU separation paused · {model} is available on CPU.")
     } else {
         format!("Not separated yet. Model: {model}.")
     };
@@ -1416,7 +1416,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             ui.ctx().copy_text(error.detail.clone());
             app.toast("Copied STEMS error details.");
         }
-    } else if let Some(reason) = crate::stems::radeon_hold() {
+    } else if let Some(reason) = crate::stems::backend_hold() {
         ui.interact(status_rect, ui.id().with("stem_driver_status"), Sense::hover()).on_hover_text(reason);
     } else if let Some(m) = model_info {
         ui.interact(status_rect, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
@@ -1427,7 +1427,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
     } else if !have && loaded && app.stem.loading != app.deck.track {
         let (label, help) = if retry_cpu { ("RETRY CPU", "Retry this track on the CPU with the same model") }
-            else if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu { ("SEPARATE ON CPU", "Separate this track on the CPU while DirectML is paused") }
+            else if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu { ("SEPARATE ON CPU", "Separate this track on the CPU while GPU separation is paused") }
             else { ("SEPARATE", "Split this track into vocal, instrument, bass and drum parts") };
         if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", label), app, help).clicked() {
             app.separate_loaded();

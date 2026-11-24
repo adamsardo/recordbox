@@ -1945,7 +1945,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         if let Some((d, t)) = app.stem.downloading {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
-        let automatic_available = crate::stems::radeon_hold().is_none();
+        let automatic_available = !crate::app::MANUAL_STEMS_PREVIEW && crate::stems::backend_hold().is_none();
         ui.add_enabled_ui(automatic_available, |ui| {
             toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
             ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
@@ -1954,6 +1954,8 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         });
         if automatic_available {
             note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately.");
+        } else if crate::app::MANUAL_STEMS_PREVIEW && crate::stems::backend_hold().is_none() {
+            note(ui, "In the Vulkan preview, load a track and choose Separate to start a job. Cached parts load automatically.");
         } else {
             note(ui, "Automatic separation is paused. Cached parts still load. You can separate one loaded track on the CPU.");
         }

@@ -307,8 +307,12 @@ def build_archive(binary: Path, source_root: Path, output: Path, platform: str, 
     manifest_path = source_root / "app/Cargo.toml"
     version = read_release_version(source_root)
     candidates = library_candidates(runtime_files or [], runtime_dirs or [], platform)
-    if vulkan and (platform != "linux" or architecture != "x86_64" or cuda12 or directml is not None):
-        raise PackageError("The Vulkan preview requires a separate Linux x86_64 build")
+    if vulkan:
+        if platform != "linux" or architecture != "x86_64" or cuda12 or directml is not None:
+            raise PackageError("The Vulkan preview requires a separate Linux x86_64 build")
+        shader = (source_root / "app/src/stems/vulkan/linear.wgsl").read_bytes()
+        if not shader or shader not in binary.read_bytes():
+            raise PackageError("The Vulkan build must contain the HTDemucs projection shader from this checkout")
     if cuda12 and (platform not in cuda_platforms(version) or architecture != "x86_64"):
         raise PackageError("Unsupported CUDA package target")
     dynamic = {}

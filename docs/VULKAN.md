@@ -26,6 +26,8 @@ Use a short, non-silent audio clip for the first run.
 
 The comparison bypasses the stem cache and runs the same speed-model checkpoint twice, first with Vulkan and CPU together, then with CPU alone. It prints separation times and relative RMS differences for drums, bass, other and vocals. Each stem must be within 3% of its CPU reference. The times exclude model loading. Compare elapsed time on your own machine before choosing the preview for longer tracks.
 
+Each GPU submission covers a bounded strip of a matrix. Recordbox waits for its completion before submitting another. Individual projection buffers are capped at 32 MiB. The Vulkan waits have deadlines, but an application cannot guarantee recovery if the graphics driver hangs inside a system call.
+
 After a Vulkan timeout or device loss, GPU work pauses for the rest of the session. **Retry CPU** repeats the failed track with its original model. To start directly on the CPU, launch `./recordbox --stems-cpu`. The comparison requires a working GPU backend.
 
 ## Build the preview

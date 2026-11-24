@@ -170,9 +170,12 @@ impl Col {
     }
 }
 
+/// The experimental hybrid backend is exercised by an explicit separation request.
+pub(crate) const MANUAL_STEMS_PREVIEW: bool = cfg!(all(target_os = "linux", feature = "vulkan"));
+
 impl Prefs {
     pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
-        self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::radeon_hold().is_none()
+        !MANUAL_STEMS_PREVIEW && self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::backend_hold().is_none()
     }
 }
 
@@ -557,6 +560,16 @@ mod prefs_tests {
         assert!(state.error_for(Some(8)).is_some());
     }
 
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    #[test]
+    fn vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model() {
+        let failure = anyhow::Error::new(crate::stems::VulkanFailure("Vulkan dispatch timed out".into()))
+            .context("Separation segment 1 of 2");
+        let error = super::StemError::separation(Some("htdemucs"), failure);
+        assert_eq!(error.retry_model, Some("htdemucs"));
+        assert!(error.detail.contains("Vulkan dispatch timed out"));
+    }
+
     #[test]
     fn manual_cpu_progress_identifies_startup_before_any_segment_finishes() {
         let mut state = super::StemState::new();
@@ -583,9 +596,9 @@ mod prefs_tests {
     fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
         let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
         assert!(!p.auto_stems_on_load(false));
-        assert!(p.auto_stems_on_load(true));
+        assert_eq!(p.auto_stems_on_load(true), !super::MANUAL_STEMS_PREVIEW);
         p.stems_auto_cpu = true;
-        assert!(p.auto_stems_on_load(false));
+        assert_eq!(p.auto_stems_on_load(false), !super::MANUAL_STEMS_PREVIEW);
         p.stems_auto_separate = false;
         assert!(!p.auto_stems_on_load(false));
         assert!(!p.auto_stems_on_load(true));
@@ -974,7 +987,10 @@ pub struct StemError {
 
 impl StemError {
     fn separation(model: Option<&'static str>, error: anyhow::Error) -> Self {
-        Self { retry_model: model.filter(|_| error.is::<crate::stems::DirectMlFailure>()),
+        let provider_failure = error.is::<crate::stems::DirectMlFailure>();
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let provider_failure = provider_failure || error.is::<crate::stems::VulkanFailure>();
+        Self { retry_model: model.filter(|_| provider_failure),
             detail: format!("Stem separation failed: {error:#}") }
     }
 }
@@ -1017,8 +1033,8 @@ impl StemState {
         self.errors.get(&track).or_else(|| self.errors.get(&None))
     }
 
-    fn manual_device(&self, track: Option<i64>, radeon_paused: bool) -> crate::stems::SeparationDevice {
-        if radeon_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
+    fn manual_device(&self, track: Option<i64>, gpu_paused: bool) -> crate::stems::SeparationDevice {
+        if gpu_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
             crate::stems::SeparationDevice::Cpu
         } else {
             crate::stems::SeparationDevice::Selected
@@ -1032,11 +1048,17 @@ impl StemState {
     pub fn separation_status(&self) -> Option<String> {
         let (_, progress) = self.separating?;
         let model = self.status_model()?.name;
-        let cpu = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() { " on CPU" } else { "" };
-        Some(if progress == 0.0 {
-            format!("Starting {model}{cpu} · waiting for the first segment")
+        let backend = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() {
+            " on CPU"
+        } else if MANUAL_STEMS_PREVIEW {
+            " with Vulkan + CPU"
         } else {
-            format!("Separating with {model}{cpu}: {:.0}%", progress * 100.0)
+            ""
+        };
+        Some(if progress == 0.0 {
+            format!("Starting {model}{backend} · waiting for the first segment")
+        } else {
+            format!("Separating with {model}{backend}: {:.0}%", progress * 100.0)
         })
     }
 
@@ -2459,7 +2481,7 @@ impl App {
 /// Vocal detection for the loaded track when neither rekordbox nor an earlier run has it:
     /// the vocal stem of an already-downloaded separation model, in the background.
     fn start_deck_vocal(&mut self, a: Arc<Decoded>) {
-        if !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
+        if MANUAL_STEMS_PREVIEW || !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
             return;
         }
         // Only with a downloaded model and a GPU (about a minute per track there; much slower on
@@ -2488,7 +2510,7 @@ impl App {
     /// mix without its drums (the drums stem subtracted), which agrees with rekordbox more
     /// often; otherwise with the ordinary analysis.
     pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
-        let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.gpu_available();
+        let stems_ok = !MANUAL_STEMS_PREVIEW && crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.gpu_available();
         // Locked tracks keep their key (Analysis Lock).
         let ids: Vec<i64> = ids.iter().copied().filter(|id| self.track(*id).map(|t| !(t.grid_locked && t.analyzed == 1)).unwrap_or(false)).collect();
         let ids = &ids[..];
@@ -2513,7 +2535,7 @@ impl App {
                     if !crate::stems::gpu_active() { return Some(crate::key::detect_key(&mono, 44100.0)); }
                     let drums = match crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true) {
                         Ok(drums) => drums,
-                        Err(_) if crate::stems::radeon_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
+                        Err(_) if crate::stems::backend_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
                         Err(_) => return None,
                     };
                     let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
@@ -2803,7 +2825,7 @@ impl App {
 
     fn resume_pending_stems(&mut self) {
         if let Some((id, execution)) = self.stem.pending.take() {
-            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::radeon_hold().is_some() { return; }
+            if execution != crate::stems::SeparationDevice::Cpu && crate::stems::backend_hold().is_some() { return; }
             if let Some(deck) = (0..4).find(|&n| self.deck_of(n).track == Some(id)) {
                 self.with_deck(deck, |app| app.separate_loaded_on(execution));
             }
@@ -2830,7 +2852,7 @@ impl App {
     }
 
     pub fn manual_stem_device(&self) -> crate::stems::SeparationDevice {
-        self.stem.manual_device(self.deck.track, crate::stems::radeon_hold().is_some())
+        self.stem.manual_device(self.deck.track, crate::stems::backend_hold().is_some())
     }
 
     /// Separate the loaded track (downloading the model first if it is missing).

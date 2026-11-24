@@ -4,29 +4,55 @@ use std::sync::OnceLock;
 struct Backend {
     #[cfg(all(windows, feature = "directml"))]
     directml: Option<super::directml::Binding>,
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    vulkan: Option<super::vulkan::Engine>,
     device: Device,
     label: String,
 }
 
 impl Backend {
     fn cpu(reason: &str) -> Self {
-        Self { #[cfg(all(windows, feature = "directml"))] directml: None, device: Device::Cpu, label: format!("CPU · {reason}") }
+        Self {
+            #[cfg(all(windows, feature = "directml"))]
+            directml: None,
+            #[cfg(all(target_os = "linux", feature = "vulkan"))]
+            vulkan: None,
+            device: Device::Cpu,
+            label: format!("CPU · {reason}"),
+        }
     }
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-// A removed D3D device cannot be used again. Keep the first reason so that queued
-// workers and the UI agree, even after the model that observed it is dropped.
-static RADEON_HOLD: OnceLock<String> = OnceLock::new();
+// Device callbacks can run while BACKEND is initializing. They only touch this
+// separate lock, so queued jobs and the UI retain the first failure.
+static BACKEND_HOLD: OnceLock<String> = OnceLock::new();
+
+pub fn backend_hold() -> Option<&'static str> {
+    BACKEND_HOLD.get().map(String::as_str)
+}
 
 pub fn radeon_hold() -> Option<&'static str> {
-    RADEON_HOLD.get().map(String::as_str)
+    #[cfg(all(windows, feature = "directml"))]
+    { backend_hold() }
+    #[cfg(not(all(windows, feature = "directml")))]
+    { None }
 }
 
 #[cfg(all(windows, feature = "directml"))]
 pub(super) fn hold_radeon(reason: String) {
-    let _ = RADEON_HOLD.set(reason);
+    let _ = BACKEND_HOLD.set(reason);
+}
+
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+pub(super) fn hold_vulkan(reason: String) {
+    BACKEND_HOLD.get_or_init(|| format!("Vulkan paused for this session · {reason}"));
+}
+
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+pub(super) fn vulkan_hold() -> Option<&'static str> {
+    backend_hold()
 }
 
 pub fn force_cpu() {
@@ -34,12 +60,21 @@ pub fn force_cpu() {
 }
 
 pub fn device() -> Device {
+    if backend_hold().is_some() { return Device::Cpu; }
     BACKEND.get_or_init(select).device.clone()
 }
 
 #[cfg(all(windows, feature = "directml"))]
 pub(super) fn directml_device() -> Option<&'static super::directml::Binding> {
+    if backend_hold().is_some() { return None; }
     BACKEND.get_or_init(select).directml.as_ref()
+}
+
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+pub(super) fn vulkan_device() -> Option<&'static super::vulkan::Engine> {
+    if backend_hold().is_some() { return None; }
+    let active = BACKEND.get_or_init(select);
+    if backend_hold().is_some() { None } else { active.vulkan.as_ref() }
 }
 
 pub fn uses_directml() -> bool {
@@ -57,7 +92,10 @@ pub(super) fn gpu_uses_shared_memory() -> bool {
 }
 
 pub fn gpu_active() -> bool {
-    uses_directml() || !device().is_cpu()
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    { vulkan_device().is_some() }
+    #[cfg(not(all(target_os = "linux", feature = "vulkan")))]
+    { uses_directml() || !device().is_cpu() }
 }
 
 #[cfg(all(windows, feature = "directml"))]
@@ -69,7 +107,32 @@ fn select() -> Backend {
     }
 }
 
-/// Status for startup and Preferences. Radeon inference is opened by a real job or --stems-device.
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+fn select() -> Backend {
+    match super::vulkan::Engine::new() {
+        Ok(engine) => Backend {
+            device: Device::Cpu,
+            label: format!("Experimental Vulkan + CPU · {} · Vulkan transformer linear layers", engine.label()),
+            vulkan: Some(engine),
+        },
+        Err(error) => Backend::cpu(&format!("Vulkan initialization failed: {error:#}")),
+    }
+}
+
+/// Enumerate physical adapters without creating a device or compiling a shader.
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+pub(super) fn vulkan_detection() -> (bool, &'static str) {
+    static DETECTED: OnceLock<(bool, String)> = OnceLock::new();
+    let (available, label) = DETECTED.get_or_init(|| match super::vulkan::adapter_names() {
+        Ok(names) if names.is_empty() => (false, "CPU · no physical Vulkan compute adapter detected".into()),
+        Ok(names) => (true, format!("Experimental Vulkan + CPU · {} · device checked on first use", names.join(", "))),
+        Err(error) => (false, format!("CPU · Vulkan adapter detection failed: {error:#}")),
+    });
+    (*available, label)
+}
+
+/// Startup and Preferences enumerate DirectML and Vulkan adapters. The first job or
+/// --stems-device performs the compute check.
 pub fn status() -> (bool, &'static str) {
     #[cfg(all(windows, feature = "directml"))]
     {
@@ -84,13 +147,22 @@ pub fn status() -> (bool, &'static str) {
         });
         radeon_hold().map_or((*available, label.as_str()), |reason| (false, reason))
     }
-    #[cfg(not(all(windows, feature = "directml")))]
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    {
+        if let Some(reason) = backend_hold() { return (false, reason); }
+        match BACKEND.get() {
+            Some(active) => (active.vulkan.is_some(), &active.label),
+            None => vulkan_detection(),
+        }
+    }
+    #[cfg(not(any(all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan"))))]
     { (gpu_active(), backend_label()) }
 }
 
 pub fn backend_label() -> &'static str {
+    if let Some(reason) = backend_hold() { return reason; }
     let selected = BACKEND.get_or_init(select);
-    radeon_hold().unwrap_or(&selected.label)
+    backend_hold().unwrap_or(&selected.label)
 }
 
 #[cfg(target_os = "macos")]
@@ -101,12 +173,12 @@ fn select() -> Backend {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), not(feature = "cuda12"), not(all(windows, feature = "directml"))))]
+#[cfg(not(any(target_os = "macos", feature = "cuda12", all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan"))))]
 fn select() -> Backend {
     Backend::cpu("standard build")
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "cuda12", not(all(windows, feature = "directml"))))]
+#[cfg(all(feature = "cuda12", not(any(target_os = "macos", all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan")))))]
 fn select() -> Backend {
     use candle_core::cuda_backend::cudarc::driver::CudaContext;
     let count = match CudaContext::device_count() {
@@ -124,7 +196,7 @@ fn select() -> Backend {
     Backend::cpu(&format!("CUDA 12 · {}", reasons.join(", ")))
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "cuda12", not(all(windows, feature = "directml"))))]
+#[cfg(all(feature = "cuda12", not(any(target_os = "macos", all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan")))))]
 fn cuda_device(ordinal: usize) -> anyhow::Result<Backend> {
     use candle_core::Tensor;
     // One explicit stream can be used by both the assessment and separation threads.
@@ -218,5 +290,56 @@ mod tests {
         let cpu = stems::graph(file, SeparationDevice::Cpu)?;
         assert!(Arc::ptr_eq(&cpu, &stems::graph(file, SeparationDevice::Cpu)?));
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "vulkan"))]
+mod vulkan_tests {
+    #[test]
+    #[ignore = "run in a fresh process before any compute backend is selected"]
+    fn passive_vulkan_detection_and_cpu_override() {
+        assert!(super::BACKEND.get().is_none());
+        assert!(crate::stems::status_report().contains("Linux Vulkan"));
+        assert!(!super::status().1.is_empty());
+        assert!(super::BACKEND.get().is_none());
+        super::force_cpu();
+        assert!(super::vulkan_device().is_none());
+        assert!(!super::status().0);
+        assert_eq!(super::backend_label(), "CPU · selected for this session");
+        assert!(crate::stems::SeparationDevice::GpuOnly.device().is_err());
+    }
+
+    #[test]
+    #[ignore = "run in a fresh process to simulate a driver loss"]
+    fn vulkan_loss_stops_gpu_requests_and_keeps_explicit_cpu_available() {
+        super::hold_vulkan("GPU work timed out".into());
+        super::hold_vulkan("second error".into());
+        assert!(super::backend_label().contains("timed out"));
+        assert_eq!(super::status(), (false, super::backend_label()));
+        assert!(!super::gpu_active());
+        assert!(super::vulkan_device().is_none());
+        for mode in [crate::stems::SeparationDevice::GpuOnly, crate::stems::SeparationDevice::Selected] {
+            let error = mode.device().unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+            assert!(error.is::<crate::stems::VulkanFailure>());
+        }
+        assert!(crate::stems::SeparationDevice::Cpu.device().unwrap().is_cpu());
+        assert!(super::BACKEND.get().is_none(), "a request reopened the GPU after device loss");
+    }
+
+    #[test]
+    #[ignore = "requires a fresh process, a Vulkan ICD, the HTDemucs checkpoint and RECORDBOX_TEST_AUDIO"]
+    fn compare_vulkan_checkpoint_with_cpu() -> anyhow::Result<()> {
+        // A software ICD may run the same Vulkan shader in CI. The released
+        // application selects physical GPUs only.
+        let path = std::env::var("RECORDBOX_TEST_AUDIO")?;
+        let engine = crate::stems::vulkan::Engine::new_for_test()?;
+        let label = format!("Vulkan test adapter · {}", engine.label());
+        assert!(super::BACKEND.set(super::Backend {
+            device: candle_core::Device::Cpu,
+            label,
+            vulkan: Some(engine),
+        }).is_ok());
+        crate::stems::compare_track(&path)
     }
 }

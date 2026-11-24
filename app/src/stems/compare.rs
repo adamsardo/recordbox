@@ -35,9 +35,25 @@ pub fn compare_track(path: &str) -> Result<()> {
         ensure!(parts.len() == 8 * frames, "Incomplete {label} output");
         Ok((parts, elapsed))
     };
-    let (gpu, gpu_time) = run(htdemucs::Graph::load_selected(&checkpoint)?, &accelerator, "GPU")?;
+    let selected = htdemucs::Graph::load_selected(&checkpoint)?;
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    let (engine, before) = {
+        let engine = super::backend::vulkan_device().context("Vulkan is unavailable for this comparison")?;
+        (engine, engine.completed_matmuls())
+    };
+    let label = if cfg!(all(target_os = "linux", feature = "vulkan")) { "Vulkan + CPU" } else { "GPU" };
+    let (gpu, gpu_time) = run(selected, &accelerator, label)?;
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    let completed = {
+        let completed = engine.completed_matmuls();
+        ensure!(completed > before, "No Vulkan multiplication completed during HTDemucs inference");
+        println!("Completed {} Vulkan matrix multiplications in the transformer linear layers. Timing includes CPU work and transfers.", completed - before);
+        completed
+    };
     let (cpu, cpu_time) = run(htdemucs::Graph::load(&checkpoint, &Device::Cpu)?, &Device::Cpu, "CPU")?;
-    println!("CPU time / GPU time: {:.2}×", cpu_time / gpu_time);
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    ensure!(engine.completed_matmuls() == completed, "Vulkan was used by the CPU reference");
+    println!("CPU time / {label} time: {:.2}×", cpu_time / gpu_time);
     let mut agree = true;
     for ((name, reference), result) in htdemucs::SOURCES.iter().zip(cpu.chunks_exact(2 * frames)).zip(gpu.chunks_exact(2 * frames)) {
         let error = relative_error(reference, result).with_context(|| format!("{name} comparison"))?;

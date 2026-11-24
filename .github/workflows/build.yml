@@ -462,7 +462,8 @@ jobs:
           for test_name in stems::vulkan::tests::projection_limits_bound_every_submission_and_buffer \
                            stems::vulkan::tests::software_vulkan_linear_matches_reference \
                            stems::htdemucs::vulkan_transformer_projections_match_cpu \
-                           stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override; do
+                           stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override \
+                           stems::backend::vulkan_tests::vulkan_loss_stops_gpu_requests_and_keeps_explicit_cpu_available; do
             cargo test "${cargo_args[@]}" "$test_name" -- --exact --include-ignored | tee "$RUNNER_TEMP/vulkan-test.log"
             grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/vulkan-test.log"
           done
@@ -477,7 +478,9 @@ jobs:
           mkdir "$dest"
           tar -xzf "${archive[0]}" -C "$dest"
           launcher=("$dest"/*/recordbox)
-          "${launcher[0]}" --stems-status | grep -F 'Linux Vulkan'
+          "${launcher[0]}" --stems-status | tee "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'Linux Vulkan' "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'no physical Vulkan compute adapter detected' "$RUNNER_TEMP/vulkan-status.log"
           "${launcher[0]}" --stems-device | grep -F 'STEMS backend: CPU ·'
           "${launcher[0]}" --stems-cpu --stems-device | grep -F 'CPU · selected for this session'
       - name: Upload the Linux Vulkan preview

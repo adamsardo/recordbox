@@ -143,6 +143,12 @@ class Archives(unittest.TestCase):
         (self.source / "docs").mkdir()
         guide = self.source / "docs/VULKAN.md"
         guide.write_text("Vulkan preview fixture\n")
+        shader = self.source / "app/src/stems/vulkan/linear.wgsl"
+        shader.parent.mkdir(parents=True)
+        shader.write_bytes(b"@compute fn fixture_projection() {}")
+        with self.assertRaisesRegex(package.PackageError, "must contain the HTDemucs projection shader"):
+            self.build("linux", "x86_64", vulkan=True)
+        self.binary.write_bytes(self.binary.read_bytes() + shader.read_bytes())
         result = self.build("linux", "x86_64", vulkan=True)
         archive_name = Path(result["archive"]).name
         self.assertEqual(archive_name, "Recordbox-0.1.0-linux-x86_64-vulkan.tar.gz")
