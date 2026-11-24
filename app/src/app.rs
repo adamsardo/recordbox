@@ -2747,7 +2747,7 @@ impl App {
                     }
                     // Preferences > DJ System > Others: Hot Cue Auto Load for imported tracks.
                     t.autoload_hotcue = self.prefs.hot_cue_auto_load_on_import;
-                    if let Ok(id) = self.db.insert_track(&t) {
+                    if let Ok(id) = self.db.insert_local_file(&t) {
                         added.push(id);
                         self.import_count += 1;
                     }
@@ -3206,6 +3206,7 @@ impl App {
             if !xt.cues.is_empty() {
                 note(self.db.replace_cues(id, &xt.cues));
             }
+            note(self.db.protect_imported_track(id));
             // What the imported TEMPO/POSITION_MARK elements became, to tell later whether they
             // were edited.
             let mut extra = xt.extra.clone();

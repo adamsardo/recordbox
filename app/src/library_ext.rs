@@ -304,6 +304,7 @@ pub struct LibExt {
     pub tag_list: Vec<i64>,
     pub tag_set: HashSet<i64>,
     pub matches: HashMap<i64, Vec<i64>>,
+    pub cleanup: Option<crate::collection_cleanup::ui::Review>,
     pub missing_open: bool,
     pub missing_sel: HashSet<i64>,
     /// Folder of a file just relocated by hand: offer to look there for the other missing files.
@@ -359,6 +360,7 @@ impl Default for LibExt {
             tag_list: vec![],
             tag_set: HashSet::new(),
             matches: HashMap::new(),
+            cleanup: None,
             missing_open: false,
             missing_sel: HashSet::new(),
             reloc_offer: None,
