@@ -191,6 +191,11 @@ impl Review {
             .collect();
     }
 
+    fn toggle_volume(&mut self, i: usize) {
+        self.volume = (self.volume != Some(i)).then_some(i);
+        self.refilter();
+    }
+
     fn browse(&mut self, ui: &mut Ui) {
         let report = Arc::clone(self.report.as_ref().expect("completed scan"));
         if !report.can_apply {
@@ -206,46 +211,51 @@ impl Review {
             report.rows.len(),
             self.os_summary
         ));
-        egui::ScrollArea::vertical()
-            .id_salt("cleanup_drives")
-            .max_height(108.0)
-            .show(ui, |ui| {
-                egui::Grid::new("cleanup_counts")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for label in [
-                            "Path origin",
-                            "Drive / volume",
-                            "Total",
-                            "Present",
-                            "Missing¹",
-                            "Protected",
-                            "Eligible",
-                        ] {
-                            ui.strong(label);
+        if ui.available_width() < 525.0 {
+            for (i, v) in report.volumes.iter().enumerate() {
+                if ui
+                    .selectable_label(self.volume == Some(i), format!("{} · {}", v.os, v.volume))
+                    .clicked()
+                {
+                    self.toggle_volume(i);
+                }
+                ui.small(format!(
+                    "Total {} · Present {} · Missing¹ {} · Protected {} · Eligible {}",
+                    v.total, v.present, v.missing, v.protected, v.candidates
+                ));
+            }
+        } else {
+            egui::Grid::new("cleanup_counts")
+                .striped(true)
+                .show(ui, |ui| {
+                    for label in [
+                        "Path origin",
+                        "Drive / volume",
+                        "Total",
+                        "Present",
+                        "Missing¹",
+                        "Protected",
+                        "Eligible",
+                    ] {
+                        ui.strong(label);
+                    }
+                    ui.end_row();
+                    for (i, v) in report.volumes.iter().enumerate() {
+                        ui.label(v.os);
+                        if ui
+                            .selectable_label(self.volume == Some(i), &v.volume)
+                            .on_hover_text("Filter tracks to this volume")
+                            .clicked()
+                        {
+                            self.toggle_volume(i);
+                        }
+                        for n in [v.total, v.present, v.missing, v.protected, v.candidates] {
+                            ui.label(n.to_string());
                         }
                         ui.end_row();
-                        for (i, v) in report.volumes.iter().enumerate() {
-                            ui.label(v.os);
-                            if ui
-                                .selectable_label(self.volume == Some(i), &v.volume)
-                                .on_hover_text("Filter tracks to this volume")
-                                .clicked()
-                            {
-                                self.volume = if self.volume == Some(i) {
-                                    None
-                                } else {
-                                    Some(i)
-                                };
-                                self.refilter();
-                            }
-                            for n in [v.total, v.present, v.missing, v.protected, v.candidates] {
-                                ui.label(n.to_string());
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
+                    }
+                });
+        }
         ui.small("¹ Missing means a file was absent under a verified local parent. Unavailable drives and remote paths stay protected.");
         ui.horizontal_wrapped(|ui| {
             for (status, count) in &report.statuses {
@@ -273,47 +283,62 @@ impl Review {
             }
         });
 
-        let height = (ui.ctx().screen_rect().height() * 0.27).clamp(68.0, 255.0);
-        egui::ScrollArea::vertical()
-            .id_salt("cleanup_tracks")
-            .max_height(height)
-            .show_rows(ui, 37.0, self.visible.len(), |ui, range| {
-                for &i in &self.visible[range] {
-                    let row = &report.rows[i];
-                    let mut on = self.selected.contains(&i);
-                    ui.push_id(row.id, |ui| {
-                        ui.horizontal(|ui| {
-                            let enabled = report.can_apply
-                                && row.candidate.is_some()
-                                && (on || self.selected.len() < store::MAX_SELECTION);
-                            if ui.add_enabled(enabled, kit::Check(&mut on)).changed() {
-                                if on {
-                                    self.selected.insert(i);
-                                } else {
-                                    self.selected.remove(&i);
-                                }
+        // Reserve the list in the dialog's one scroll area, painting only visible rows.
+        // The drive table and records then move together on narrow or short screens.
+        let step = 37.0 + ui.spacing().item_spacing.y;
+        let size = egui::vec2(ui.available_width(), step * self.visible.len() as f32);
+        let (_, list) = ui.allocate_space(size);
+        let clip = ui.clip_rect().intersect(list);
+        if !clip.is_positive() {
+            return;
+        }
+        let first = (((clip.top() - list.top()) / step).floor() as usize).min(self.visible.len());
+        let end = (((clip.bottom() - list.top()) / step).ceil() as usize).min(self.visible.len());
+        for (offset, &i) in self.visible[first..end].iter().enumerate() {
+            let row_top = list.top() + (first + offset) as f32 * step;
+            let row_rect = egui::Rect::from_min_size(
+                egui::pos2(list.left(), row_top),
+                egui::vec2(list.width(), step),
+            );
+            let row = &report.rows[i];
+            let mut on = self.selected.contains(&i);
+            ui.scope_builder(
+                egui::UiBuilder::new().id_salt(row.id).max_rect(row_rect),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let enabled = report.can_apply
+                            && row.candidate.is_some()
+                            && (on || self.selected.len() < store::MAX_SELECTION);
+                        if ui.add_enabled(enabled, kit::Check(&mut on)).changed() {
+                            if on {
+                                self.selected.insert(i);
+                            } else {
+                                self.selected.remove(&i);
                             }
-                            ui.vertical(|ui| {
-                                ui.add(
-                                    egui::Label::new(format!(
-                                        "{} · {} · #{}",
-                                        row.title,
-                                        reason(row),
-                                        row.id
-                                    ))
-                                    .truncate(),
-                                );
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(&row.path).small())
-                                        .truncate(),
-                                )
-                                .on_hover_text(&row.path);
-                            });
-                        })
-                    });
-                }
-            });
+                        }
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(format!(
+                                    "{} · {} · #{}",
+                                    row.title,
+                                    reason(row),
+                                    row.id
+                                ))
+                                .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&row.path).small()).truncate(),
+                            )
+                            .on_hover_text(&row.path);
+                        });
+                    })
+                },
+            );
+        }
+    }
 
+    fn browse_actions(&mut self, ui: &mut Ui) {
+        let report = Arc::clone(self.report.as_ref().expect("completed scan"));
         ui.separator();
         if report.can_apply {
             if ui.checkbox(&mut self.compare, "My Music folder stays offline-accessible and outside cloud sync. Allow byte comparison (up to 8 GiB).").changed() && !self.compare && report.compare_bytes {
@@ -369,31 +394,7 @@ impl Review {
             })
             .count();
         ui.label(format!("Selected · {} verified missing · {duplicates} exact duplicates. {} of {} references will remain.", count - duplicates, report.rows.len() - count, report.rows.len()));
-        egui::ScrollArea::vertical()
-            .id_salt("cleanup_chosen")
-            .max_height(125.0)
-            .show(ui, |ui| {
-                for &i in &self.selected {
-                    let row = &report.rows[i];
-                    ui.label(format!("#{} · {} · {}", row.id, row.title, reason(row)));
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&row.path).small())
-                            .selectable(true)
-                            .wrap(),
-                    );
-                    if let Some(Candidate::Duplicate { keeper }) = row.candidate {
-                        let retained = &report.rows[self.keepers[&keeper]];
-                        ui.add(
-                            egui::Label::new(format!(
-                                "Keep #{} · {} · {}",
-                                retained.id, retained.title, retained.path
-                            ))
-                            .selectable(true)
-                            .wrap(),
-                        );
-                    }
-                }
-            });
+        chosen_paths(ui, &report, &self.selected, &self.keepers);
         ui.label("Recordbox rechecks the selected references and verifies a recovery backup before moving them. Music files, USB exports and the AlphaTheta library stay in place.");
         if let Some(parent) = self.library.parent() {
             ui.label(format!(
@@ -440,6 +441,35 @@ impl Review {
     }
 }
 
+/// Paint the entire reviewed batch in the enclosing confirmation scroll area.
+pub(super) fn chosen_paths(
+    ui: &mut Ui,
+    report: &Report,
+    selected: &BTreeSet<usize>,
+    keepers: &BTreeMap<i64, usize>,
+) {
+    for &i in selected {
+        let row = &report.rows[i];
+        ui.label(format!("#{} · {} · {}", row.id, row.title, reason(row)));
+        ui.add(
+            egui::Label::new(egui::RichText::new(&row.path).small())
+                .selectable(true)
+                .wrap(),
+        );
+        if let Some(Candidate::Duplicate { keeper }) = row.candidate {
+            let retained = &report.rows[keepers[&keeper]];
+            ui.add(
+                egui::Label::new(format!(
+                    "Keep #{} · {} · {}",
+                    retained.id, retained.title, retained.path
+                ))
+                .selectable(true)
+                .wrap(),
+            );
+        }
+    }
+}
+
 fn reason(row: &Row) -> String {
     match &row.candidate {
         Some(Candidate::Duplicate { keeper }) => format!("{} · keep #{keeper}", row.explanation()),
@@ -483,7 +513,13 @@ pub fn show(app: &mut App, ctx: &Context) {
         kit::apply_style(ui);
         ui.set_width((ctx.screen_rect().width() - 50.0).clamp(250.0, 740.0));
         ui.heading("Review collection cleanup");
-        egui::ScrollArea::vertical().id_salt("cleanup_body").max_height((ctx.screen_rect().height() - 125.0).max(90.0)).show(ui, |ui| {
+        let browsing = matches!(review.phase, Phase::Browse);
+        let confirming = matches!(review.phase, Phase::Confirm);
+        let footer = if browsing && review.report.as_ref().is_some_and(|r| r.can_apply) { 235.0 } else { 145.0 };
+        let body_height = (ctx.screen_rect().height() - footer).clamp(60.0, 650.0);
+        // Give the area its final viewport immediately when the asynchronous scan returns.
+        let min_height = if browsing || confirming { body_height } else { 60.0 };
+        egui::ScrollArea::vertical().id_salt(("cleanup_body", confirming)).max_height(body_height).min_scrolled_height(min_height).show(ui, |ui| {
             ui.label(format!("Active recordbox library · {}", review.library.display()));
             match &review.phase {
                 Phase::Start => {}
@@ -507,6 +543,9 @@ pub fn show(app: &mut App, ctx: &Context) {
                 }
             }
         });
+        if matches!(review.phase, Phase::Browse) {
+            review.browse_actions(ui);
+        }
         ui.add_enabled(!matches!(review.phase, Phase::Working { .. }), btn("Close")).clicked()
     });
     if !response.inner || applying {

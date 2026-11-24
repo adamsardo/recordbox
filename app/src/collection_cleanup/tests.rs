@@ -1,5 +1,6 @@
 use super::*;
 use std::time::UNIX_EPOCH;
+mod native_roundtrip;
 
 fn row(id: i64, status: PathStatus, volume: &str) -> Row {
     let present = status == PathStatus::Present;
@@ -37,6 +38,69 @@ fn report(rows: Vec<Row>, compare_bytes: bool, can_apply: bool) -> Report {
         hashed_files: 0,
         unverified_files: 0,
     }
+}
+
+#[test]
+fn final_review_scrolls_to_the_last_of_25_full_candidate_and_keeper_paths() {
+    use eframe::egui;
+
+    let mut rows = Vec::new();
+    let mut selected = BTreeSet::new();
+    let mut keepers = BTreeMap::new();
+    for id in 1..=25 {
+        let mut duplicate = row(id, PathStatus::Present, "C:");
+        let keeper = id + 25;
+        duplicate.candidate = Some(Candidate::Duplicate { keeper });
+        selected.insert(rows.len());
+        rows.push(duplicate);
+        keepers.insert(keeper, rows.len());
+        rows.push(row(keeper, PathStatus::Present, "C:"));
+    }
+    let r = report(rows, false, false);
+    let ctx = egui::Context::default();
+    let frame = |offset: f32| {
+        let mut bottom = 0.0;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(440.0, 280.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let list = egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .vertical_scroll_offset(offset)
+                        .show(ui, |ui| {
+                            ui::chosen_paths(ui, &r, &selected, &keepers);
+                        });
+                    bottom = list.content_size.y - list.inner_rect.height();
+                });
+            },
+        );
+        let visible: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.visual_bounding_rect().intersects(s.clip_rect) => {
+                    Some(t.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        (bottom, visible)
+    };
+    let (bottom, first) = frame(0.0);
+    assert!(bottom > 0.0);
+    assert!(first.iter().any(|label| label == "C:/Music/1.flac"));
+    assert!(!first.iter().any(|label| label == "C:/Music/25.flac"));
+    let (_, last) = frame(bottom);
+    assert!(last.iter().any(|label| label == "C:/Music/25.flac"));
+    assert!(last
+        .iter()
+        .any(|label| label.contains("Keep #50") && label.contains("C:/Music/50.flac")));
 }
 
 #[test]

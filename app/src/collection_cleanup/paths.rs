@@ -251,7 +251,13 @@ impl PathInspector {
         } else {
             Os::Other
         };
-        let home = dirs::home_dir().filter(|p| p.is_absolute() && os != Os::Other);
+        let home = dirs::home_dir();
+        // Windows Known Folders ignore the isolated HOME of the native integration test.
+        #[cfg(all(windows, test))]
+        let home = std::env::var_os("RECORDBOX_TEST_CLEANUP_HOME")
+            .map(PathBuf::from)
+            .or(home);
+        let home = home.filter(|p| p.is_absolute() && os != Os::Other);
         let providers = home.as_ref().map(|dir| provider_roots::discover(dir));
         let music = home
             .and_then(|dir| slash_path(&dir.join("Music"), os))
