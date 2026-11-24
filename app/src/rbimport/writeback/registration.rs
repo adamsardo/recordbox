@@ -287,7 +287,7 @@ mod tests {
             params![
                 recorded,
                 format!("{:x}", Md5::digest(&embedding)),
-                embedding.len()
+                i64::try_from(embedding.len())?
             ],
         )?;
         assert_eq!(
