@@ -21,6 +21,7 @@ fn isolated(test: &str, run: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
         .env(CHILD, test)
         .env("PREPDECK_DATA", profile.path())
+        .env_remove("PREPDECK_STEM_MODEL")
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     ensure!(
@@ -73,7 +74,7 @@ fn finish_loading(app: &mut App) {
             app.stem.separating.is_none(),
             "cache restoration started inference"
         );
-        if app.deck.loading.is_none() && !app.loading_stems() {
+        if app.stem.model.is_some() && app.deck.loading.is_none() && !app.loading_stems() {
             assert!(app.deck.audio.is_some(), "the generated WAV did not load");
             return;
         }
@@ -168,6 +169,107 @@ fn late_speed_result_preserves_the_selected_quality_parts() -> Result<()> {
             app.select_stem_model(speed);
             finish_loading(&mut app);
             assert_parts(&app, -0.25);
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn performance_part_button_can_read_a_cache_while_another_deck_separates() -> Result<()> {
+    isolated(
+        "performance_part_button_can_read_a_cache_while_another_deck_separates",
+        |dir| {
+            let mut app = open_app();
+            let (a, _) = track(&app, dir, "uncached.wav")?;
+            let (b, cache_b) = track(&app, dir, "cached.wav")?;
+            save_parts(&cache_b, 0.5)?;
+            app.reload_tracks();
+            app.set_app_mode(1);
+            app.load_track(a);
+            finish_loading(&mut app);
+
+            // Stand in for a long-running inference job on deck 1.
+            app.stem.separating = Some((a, 0.5));
+            app.stem.active_key = app.deck.stem_cache_key.clone();
+            app.activate_deck(1);
+            app.load_track(b);
+            crate::prefs_ext::stem_part_click(&mut app, &[3]);
+            assert!(
+                app.loading_stems(),
+                "the part button did not request the saved stems"
+            );
+            let result = app.stem.rx.recv_timeout(Duration::from_secs(10))?;
+            app.stem.tx.send(result).unwrap();
+            app.poll_stems();
+            assert_parts(&app, 0.5);
+            assert_eq!(app.stem.separating, Some((a, 0.5)));
+            assert!(app.stem.pending.is_none());
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn performance_decks_restore_speed_and_quality_in_three_part_mode() -> Result<()> {
+    isolated(
+        "performance_decks_restore_speed_and_quality_in_three_part_mode",
+        |dir| {
+            let mut app = open_app();
+            let speed = stems::spec("htdemucs").unwrap();
+            let quality = stems::spec(MODEL).unwrap();
+            let (a, quality_a) = track(&app, dir, "left.wav")?;
+            let (b, quality_b) = track(&app, dir, "right.wav")?;
+            app.reload_tracks();
+            for (id, path, sample) in [(a, quality_a, 0.25), (b, quality_b, 0.5)] {
+                save_parts(&path, sample)?;
+                save_parts(
+                    &stems::cache_path(&app.track(id).unwrap().path, speed.id),
+                    -sample,
+                )?;
+            }
+            app.prefs.stem_parts = 3;
+            app.prefs.stems_auto_download = false;
+            app.set_app_mode(1);
+            let load_decks = |app: &mut App| {
+                for (deck, id) in [(0, a), (1, b)] {
+                    app.activate_deck(deck);
+                    app.load_track(id);
+                }
+            };
+            let check_decks = |app: &mut App, left, right| {
+                for (deck, sample) in [(0, left), (1, right)] {
+                    app.with_deck(deck, |app| {
+                        finish_loading(app);
+                        assert_parts(app, sample);
+                    });
+                }
+                assert!(app.stem.pending.is_none() && app.stem.downloading.is_none());
+            };
+
+            load_decks(&mut app);
+            check_decks(&mut app, 0.25, 0.5);
+            app.select_stem_model(speed);
+            check_decks(&mut app, -0.25, -0.5);
+            app.save_prefs();
+            drop(app);
+
+            let mut reopened = open_app();
+            assert!(reopened.performance());
+            assert_eq!(reopened.prefs.stem_parts, 3);
+            reopened.stem.model = None;
+            reopened.stems_init();
+            reopened.reload_tracks();
+            load_decks(&mut reopened);
+            check_decks(&mut reopened, -0.25, -0.5);
+            reopened.select_stem_model(quality);
+            check_decks(&mut reopened, 0.25, 0.5);
+            // The INST button controls bass and instruments together on the active deck.
+            crate::prefs_ext::stem_part_click(&mut reopened, &[2, 1]);
+            assert_eq!(
+                reopened.player.decks[1].lock().stem_on,
+                [true, false, false, true]
+            );
+            assert_eq!(reopened.player.decks[0].lock().stem_on, [true; 4]);
             Ok(())
         },
     )

@@ -180,6 +180,10 @@ impl Prefs {
     pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
         !MANUAL_STEMS_PREVIEW && self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::backend_hold().is_none()
     }
+
+    fn stem_cache_limit(&self) -> Option<u64> {
+        (!self.keep_all_stems).then_some(u64::from(self.stem_cache_gb) * 1_000_000_000)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,8 +252,10 @@ pub struct Prefs {
     pub stems_auto_separate: bool,
     /// Also start uncached model inference on Load when no accelerator is available.
     pub stems_auto_cpu: bool,
-    /// Most disk space the kept stems may use, in GB (the least recently used go first).
+    /// Storage budget in decimal GB. At zero, each new save keeps only its own result.
     pub stem_cache_gb: u32,
+    /// Skip automatic eviction and retain the budget in case the user switches back.
+    pub keep_all_stems: bool,
     /// Import play histories from connected devices automatically.
     pub import_device_history: bool,
     /// Keyboard shortcuts changed from their defaults: action id -> key name.
@@ -531,6 +537,52 @@ mod reanalysis_tests {
 mod prefs_tests {
     fn cache_key(track: i64, model: &'static str) -> super::StemCacheKey {
         super::StemCacheKey { track, model, path: "example.stems".into() }
+    }
+
+    #[test]
+    fn stem_storage_preferences_preserve_legacy_budgets_and_opt_in() {
+        let default: super::Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.stem_cache_limit(), Some(20_000_000_000));
+        for gb in [0, 7, u32::MAX] {
+            let mut prefs: super::Prefs = serde_json::from_value(serde_json::json!({"stem_cache_gb": gb})).unwrap();
+            assert_eq!(prefs.stem_cache_limit(), Some(u64::from(gb) * 1_000_000_000));
+            prefs.keep_all_stems = true;
+            let saved: super::Prefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(saved.stem_cache_limit(), None);
+            assert_eq!(saved.stem_cache_gb, gb);
+        }
+    }
+
+    #[test]
+    fn a_running_stem_job_uses_the_budget_in_effect_after_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("000000000000000000000001-htdemucs.stems");
+        let new = dir.path().join("000000000000000000000001-htdemucs_ft.stems");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        let mut prefs = super::Prefs { stem_cache_gb: 0, ..Default::default() };
+        let state = super::StemState::new();
+        state.update_cache_limit(&prefs);
+        let worker_limit = state.cache_limit.clone();
+        let finish_save = || crate::stems::trim_cache(&new, || *worker_limit.lock());
+
+        prefs.keep_all_stems = true;
+        state.update_cache_limit(&prefs);
+        finish_save();
+        assert!(old.exists() && new.exists());
+
+        prefs.keep_all_stems = false;
+        prefs.stem_cache_gb = 1;
+        state.update_cache_limit(&prefs);
+        finish_save();
+        assert!(old.exists() && new.exists());
+
+        prefs.stem_cache_gb = 0;
+        state.update_cache_limit(&prefs);
+        assert!(old.exists(), "changing the budget must not run eviction");
+        finish_save();
+        assert!(!old.exists());
+        assert!(new.exists(), "even a zero budget keeps the result just saved");
     }
 
     #[test]
@@ -917,6 +969,7 @@ impl Default for Prefs {
             stems_auto_separate: true,
             stems_auto_cpu: false,
             stem_cache_gb: 20,
+            keep_all_stems: false,
             import_device_history: true,
             keymap: Default::default(),
             column_browser: false,
@@ -1059,6 +1112,9 @@ pub struct StemState {
     // None is a shared model download error. Deck errors and retries belong to their track.
     errors: HashMap<Option<i64>, StemError>,
     last_cache_warning: Option<(StemCacheKey, String)>,
+    // Read by the worker after saving and during eviction. Preferences may change during inference.
+    cache_limit: Arc<parking_lot::Mutex<Option<u64>>>,
+    pub(crate) cache_usage: Option<Arc<std::sync::OnceLock<u64>>>,
     active_key: Option<StemCacheKey>,
     pub execution: crate::stems::SeparationDevice,
     /// Track to separate as soon as the model download finishes.
@@ -1070,6 +1126,24 @@ pub struct StemState {
 }
 
 impl StemState {
+    fn update_cache_limit(&self, prefs: &Prefs) {
+        *self.cache_limit.lock() = prefs.stem_cache_limit();
+    }
+
+    pub(crate) fn cache_usage(&mut self, ctx: &egui::Context) -> Option<u64> {
+        let usage = self.cache_usage.get_or_insert_with(|| {
+            let slot = Arc::new(std::sync::OnceLock::new());
+            let result = slot.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = result.set(crate::stems::cache_size());
+                ctx.request_repaint();
+            });
+            slot
+        });
+        usage.get().copied()
+    }
+
     pub(crate) fn reading_cache(&self) -> bool {
         !self.loading.is_empty()
     }
@@ -1087,6 +1161,9 @@ impl StemState {
     }
 
     fn record_cache_write(&mut self, key: StemCacheKey, result: Result<(), String>) {
+        if result.is_ok() {
+            self.cache_usage = None;
+        }
         match result {
             Err(warning) => self.last_cache_warning = Some((key, warning)),
             Ok(()) if self.last_cache_warning.as_ref().is_some_and(|(failed, _)| failed == &key) => {
@@ -1149,7 +1226,7 @@ impl StemState {
 
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        StemState { hw: None, model: None, active_key: None, model_ready: false, downloading: None, separating: None, loading: HashMap::new(), errors: HashMap::new(), last_cache_warning: None, execution: crate::stems::SeparationDevice::Selected, pending: None, cancel: Default::default(), download_cancel: Default::default(), tx, rx }
+        StemState { hw: None, model: None, active_key: None, model_ready: false, downloading: None, separating: None, loading: HashMap::new(), errors: HashMap::new(), last_cache_warning: None, cache_limit: Default::default(), cache_usage: None, execution: crate::stems::SeparationDevice::Selected, pending: None, cancel: Default::default(), download_cancel: Default::default(), tx, rx }
     }
 }
 
@@ -1291,6 +1368,7 @@ pub struct Toast {
 #[derive(Default)]
 pub struct Dialogs {
     pub prefs_open: bool,
+    pub confirm_clear_stems: bool,
     pub library_sync_review: Option<crate::ui_sync::Review>,
     pub prefs_tab: u8,
     /// Shortcuts window, backup/restore, reset confirmations (prefs_ext.rs).
@@ -1580,6 +1658,8 @@ impl App {
         crate::prefs_ext::set_stream_opts(&prefs);
         let audio_device = prefs.audio_device.clone();
         let pool = AnalysisPool::new(ctx.clone(), prefs.analysis_threads);
+        let stem = StemState::new();
+        stem.update_cache_limit(&prefs);
         App {
             deck_options,
             db,
@@ -1606,7 +1686,7 @@ impl App {
             related_built_for: None,
             load_after_import: None,
             node_drag: None,
-            stem: StemState::new(),
+            stem,
             undo: vec![],
             redo: vec![],
             search: String::new(),
@@ -2028,6 +2108,7 @@ impl App {
     }
 
     pub fn save_prefs(&self) {
+        self.stem.update_cache_limit(&self.prefs);
         // While the sub-browser's own columns and sort are swapped in, nothing is written
         // (ui_browser_ext.rs saves afterwards).
         if self.ext.in_sub {
@@ -2935,6 +3016,10 @@ impl App {
         self.deck.stem_cache_key.as_ref().is_some_and(|key| self.stem.loading.contains_key(key))
     }
 
+    pub(crate) fn separating_stems(&self) -> bool {
+        self.deck.stem_cache_key.as_ref().is_some_and(|key| self.stem.active_key.as_ref() == Some(key))
+    }
+
     // A model change can complete while reads or inference for the previous model are in flight.
     pub(crate) fn select_stem_model(&mut self, model: &'static crate::stems::ModelSpec) {
         self.prefs.stem_model = Some(model.id.to_owned());
@@ -3031,7 +3116,7 @@ impl App {
         let cancel: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
         self.stem.cancel = cancel.clone();
         let audio = self.deck.audio.clone();
-        let cache_limit = self.prefs.stem_cache_gb as u64 * 1_000_000_000;
+        let cache_limit = self.stem.cache_limit.clone();
         let worker = std::thread::Builder::new().name("rb-stems".into()).spawn(move || {
             let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
                 let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
@@ -3052,7 +3137,7 @@ impl App {
                 if cancelled() { anyhow::bail!("stopped"); }
                 let saved = match crate::stems::save(&key.path, &st) {
                     Ok(()) => {
-                        crate::stems::trim_cache(cache_limit, &key.path);
+                        crate::stems::trim_cache(&key.path, || *cache_limit.lock());
                         Ok(())
                     }
                     Err(error) => Err(format!(

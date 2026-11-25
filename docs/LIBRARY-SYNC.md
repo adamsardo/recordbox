@@ -81,6 +81,22 @@ After Recordbox separates a track, it caches the four stereo parts in a `.stems`
 
 Setting `PREPDECK_DATA` puts the cache in the `stems` subfolder of that directory. Filenames have the form `<24 hex characters>-<model>.stems`. Recordbox hashes the audio path, file size and modification time in seconds for the prefix. The file header stores the format and frame count. Library Workbench can inspect its structure in **Library lab → Formats & STEMS**. [Recordbox cache code](../app/src/stems/mod.rs) · [Workbench format inspector](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/FORMATS-AND-STEMS.md)
 
+### How much separation is saved?
+
+| Analysis setting | Models run | Saved per track | Size for four minutes |
+| --- | ---: | --- | ---: |
+| Prioritize speed | 1 | Four stereo parts in `-htdemucs.stems` | 169.34 MB |
+| Prioritize sound quality | 4 | Four stereo parts in `-htdemucs_ft.stems` | 169.34 MB |
+| Both, run separately | 5 in total | Two files for the same track | 338.69 MB |
+
+Each file stores drums, bass, instruments and vocals as 16-bit PCM at 44,100 stereo frames per second. One minute takes 42.34 MB plus a 16-byte header per file. For comparison, four minutes of stereo 16-bit/44.1 kHz WAV audio takes about 42.34 MB, and a 320 kb/s MP3 takes about 9.6 MB, excluding tags. Track duration determines the size of the separation. Downloaded model weights are shared between tracks and live in the separate `models` directory.
+
+Export and Performance decks use the same cache. The 3-part layout groups bass with instruments under **INST**. Both layouts save all four parts. Completed files survive track changes, switching models, and closing Recordbox. Unloading a track from its last deck before separation finishes cancels the job. On a later load, Recordbox needs the same model, source path, size and modification time to reuse the stored audio.
+
+The default **20 GB** budget is shared across tracks and models. It fits about 118 four-minute tracks with one model or 59 with both. Adjust the budget or select **Keep all saved stems** in **Preferences → Extensions → STEMS**. With a budget, a successful save can remove older results to make room and always retains the file just saved. Keep all lets the folder grow until you clear saved stems or the drive runs out of space. Changing the preference alone does not remove files.
+
+For a backup, copy the `stems` folder separately from the Recordbox library backup. When restoring to another installation, preserve the source audio paths, file sizes and modification times so Recordbox can recognize the saved work.
+
 AlphaTheta’s own per-track STEMS storage and a compatible import format remain unverified. AlphaTheta documents `.rbsc` as a captured DRUMS sample. A useful native sample for whole-track separation starts with a short self-created track in a disposable AlphaTheta library. Record the rekordbox version, OS, mode and STEMS setting, inventory the library and cache before and after separation, then check whether any generated file persists after quitting and reopening rekordbox. Ratings, cues, BPM, key and beat-grid write-back can be tested independently of STEMS. [AlphaTheta sample capture in Workbench](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/DISCOVERY-ASSETS-HISTORY.md) · [Workbench STEMS evidence](https://github.com/fantuz/rekordbox-migration-helper/blob/b10e1a45a7a94c0c531d6064eefb79024618cf5e/docs/STEMS-WORKFLOWS.md)
 
 ## Sync a USB drive

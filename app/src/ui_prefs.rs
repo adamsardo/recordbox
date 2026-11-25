@@ -50,7 +50,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 116] = [
+const SETTINGS: [(u8, usize, &str); 118] = [
     (7, 2, "Apply CFX to Sampler using MIC COLOR control knob."),
     (7, 3, "SLOT"),
     (7, 3, "Do not overwrite the loaded Slot."),
@@ -163,6 +163,8 @@ const SETTINGS: [(u8, usize, &str); 116] = [
     (6, 0, "Reset the MUTE/SOLO state while loading"),
     (6, 0, "Stem separation model"),
     (6, 0, "Allow automatic separation on CPU"),
+    (6, 0, "Keep all saved stems"),
+    (6, 0, "STEMS storage budget"),
     (0, 0, "Playback animation"),
     (1, 0, "Analysis workers"),
     (2, 6, "Supported devices"),
@@ -312,6 +314,8 @@ const WIN: egui::Vec2 = vec2(800.0, 800.0);
 
 pub fn prefs_window(app: &mut App, ctx: &Context) {
     if !app.dialogs.prefs_open {
+        app.dialogs.confirm_clear_stems = false;
+        app.stem.cache_usage = None;
         return;
     }
     // Preferences opens in its own window, like the original. Screenshot mode (and backends
@@ -399,6 +403,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
     let key = format!("prefs_subtab_{page}");
     let mut sub_tab: usize = ui.ctx().data_mut(|d| *d.get_temp_mut_or(egui::Id::new(&key), 0usize)).min(tabs.len() - 1);
     let searching = !app.dialogs.ext.prefs_search.trim().is_empty();
+    if page != 6 || searching {
+        app.dialogs.confirm_clear_stems = false;
+        app.stem.cache_usage = None;
+    }
     // Tab strip on black, 30 pt tall: the active tab blue, the others #1E1E1E with #AAAAAA text.
     let mut x = 164.0;
     let names: Vec<&str> = if searching { vec!["Search results"] } else { tabs.to_vec() };
@@ -1993,15 +2001,51 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
                 note(ui, "Load a track on the active deck to separate it.");
             }
         }
-        note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
-        let path = crate::db::data_dir_for_inspection().join("stems");
-        ui.add(egui::Label::new(format!("recordbox STEMS cache · {}", path.display())).selectable(true).wrap());
-        if let Some(warning) = app.stem.cache_warning() {
-            ui.add(egui::Label::new(RichText::new(warning).color(CAUTION_TX)).selectable(true).wrap());
-        }
+    });
+    card(ui, "Saved stems", |ui| {
+        note(ui, "Speed and quality each save four stereo parts, about 42 MB per minute per model. Export and Performance share these files.");
+        toggle(ui, &mut app.prefs.keep_all_stems, "Keep all saved stems");
         kit::block(ui, |ui| {
-            if ui.add(btn("Clear separated stems")).clicked() {
-                crate::stems::clear_cache();
+            ui.add_enabled_ui(!app.prefs.keep_all_stems, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("STEMS storage budget");
+                    ui.add(egui::DragValue::new(&mut app.prefs.stem_cache_gb).update_while_editing(false).suffix(" GB"));
+                });
+            });
+        });
+        if app.prefs.keep_all_stems {
+            note(ui, "New saves can use all available disk space. Saved parts stay on disk until you clear them.");
+        } else if app.prefs.stem_cache_gb == 0 {
+            note(ui, "With a zero budget, each new save removes all other saved parts.");
+        } else {
+            note(ui, "After a new result is saved, the least recently used parts are removed until storage fits the budget. The new result is always kept.");
+        }
+        match app.stem.cache_usage(ui.ctx()) {
+            Some(bytes) => kit::line(ui, &format!("{:.2} GB in use", bytes as f64 / 1e9)),
+            None => kit::line(ui, "Checking space in use…"),
+        }
+        let path = crate::db::data_dir_for_inspection().join("stems");
+        kit::block(ui, |ui| {
+            ui.add(egui::Label::new(format!("Cache folder · {}", path.display())).selectable(true).wrap());
+            if let Some(warning) = app.stem.cache_warning() {
+                ui.add(egui::Label::new(RichText::new(warning).color(CAUTION_TX)).selectable(true).wrap());
+            }
+            if app.dialogs.confirm_clear_stems {
+                ui.label("Clear all saved speed and quality parts? Rebuilding them requires running separation again.");
+                ui.horizontal(|ui| {
+                    if ui.add(btn("Cancel")).clicked() {
+                        app.dialogs.confirm_clear_stems = false;
+                    }
+                    if ui.add(btn("Clear saved parts")).clicked() {
+                        app.dialogs.confirm_clear_stems = false;
+                        app.stem.cache_usage = None;
+                        if let Err(error) = crate::stems::clear_cache() {
+                            app.toast_err(format!("Could not clear all saved stems. {error:#}"));
+                        }
+                    }
+                });
+            } else if ui.add(btn("Clear separated stems")).clicked() {
+                app.dialogs.confirm_clear_stems = true;
             }
         });
     });
