@@ -731,8 +731,16 @@ fn saved_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
     Ok(entries)
 }
 
-pub fn cache_size() -> u64 {
-    saved_entries(&stems_dir()).unwrap_or_default().iter().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
+pub fn cache_size() -> std::io::Result<u64> {
+    let mut bytes = 0;
+    for entry in saved_entries(&stems_dir())? {
+        match entry.metadata() {
+            Ok(metadata) => bytes += metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(bytes)
 }
 
 /// Apply the current retention policy after a successful save. Always keep that result,

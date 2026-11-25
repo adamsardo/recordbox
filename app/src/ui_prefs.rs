@@ -2021,7 +2021,8 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             note(ui, "After a new result is saved, the least recently used parts are removed until storage fits the budget. The new result is always kept.");
         }
         match app.stem.cache_usage(ui.ctx()) {
-            Some(bytes) => kit::line(ui, &format!("{:.2} GB in use", bytes as f64 / 1e9)),
+            Some(Ok(bytes)) => kit::line(ui, &format!("{:.2} GB in use", *bytes as f64 / 1e9)),
+            Some(Err(error)) => kit::line(ui, &format!("Could not measure the saved stems. {error}")),
             None => kit::line(ui, "Checking space in use…"),
         }
         let path = crate::db::data_dir_for_inspection().join("stems");

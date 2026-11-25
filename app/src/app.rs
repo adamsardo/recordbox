@@ -1114,7 +1114,7 @@ pub struct StemState {
     last_cache_warning: Option<(StemCacheKey, String)>,
     // Read by the worker after saving and during eviction. Preferences may change during inference.
     cache_limit: Arc<parking_lot::Mutex<Option<u64>>>,
-    pub(crate) cache_usage: Option<Arc<std::sync::OnceLock<u64>>>,
+    pub(crate) cache_usage: Option<Arc<std::sync::OnceLock<std::io::Result<u64>>>>,
     active_key: Option<StemCacheKey>,
     pub execution: crate::stems::SeparationDevice,
     /// Track to separate as soon as the model download finishes.
@@ -1130,7 +1130,7 @@ impl StemState {
         *self.cache_limit.lock() = prefs.stem_cache_limit();
     }
 
-    pub(crate) fn cache_usage(&mut self, ctx: &egui::Context) -> Option<u64> {
+    pub(crate) fn cache_usage(&mut self, ctx: &egui::Context) -> Option<&std::io::Result<u64>> {
         let usage = self.cache_usage.get_or_insert_with(|| {
             let slot = Arc::new(std::sync::OnceLock::new());
             let result = slot.clone();
@@ -1141,7 +1141,7 @@ impl StemState {
             });
             slot
         });
-        usage.get().copied()
+        usage.get()
     }
 
     pub(crate) fn reading_cache(&self) -> bool {
