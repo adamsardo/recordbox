@@ -658,10 +658,10 @@ const MAGIC: &[u8; 8] = b"PDSTEMS1";
 
 /// Stored as 16-bit PCM (planar) to keep the cache small.
 pub fn save(path: &Path, s: &Stems) -> Result<()> {
-    let tmp = path.with_extension("part");
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    f.write_all(MAGIC)?;
-    f.write_all(&(s.len as u64).to_le_bytes())?;
+    anyhow::ensure!(s.len.checked_mul(8) == Some(s.data.len()), "incomplete separated stems");
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("missing STEMS cache directory")?)?;
+    tmp.write_all(MAGIC)?;
+    tmp.write_all(&(s.len as u64).to_le_bytes())?;
     // Converted a block at a time: one write per sample made this the slowest step after the
     // model itself.
     let mut block = Vec::with_capacity(2 << 16);
@@ -670,28 +670,35 @@ pub fn save(path: &Path, s: &Stems) -> Result<()> {
         for v in chunk {
             block.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
         }
-        f.write_all(&block)?;
+        tmp.write_all(&block)?;
     }
     // On disk before it gets its final name, so a crash can't leave a short cache file that
     // looks complete.
-    let file = f.into_inner().map_err(|e| anyhow!("{e}"))?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
     Ok(())
 }
 
 pub fn load(path: &Path) -> Result<Stems> {
-    let b = std::fs::read(path)?;
-    if b.len() < 16 || &b[..8] != MAGIC {
-        return Err(anyhow!("not a stems cache file"));
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0; 16];
+    file.read_exact(&mut header).context("reading the STEMS cache header")?;
+    anyhow::ensure!(&header[..8] == MAGIC, "not a stems cache file");
+    let frames = u64::from_le_bytes(header[8..].try_into()?);
+    let bytes = file.metadata()?.len().checked_sub(16).context("stems cache file is incomplete")?;
+    anyhow::ensure!(frames.checked_mul(16) == Some(bytes), "stems cache file is incomplete");
+    let len = usize::try_from(frames)?;
+    let samples = usize::try_from(bytes / 2)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(samples).context("allocating memory for saved stems")?;
+    // Decode directly into the playback allocation. A four-minute track has about 169 MB of PCM.
+    let mut block = vec![0; 128 * 1024];
+    while data.len() < samples {
+        let count = (samples - data.len()).min(block.len() / 2);
+        let part = &mut block[..count * 2];
+        file.read_exact(part)?;
+        data.extend(part.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0));
     }
-    let len = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
-    let body = &b[16..];
-    if body.len() != 8 * len * 2 {
-        return Err(anyhow!("stems cache file is incomplete"));
-    }
-    let data = body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0).collect();
     Ok(Stems { len, data })
 }
 
@@ -793,6 +800,20 @@ mod tests {
         assert_eq!(choose(&no_gpu).id, "htdemucs");
         let ft = spec("htdemucs_ft").unwrap();
         assert!(runs_on(ft, &big) && !runs_on(ft, &small) && !runs_on(ft, &no_gpu));
+    }
+
+    #[test]
+    fn incomplete_stems_do_not_replace_a_saved_track() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let saved = dir.path().join("track.stems");
+        save(&saved, &Stems { len: 1, data: vec![0.; 8] })?;
+        assert!(save(&saved, &Stems { len: 2, data: vec![0.; 8] }).is_err());
+        assert_eq!(load(&saved)?.len, 1);
+        let mut header = MAGIC.to_vec();
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&saved, header)?;
+        assert!(load(&saved).is_err());
+        Ok(())
     }
 
     #[test]

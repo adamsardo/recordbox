@@ -447,7 +447,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     } else if let Some((done, total)) = app.stem.downloading {
         let text = if total > 0 { format!("Downloading stem model · {:.0}%", 100.0 * done as f64 / total as f64) } else { "Downloading stem model…".to_owned() };
         p.text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
-    } else if app.stem.loading.is_some() {
+    } else if app.stem.reading_cache() {
         p.text(mid.left_center(), Align2::LEFT_CENTER, "Reading cached stems…", rb(11.5), TEXT);
     } else if let Some(status) = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status()) {
         p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, status, rb(11.5), TEXT);

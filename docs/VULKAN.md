@@ -16,6 +16,12 @@ The Linux x64 Vulkan preview runs HTDemucs transformer linear layers on a physic
    The first command lists detected hardware and installed checkpoints. The second runs a small calculation and reports the selected backend. A successful GPU probe identifies **Vulkan + CPU** and the adapter name. A CPU result gives the reason. A full-model test exercises much more of the driver than the probe does.
 4. In **Preferences → Extensions → STEMS**, enable STEMS, select **Prioritize speed** and download **HTDemucs**. Load a track and choose **STEMS → Separate**. In this preview, loading a track can load cached parts. Starting a new deck separation requires pressing **Separate**, including when earlier versions saved an automatic-separation preference.
 
+## Reuse a quality separation
+
+**Prioritize sound quality** runs four fine-tuned checkpoints, one per stem. **Prioritize speed** runs one checkpoint for all four. Both settings save all four parts after deck separation finishes. Leave the track on a deck until the parts are ready. Unloading it from its last deck cancels unfinished work.
+
+Open **Preferences → Extensions → STEMS** to see the cache folder and current usage. On Linux the usual folder is `~/.local/share/Recordbox/stems`; the quality file ends in `-htdemucs_ft.stems`. A four-minute track uses about 169 MB. Reloading the same track with the same model reads this file. Changing the audio path, size, modification time or model can require a fresh separation.
+
 ## Compare one track
 
 Use a short, non-silent audio clip for the first run.

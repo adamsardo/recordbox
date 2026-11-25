@@ -1887,9 +1887,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         }
         ui.add_space(2.0);
         if let Some(m) = pick.filter(|m| m.id != cur) {
-            app.prefs.stem_model = Some(m.id.to_string());
-            app.stem.model = Some(m.id.to_string());
-            app.stem.model_ready = crate::stems::model_ready(m);
+            app.select_stem_model(m);
         }
     });
     card(ui, "Layout", |ui| {
@@ -1976,7 +1974,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
                 if let Some(error) = app.stem.error_for(Some(id)) {
                     note(ui, &error.detail);
                 }
-                if app.stem.loading == Some(id) {
+                if app.loading_stems() {
                     note(ui, "Loading saved parts for the active deck…");
                 } else if app.player.state.lock().stems.is_some() {
                     note(ui, "Separated parts are ready on the active deck.");
@@ -1998,6 +1996,9 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
         let path = crate::db::data_dir_for_inspection().join("stems");
         ui.add(egui::Label::new(format!("recordbox STEMS cache · {}", path.display())).selectable(true).wrap());
+        if let Some(warning) = app.stem.cache_warning() {
+            ui.add(egui::Label::new(RichText::new(warning).color(CAUTION_TX)).selectable(true).wrap());
+        }
         kit::block(ui, |ui| {
             if ui.add(btn("Clear separated stems")).clicked() {
                 crate::stems::clear_cache();
