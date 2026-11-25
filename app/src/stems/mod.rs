@@ -658,10 +658,10 @@ const MAGIC: &[u8; 8] = b"PDSTEMS1";
 
 /// Stored as 16-bit PCM (planar) to keep the cache small.
 pub fn save(path: &Path, s: &Stems) -> Result<()> {
-    let tmp = path.with_extension("part");
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    f.write_all(MAGIC)?;
-    f.write_all(&(s.len as u64).to_le_bytes())?;
+    anyhow::ensure!(s.len.checked_mul(8) == Some(s.data.len()), "incomplete separated stems");
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("missing STEMS cache directory")?)?;
+    tmp.write_all(MAGIC)?;
+    tmp.write_all(&(s.len as u64).to_le_bytes())?;
     // Converted a block at a time: one write per sample made this the slowest step after the
     // model itself.
     let mut block = Vec::with_capacity(2 << 16);
@@ -670,44 +670,86 @@ pub fn save(path: &Path, s: &Stems) -> Result<()> {
         for v in chunk {
             block.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
         }
-        f.write_all(&block)?;
+        tmp.write_all(&block)?;
     }
     // On disk before it gets its final name, so a crash can't leave a short cache file that
     // looks complete.
-    let file = f.into_inner().map_err(|e| anyhow!("{e}"))?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
     Ok(())
 }
 
 pub fn load(path: &Path) -> Result<Stems> {
-    let b = std::fs::read(path)?;
-    if b.len() < 16 || &b[..8] != MAGIC {
-        return Err(anyhow!("not a stems cache file"));
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0; 16];
+    file.read_exact(&mut header).context("reading the STEMS cache header")?;
+    anyhow::ensure!(&header[..8] == MAGIC, "not a stems cache file");
+    let frames = u64::from_le_bytes(header[8..].try_into()?);
+    let bytes = file.metadata()?.len().checked_sub(16).context("stems cache file is incomplete")?;
+    anyhow::ensure!(frames.checked_mul(16) == Some(bytes), "stems cache file is incomplete");
+    let len = usize::try_from(frames)?;
+    let samples = usize::try_from(bytes / 2)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(samples).context("allocating memory for saved stems")?;
+    // Decode directly into the playback allocation. A four-minute track has about 169 MB of PCM.
+    let mut block = vec![0; 128 * 1024];
+    while data.len() < samples {
+        let count = (samples - data.len()).min(block.len() / 2);
+        let part = &mut block[..count * 2];
+        file.read_exact(part)?;
+        data.extend(part.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0));
     }
-    let len = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
-    let body = &b[16..];
-    if body.len() != 8 * len * 2 {
-        return Err(anyhow!("stems cache file is incomplete"));
+    // Mounted volumes can suppress automatic access times. Restoring audio still works on
+    // read-only media even when the cache cannot record this use.
+    let accessed = std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now());
+    #[cfg(not(windows))]
+    let _ = file.set_times(accessed);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Windows requires FILE_WRITE_ATTRIBUTES even when only updating the access time.
+        if let Ok(attrs) = std::fs::OpenOptions::new().access_mode(0x100).open(path) {
+            let _ = attrs.set_times(accessed);
+        }
     }
-    let data = body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0).collect();
     Ok(Stems { len, data })
 }
 
-/// Total size of the stems cache in bytes.
-pub fn cache_size() -> u64 {
-    std::fs::read_dir(stems_dir()).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
+// Match only files produced by cache_path. Other files in a shared directory and
+// temporary files from an active separation must survive both trimming and clearing.
+fn saved_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some((key, model)) = name.to_str().and_then(|n| n.strip_suffix(".stems")).and_then(|n| n.split_once('-')) else { continue };
+        if key.len() == 24 && key.bytes().all(|b| b.is_ascii_hexdigit())
+            && spec(model).is_some() && entry.file_type()?.is_file() {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
-/// Keep the cache within `limit` bytes by removing the stems used longest ago (never `keep`,
-/// the file just written). Separating on every load would otherwise fill the disk: a track's
-/// stems take about 250 MB.
-pub fn trim_cache(limit: u64, keep: &Path) {
-    let Ok(rd) = std::fs::read_dir(stems_dir()) else { return };
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
-        .flatten()
-        .filter(|e| e.path().extension().map(|x| x == "stems").unwrap_or(false))
+pub fn cache_size() -> std::io::Result<u64> {
+    let mut bytes = 0;
+    for entry in saved_entries(&stems_dir())? {
+        match entry.metadata() {
+            Ok(metadata) => bytes += metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(bytes)
+}
+
+/// Apply the current retention policy after a successful save. Always keep that result,
+/// including when a single track exceeds the whole budget.
+pub fn trim_cache(keep: &Path, limit: impl Fn() -> Option<u64>) {
+    if limit().is_none() { return; }
+    let Some(dir) = keep.parent() else { return };
+    let Ok(entries) = saved_entries(dir) else { return };
+    let mut files: Vec<_> = entries.into_iter()
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((m.accessed().or_else(|_| m.modified()).ok()?, m.len(), e.path()))
@@ -716,6 +758,7 @@ pub fn trim_cache(limit: u64, keep: &Path) {
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     files.sort();
     for (_, len, path) in files {
+        let Some(limit) = limit() else { break };
         if total <= limit {
             break;
         }
@@ -725,17 +768,58 @@ pub fn trim_cache(limit: u64, keep: &Path) {
     }
 }
 
-pub fn clear_cache() {
-    if let Ok(rd) = std::fs::read_dir(stems_dir()) {
-        for e in rd.flatten() {
-            let _ = std::fs::remove_file(e.path());
+pub fn clear_cache() -> Result<()> {
+    clear_saved_entries(&stems_dir())
+}
+
+fn clear_saved_entries(dir: &Path) -> Result<()> {
+    for entry in saved_entries(dir)? {
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("Removing {}", path.display()));
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_uses_the_last_disk_load_and_keeps_other_files() -> Result<()> {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let folder = tempfile::tempdir()?;
+        let speed = folder.path().join("000000000000000000000001-htdemucs.stems");
+        let quality = folder.path().join("000000000000000000000001-htdemucs_ft.stems");
+        let newest = folder.path().join("000000000000000000000002-htdemucs.stems");
+        let parts = Stems { len: 1, data: vec![0.0; 8] };
+        for (index, path) in [&quality, &speed, &newest].into_iter().enumerate() {
+            save(path, &parts)?;
+            let then = UNIX_EPOCH + Duration::from_secs(1_000_000_000 + index as u64 * 300);
+            File::options().write(true).open(path)?.set_times(FileTimes::new().set_accessed(then).set_modified(then))?;
+        }
+        let foreign = folder.path().join("my-recording.stems");
+        let temp = folder.path().join(".in-progress");
+        std::fs::write(&foreign, b"recording")?;
+        std::fs::write(&temp, b"in progress")?;
+        load(&quality)?;
+        let result_bytes = std::fs::metadata(&quality)?.len();
+        trim_cache(&newest, || Some(result_bytes * 2));
+        assert!(!speed.exists());
+        assert!(quality.exists() && newest.exists());
+        trim_cache(&newest, || Some(0));
+        assert!(!quality.exists() && newest.exists());
+        clear_saved_entries(folder.path())?;
+        assert!(!newest.exists());
+        assert_eq!(std::fs::read(foreign)?, b"recording");
+        assert_eq!(std::fs::read(temp)?, b"in progress");
+        Ok(())
+    }
 
     #[test]
     fn incomplete_checkpoint_is_replaced_only_after_a_verified_download() -> Result<()> {
@@ -793,6 +877,20 @@ mod tests {
         assert_eq!(choose(&no_gpu).id, "htdemucs");
         let ft = spec("htdemucs_ft").unwrap();
         assert!(runs_on(ft, &big) && !runs_on(ft, &small) && !runs_on(ft, &no_gpu));
+    }
+
+    #[test]
+    fn incomplete_stems_do_not_replace_a_saved_track() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let saved = dir.path().join("track.stems");
+        save(&saved, &Stems { len: 1, data: vec![0.; 8] })?;
+        assert!(save(&saved, &Stems { len: 2, data: vec![0.; 8] }).is_err());
+        assert_eq!(load(&saved)?.len, 1);
+        let mut header = MAGIC.to_vec();
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&saved, header)?;
+        assert!(load(&saved).is_err());
+        Ok(())
     }
 
     #[test]

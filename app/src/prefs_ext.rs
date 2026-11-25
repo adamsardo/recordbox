@@ -568,7 +568,7 @@ pub fn stem_part_click(app: &mut App, srcs: &[usize]) {
         // rekordbox's status line for a part pressed before its data exists. recordbox also
         // starts the separation if it is not running yet (it is, when tracks are separated
         // on load).
-        if app.stem.separating.is_some() || app.stem.loading.is_some() {
+        if app.separating_stems() || app.loading_stems() {
             app.toast("There is no analysis data for the STEMS function.");
         } else {
             app.separate_loaded();

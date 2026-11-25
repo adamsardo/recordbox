@@ -377,18 +377,24 @@ impl Engine {
                     1,
                 );
             }
-            if first + nrows == rows {
+            let last_strip = first + nrows == rows;
+            if last_strip {
                 commands.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes as u64);
             }
             let buffer = commands.finish();
             ready()?;
             self.queue.submit([buffer]);
+            if last_strip {
+                // The readback can be mapped only after this submission's copy finishes.
+                break;
+            }
             let (tx, rx) = mpsc::channel();
             self.queue.on_submitted_work_done(move || {
                 let _ = tx.send(());
             });
             self.wait(rx)?;
         }
+        ready()?;
         let slice = readback.slice(..);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
