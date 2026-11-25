@@ -104,6 +104,7 @@ pub(crate) fn apply(db: &Db, lib: &RbLibrary) -> Result<Summary> {
             Some(t) => (t.id, false),
         };
         let cur = existing;
+        db.protect_imported_track(id)?;
         let locked = cur.as_ref().map(|t| t.grid_locked).unwrap_or(false);
         if changed {
             if let Some(cur) = &cur {
@@ -326,6 +327,29 @@ mod tests {
             smart_lists: 0,
             histories: vec![],
         }
+    }
+
+    #[test]
+    fn native_match_protects_a_previously_direct_import_without_a_writeback_baseline() -> Result<()>
+    {
+        let db = Db::open(Path::new(":memory:"))?;
+        let mut lib = library("v1", "Source");
+        lib.tracks[0].xt.track.file_size = 2048;
+        lib.tracks[0].xt.cues.clear();
+        lib.tracks[0].xt.grid = None;
+        lib.playlists.clear();
+        let id = db.insert_local_file(&lib.tracks[0].xt.track)?;
+        let has_origin = || {
+            db.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM direct_file_imports WHERE track_id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
+        };
+        assert!(has_origin()?);
+        assert_eq!(apply(&db, &lib)?.added, 0);
+        assert!(!has_origin()?);
+        Ok(())
     }
 
     #[test]

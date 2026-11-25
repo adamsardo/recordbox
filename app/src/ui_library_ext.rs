@@ -775,6 +775,19 @@ pub fn collection_menu(app: &mut App, ui: &mut Ui) {
             app.export_collection_xml(&f);
         }
     }
+    ui.separator();
+    if ui.button("Display All Missing Files").clicked() {
+        ui.close_menu();
+        app.open_missing_file_manager();
+    }
+    if ui.button("Review collection cleanup…").clicked() {
+        ui.close_menu();
+        crate::collection_cleanup::ui::open(app, None);
+    }
+    if ui.button("Restore Removed Tracks…").clicked() {
+        ui.close_menu();
+        crate::menus::handle(app, "trash");
+    }
 }
 
 /// "Import Playlist" file chooser, into `parent` (0 = the Playlists root).
@@ -1947,6 +1960,7 @@ pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
 pub fn windows(app: &mut App, ctx: &egui::Context) {
     color_picker(app, ctx);
     missing_file_manager(app, ctx);
+    crate::collection_cleanup::ui::show(app, ctx);
     // Duplicates being added to a playlist.
     if let Some((pl, ids)) = app.ext.dup_confirm.clone() {
         let name = app.node(pl).map(|n| n.name.clone()).unwrap_or_default();
@@ -2035,11 +2049,11 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
 }
 
 /// Missing File Manager: every track whose file is gone, with Relocate / Auto Relocate /
-/// Delete for one, the ticked ones, or all, and the Auto Relocate Search Folders.
+/// review selected references for cleanup, and the Auto Relocate Search Folders.
 /// Missing File Manager (reference 16): a 602 x 528 pt window on #1E1E1E. A black table from
 /// 4 pt in (Track Title, artist, album in 120 pt columns, then location; 27 pt header with grey
 /// labels, 25 pt rows, the chosen ones #294C6A) with its scroll bar along the bottom; the
-/// number of tracks at the right under it; then Auto Relocate, Relocate and Delete (108 x 28 pt
+/// number of tracks at the right under it; then Auto Relocate, Relocate and Review cleanup (108 x 28 pt
 /// from 15 pt in, 15.5 pt apart) and OK at the right. The buttons act on the chosen rows
 /// (Auto Relocate on all of them when none is chosen); the search folders are in the table's
 /// right-click menu.
@@ -2143,7 +2157,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
         let picked: Vec<i64> = missing.iter().map(|t| t.id).filter(|t| app.ext.missing_sel.contains(t)).collect();
         let all: Vec<i64> = missing.iter().map(|t| t.id).collect();
         let target = if picked.is_empty() { all } else { picked.clone() };
-        for (k, (label, x)) in [("Auto Relocate", 15.0), ("Relocate", 138.5), ("Delete", 262.5), ("OK", 474.5)].into_iter().enumerate() {
+        for (k, (label, x)) in [("Auto Relocate", 15.0), ("Relocate", 138.5), ("Review cleanup…", 262.5), ("OK", 474.5)].into_iter().enumerate() {
             let br = Rect::from_min_size(pos2(r.min.x + x, r.min.y + 489.0), vec2(108.5, 28.0));
             let enabled = match k {
                 0 => !target.is_empty() && !busy,
@@ -2163,7 +2177,10 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
                             app.relocate_to(picked[0], &f);
                         }
                     }
-                    2 => app.dialogs.confirm_remove = Some(picked.clone()),
+                    2 => {
+                        app.ext.missing_open = false;
+                        crate::collection_cleanup::ui::open(app, Some(picked.iter().copied().collect()));
+                    }
                     _ => app.ext.missing_open = false,
                 }
             }

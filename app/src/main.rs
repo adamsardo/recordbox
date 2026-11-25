@@ -8,6 +8,7 @@ mod backup;
 mod brand;
 mod cfx;
 mod browser_ext;
+mod collection_cleanup;
 mod db;
 mod demo;
 mod device_ext;
@@ -298,6 +299,9 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         if !hot_held && !ctx.input(|i| i.pointer.any_down()) {
             app.hot_cue_up();
         }
+    }
+    if app.ext.cleanup.is_some() {
+        return;
     }
     // Library edit Undo/Redo (text fields keep their own undo while they are being edited).
     if !ctx.wants_keyboard_input() {

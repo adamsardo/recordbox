@@ -44,8 +44,8 @@ pub struct Db {
 const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples,key_manual,key_text";
 
 /// Library schema version (SQLite user_version). Version 0 is a library from before
-/// versioning; 2 is the current layout.
-pub const SCHEMA_VERSION: i64 = 3;
+/// versioning. Version 4 records the origin of new direct file imports for cleanup review.
+pub const SCHEMA_VERSION: i64 = 4;
 
 impl Db {
     /// The main database attached to this connection (including a custom library directory).
@@ -126,6 +126,13 @@ impl Db {
         // an interrupted upgrade leaves the library as it was (a backup was taken above).
         conn.execute_batch("BEGIN")?;
         let migrate = (|| -> Result<()> {
+            // Older rows have no proof of origin. Deliberately leave them out.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS direct_file_imports(
+                    track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE);
+                 CREATE TRIGGER IF NOT EXISTS protect_changed_import AFTER UPDATE ON tracks
+                 BEGIN DELETE FROM direct_file_imports WHERE track_id=OLD.id; END;"
+            )?;
             if conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
             }
@@ -274,6 +281,26 @@ impl Db {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The file importer actually read this track on this computer. Imported library rows,
+    /// restored trash and preexisting collection records have no such evidence.
+    pub fn insert_local_file(&self, t: &Track) -> Result<i64> {
+        if t.file_size == 0 || t.sample_rate == 0 {
+            // The file importer can keep an unparsed or inaccessible file by name alone.
+            return self.insert_track(t);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_track(t)?;
+        anyhow::ensure!(self.conn.changes() == 1, "The file did not create a new track.");
+        self.conn.execute("INSERT INTO direct_file_imports(track_id) VALUES(?1)", [id])?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn protect_imported_track(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM direct_file_imports WHERE track_id=?1", [id])?;
+        Ok(())
     }
 
     pub fn update_track(&self, t: &Track) -> Result<()> {
