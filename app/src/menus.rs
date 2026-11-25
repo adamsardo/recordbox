@@ -28,7 +28,7 @@ thread_local! {
 }
 
 /// Every menu command: (id, label, ticked item). The order here is not the menu order.
-pub const COMMANDS: [(&str, &str, bool); 65] = [
+pub const COMMANDS: [(&str, &str, bool); 66] = [
     ("edit_cut", "Cut", false),
     ("edit_copy", "Copy", false),
     ("edit_paste", "Paste", false),
@@ -41,6 +41,7 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("backup", "Backup Library", false),
     ("restore", "Restore Library", false),
     ("missing", "Display All Missing Files", false),
+    ("collection_cleanup", "Review collection cleanup…", false),
     ("export_xml", "Export Collection in xml format", false),
     ("export_playlists_info", "Export Playlists Information", false),
     ("sync_rekordbox", "Review desktop library sync…", false),
@@ -155,7 +156,7 @@ pub fn build() -> Option<Menu> {
         let library = Submenu::new("Library", true);
         library.append_items(&[it(&h, "backup"), it(&h, "restore")]).ok()?;
         let file = Submenu::new("File", true);
-        file.append_items(&[&import, &library, &sep(), it(&h, "missing"), &sep(), it(&h, "export_xml"), it(&h, "export_playlists_info"), &sep(), it(&h, "sync_rekordbox"), it(&h, "import_xml"), it(&h, "relocate_missing"), it(&h, "library_folder")]).ok()?;
+        file.append_items(&[&import, &library, &sep(), it(&h, "missing"), it(&h, "collection_cleanup"), &sep(), it(&h, "export_xml"), it(&h, "export_playlists_info"), &sep(), it(&h, "sync_rekordbox"), it(&h, "import_xml"), it(&h, "relocate_missing"), it(&h, "library_folder")]).ok()?;
         let edit = Submenu::new("Edit", true);
         edit.append_items(&[it(&h, "undo"), it(&h, "redo"), &sep(), it(&h, "edit_cut"), it(&h, "edit_copy"), it(&h, "edit_paste"), it(&h, "edit_select_all")]).ok()?;
         let view = Submenu::new("View", true);
@@ -369,6 +370,9 @@ pub fn sync(app: &App) {
 const AUDIO_EXT: [&str; 9] = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "alac", "mp4"];
 
 pub fn handle(app: &mut App, id: &str) {
+    if app.ext.cleanup.is_some() && !matches!(id, "edit_cut" | "edit_copy" | "edit_paste" | "edit_select_all") {
+        return;
+    }
     let sel = selected(app);
     match id {
         "about" | "h_about" => app.dialogs.about = true,
@@ -427,6 +431,7 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "missing" => app.open_missing_file_manager(),
+        "collection_cleanup" => crate::collection_cleanup::ui::open(app, None),
         "relocate_missing" => {
             if let Some(d) = rfd::FileDialog::new().set_title("Folder to search for the missing files").pick_folder() {
                 app.relocate_missing(&d);

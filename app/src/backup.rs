@@ -263,6 +263,9 @@ pub fn stage_restore(archive: &Path, work_dir: &Path, artwork_dir: &Path, with_m
     }
     {
         let d = crate::db::Db::open(&db)?;
+        // A portable backup can come from another computer with the same user and paths.
+        // Preserve the catalog, but only fresh imports can establish local cleanup eligibility.
+        d.conn.execute("DELETE FROM direct_file_imports", [])?;
         // Artwork paths are absolute: point them at this computer's artwork folder.
         let rows: Vec<(i64, String)> = {
             let mut st = d.conn.prepare("SELECT id, artwork FROM tracks WHERE artwork != ''")?;

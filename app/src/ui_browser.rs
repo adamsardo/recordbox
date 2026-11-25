@@ -292,12 +292,11 @@ fn menus(app: &mut App, ui: &mut Ui) {
         ui.separator();
         if ui.button("Display All Missing Files").clicked() {
             ui.close_menu();
-            app.set_view(View::Collection);
-            app.side = SideMode::Collection;
-            app.search.clear();
-            let missing: Vec<i64> = app.tracks.iter().filter(|t| t.missing).map(|t| t.id).collect();
-            app.toast(format!("{} missing file(s) in the collection", missing.len()));
-            app.selected = missing.into_iter().collect();
+            app.open_missing_file_manager();
+        }
+        if ui.button("Review collection cleanup…").clicked() {
+            ui.close_menu();
+            crate::collection_cleanup::ui::open(app, None);
         }
         if ui.button("Show library folder").clicked() {
             ui.close_menu();

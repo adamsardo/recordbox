@@ -264,6 +264,7 @@ impl App {
     /// Add one imported device track to the collection (or find it there already).
     fn add_imported(&mut self, it: ImportedTrack) -> Option<(i64, bool)> {
         if let Some(id) = self.db.track_by_path(&it.track.path) {
+            self.db.protect_imported_track(id).ok()?;
             return Some((id, false));
         }
         let id = self.db.insert_track(&it.track).ok()?;

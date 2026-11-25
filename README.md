@@ -50,6 +50,12 @@ phrase versions, with generated parser regressions. See
 [ANLZ import integrity](docs/ANLZ-IMPORT-INTEGRITY.md) for the exact scope and
 remaining compatibility limits.
 
+Right-click **Collection → All** and choose **Review collection cleanup…** to see how many references point
+to each Windows drive or macOS volume, including disconnected disks and cloud
+folders. Linux offers a read-only review. Windows and macOS can move a reviewed
+selection of eligible references into Recordbox’s own Removed Tracks.
+[Cleanup criteria and recovery](docs/COLLECTION-CLEANUP.md)
+
 ## Scope
 
 The first version is deliberately limited to preparation: everything you do *before* the set. Performance features such as live mixing, effects, lighting and video aren't part of it.
