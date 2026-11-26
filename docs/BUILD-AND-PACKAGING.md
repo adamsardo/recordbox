@@ -45,6 +45,21 @@ published release assets are retained separately. Only the fork's gated release
 publication job receives contents-write access. Automation does not change
 repository protection settings.
 
+## Homebrew on macOS
+
+The fork’s tap builds the tagged Rust source on the Mac where you install it. Install the Xcode Command Line Tools and Homebrew before building the app.
+
+```sh
+brew tap fantuz/recordbox https://github.com/fantuz/recordbox
+brew install --build-from-source fantuz/recordbox/recordbox
+brew test fantuz/recordbox/recordbox
+open "$(brew --prefix fantuz/recordbox/recordbox)/libexec/Recordbox.app"
+```
+
+You can also start `recordbox` from the terminal. The build downloads its compiler and locked dependencies. The installed app uses macOS system libraries and carries a local ad-hoc signature. Developer ID signing and Apple notarization are separate distribution processes.
+
+After publishing a new stable release, update the `tag` and full commit `revision` together in the tap’s formula. Use the commit identified in the release notes, and check that the release tag resolves to it. The Homebrew workflow installs the formula by its tap name and tests the installed bundle. Once the formula change reaches the tap’s default branch, users can run `brew update` and `brew upgrade fantuz/recordbox/recordbox`. [Homebrew formula](../Formula/recordbox.rb) · [Native installation check](../.github/workflows/homebrew.yml)
+
 ## Fork release process
 
 The first packaged release of `fantuz/recordbox` is **0.5.0**. Each release goes
