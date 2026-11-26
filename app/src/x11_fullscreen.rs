@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt, EventMask, Window,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt, EventMask, GetPropertyReply, Window,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -123,6 +123,17 @@ impl Desktop {
         )
     }
 
+    fn active_window(&self) -> Option<Window> {
+        // xfwm4 can append a zero word. The first WINDOW is the active client.
+        let reply = self
+            .connection
+            .get_property(false, self.root, self.atoms._NET_ACTIVE_WINDOW, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        active_client(&reply)
+    }
+
     fn main_fullscreen(&self, main: Window) -> Option<bool> {
         let mut cached = self.cached_main_fullscreen.lock().ok()?;
         // Drain available notifications without waiting for the WM or scheduling redraws.
@@ -191,6 +202,16 @@ impl Desktop {
     }
 }
 
+fn active_client(reply: &GetPropertyReply) -> Option<Window> {
+    if reply.type_ == x11rb::NONE {
+        Some(x11rb::NONE)
+    } else if reply.type_ == u32::from(AtomEnum::WINDOW) {
+        reply.value32()?.next()
+    } else {
+        None
+    }
+}
+
 /// Read the WM's actual state. Passive requests bypass winit's cached fullscreen value.
 pub(super) fn main_fullscreen(ctx: &egui::Context) -> Option<bool> {
     let session = session(ctx)?;
@@ -218,10 +239,10 @@ pub(super) fn toggle(ctx: &egui::Context, origin: egui::ViewportId, detached: bo
     } else {
         (main, None)
     };
-    let Some(active) = desktop.words(desktop.root, desktop.atoms._NET_ACTIVE_WINDOW, AtomEnum::WINDOW, 1) else {
+    let Some(active) = desktop.active_window() else {
         return false;
     };
-    if active != [origin] {
+    if active != origin {
         return true;
     }
     let Some(current) = desktop.fullscreen(origin) else {
@@ -235,4 +256,24 @@ pub(super) fn toggle(ctx: &egui::Context, origin: egui::ViewportId, detached: bo
         }
     }
     desktop.request(origin, !current).is_some() && desktop.connection.flush().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_active_client_even_when_the_wm_appends_another_word() {
+        let window: Window = 0x600009;
+        let reply = GetPropertyReply {
+            type_: AtomEnum::WINDOW.into(),
+            format: 32,
+            value_len: 1,
+            bytes_after: 4,
+            value: window.to_ne_bytes().to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(active_client(&reply), Some(window));
+        assert_eq!(active_client(&GetPropertyReply::default()), Some(x11rb::NONE));
+    }
 }
