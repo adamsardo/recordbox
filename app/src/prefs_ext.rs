@@ -744,9 +744,6 @@ pub struct DialogsExt {
     pub backup_done: Option<(String, String)>,
     /// "Reset to defaults" waiting for confirmation: Some(page) for one page, Some(None) all.
     pub reset_ask: Option<Option<u8>>,
-    /// Full screen asked for from the menu or keyboard (applied by the main loop).
-    pub toggle_fullscreen: bool,
-    pub fullscreen: bool,
 }
 
 /// Playlist > Sort Items: the children of a folder (0 = the top level) by name.

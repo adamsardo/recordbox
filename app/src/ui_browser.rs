@@ -151,7 +151,7 @@ fn header_output(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
     let rx = r.max.x;
     let ty = r.min.y;
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, chrono::Local::now().format("%H:%M").to_string(), FontId::proportional(10.7), WHITE);
+    p.text(pos2(rx - 32.0, ty + 13.8), Align2::RIGHT_CENTER, chrono::Local::now().format("%H:%M").to_string(), FontId::proportional(10.7), WHITE);
     let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
     let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
     crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
@@ -190,7 +190,8 @@ fn header_output(app: &mut App, ui: &mut Ui, r: Rect) {
 }
 
 /// right-hand items measured from the right edge of a 1512 pt window).
-pub fn header_bar(app: &mut App, ui: &mut Ui) {
+pub fn header_bar(app: &mut App, ui: &mut Ui) -> bool {
+    let library_detached = app.library_window.is_some();
     let r = ui.max_rect();
     let p = ui.painter().clone();
     p.rect_filled(r, 0.0, BG1);
@@ -216,10 +217,22 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
     });
+    let window_button = Rect::from_min_max(pos2(r.right() - 28.0, r.top()), r.max);
+    let label = if library_detached { "Reattach library browser" } else { "Detach library browser" };
+    let response = ui.interact(window_button, ui.id().with("detach_library"), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let bg = if response.hovered() { BTN } else { BG1 };
+    p.rect_filled(window_button, 0.0, bg);
+    let outline = Stroke::new(1.3, if library_detached { BLUE } else { WHITE });
+    for offset in [vec2(-2.0, 2.0), vec2(2.0, -2.0)] {
+        let pane = Rect::from_center_size(window_button.center() + offset, vec2(12.0, 9.0));
+        p.rect(pane, 1.0, bg, outline, egui::StrokeKind::Inside);
+    }
+    let toggle_library = tipf(response, label).clicked();
     header_output(app, ui, r);
     if perf {
         performance_header(app, ui, r);
-        return;
+        return toggle_library;
     }
     // Layout selector: an 18 × 9 frame at x 136–154, y 9.5–18.5.
     let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
@@ -234,7 +247,8 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         // (App::set_player_layout: 0–3 player layouts, 4 = browser only).
         let cur = app.player_layout();
         for (i, name) in ["1 Player", "2 Players", "Dual Player", "Simple Player", "Full Browser"].iter().enumerate() {
-            let resp = ui.selectable_label(cur == i as u8, format!("        {name}"));
+            let resp = ui.add_enabled(!library_detached || i != 4, egui::SelectableLabel::new(cur == i as u8, format!("        {name}")))
+                .on_disabled_hover_text("Reattach the library to use Full Browser.");
             crate::icons_player::layout_mark(ui.painter(), pos2(resp.rect.min.x + 15.0, resp.rect.center().y), i as u8, WHITE);
             if resp.clicked() {
                 app.set_player_layout(i as u8);
@@ -252,7 +266,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         app.prefs.auto_analysis = !app.prefs.auto_analysis;
         app.save_prefs();
     }
-
+    toggle_library
 }
 
 fn menus(app: &mut App, ui: &mut Ui) {
@@ -462,14 +476,29 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
 }
 
 // ------------------------------------------------------------------------------------ browser
+// CentralPanel includes the viewport in its ID. Give the browser a single widget tree so
+// egui keeps its scroll positions and text edit state when it moves between native windows.
+fn browser_ui(panel: &Ui) -> Ui {
+    let builder = egui::UiBuilder::new().max_rect(panel.max_rect()).layer_id(panel.layer_id()).layout(*panel.layout()).style(panel.style().clone());
+    let mut ui = Ui::new(panel.ctx().clone(), egui::Id::new("recordbox_browser_contents"), builder);
+    ui.set_clip_rect(panel.clip_rect());
+    ui
+}
+
 /// Browser geometry measured in the original (pt): icon strip 0..26.5, tree pane 26.5..247,
 /// track list 253..1485.5, right icon strip 1488..1512; top row of the tree area 20 pt high.
-pub fn browser(app: &mut App, ui: &mut Ui) {
+pub fn browser(app: &mut App, panel: &mut Ui) {
+    let ui = &mut browser_ui(panel);
     app.poll_library_ext();
+    if ui.input(|i| i.events.contains(&egui::Event::WindowFocused(false))) {
+        app.drag = None;
+        app.sub_drag = false;
+        app.node_drag = None;
+    }
     // rekordbox's browser starts 283 pt below the window top: one point above this panel (the
     // player's last point is empty), so the browser is drawn from there.
     let mut full = ui.max_rect();
-    if !app.prefs.browser_only {
+    if !app.prefs.browser_only && ui.ctx().viewport_id() == egui::ViewportId::ROOT {
         full.min.y -= 1.0;
         let mut clip = ui.clip_rect();
         clip.min.y = clip.min.y.min(full.min.y);
@@ -2067,7 +2096,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                     sa = sa.vertical_scroll_offset((y - (h - rh) * 0.5).max(0.0));
                 } else {
                     // Scroll only as far as needed to show the row.
-                    let id = ui.make_persistent_id("vscroll");
+                    let id = ui.make_persistent_id(egui::Id::new("vscroll"));
                     let cur = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.offset.y).unwrap_or(0.0);
                     let view_h = (h - rh).max(rh);
                     if y < cur {
@@ -2631,6 +2660,49 @@ mod collection_render_tests {
 
     fn input() -> egui::RawInput {
         egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 240.0))), ..Default::default() }
+    }
+
+    #[test]
+    fn tree_and_track_offsets_follow_the_browser_between_windows() {
+        let ctx = context();
+        let library = egui::ViewportId::from_hash_of("recordbox_library");
+        let frame = |viewport_id, set: Option<[f32; 5]>| {
+            let mut raw = egui::RawInput { viewport_id, ..input() };
+            raw.viewports.entry(library).or_default();
+            let mut offsets = [0.0; 5];
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |panel| {
+                    let mut browser = browser_ui(panel);
+                    let mut tree = egui::ScrollArea::vertical().max_height(45.0);
+                    if let Some(values) = set {
+                        tree = tree.vertical_scroll_offset(values[0]);
+                    }
+                    offsets[0] = tree.show(&mut browser, |ui| ui.set_min_height(4000.0)).state.offset.y;
+                    for (index, name) in [(1, "main_list"), (3, "sub_list")] {
+                        let mut pane = browser.new_child(egui::UiBuilder::new().id_salt(name));
+                        let mut horizontal = egui::ScrollArea::horizontal().id_salt("hscroll");
+                        let mut vertical = egui::ScrollArea::vertical().id_salt("vscroll").max_height(45.0);
+                        if let Some(values) = set {
+                            horizontal = horizontal.horizontal_scroll_offset(values[index]);
+                            vertical = vertical.vertical_scroll_offset(values[index + 1]);
+                        }
+                        let tracks = horizontal.show(&mut pane, |ui| {
+                            ui.set_min_width(1500.0);
+                            vertical.show(ui, |ui| ui.set_min_height(4000.0)).state.offset.y
+                        });
+                        offsets[index] = tracks.state.offset.x;
+                        offsets[index + 1] = tracks.inner;
+                    }
+                });
+            });
+            offsets
+        };
+        let first = [108.0, 126.0, 977.0, 48.0, 313.0];
+        let second = [212.0, 58.0, 512.0, 152.0, 863.0];
+        assert_eq!(frame(egui::ViewportId::ROOT, Some(first)), first);
+        assert_eq!(frame(library, None), first);
+        assert_eq!(frame(library, Some(second)), second);
+        assert_eq!(frame(egui::ViewportId::ROOT, None), second);
     }
 
     /// The former row path, including offscreen painting/text layout. Keep this

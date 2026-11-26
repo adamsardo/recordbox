@@ -497,6 +497,15 @@ fn busy(app: &App, report: &Report, selected: &BTreeSet<usize>) -> bool {
         || selected_track(app.ext.preview.state.lock().track)
 }
 
+/// The library can redock during cleanup. Keep the process alive while changes are being applied.
+pub fn guard_app_close(app: &App, ctx: &Context) {
+    if ctx.input(|i| i.viewport().close_requested())
+        && matches!(app.ext.cleanup.as_ref().map(|review| &review.phase), Some(Phase::Working { applying: true, .. }))
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    }
+}
+
 pub fn show(app: &mut App, ctx: &Context) {
     let Some(mut review) = app.ext.cleanup.take() else {
         return;
@@ -506,9 +515,6 @@ pub fn show(app: &mut App, ctx: &Context) {
     }
     review.poll(app);
     let applying = matches!(review.phase, Phase::Working { applying: true, .. });
-    if applying && ctx.input(|i| i.viewport().close_requested()) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-    }
     let response = egui::Modal::new("collection_cleanup".into()).frame(kit::dialog_frame(ctx)).show(ctx, |ui| {
         kit::apply_style(ui);
         ui.set_width((ctx.screen_rect().width() - 50.0).clamp(250.0, 740.0));

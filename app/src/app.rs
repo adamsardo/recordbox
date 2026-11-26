@@ -1608,6 +1608,9 @@ pub struct App {
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
+    pub(crate) library_window: Option<crate::DetachedLibrary>,
+    /// A track being dragged between the decks or sampler while the library is in another window.
+    detached_player_drag: Option<Vec<i64>>,
     pub textures: HashMap<String, Option<egui::TextureHandle>>,
     pub ctx: egui::Context,
     pub screenshot: Option<(String, u32)>,
@@ -1617,14 +1620,24 @@ pub struct App {
     pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
-    /// Edit menu commands waiting to be handed to egui as input events on the next frame:
-    /// 0 cut, 1 copy, 2 paste, 3 select all.
-    pub edit_cmds: Vec<u8>,
+    /// Native Edit menu actions waiting for the focused window's text field or track list.
+    pub edit_events: Vec<egui::Event>,
     /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
     pub ext: crate::library_ext::LibExt,
 }
 
 impl App {
+    /// Native windows have independent pointer positions and releases. Keep the decks' drag
+    /// available to the sampler in their window and the browser drag available in the library.
+    pub fn with_detached_player_drag(&mut self, ctx: &egui::Context, draw: impl FnOnce(&mut App)) {
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+        draw(self);
+        if ctx.input(|i| !i.focused || !i.pointer.any_down()) {
+            self.drag = None;
+        }
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+    }
+
     fn open_library(ctx: &egui::Context, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
         crate::theme::apply(ctx);
         // SVG images (the recordbox logo).
@@ -1728,13 +1741,15 @@ impl App {
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
+            library_window: None,
+            detached_player_drag: None,
             textures: HashMap::new(),
             ctx: ctx.clone(),
             screenshot: screenshot.map(|s| (s, 0)),
             scroll_to_selected: false,
             list_scroll_to: None,
             menu: None,
-            edit_cmds: vec![],
+            edit_events: vec![],
             ext: Default::default(),
         }
     }
@@ -3682,7 +3697,7 @@ impl App {
         }
     }
 
-    pub fn update_transport(&mut self, ctx: &egui::Context) {
+    pub fn update_transport(&mut self, ctx: &egui::Context, decks_visible: bool) {
         let running = self.player.transport_running();
         #[cfg(target_os = "linux")]
         {
@@ -3706,10 +3721,10 @@ impl App {
             }
         }
         if running {
-            if self.prefs.browser_only && !self.performance() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            } else {
+            if decks_visible {
                 self.repaint_playback(ctx);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
     }

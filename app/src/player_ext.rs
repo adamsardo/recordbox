@@ -395,14 +395,19 @@ pub fn adjacent_row(list: &[i64], current: Option<i64>, dir: i32, ok: impl Fn(i6
 
 impl App {
     // ------------------------------------------------------------------ decks and layouts
+    /// Detaching a full browser reveals the last chosen player layout in the main window.
+    pub fn full_browser(&self) -> bool {
+        self.prefs.browser_only && self.library_window.is_none()
+    }
+
     /// A layout with both decks is showing (2 Players or Dual Player).
     pub fn two_players(&self) -> bool {
-        self.performance() || (!self.prefs.browser_only && matches!(self.prefs.player_layout, 1 | 3))
+        self.performance() || (!self.full_browser() && matches!(self.prefs.player_layout, 1 | 3))
     }
 
     /// The Dual Player layout is showing.
     pub fn dual_player(&self) -> bool {
-        !self.performance() && !self.prefs.browser_only && self.prefs.player_layout == 3
+        !self.performance() && !self.full_browser() && self.prefs.player_layout == 3
     }
 
     /// PERFORMANCE mode (decks with a mixer) is showing.
@@ -592,7 +597,7 @@ impl App {
 
     /// 0 = 1 Player, 1 = 2 Players, 2 = Dual Player, 3 = Simple Player, 4 = Full Browser.
     pub fn player_layout(&self) -> u8 {
-        if self.prefs.browser_only {
+        if self.full_browser() {
             4
         } else {
             [0, 1, 3, 2][self.prefs.player_layout.min(3) as usize]

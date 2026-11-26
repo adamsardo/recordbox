@@ -59,28 +59,74 @@ struct Gui {
     app: App,
 }
 
+const MAIN_MIN_SIZE: egui::Vec2 = egui::vec2(1100.0, 700.0);
+
+struct DetachedLibrary {
+    initial_size: egui::Vec2,
+    docked_size: Option<egui::Vec2>,
+    deck_window_height: f32,
+}
+
+impl DetachedLibrary {
+    fn open(ctx: &egui::Context, player_height: f32) -> Self {
+        let size = ctx.screen_rect().size();
+        let docked_size = windowed(ctx).then_some(size);
+        let deck_window_height = player_height + 56.0; // Header and status bar.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(MAIN_MIN_SIZE.x, deck_window_height)));
+        if docked_size.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.x, deck_window_height)));
+        }
+        Self {
+            initial_size: egui::vec2(size.x, (size.y - deck_window_height).max(400.0)),
+            docked_size,
+            deck_window_height,
+        }
+    }
+
+    fn fit_decks(&mut self, ctx: &egui::Context, player_height: f32) {
+        let height = player_height + 56.0;
+        if self.deck_window_height != height {
+            let size = ctx.screen_rect().size();
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(MAIN_MIN_SIZE.x, height)));
+            // Follow deck layout changes only while the user has kept the compact height.
+            if windowed(ctx) && (size.y - self.deck_window_height).abs() <= 2.0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.x, height)));
+            }
+            self.deck_window_height = height;
+        }
+    }
+
+    fn reattach(self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MAIN_MIN_SIZE));
+        if let Some(size) = self.docked_size.filter(|_| windowed(ctx)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        ctx.request_repaint();
+    }
+}
+
+fn windowed(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().fullscreen != Some(true) && i.viewport().maximized != Some(true))
+}
+
+fn window_input(app: &mut App, ctx: &egui::Context) {
+    menus::apply_edit_commands(app, ctx);
+    window_fullscreen(&app.prefs, ctx);
+    if ctx.input(|i| i.focused || i.events.contains(&egui::Event::WindowFocused(false))) {
+        shortcuts(app, ctx);
+    }
+}
+
+fn library_panel(app: &mut App, ctx: &egui::Context) {
+    egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        ui_browser::browser(app, ui);
+    });
+}
+
 impl eframe::App for Gui {
     /// PREPDECK_SHOT_DRAG (with --screenshot): drag hot cue A 100 px to the right with real
     /// pointer events, to check marker dragging end to end; the result goes to stderr.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        // Edit menu commands (and their shortcuts, which the menu bar takes before the view sees
-        // the keys) become the input events egui's text fields and the track list act on.
-        for c in std::mem::take(&mut self.app.edit_cmds) {
-            match c {
-                0 => raw.events.push(egui::Event::Cut),
-                1 => raw.events.push(egui::Event::Copy),
-                2 => {
-                    if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok()) {
-                        raw.events.push(egui::Event::Paste(t));
-                    }
-                }
-                _ => {
-                    let m = egui::Modifiers { command: true, mac_cmd: true, ..Default::default() };
-                    raw.events.push(egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: m });
-                    raw.events.push(egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: false, repeat: false, modifiers: m });
-                }
-            }
-        }
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         self.app.shot_perf_events(frame, raw);
@@ -159,38 +205,79 @@ impl eframe::App for Gui {
         step!(backup::poll(app));
         step!(menus::poll(app));
         step!(menus::sync(app));
-        shortcuts(app, ctx);
-        // Full screen (View menu, keyboard): the window follows; the menu tick follows the window.
-        let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if std::mem::take(&mut app.dialogs.ext.toggle_fullscreen) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
-        }
-        app.dialogs.ext.fullscreen = fs;
+        window_input(app, ctx);
 
-        egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
-            step!(ui_browser::header_bar(app, ui));
-        });
+        let toggle_library = egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
+            ui_browser::header_bar(app, ui)
+        }).inner;
+        if toggle_library {
+            if let Some(window) = app.library_window.take() {
+                window.reattach(ctx);
+            } else if !ctx.embed_viewports() {
+                app.library_window = Some(DetachedLibrary::open(ctx, app.player_height()));
+            }
+        }
         egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
-        if !app.prefs.browser_only || app.performance() {
+        let decks_visible = !app.full_browser() || app.performance();
+        if decks_visible {
             // The header is 28 pt and 1 Player / 2 Players 256 pt tall with no rule between them
             // (measured on rekordbox: the player ends 284 pt below the window top); the Simple
             // Player is one 58 pt row.
             let h = app.player_height();
             let perf = app.performance();
-            egui::TopBottomPanel::top(egui::Id::new(("player", if perf { 9 } else { app.prefs.player_layout.min(3) }))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
-                _ if perf => step!(ui_perf::performance(app, ui)),
-                1 | 3 => step!(ui_player2::two_players(app, ui)),
-                2 => step!(ui_player2::simple_player(app, ui)),
-                _ => step!(ui_player::player_panel(app, ui)),
+            let draw_players = |app: &mut App| {
+                egui::TopBottomPanel::top(egui::Id::new(("player", if perf { 9 } else { app.prefs.player_layout.min(3) }))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+                    _ if perf => step!(ui_perf::performance(app, ui)),
+                    1 | 3 => step!(ui_player2::two_players(app, ui)),
+                    2 => step!(ui_player2::simple_player(app, ui)),
+                    _ => step!(ui_player::player_panel(app, ui)),
+                });
+            };
+            if app.library_window.is_some() {
+                app.with_detached_player_drag(ctx, draw_players);
+            } else {
+                draw_players(app);
+            }
+        }
+        let library_id = egui::ViewportId::from_hash_of("recordbox_library");
+        let deck_height = app.player_height();
+        if let Some(window) = &mut app.library_window {
+            window.fit_decks(ctx, deck_height);
+            let builder = egui::ViewportBuilder::default().with_title("recordbox — Library")
+                .with_inner_size(window.initial_size).with_min_inner_size([900.0, 360.0]);
+            let reattach = ctx.show_viewport_immediate(library_id, builder, |child, class| {
+                if class == egui::ViewportClass::Embedded || child.input(|i| i.viewport().close_requested()) {
+                    return true;
+                }
+                window_input(app, child);
+                step!(library_panel(app, child));
+                step!(ui_dialogs::library_dialogs(app, child));
+                false
+            });
+            if reattach {
+                if let Some(window) = app.library_window.take() {
+                    window.reattach(ctx);
+                }
+            }
+        }
+        if app.library_window.is_none() {
+            step!(library_panel(app, ctx));
+        }
+        step!(ui_prefs::prefs_window(app, ctx));
+        if app.library_window.is_none() {
+            step!(ui_dialogs::library_dialogs(app, ctx));
+        } else if app.ext.cleanup.is_some() {
+            egui::Modal::new("detached_collection_cleanup".into()).show(ctx, |ui| {
+                ui.label("Collection cleanup is open in the library browser.");
+                if ui.button("Show library").clicked() {
+                    ctx.send_viewport_cmd_to(library_id, egui::ViewportCommand::Focus);
+                }
             });
         }
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
-            step!(ui_browser::browser(app, ui));
-        });
-        step!(ui_dialogs::dialogs(app, ctx));
-        app.update_transport(ctx);
+        collection_cleanup::ui::guard_app_close(app, ctx);
+        app.update_transport(ctx, decks_visible);
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -278,6 +365,29 @@ fn recordbox_actions() -> Vec<&'static str> {
     app::ACTIONS.iter().map(|a| a.0).collect()
 }
 
+/// F11 also works inside a search field. An explicit key binding for another action wins.
+fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context) {
+    let fullscreen = ctx.input_mut(|i| {
+        if !i.focused {
+            return None;
+        }
+        let mut toggle = false;
+        i.events.retain(|event| {
+            if let egui::Event::Key { key: egui::Key::F11, pressed: true, repeat, modifiers, .. } = event {
+                if modifiers.is_none() && !prefs.keymap.iter().any(|(action, key)| action != "fullscreen" && key == "F11") {
+                    toggle |= !repeat;
+                    return false;
+                }
+            }
+            true
+        });
+        toggle.then(|| !i.viewport().fullscreen.unwrap_or(false))
+    });
+    if let Some(fullscreen) = fullscreen {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+    }
+}
+
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
     // Previews never outlive what holds them: losing the window's focus ends them (key-up
     // events are not delivered then), and a hot-cue preview ends once neither a hot-cue key nor
@@ -293,6 +403,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         if app.searching() != 0 && !ctx.input(|i| i.pointer.any_down()) {
             app.search(0);
         }
+        return;
     }
     if app.deck.hot_preview.is_some() {
         let hot_held = (1..=8).any(|n| app.prefs.key_for(&format!("hot{n}")).map(|k| ctx.input(|i| i.key_down(k))).unwrap_or(false));
@@ -511,7 +622,7 @@ fn main() -> eframe::Result<()> {
     let deck_options = DeckOptions::from_args(&args[1..]);
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
     let shot_mode = screenshot.is_some();
-    let mut viewport = egui::ViewportBuilder::default().with_title("recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
+    let mut viewport = egui::ViewportBuilder::default().with_title("recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size(MAIN_MIN_SIZE);
     // The recordbox mark as the window and Dock icon.
     if let Some(icon) = brand::mark_icon(512) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
