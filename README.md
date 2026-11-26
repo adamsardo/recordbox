@@ -40,7 +40,7 @@ The upstream project is being built in the open with an AI coding agent (Claude 
 
 ## What it's aiming for
 
-- **Library:** import, browse, search and organise your tracks
+- **Library:** import, browse, search and organise your tracks. In EXPORT and PERFORMANCE, the overlapping-windows button at the right of the top bar opens the browser in its own window. Close the library window to reattach it. You can resize or maximize each window independently. Press F11 in either window to toggle fullscreen for both together.
 - **Analysis:** tempo, optional high-precision beat grids for steady and changing tempos, key and waveforms
 - **Preparation:** cues, loops, playlists and the rest of the pre-set workflow
 - **USB export** for CDJ/XDJ models that read the classic Device Library.

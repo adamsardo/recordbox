@@ -35,6 +35,7 @@ const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "recordbox has no subscript
 // Extensions is where rekordbox keeps its STEMS page (in Performance mode).
 // Controller holds the Performance mixer's settings, as in rekordbox.
 const PAGES: [(u8, &str); 8] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (7, "Controller"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced"), (6, "Extensions")];
+const SHORTCUT_WAIT_ID: &str = "key_wait";
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
     match page {
@@ -330,6 +331,12 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
         if class == egui::ViewportClass::Embedded {
             prefs_embedded(app, vctx);
             return;
+        }
+        crate::menus::apply_edit_commands(app, vctx);
+        let assigning_key = app.dialogs.prefs_tab == 3 && app.dialogs.ext.prefs_search.trim().is_empty()
+            && vctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SHORTCUT_WAIT_ID))).flatten().is_some();
+        if !assigning_key {
+            crate::window_fullscreen(&app.prefs, vctx, None);
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(vctx, |ui| {
             let h = ui.available_height();
@@ -1448,7 +1455,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
     let cat = ACTION_CATEGORIES[tab.min(ACTION_CATEGORIES.len() - 1)];
     card(ui, cat, |ui| {
         kit::line(ui, "Click a shortcut, then press the new key for that action, with Ctrl, Opt, Shift or ⌘ if you like (Esc cancels, Delete clears).");
-        let wait_id = egui::Id::new("key_wait");
+        let wait_id = egui::Id::new(SHORTCUT_WAIT_ID);
         let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
         if let Some(action) = &waiting {
             let got = ui.input(|i| {
@@ -1517,6 +1524,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
             }
         }));
         note(ui, "⌘ and Ctrl shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
+        note(ui, "F11 toggles full screen for the main window and detached library together unless you assign it to another action.");
     });
 }
 

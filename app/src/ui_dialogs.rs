@@ -9,8 +9,7 @@ use crate::theme::*;
 use crate::ui_kit::{self as kit, btn};
 use egui::{vec2, Context, RichText, Ui};
 
-pub fn dialogs(app: &mut App, ctx: &Context) {
-    crate::ui_prefs::prefs_window(app, ctx);
+pub fn library_dialogs(app: &mut App, ctx: &Context) {
     crate::ui_prefs::extra_windows(app, ctx);
     crate::ui_sync::show(app, ctx);
     info_window(app, ctx);

@@ -517,6 +517,24 @@ impl Db {
         self.conn.execute("DELETE FROM cues WHERE id=?1", [id])?;
         Ok(())
     }
+    /// A hot-cue slot is one pad even when an older library contains duplicate rows.
+    /// Capture Undo and replace (or clear) the slot in one transaction.
+    pub fn edit_hot_cue(&self, track: i64, slot: i32, replacement: Option<&Cue>) -> Result<(Vec<Cue>, Vec<Cue>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let before = self.cues(track)?;
+        let count = before.iter().filter(|c| c.kind == CueKind::Hot && c.slot == slot).count();
+        if count > 0 {
+            let removed = tx.execute("DELETE FROM cues WHERE track_id=?1 AND kind=1 AND slot=?2", params![track, slot])?;
+            anyhow::ensure!(removed == count, "The hot cue could not be removed");
+        }
+        if let Some(cue) = replacement {
+            self.save_cue(cue)?;
+        }
+        let after = self.cues(track)?;
+        anyhow::ensure!(after.iter().filter(|c| c.kind == CueKind::Hot && c.slot == slot).count() == usize::from(replacement.is_some()), "The hot cue could not be saved");
+        tx.commit()?;
+        Ok((before, after))
+    }
     pub fn replace_cues(&self, track: i64, cues: &[Cue]) -> Result<()> {
         self.conn.execute("DELETE FROM cues WHERE track_id=?1", [track])?;
         for c in cues {
@@ -526,6 +544,17 @@ impl Db {
             self.save_cue(&c)?;
         }
         Ok(())
+    }
+
+    /// Undo/Redo needs the inverse edit and the new row IDs from the same committed write.
+    pub fn restore_cues(&self, track: i64, cues: &[Cue]) -> Result<(Vec<Cue>, Vec<Cue>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = self.cues(track)?;
+        self.replace_cues(track, cues)?;
+        let restored = self.cues(track)?;
+        anyhow::ensure!(restored.len() == cues.len(), "Could not restore every cue");
+        tx.commit()?;
+        Ok((previous, restored))
     }
 
     // ---- grid & waveform

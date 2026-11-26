@@ -480,32 +480,18 @@ impl App {
     }
 
     /// A freshly analysed track without cues gets the cues of the personal tendency.
-    pub fn apply_cue_tendency(&mut self, id: i64, grid: &BeatGrid) {
+    pub fn apply_cue_tendency(&self, id: i64, grid: &BeatGrid, cleared_hot_slots: &HashSet<i32>) -> bool {
         if self.prefs.bx.cue_tendency.is_empty() || self.db.cues(id).map(|c| !c.is_empty()).unwrap_or(true) {
-            return;
+            return false;
         }
         let dur = self.track(id).map(|t| t.duration).unwrap_or(0.0);
-        let cues = tendency_cues(&self.prefs.bx.cue_tendency, id, grid, dur);
-        if cues.is_empty() {
-            return;
-        }
-        let (mut h, mut m) = (0, 0);
-        for c in &cues {
-            if self.db.save_cue(c).is_ok() {
-                if c.kind == CueKind::Hot {
-                    h += 1;
-                    self.hot_positions.entry(id).or_default().push((c.start, c.slot, 0));
-                } else {
-                    m += 1;
-                }
+        let mut added = false;
+        for cue in tendency_cues(&self.prefs.bx.cue_tendency, id, grid, dur) {
+            if cue.kind != CueKind::Hot || !cleared_hot_slots.contains(&cue.slot) {
+                added |= self.db.save_cue(&cue).is_ok();
             }
         }
-        let e = self.cue_counts.entry(id).or_insert((0, 0));
-        e.0 += h;
-        e.1 += m;
-        if self.deck.track == Some(id) {
-            self.deck.cues = self.db.cues(id).unwrap_or_default();
-        }
+        added
     }
 }
 

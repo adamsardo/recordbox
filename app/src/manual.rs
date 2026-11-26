@@ -19,6 +19,9 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 </ul>
 <h3>The window</h3>
 <p>Top: the player (waveforms, transport, cues, grid). Below: the browser with the Tree View on the left (Collection, Playlists, Related Tracks, Explorer, Devices, Histories) and the track list on the right. <i>View</i> switches between <b>1 Player</b>, <b>2 Players</b>, <b>Simple Player</b> and <b>Full Browser</b>.</p>
+<p>In <b>EXPORT</b> and <b>PERFORMANCE</b>, click the overlapping windows at the far right of the top bar to open the library browser in its own window. The decks, GRID and MEMORY controls stay in the main window. Everything below them moves together, including the collection tree, playlists, filters, search and track list. You keep your selection and place in the list. Close the library window or click the same icon again to continue browsing in the main window.</p>
+<p>You can move, resize or maximize each window independently. To fill two monitors, move the library to the second monitor, then press <kbd>F11</kbd> in either window. Both windows enter fullscreen on their own monitors. On one monitor, the window where you pressed <kbd>F11</kbd> stays in front so you can keep working there. Press <kbd>F11</kbd> again to restore both windows. With the library attached, <kbd>F11</kbd> toggles the main window.</p>
+<p><kbd>Space</kbd> plays or pauses the active deck in both modes. When editing a search or text field, it types a space. To switch windows, use <kbd>Alt+Tab</kbd> on Windows or most Linux desktops. On macOS, use <kbd>Command+`</kbd> for windows in the same Space, or Mission Control for windows in different fullscreen Spaces.</p>
 "#),
     ("import", "Importing music", r#"
 <ul>
@@ -81,7 +84,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 "#),
     ("player", "The player", r#"
 <ul>
-<li>Load a track with a double-click, Return, or by dragging it onto the player.</li>
+<li>Choose the destination player or deck in the toolbar above the track list, then double-click a track title or select it and press Return to load it. This also works with the library detached. With the browser and player in one window, you can also drag a track onto the player.</li>
 <li><b>Overview</b> (whole track) and <b>enlarged waveform</b>: click or drag to move; Zoom In / Zoom Out / Reset Zoom change the enlarged waveform's scale. Waveform colour (BLUE, RGB, 3Band) is in Preferences &gt; View &gt; Color, Full / Half Waveform in Preferences &gt; View &gt; Display Type.</li>
 <li><b>Play/Pause</b> and <b>Cue</b>: Cue while paused sets the cue point; holding it previews from the cue point.</li>
 <li><b>Search</b> buttons scan through the track while held; <b>Previous / Next Track</b> load the neighbouring row of the list.</li>
@@ -93,7 +96,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 "#),
     ("cues", "Cues and loops", r#"
 <h3>Hot cues</h3>
-<p>Eight hot cues, A–H. Press an empty pad (or its key) to set it at the playhead; press a set one to jump there (hold while paused to preview). Clear with the × on the pad or the Clear Hot Cue shortcut. Right-click a pad for its colour and comment. Hot cue markers on the enlarged waveform can be dragged.</p>
+<p>The number keys <kbd>1</kbd> through <kbd>8</kbd> control hot cues A–H on the active deck. Press an empty pad or its key to set a cue at the playhead. Press it again to jump there, or hold it while paused to preview. To clear one cue, hold <kbd>Shift</kbd> and press its number, or click the × on its pad. For example, <kbd>Shift+1</kbd> clears A. Use <b>Edit &gt; Undo</b> to restore it. Right-click a pad for its colour and comment. Drag a hot cue marker on the enlarged waveform to move it.</p>
 <h3>Memory cues</h3>
 <p><b>Memory</b> stores the current cue point (or the active loop) as a memory cue. Call Next / Previous Memory Cue step through them; Memory Cue 1–10 call one directly; Delete Memory Cue removes the one at the cue point. The memory list in the side panel shows them with their comments and colours.</p>
 <h3>Loops</h3>

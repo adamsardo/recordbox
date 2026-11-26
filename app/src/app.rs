@@ -15,6 +15,8 @@ use std::time::Instant;
 
 #[cfg(test)]
 mod stem_cache_tests;
+#[cfg(test)]
+mod hot_cue_persistence_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Col {
@@ -1576,6 +1578,8 @@ pub struct App {
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
     pub pool: AnalysisPool,
+    /// Hot slots the user cleared while this track's library analysis was outstanding.
+    cleared_analysis_hot_slots: HashMap<i64, HashSet<i32>>,
     pub analysis_total: usize,
     pub analysis_done: usize,
     pub importing: Option<Receiver<Option<Track>>>,
@@ -1608,6 +1612,9 @@ pub struct App {
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
+    pub(crate) library_window: Option<crate::DetachedLibrary>,
+    /// A track being dragged between the decks or sampler while the library is in another window.
+    detached_player_drag: Option<Vec<i64>>,
     pub textures: HashMap<String, Option<egui::TextureHandle>>,
     pub ctx: egui::Context,
     pub screenshot: Option<(String, u32)>,
@@ -1617,14 +1624,24 @@ pub struct App {
     pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
-    /// Edit menu commands waiting to be handed to egui as input events on the next frame:
-    /// 0 cut, 1 copy, 2 paste, 3 select all.
-    pub edit_cmds: Vec<u8>,
+    /// Native Edit menu actions waiting for the focused window's text field or track list.
+    pub edit_events: Vec<egui::Event>,
     /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
     pub ext: crate::library_ext::LibExt,
 }
 
 impl App {
+    /// Native windows have independent pointer positions and releases. Keep the decks' drag
+    /// available to the sampler in their window and the browser drag available in the library.
+    pub fn with_detached_player_drag(&mut self, ctx: &egui::Context, draw: impl FnOnce(&mut App)) {
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+        draw(self);
+        if ctx.input(|i| !i.focused || !i.pointer.any_down()) {
+            self.drag = None;
+        }
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+    }
+
     fn open_library(ctx: &egui::Context, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
         crate::theme::apply(ctx);
         // SVG images (the recordbox logo).
@@ -1707,6 +1724,7 @@ impl App {
             load_target: 0,
             deck: Deck::default(),
             pool,
+            cleared_analysis_hot_slots: HashMap::new(),
             analysis_total: 0,
             analysis_done: 0,
             importing: None,
@@ -1728,13 +1746,15 @@ impl App {
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
+            library_window: None,
+            detached_player_drag: None,
             textures: HashMap::new(),
             ctx: ctx.clone(),
             screenshot: screenshot.map(|s| (s, 0)),
             scroll_to_selected: false,
             list_scroll_to: None,
             menu: None,
-            edit_cmds: vec![],
+            edit_events: vec![],
             ext: Default::default(),
         }
     }
@@ -3533,7 +3553,14 @@ impl App {
         }
     }
 
+    pub(crate) fn suppress_pending_analysis_hot_slot(&mut self, track: i64, slot: i32) {
+        if (0..8).contains(&slot) && self.track(track).is_some_and(|t| t.analyzed == 3) {
+            self.cleared_analysis_hot_slots.entry(track).or_default().insert(slot);
+        }
+    }
+
     pub fn apply_analysis(&mut self, id: i64, r: Result<crate::analysis::AnalysisResult, String>) {
+        let cleared_hot_slots = self.cleared_analysis_hot_slots.remove(&id).unwrap_or_default();
         let existing_grid = self.db.grid(id).filter(|g| !g.is_empty());
         // Earlier analysis means a stored waveform (a grid alone can come from an import).
         let had_analysis = self.db.wave(id).is_some();
@@ -3592,43 +3619,28 @@ impl App {
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
                 self.previews.insert(id, preview);
-                let new_grid = save_grid.clone();
-                if let Some(g) = save_grid {
-                    let _ = self.db.save_grid(id, &g);
+                if let Some(g) = &save_grid {
+                    let _ = self.db.save_grid(id, g);
                 }
-                // CUE Analysis Playlist: cues of the personal CUE tendency (browser_ext.rs).
-                if first_analysis {
-                    if let Some(g) = &new_grid {
-                        self.apply_cue_tendency(id, g);
-                    }
-                }
-                // rekordbox sets hot cue A, named "1.1Bars", on the first downbeat when it first
-                // analyses a track (seen on every analysed track of the user's library, created
-                // during analysis). Only on a fresh grid and for a track with no cues yet.
-                if self.prefs.auto_first_downbeat_cue && first_analysis {
-                    if let Some(g) = &new_grid {
+                if let Some(g) = save_grid.as_ref().filter(|_| first_analysis) {
+                    let mut added_cues = self.apply_cue_tendency(id, g, &cleared_hot_slots);
+                    // Rekordbox's default Hot Cue A ("1.1Bars") applies to a track without cues.
+                    if self.prefs.auto_first_downbeat_cue && !cleared_hot_slots.contains(&0)
+                        && !added_cues && self.db.cues(id).is_ok_and(|cues| cues.is_empty())
+                    {
                         let dur = self.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
                         if let Some(b) = g.beats(dur).into_iter().find(|b| b.beat == 1) {
-                            if self.db.cues(id).map(|c| c.is_empty()).unwrap_or(false) {
-                                let c = Cue { id: 0, track_id: id, kind: CueKind::Hot, slot: 0, start: b.time, end: None, color: 0, comment: "1.1Bars".into(), active_loop: false };
-                                let _ = self.db.save_cue(&c);
-                                if let Some(e) = self.cue_counts.get_mut(&id) {
-                                    e.0 += 1;
-                                } else {
-                                    self.cue_counts.insert(id, (1, 0));
-                                }
-                                self.hot_positions.entry(id).or_default().push((b.time, 0, 0));
-                                if self.deck.track == Some(id) {
-                                    self.deck.cues = self.db.cues(id).unwrap_or_default();
-                                }
-                            }
+                            let c = Cue { id: 0, track_id: id, kind: CueKind::Hot, slot: 0, start: b.time, end: None, color: 0, comment: "1.1Bars".into(), active_loop: false };
+                            added_cues = self.db.save_cue(&c).is_ok();
                         }
                     }
-                }
-                // Preferences > Analysis > CUE Analysis: memory cue at the first beat.
-                if self.prefs.memory_cue_first_beat && first_analysis {
-                    if let Some(g) = &new_grid {
-                        crate::prefs_ext::memory_cue_at_first_beat(self, id, g);
+                    if self.prefs.memory_cue_first_beat {
+                        added_cues |= crate::prefs_ext::memory_cue_at_first_beat(self, id, g);
+                    }
+                    if added_cues {
+                        if let Ok(cues) = self.db.cues(id) {
+                            self.set_track_cues(id, cues);
+                        }
                     }
                 }
                 if self.deck.track == Some(id) {
@@ -3682,7 +3694,7 @@ impl App {
         }
     }
 
-    pub fn update_transport(&mut self, ctx: &egui::Context) {
+    pub fn update_transport(&mut self, ctx: &egui::Context, decks_visible: bool) {
         let running = self.player.transport_running();
         #[cfg(target_os = "linux")]
         {
@@ -3706,10 +3718,10 @@ impl App {
             }
         }
         if running {
-            if self.prefs.browser_only && !self.performance() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-            } else {
+            if decks_visible {
                 self.repaint_playback(ctx);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
     }
@@ -3962,8 +3974,7 @@ impl App {
     }
 
     pub fn hot_cue_down(&mut self, slot: i32) {
-        let Some(tid) = self.deck.track else { return };
-        if self.deck.audio.is_none() {
+        if self.deck.track.is_none() || self.deck.audio.is_none() {
             return;
         }
         if let Some(c) = self.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned() {
@@ -3987,17 +3998,11 @@ impl App {
             }
         } else {
             let lr = self.player.state.lock().loop_range;
-            let (start, end, color) = match lr {
-                Some((a, b)) => (a, Some(b), hotcue_default_color(slot, true)),
-                None => (self.quantized(self.pos()), None, hotcue_default_color(slot, false)),
+            let (start, end) = match lr {
+                Some((a, b)) => (a, Some(b)),
+                None => (self.quantized(self.pos()), None),
             };
-            let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
-            self.snapshot_cues();
-            if let Ok(id) = self.db.save_cue(&c) {
-                c.id = id;
-                self.deck.cues.push(c);
-                self.refresh_cue_counts(tid);
-            }
+            self.set_hot(slot, start, end);
         }
     }
     pub fn hot_cue_up(&mut self) {
@@ -4024,16 +4029,6 @@ impl App {
         self.redo.clear();
     }
 
-    /// The current state matching `e` (what Redo/Undo will need to go back to).
-    fn current_of(&self, e: &Edit) -> Option<Edit> {
-        match e {
-            Edit::Cues { track, .. } => Some(Edit::Cues { track: *track, before: self.db.cues(*track).unwrap_or_default() }),
-            Edit::Track { before } => self.db.track(before.id).map(|t| Edit::Track { before: t }),
-            Edit::Grid { track, .. } => Some(Edit::Grid { track: *track, before: self.db.grid(*track).unwrap_or_default() }),
-            Edit::Phrases { track, .. } => Some(Edit::Phrases { track: *track, before: self.stored_phrases(*track) }),
-        }
-    }
-
     /// Remember a track's edited phrases before a PHRASE EDIT change (for Undo).
     pub fn record_phrases(&mut self, track: i64) {
         let before = self.stored_phrases(track);
@@ -4048,47 +4043,42 @@ impl App {
         }
     }
 
-    fn restore(&mut self, e: Edit) {
-        match e {
-            Edit::Phrases { track, before } => self.store_phrases(track, before),
+    /// Apply a history entry and capture its inverse. A failed cue write leaves the entry retryable.
+    fn restore(&mut self, edit: &Edit) -> anyhow::Result<Option<Edit>> {
+        Ok(match edit {
+            Edit::Phrases { track, before } => {
+                let previous = self.stored_phrases(*track);
+                self.store_phrases(*track, before.clone());
+                Some(Edit::Phrases { track: *track, before: previous })
+            }
             Edit::Cues { track, before } => {
-                let _ = self.db.replace_cues(track, &before);
-                if self.deck.track == Some(track) {
-                    self.deck.cues = self.db.cues(track).unwrap_or_default();
-                }
-                for d in self.px.parked.iter_mut() {
-                    if d.track == Some(track) {
-                        d.cues = self.db.cues(track).unwrap_or_default();
+                let (previous, restored) = self.db.restore_cues(*track, before)?;
+                for cue in previous.iter().filter(|cue| cue.kind == CueKind::Hot) {
+                    if !restored.iter().any(|other| other.kind == CueKind::Hot && other.slot == cue.slot) {
+                        self.suppress_pending_analysis_hot_slot(*track, cue.slot);
                     }
                 }
-                let cues = self.db.cues(track).unwrap_or_default();
-                let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
-                if hp.is_empty() {
-                    self.hot_positions.remove(&track);
-                } else {
-                    self.hot_positions.insert(track, hp);
-                }
-                let (h, m) = (cues.iter().filter(|c| c.kind == CueKind::Hot).count(), cues.iter().filter(|c| c.kind == CueKind::Memory).count());
-                if h + m == 0 {
-                    self.cue_counts.remove(&track);
-                } else {
-                    self.cue_counts.insert(track, (h, m));
-                }
+                self.set_track_cues(*track, restored);
+                Some(Edit::Cues { track: *track, before: previous })
             }
             Edit::Track { before } => {
-                let _ = self.db.update_track(&before);
+                let previous = self.db.track(before.id);
+                let _ = self.db.update_track(before);
                 if let Some(t) = self.track_mut(before.id) {
-                    *t = before;
+                    t.clone_from(before);
                 }
                 self.list_dirty = true;
+                previous.map(|before| Edit::Track { before })
             }
             Edit::Grid { track, before } => {
+                let track = *track;
+                let previous = Some(Edit::Grid { track, before: self.db.grid(track).unwrap_or_default() });
                 // Analysis Lock also holds against Undo/Redo.
                 if self.track(track).map(|t| t.grid_locked).unwrap_or(false) {
                     self.toast_err("This track's analysis is locked; unlock it to change its grid.");
-                    return;
+                    return Ok(previous);
                 }
-                let _ = self.db.save_grid(track, &before);
+                let _ = self.db.save_grid(track, before);
                 for n in 0..4u8 {
                     if n != self.px.active && self.px.parked[n as usize].track == Some(track) {
                         let g = before.clone();
@@ -4096,10 +4086,11 @@ impl App {
                     }
                 }
                 if self.deck.track == Some(track) {
-                    self.set_deck_grid(before, false);
+                    self.set_deck_grid(before.clone(), false);
                 }
+                previous
             }
-        }
+        })
     }
 
     pub fn undo_len(&self) -> usize {
@@ -4108,27 +4099,59 @@ impl App {
 
     pub fn undo_edit(&mut self) {
         let Some(e) = self.undo.pop() else { return };
-        if let Some(cur) = self.current_of(&e) {
-            self.redo.push(cur);
+        match self.restore(&e) {
+            Ok(Some(inverse)) => self.redo.push(inverse),
+            Ok(None) => {}
+            Err(error) => {
+                self.undo.push(e);
+                self.toast_err(format!("Could not undo cue edit: {error}"));
+            }
         }
-        self.restore(e);
     }
 
     pub fn redo_edit(&mut self) {
         let Some(e) = self.redo.pop() else { return };
-        if let Some(cur) = self.current_of(&e) {
-            self.undo.push(cur);
+        match self.restore(&e) {
+            Ok(Some(inverse)) => self.undo.push(inverse),
+            Ok(None) => {}
+            Err(error) => {
+                self.redo.push(e);
+                self.toast_err(format!("Could not redo cue edit: {error}"));
+            }
         }
-        self.restore(e);
+    }
+
+    pub fn clear_hot_cue(&mut self, slot: i32) {
+        self.edit_hot_cue(slot, None);
+    }
+
+    pub(crate) fn edit_hot_cue(&mut self, slot: i32, replacement: Option<&Cue>) {
+        if !(0..8).contains(&slot) { return; }
+        let Some(track) = self.deck.track else { return };
+        let (before, after) = match self.db.edit_hot_cue(track, slot, replacement) {
+            Ok(cues) => cues,
+            Err(error) => return self.toast_err(format!("Could not change hot cue: {error}")),
+        };
+        if replacement.is_some() || after.len() != before.len() {
+            self.record(Edit::Cues { track, before });
+            if replacement.is_none() {
+                self.suppress_pending_analysis_hot_slot(track, slot);
+            }
+        }
+        self.set_track_cues(track, after);
     }
 
     pub fn delete_cue(&mut self, cue_id: i64) {
-        self.snapshot_cues();
-        let _ = self.db.delete_cue(cue_id);
-        self.deck.cues.retain(|c| c.id != cue_id);
-        if let Some(t) = self.deck.track {
-            self.refresh_cue_counts(t);
+        let Some(cue) = self.deck.cues.iter().find(|c| c.id == cue_id) else { return };
+        if cue.kind == CueKind::Hot {
+            return self.clear_hot_cue(cue.slot);
         }
+        if let Err(error) = self.db.delete_cue(cue_id) {
+            return self.toast_err(format!("Could not remove cue: {error}"));
+        }
+        self.snapshot_cues();
+        self.deck.cues.retain(|c| c.id != cue_id);
+        if let Some(t) = self.deck.track { self.refresh_cue_counts(t); }
     }
     pub fn update_cue(&mut self, c: Cue) {
         self.snapshot_cues();
@@ -4153,18 +4176,36 @@ impl App {
         }
     }
     pub fn refresh_cue_counts(&mut self, tid: i64) {
-        let hp: Vec<(f64, i32, u8)> = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
+        self.set_track_cues(tid, self.deck.cues.clone());
+    }
+
+    fn set_track_cues(&mut self, tid: i64, cues: Vec<Cue>) {
+        // A track has one set of cues, even when it is loaded on more than one deck.
+        for deck in &mut self.px.parked {
+            if deck.track == Some(tid) {
+                deck.cues.clone_from(&cues);
+            }
+        }
+        for (deck, _, _) in self.deck_backup.iter_mut().chain(self.px.parked_backup.iter_mut().flatten()) {
+            if deck.track == Some(tid) {
+                deck.cues.clone_from(&cues);
+            }
+        }
+        let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
         if hp.is_empty() {
             self.hot_positions.remove(&tid);
         } else {
             self.hot_positions.insert(tid, hp);
         }
-        let h = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).count();
-        let m = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).count();
+        let h = cues.iter().filter(|c| c.kind == CueKind::Hot).count();
+        let m = cues.iter().filter(|c| c.kind == CueKind::Memory).count();
         if h + m == 0 {
             self.cue_counts.remove(&tid);
         } else {
             self.cue_counts.insert(tid, (h, m));
+        }
+        if self.deck.track == Some(tid) {
+            self.deck.cues = cues;
         }
     }
 
