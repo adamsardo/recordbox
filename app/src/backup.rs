@@ -189,6 +189,7 @@ pub struct Staged {
 
 pub fn read_manifest(archive: &Path) -> Result<Manifest> {
     let mut za = zip::ZipArchive::new(std::fs::File::open(archive)?).map_err(|_| anyhow!("This file is not a recordbox library backup."))?;
+    za.validate_header_consistency().context("The backup's ZIP headers are inconsistent or damaged.")?;
     let mut s = String::new();
     za.by_name("manifest.json").map_err(|_| anyhow!("This file is not a recordbox library backup."))?.read_to_string(&mut s)?;
     let m: Manifest = serde_json::from_str(&s).map_err(|_| anyhow!("The backup's contents list cannot be read."))?;
@@ -238,10 +239,11 @@ fn extract(za: &mut zip::ZipArchive<std::fs::File>, entry: &str, dest: &Path, ca
 pub fn stage_restore(archive: &Path, work_dir: &Path, artwork_dir: &Path, with_music: bool, progress: Progress, cancel: &AtomicBool) -> Result<Staged> {
     progress(0, 1, "Preparing restore...");
     let manifest = read_manifest(archive)?;
+    let mut za = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
+    za.validate_header_consistency().context("The backup's ZIP headers are inconsistent or damaged.")?;
     let _ = std::fs::remove_dir_all(work_dir);
     std::fs::create_dir_all(work_dir)?;
-    let mut za = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
-    let names: Vec<String> = za.file_names().map(|s| s.to_string()).collect();
+    let names: Vec<String> = za.file_names().map(|name| name.map(|s| s.into_owned())).collect::<zip::result::ZipResult<_>>()?;
     let total: u64 = (0..za.len()).filter_map(|i| za.by_index(i).ok().map(|f| f.size())).sum();
     let mut done = 0u64;
     let db = work_dir.join("library.db");
@@ -261,6 +263,9 @@ pub fn stage_restore(archive: &Path, work_dir: &Path, artwork_dir: &Path, with_m
     }
     {
         let d = crate::db::Db::open(&db)?;
+        // A portable backup can come from another computer with the same user and paths.
+        // Preserve the catalog, but only fresh imports can establish local cleanup eligibility.
+        d.conn.execute("DELETE FROM direct_file_imports", [])?;
         // Artwork paths are absolute: point them at this computer's artwork folder.
         let rows: Vec<(i64, String)> = {
             let mut st = d.conn.prepare("SELECT id, artwork FROM tracks WHERE artwork != ''")?;
@@ -526,6 +531,64 @@ mod tests {
         // The restored database still takes writes through the same connection.
         db.set_setting("after", "1");
         assert_eq!(db.setting("after").as_deref(), Some("1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mismatched_zip_headers_are_refused_before_restore_writes() {
+        let d = dir("mismatched_headers");
+        let art = d.join("artwork");
+        std::fs::create_dir_all(&art).unwrap();
+        let image = art.join("aa.jpg");
+        std::fs::write(&image, b"jpeg bytes").unwrap();
+        let song = d.join("one.mp3");
+        std::fs::write(&song, b"music bytes").unwrap();
+        let db_path = d.join("library.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        let mut t = crate::importer::read_track(&song);
+        t.title = "Original".into();
+        t.artwork = image.to_string_lossy().to_string();
+        db.insert_track(&t).unwrap();
+        let archive = d.join("valid.zip");
+        let never = AtomicBool::new(false);
+        write_backup(&db_path, &art, &archive, true, &|_, _, _| {}, &never).unwrap();
+        assert!(read_manifest(&archive).is_ok());
+        let valid = std::fs::read(&archive).unwrap();
+
+        db.conn.execute("UPDATE tracks SET title='Changed'", []).unwrap();
+        std::fs::remove_file(&song).unwrap();
+        std::fs::remove_file(&image).unwrap();
+        let work = d.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let sentinel = work.join("keep.txt");
+        std::fs::write(&sentinel, b"existing work").unwrap();
+
+        // Keep the central directory and payload intact; change only the corresponding
+        // local header name. Also check an entry not needed to read the manifest.
+        for (i, entry) in ["manifest.json", "library.db", "artwork/aa.jpg"].iter().enumerate() {
+            let mut za = zip::ZipArchive::new(std::io::Cursor::new(&valid)).unwrap();
+            let offset = za.by_name(entry).unwrap().header_start() as usize;
+            let mut malformed = valid.clone();
+            assert_eq!(&malformed[offset..offset + 4], b"PK\x03\x04");
+            let name_len = u16::from_le_bytes([malformed[offset + 26], malformed[offset + 27]]) as usize;
+            let name_start = offset + 30;
+            assert_eq!(&malformed[name_start..name_start + name_len], entry.as_bytes());
+            malformed[name_start + name_len - 1] ^= 1;
+            let bad = d.join(format!("mismatched-{i}.zip"));
+            std::fs::write(&bad, &malformed).unwrap();
+
+            assert!(read_manifest(&bad).unwrap_err().to_string().contains("ZIP headers"));
+            assert!(stage_restore(&bad, &work, &art, true, &|_, _, _| {}, &never)
+                .unwrap_err().to_string().contains("ZIP headers"));
+            assert_eq!(titles(&db.conn), vec!["Changed"]);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"existing work");
+            assert!(!work.join("library.db").exists());
+            assert!(!song.exists());
+            assert!(!image.exists());
+            assert_eq!(std::fs::read(&bad).unwrap(), malformed);
+        }
+        assert_eq!(std::fs::read(&archive).unwrap(), valid);
+        drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }
 

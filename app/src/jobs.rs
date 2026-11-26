@@ -1,11 +1,13 @@
 //! Background work: analysis workers, file import, player loading and device export.
 
 use eframe::egui;
-use crate::analysis::{analyze_file, AnalysisResult, AnalysisSettings};
-use crate::audio::{decode_file, Decoded};
+use crate::analysis::{analyze_file_on_worker, AnalysisResult, AnalysisSettings};
+use crate::audio::{decode_until, Decoded};
 use crate::model::Track;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub struct AnalysisJob {
@@ -14,52 +16,96 @@ pub struct AnalysisJob {
     pub settings: AnalysisSettings,
 }
 
+#[derive(Default)]
+struct AnalysisQueue {
+    jobs: VecDeque<AnalysisJob>,
+    active: usize,
+}
+
+type AnalysisOutcome = (i64, Result<AnalysisResult, String>);
+
 pub struct AnalysisPool {
-    tx: Sender<AnalysisJob>,
-    pub rx: Receiver<(i64, Result<AnalysisResult, String>)>,
+    workers: rayon::ThreadPool,
+    queue: Arc<Mutex<AnalysisQueue>>,
+    results: Sender<AnalysisOutcome>,
+    pub rx: Receiver<AnalysisOutcome>,
     pub pending: Arc<AtomicUsize>,
-    pub cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+    pub available_cpus: usize,
+}
+
+fn analysis_threads(requested: usize, available: usize) -> usize {
+    let limit = available.clamp(1, 12);
+    if requested == 0 { available.saturating_sub(1).clamp(1, limit) } else { requested.min(limit) }
+}
+
+fn build_workers(count: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new().num_threads(count).thread_name(|i| format!("rb-analysis-{i}"))
+        .build().expect("start analysis workers")
 }
 
 impl AnalysisPool {
-    pub fn new(ctx: egui::Context) -> AnalysisPool {
-        let (tx, jrx) = unbounded::<AnalysisJob>();
-        let (rtx, rx) = unbounded();
-        let pending = Arc::new(AtomicUsize::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        // All cores but three (the interface, the audio thread and the system keep theirs), at
-        // most 12: each worker holds a decoded track in memory. Measured on 30 tracks on a
-        // 15-core Mac: 5 workers 7.8 s, 10 workers 5.1 s, 13 workers 4.5 s.
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(3).clamp(1, 12);
-        for _ in 0..n {
-            let jrx = jrx.clone();
-            let rtx = rtx.clone();
-            let pending = pending.clone();
-            let cancel = cancel.clone();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                while let Ok(job) = jrx.recv() {
-                    if cancel.load(Ordering::Relaxed) {
-                        pending.fetch_sub(1, Ordering::Relaxed);
-                        let _ = rtx.send((job.track_id, Err("stopped".into())));
-                        continue;
-                    }
-                    let r = analyze_file(&job.path, &job.settings).map_err(|e| e.to_string());
-                    pending.fetch_sub(1, Ordering::Relaxed);
-                    let _ = rtx.send((job.track_id, r));
-                    ctx.request_repaint();
-                }
-            });
+    pub fn new(ctx: egui::Context, requested: usize) -> AnalysisPool {
+        let available = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+        let (results, rx) = unbounded();
+        AnalysisPool {
+            workers: build_workers(analysis_threads(requested, available)), available_cpus: available,
+            queue: Default::default(), results, rx, pending: Default::default(), ctx,
         }
-        AnalysisPool { tx, rx, pending, cancel }
     }
+
+    pub fn thread_count(&self) -> usize {
+        self.workers.current_num_threads()
+    }
+
+    pub fn set_threads(&mut self, requested: usize) {
+        let count = analysis_threads(requested, self.available_cpus);
+        if count != self.thread_count() && self.pending.load(Ordering::Acquire) == 0 {
+            // Results already delivered to the UI channel survive a change of pool.
+            self.workers = build_workers(count);
+            self.queue = Default::default();
+        }
+    }
+
     pub fn submit(&self, job: AnalysisJob) {
-        self.cancel.store(false, Ordering::Relaxed);
+        let mut queue = self.queue.lock();
+        queue.jobs.push_back(job);
         self.pending.fetch_add(1, Ordering::Relaxed);
-        let _ = self.tx.send(job);
+        // Bound live decoded tracks as well as CPU threads. Work stealing inside
+        // a DSP pass must never start an unbounded number of waiting tracks.
+        if queue.active >= self.thread_count() { return; }
+        queue.active += 1;
+        drop(queue);
+        let queue = self.queue.clone();
+        let results = self.results.clone();
+        let pending = self.pending.clone();
+        let ctx = self.ctx.clone();
+        self.workers.spawn_fifo(move || loop {
+            let job = {
+                let mut q = queue.lock();
+                match q.jobs.pop_front() {
+                    Some(job) => job,
+                    None => { q.active -= 1; return; }
+                }
+            };
+            // A codec or DSP panic must retire this job and leave the other tracks runnable.
+            let result = std::panic::catch_unwind(|| analyze_file_on_worker(&job.path, &job.settings))
+                .map_err(|_| "track analysis panicked".to_owned())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = results.send((job.track_id, result));
+            pending.fetch_sub(1, Ordering::Release);
+            ctx.request_repaint();
+        });
     }
+
     pub fn stop(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        let waiting = std::mem::take(&mut self.queue.lock().jobs);
+        let cancelled = waiting.len();
+        for job in waiting {
+            let _ = self.results.send((job.track_id, Err("stopped".into())));
+        }
+        self.pending.fetch_sub(cancelled, Ordering::Release);
+        self.ctx.request_repaint();
     }
 }
 
@@ -80,10 +126,10 @@ pub fn spawn_import(paths: Vec<std::path::PathBuf>, ctx: egui::Context) -> Recei
     rx
 }
 
-pub fn spawn_load(track_id: i64, path: String, ctx: egui::Context) -> Receiver<(i64, Result<Arc<Decoded>, String>)> {
+pub fn spawn_load(track_id: i64, path: String, ctx: egui::Context, cancel: Arc<AtomicBool>) -> Receiver<(i64, Result<Arc<Decoded>, String>)> {
     let (tx, rx) = unbounded();
     std::thread::spawn(move || {
-        let r = decode_file(&path).map(Arc::new).map_err(|e| e.to_string());
+        let r = decode_until(&path, || cancel.load(Ordering::Relaxed)).map(Arc::new).map_err(|e| e.to_string());
         let _ = tx.send((track_id, r));
         ctx.request_repaint();
     });
@@ -118,23 +164,84 @@ pub fn spawn_export(req: crate::export::usb::ExportRequest, ctx: egui::Context) 
 #[cfg(test)]
 mod throughput_probe {
     /// Opt-in: PREPDECK_PATHS=<file with one audio path per line> PREPDECK_N=<workers>.
+    /// Add PREPDECK_PRECISE=1 to measure high-precision grid analysis on the same files.
     /// Prints how long analysing those files takes with that many workers.
     #[test]
     #[ignore]
     fn analysis_workers() {
         let paths: Vec<String> = std::fs::read_to_string(std::env::var("PREPDECK_PATHS").unwrap()).unwrap().lines().map(|s| s.to_string()).collect();
-        let n: usize = std::env::var("PREPDECK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let t = std::time::Instant::now();
-        std::thread::scope(|s| {
-            for _ in 0..n {
-                s.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(p) = paths.get(i) else { break };
-                    let _ = crate::analysis::analyze_file(p, &Default::default());
-                });
-            }
-        });
-        eprintln!("{} files, {} workers: {:.1} s", paths.len(), n, t.elapsed().as_secs_f32());
+        let n = std::env::var("PREPDECK_N").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let high_precision = std::env::var("PREPDECK_PRECISE").as_deref() == Ok("1");
+        let settings = super::AnalysisSettings { high_precision, ..Default::default() };
+        let pool = super::AnalysisPool::new(eframe::egui::Context::default(), n);
+        let start = std::time::Instant::now();
+        for (i, path) in paths.iter().enumerate() {
+            pool.submit(super::AnalysisJob { track_id: i as i64, path: path.clone(), settings: settings.clone() });
+        }
+        for _ in &paths { pool.rx.recv().unwrap().1.unwrap(); }
+        eprintln!("{} files, {} workers: {:.3} s", paths.len(), pool.thread_count(), start.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod analysis_pool_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn worker_budget_reserves_a_processor_and_caps_live_decodes() {
+        for (cpus, automatic) in [(1, 1), (2, 1), (4, 3), (8, 7), (13, 12), (64, 12)] {
+            assert_eq!(analysis_threads(0, cpus), automatic);
+            assert_eq!(analysis_threads(1, cpus), 1);
+            assert_eq!(analysis_threads(99, cpus), cpus.min(12));
+        }
+    }
+
+    #[test]
+    fn stopping_queued_work_does_not_cancel_the_next_submission() {
+        let ctx = egui::Context::default();
+        let pool = AnalysisPool::new(ctx, 1);
+        let (entered, wait_entered) = crossbeam_channel::bounded(0);
+        let (release, wait_release) = crossbeam_channel::bounded(0);
+        pool.workers.spawn(move || { entered.send(()).unwrap(); wait_release.recv().unwrap(); });
+        wait_entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let job = |track_id| AnalysisJob { track_id, path: "/missing/synthetic.wav".into(), settings: Default::default() };
+        for id in 1..=3 { pool.submit(job(id)); }
+        pool.stop();
+        pool.submit(job(4));
+        release.send(()).unwrap();
+        for id in 1..=4 {
+            let (track, result) = pool.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(track, id);
+            assert_eq!(result.err().unwrap() == "stopped", id < 4);
+        }
+    }
+
+    #[test]
+    fn parallel_analysis_matches_serial_for_normal_dynamic_and_disabled_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pulse.wav");
+        let sr = 22050;
+        let samples: Vec<f32> = (0..sr * 10).flat_map(|i| {
+            let beat = if i % (sr / 2) < 200 { 0.55 } else { 0.03 };
+            let v = beat * (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin();
+            [v, v * 0.8]
+        }).collect();
+        crate::demo::write_wav(&path, sr, &samples).unwrap();
+        let path = path.to_str().unwrap();
+        let workers = build_workers(3);
+        for (dynamic, high_precision, do_grid, do_key) in [
+            (false, false, true, true), (true, false, true, true),
+            (false, true, true, true), (true, true, true, true), (false, true, false, false),
+        ] {
+            let settings = AnalysisSettings { dynamic, high_precision, do_grid, do_key, ..Default::default() };
+            let a = crate::analysis::analyze_file(path, &settings).unwrap();
+            let b = workers.install(|| analyze_file_on_worker(path, &settings)).unwrap();
+            assert_eq!((a.duration.to_bits(), a.raw_samples, a.sample_rate, a.bpm.to_bits(), a.key),
+                       (b.duration.to_bits(), b.raw_samples, b.sample_rate, b.bpm.to_bits(), b.key));
+            assert_eq!(serde_json::to_value(a.grid).unwrap(), serde_json::to_value(b.grid).unwrap());
+            assert_eq!(a.wave.frames, b.wave.frames);
+            assert_eq!((a.gain_db.to_bits(), a.peak.to_bits()), (b.gain_db.to_bits(), b.peak.to_bits()));
+        }
     }
 }

@@ -80,6 +80,19 @@ pub(crate) fn cue_button_face(p: &egui::Painter, c: Pos2, dia: f32, lit: bool, l
     p.text(c - vec2(0.0, 0.25), Align2::CENTER_CENTER, "CUE", caps(9.0 * k), if loaded { WHITE } else { hex(0x323232) });
 }
 
+pub(crate) fn play_control(app: &App, ui: &mut Ui, center: Pos2, hit_size: egui::Vec2, diameter: f32) -> bool {
+    let enabled = !app.deck_options.disable_play;
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let response = ui.interact(Rect::from_center_size(center, hit_size), ui.id().with("playbtn"), sense);
+    play_button_face(ui.painter(), center, diameter, app.playing(), enabled && response.hovered());
+    if !enabled {
+        ui.painter().circle_filled(center, diameter / 2.0, Color32::from_black_alpha(150));
+        response.on_hover_text("Playback is disabled for this session (--disable-play).");
+        return false;
+    }
+    tip(response, app, "Play/Pause").clicked()
+}
+
 /// The round PLAY button on the same grid: stopped, a 40 % green ring and a grey triangle;
 /// playing, the full ring, a raised face and white pause bars.
 pub(crate) fn play_button_face(p: &egui::Painter, c: Pos2, dia: f32, playing: bool, hovered: bool) {
@@ -155,9 +168,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     }
     // PLAY
     let play_c = pos2(lx + 40.0, ly + 214.0);
-    let pr = ui.interact(Rect::from_center_size(play_c, vec2(42.0, 42.0)), ui.id().with("playbtn"), Sense::click());
-    play_button_face(&p, play_c, 40.0, playing, pr.hovered());
-    if tip(pr, app, "Play/Pause").clicked() {
+    if play_control(app, ui, play_c, vec2(42.0, 42.0), 40.0) {
         app.play_pause();
     }
 
@@ -270,9 +281,6 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // A track dragged from the list and dropped on the player is loaded.
     crate::ui_player2::drop_to_load(app, ui, full);
 
-    if playing || app.searching() != 0 || app.deck.loading.is_some() {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// The largest rectangle of a picture's proportions centred in `bx`.
@@ -303,23 +311,335 @@ pub(crate) fn draw_note_icon(p: &egui::Painter, r: Rect) {
 }
 
 /// Colour + height for one waveform column according to the chosen display style.
-pub fn wave_bars(mode: u8, v: [u8; 4]) -> Vec<(f32, Color32)> {
+#[derive(Clone, Copy, Debug)]
+pub struct WaveBars {
+    layers: [(f32, Color32); 3],
+    len: usize,
+}
+
+impl WaveBars {
+    fn one(height: f32, color: Color32) -> Self {
+        WaveBars { layers: [(height, color), (0.0, Color32::TRANSPARENT), (0.0, Color32::TRANSPARENT)], len: 1 }
+    }
+
+    fn three(layers: [(f32, Color32); 3]) -> Self {
+        WaveBars { layers, len: 3 }
+    }
+
+    fn scaled(mut self, scale: f32) -> Self {
+        for (height, _) in &mut self.layers[..self.len] {
+            *height *= scale;
+        }
+        self
+    }
+}
+
+impl IntoIterator for WaveBars {
+    type Item = (f32, Color32);
+    type IntoIter = std::iter::Take<std::array::IntoIter<Self::Item, 3>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.layers.into_iter().take(self.len)
+    }
+}
+
+pub fn wave_bars(mode: u8, v: [u8; 4]) -> WaveBars {
     let f = |x: u8| x as f32 / 255.0;
     match mode {
         0 => {
             let white = (f(v[3]) / (f(v[0]) + 0.05)).min(1.0);
             let c = Color32::from_rgb((30.0 + 180.0 * white) as u8, (120.0 + 110.0 * white) as u8, 255);
-            vec![(f(v[0]), c)]
+            WaveBars::one(f(v[0]), c)
         }
         1 => {
             let (r, g, b) = (f(v[1]), f(v[2]), f(v[3]) * 1.3);
             let m = r.max(g).max(b).max(0.01);
             let c = Color32::from_rgb((255.0 * r / m) as u8, (255.0 * g / m) as u8, (255.0 * (b / m).min(1.0)) as u8);
-            vec![(f(v[0]), c)]
+            WaveBars::one(f(v[0]), c)
         }
         // 3Band from display levels (track-list previews): blue body as the envelope, then
         // smaller orange and white layers, matching the original's balance of colours.
-        _ => vec![(f(v[0]), WAVE_LOW), (f(v[2]) * 0.6, WAVE_MID), (f(v[3]) * 0.35, WAVE_HIGH)],
+        _ => WaveBars::three([(f(v[0]), WAVE_LOW), (f(v[2]) * 0.6, WAVE_MID), (f(v[3]) * 0.35, WAVE_HIGH)]),
+    }
+}
+
+type NativeWaveform = std::sync::Arc<(Vec<[u8; 3]>, Vec<[u8; 3]>)>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OverviewKey {
+    track: Option<i64>,
+    wave_ptr: usize,
+    wave_len: usize,
+    width: usize,
+    mode: u8,
+    native_ptr: usize,
+    native_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct OverviewColumn {
+    bars: WaveBars,
+    played_colors: [Color32; 3],
+}
+
+/// One prepared overview per deck. Waveforms are immutable between load/analysis installs;
+/// those installs reset this cache even if an allocator reuses a buffer address.
+#[derive(Default)]
+pub struct OverviewCache {
+    key: Option<OverviewKey>,
+    columns: Vec<OverviewColumn>,
+    // Keep native identity alive while its pointer is part of the key.
+    native: Option<NativeWaveform>,
+    #[cfg(test)]
+    rebuilds: usize,
+}
+
+impl OverviewCache {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn prepared(&mut self, track: Option<i64>, wave: &Waveform, width: usize, mode: u8, native: Option<&NativeWaveform>) -> &[OverviewColumn] {
+        let key = OverviewKey {
+            track,
+            wave_ptr: wave.frames.as_ptr() as usize,
+            wave_len: wave.frames.len(),
+            width,
+            mode,
+            native_ptr: native.map(|w| std::sync::Arc::as_ptr(w) as usize).unwrap_or(0),
+            native_len: native.map(|w| w.1.len()).unwrap_or(0),
+        };
+        if self.key != Some(key) {
+            self.columns = prepare_overview(wave, width, mode, native.map(|w| w.1.as_slice()));
+            self.key = Some(key);
+            self.native = native.cloned();
+            #[cfg(test)]
+            { self.rebuilds += 1; }
+        }
+        &self.columns
+    }
+}
+
+fn prepare_overview(wave: &Waveform, width: usize, mode: u8, native: Option<&[[u8; 3]]>) -> Vec<OverviewColumn> {
+    let cols = wave.columns(width);
+    let top = cols.iter().map(|c| { let d = Waveform::disp(c); d[0].max(d[1]) }).max().unwrap_or(255).max(1) as f32;
+    let norm = (255.0 / top).min(4.0);
+    cols.iter().enumerate().map(|(i, c)| {
+        let mut d = Waveform::disp(c);
+        for v in d.iter_mut() {
+            *v = (*v as f32 * norm).min(255.0) as u8;
+        }
+        let mut bars = if mode >= 2 {
+            // Native overview units correspond to 0.25 / 0.115 / 0.085 points per
+            // low/mid/high unit in the original 24-point overview area.
+            let [lo, mi, hi] = match native {
+                Some(values) if !values.is_empty() => values[(i * values.len() / width.max(1)).min(values.len() - 1)],
+                _ => crate::export::anlz::three_band_overview(c),
+            };
+            let (b, o, w) = (lo as f32 * 0.25 / 24.0, mi as f32 * 0.115 / 24.0, hi as f32 * 0.085 / 24.0);
+            WaveBars::three([(b + o + w, WAVE_HIGH), (b + o, WAVE_MID), (b, WAVE_LOW)])
+        } else {
+            wave_bars(mode, d)
+        };
+        let mut played_colors = [Color32::TRANSPARENT; 3];
+        for (index, (height, color)) in bars.layers[..bars.len].iter_mut().enumerate() {
+            *height = height.min(1.0) * 24.0;
+            played_colors[index] = color.gamma_multiply(0.45);
+        }
+        OverviewColumn { bars, played_colors }
+    }).collect()
+}
+
+fn overview_bars(columns: &[OverviewColumn], r: Rect, base: f32, duration: f64, pos: f64) -> crate::ui_kit::Bars {
+    let mut bars = crate::ui_kit::Bars::new();
+    for (i, column) in columns.iter().enumerate() {
+        let x = r.min.x + i as f32 + 0.5;
+        let played = (i as f64 / columns.len() as f64) * duration < pos;
+        for (index, (height, color)) in column.bars.into_iter().enumerate() {
+            let color = if played { column.played_colors[index] } else { color };
+            bars.column(x, base, base - height, color);
+        }
+    }
+    bars
+}
+
+#[cfg(test)]
+mod waveform_cache_tests {
+    use super::*;
+
+    fn wave(len: usize) -> Waveform {
+        Waveform { frames: (0..len).map(|i| std::array::from_fn(|k| (i.wrapping_mul(37) + k * 53) as u8)).collect() }
+    }
+
+    // Original allocation-based layer preparation, retained as the visual reference.
+    fn original_layers(mode: u8, v: [u8; 4]) -> Vec<(f32, Color32)> {
+        let f = |x: u8| x as f32 / 255.0;
+        match mode {
+            0 => {
+                let white = (f(v[3]) / (f(v[0]) + 0.05)).min(1.0);
+                vec![(f(v[0]), Color32::from_rgb((30.0 + 180.0 * white) as u8, (120.0 + 110.0 * white) as u8, 255))]
+            }
+            1 => {
+                let (r, g, b) = (f(v[1]), f(v[2]), f(v[3]) * 1.3);
+                let m = r.max(g).max(b).max(0.01);
+                vec![(f(v[0]), Color32::from_rgb((255.0 * r / m) as u8, (255.0 * g / m) as u8, (255.0 * (b / m).min(1.0)) as u8))]
+            }
+            _ => vec![(f(v[0]), WAVE_LOW), (f(v[2]) * 0.6, WAVE_MID), (f(v[3]) * 0.35, WAVE_HIGH)],
+        }
+    }
+
+    fn original_overview(wave: &Waveform, width: usize, mode: u8, native: Option<&[[u8; 3]]>, r: Rect, duration: f64, pos: f64) -> egui::Mesh {
+        let cols = wave.columns(width);
+        let top = cols.iter().map(|c| { let d = Waveform::disp(c); d[0].max(d[1]) }).max().unwrap_or(255).max(1) as f32;
+        let norm = (255.0 / top).min(4.0);
+        let mut bars = crate::ui_kit::Bars::new();
+        let base = r.min.y + 30.0;
+        for (i, c) in cols.iter().enumerate() {
+            let mut d = Waveform::disp(c);
+            for v in d.iter_mut() {
+                *v = (*v as f32 * norm).min(255.0) as u8;
+            }
+            let layers = if mode >= 2 {
+                let [lo, mi, hi] = match native {
+                    Some(values) if !values.is_empty() => values[(i * values.len() / width.max(1)).min(values.len() - 1)],
+                    _ => crate::export::anlz::three_band_overview(c),
+                };
+                let (b, o, w) = (lo as f32 * 0.25 / 24.0, mi as f32 * 0.115 / 24.0, hi as f32 * 0.085 / 24.0);
+                vec![(b + o + w, WAVE_HIGH), (b + o, WAVE_MID), (b, WAVE_LOW)]
+            } else {
+                original_layers(mode, d)
+            };
+            let played = (i as f64 / width as f64) * duration < pos;
+            for (height, color) in layers {
+                let color = if played { color.gamma_multiply(0.45) } else { color };
+                bars.column(r.min.x + i as f32 + 0.5, base, base - height.min(1.0) * 24.0, color);
+            }
+        }
+        bars.into_mesh()
+    }
+
+    #[test]
+    fn stack_layers_keep_exact_counts_order_heights_and_colors() {
+        for mode in [0, 1, 2, 5] {
+            for v in 0..=255u8 {
+                let input = [v, 255 - v, v.rotate_left(1), v.rotate_right(1)];
+                let expected = original_layers(mode, input);
+                assert_eq!(wave_bars(mode, input).into_iter().collect::<Vec<_>>(), expected);
+                let scaled: Vec<_> = expected.iter().map(|(h, c)| (h * DETAIL_FULL_SCALE, *c)).collect();
+                assert_eq!(wave_bars(mode, input).scaled(DETAIL_FULL_SCALE).into_iter().collect::<Vec<_>>(), scaled);
+                assert_eq!(expected.len(), if mode < 2 { 1 } else { 3 });
+            }
+        }
+    }
+
+    #[test]
+    fn cached_overview_mesh_matches_original_at_live_positions() {
+        let native = vec![[3, 100, 255], [240, 4, 17], [0, 0, 0]];
+        for len in [0, 1, 7, 119] {
+            let wave = wave(len);
+            for width in [0, 1, 3, 127] {
+                for mode in [0, 1, 2, 5] {
+                    for values in [None, Some(&[][..]), Some(native.as_slice())] {
+                        let prepared = prepare_overview(&wave, width, mode, values);
+                        for (x, y, duration, pos) in [(0.0, 0.0, 180.0, -1.0), (10.25, 4.5, 180.0, 0.0), (-3.5, 8.75, 180.0, 90.0), (0.0, 2.0, 180.0, 181.0)] {
+                            let r = Rect::from_min_size(pos2(x, y), vec2(width as f32 + 0.75, 33.0));
+                            let expected = original_overview(&wave, width, mode, values, r, duration, pos);
+                            assert_eq!(overview_bars(&prepared, r, y + 30.0, duration, pos).into_mesh(), expected, "len={len} width={width} mode={mode}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overview_cache_rebuilds_for_each_static_input() {
+        let mut cache = OverviewCache::default();
+        let mut wave = wave(7);
+        let native = std::sync::Arc::new((vec![], vec![[1, 2, 3]; 3]));
+        cache.prepared(Some(1), &wave, 10, 2, Some(&native));
+        assert_eq!(cache.rebuilds, 1);
+        cache.prepared(Some(1), &wave, 10, 2, Some(&native));
+        assert_eq!(cache.rebuilds, 1);
+        cache.prepared(Some(2), &wave, 10, 2, Some(&native));
+        cache.prepared(Some(2), &wave, 11, 2, Some(&native));
+        cache.prepared(Some(2), &wave, 11, 1, Some(&native));
+        cache.prepared(Some(2), &wave, 11, 1, None);
+        assert_eq!(cache.rebuilds, 5);
+        let replacement = Waveform { frames: wave.frames.clone() };
+        cache.prepared(Some(2), &replacement, 11, 1, None);
+        assert_eq!(cache.rebuilds, 6, "same-length replacement is a different source");
+        wave.frames.push([255; 8]);
+        cache.prepared(Some(2), &wave, 11, 1, None);
+        assert_eq!(cache.rebuilds, 7);
+        let replacement = std::sync::Arc::new((vec![], vec![[40, 50, 60]; 3]));
+        cache.prepared(Some(2), &wave, 11, 2, Some(&native));
+        cache.prepared(Some(2), &wave, 11, 2, Some(&replacement));
+        assert_eq!(cache.rebuilds, 9, "native replacement with the same length invalidates");
+        cache.prepared(Some(2), &wave, 1, 2, Some(&replacement));
+        assert_eq!(cache.columns.len(), 1, "only the latest width is retained");
+    }
+
+    #[test]
+    fn overview_cache_clear_and_track_carry_end_source_lifetimes() {
+        let wave = wave(7);
+        let native = std::sync::Arc::new((vec![], vec![[1, 2, 3]; 3]));
+        let weak = std::sync::Arc::downgrade(&native);
+        let mut deck = crate::player_ext::DeckExt::default();
+        deck.master_tempo = true;
+        deck.overview_cache.prepared(Some(1), &wave, 10, 2, Some(&native));
+        drop(native);
+        assert!(weak.upgrade().is_some(), "cache pins the native identity against allocator reuse");
+        let carried = deck.carried();
+        assert!(carried.master_tempo);
+        assert!(carried.overview_cache.key.is_none(), "loading another track carries no prepared waveform");
+        assert!(deck.overview_cache.key.is_some(), "a parked/backup deck keeps its own cache");
+        deck.overview_cache.clear();
+        assert!(weak.upgrade().is_none());
+        assert!(deck.overview_cache.columns.is_empty());
+        // Analysis installs explicitly clear first: even address/length reuse must rebuild.
+        let mut same_buffer = wave;
+        deck.overview_cache.prepared(Some(1), &same_buffer, 10, 2, None);
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 33.0));
+        let old = overview_bars(&deck.overview_cache.columns, r, 30.0, 1.0, 0.0).into_mesh();
+        same_buffer.frames.fill([0; 8]);
+        deck.overview_cache.clear();
+        let new = deck.overview_cache.prepared(Some(1), &same_buffer, 10, 2, None);
+        assert_ne!(overview_bars(new, r, 30.0, 1.0, 0.0).into_mesh(), old);
+        assert_eq!(deck.overview_cache.rebuilds, 1);
+    }
+
+    /// Opt-in, synthetic and device-free: compare preparation plus Bars mesh generation.
+    /// Run with `cargo test --release cpu_overview_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cpu_overview_cost() {
+        fn measure(mut frame: impl FnMut(usize)) -> f64 {
+            let mut times = vec![];
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for i in 0..300 { frame(i); }
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            times[2]
+        }
+        for (seconds, width, mode, has_native) in [(180, 1126, 2, false), (180, 1126, 2, true), (600, 1600, 2, false), (180, 1126, 0, false), (180, 1126, 1, false)] {
+            let wave = wave(seconds * 150);
+            let native = std::sync::Arc::new((vec![], vec![[30, 100, 200], [200, 40, 10], [0, 0, 0]]));
+            let native = has_native.then_some(&native);
+            let values = native.map(|w| w.1.as_slice());
+            let r = Rect::from_min_size(pos2(163.5, 21.0), vec2(width as f32, 33.0));
+            let duration = seconds as f64;
+            let mut cache = OverviewCache::default();
+            for pos in [0.0, duration / 3.0, duration] {
+                assert_eq!(overview_bars(cache.prepared(Some(1), &wave, width, mode, native), r, 51.0, duration, pos).into_mesh(), original_overview(&wave, width, mode, values, r, duration, pos));
+            }
+            let legacy = measure(|i| { std::hint::black_box(original_overview(&wave, width, mode, values, r, duration, i as f64 / 300.0 * duration)); });
+            let cold = measure(|i| { cache.clear(); std::hint::black_box(overview_bars(cache.prepared(Some(1), &wave, width, mode, native), r, 51.0, duration, i as f64 / 300.0 * duration).into_mesh()); });
+            let warm = measure(|i| { std::hint::black_box(overview_bars(cache.prepared(Some(1), &wave, width, mode, native), r, 51.0, duration, i as f64 / 300.0 * duration).into_mesh()); });
+            eprintln!("cpu_overview_cost seconds={seconds} width={width} mode={mode} native={has_native} frames=300 median_of=5 legacy_full_mesh_ms={legacy:.3} cold_full_mesh_ms={cold:.3} warm_full_mesh_ms={warm:.3}");
+        }
     }
 }
 
@@ -330,45 +650,12 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     // letters), bars up to 24 pt tall, a 3 pt progress frame from 3 pt under the baseline and
     // white minute ticks from 8 to 10 pt under it.
     let base = r.min.y + 30.0;
-    let full_h = 24.0;
     // The overview always shows the whole mix, as in rekordbox: only the enlarged waveform
     // follows the parts that sound.
-    let stem_view = false;
     if let Some(w) = app.deck.wave.as_ref() {
         let n = r.width().max(1.0) as usize;
-        let cols = w.columns(n);
-        // the overview fills its height at the track's loudest column
-        let top = cols.iter().map(|c| { let d = Waveform::disp(c); d[0].max(d[1]) }).max().unwrap_or(255).max(1) as f32;
-        let norm = (255.0 / top).min(4.0);
-        let mut bars = crate::ui_kit::Bars::new();
-        for (i, c) in cols.iter().enumerate() {
-            let x = r.min.x + i as f32 + 0.5;
-            let played = (i as f64 / n as f64) * dur < pos;
-            let mut d = Waveform::disp(c);
-            for v in d.iter_mut() {
-                *v = (*v as f32 * norm).min(255.0) as u8;
-            }
-            let layers: Vec<(f32, Color32)> = if app.prefs.wave_color >= 2 {
-                // 3Band overview, as the original draws it: low (blue) from the baseline, mid
-                // (orange) stacked on it, high (white) on top. Heights per band unit were
-                // measured from the original's screen (0.25, 0.115, 0.085 pt) against its own
-                // overview values; the values come from the model fitted to its files.
-                let [lo, mi, hi] = match &app.deck.rb_wave {
-                    // rekordbox's own overview values for this file, when available.
-                    Some(rw) if !rw.1.is_empty() && !stem_view => rw.1[(i * rw.1.len() / n.max(1)).min(rw.1.len() - 1)],
-                    _ => crate::export::anlz::three_band_overview(c),
-                };
-                let (b, o, w) = (lo as f32 * 0.25 / full_h, mi as f32 * 0.115 / full_h, hi as f32 * 0.085 / full_h);
-                vec![(b + o + w, WAVE_HIGH), (b + o, WAVE_MID), (b, WAVE_LOW)]
-            } else {
-                wave_bars(app.prefs.wave_color, d)
-            };
-            for (h, col) in layers {
-                let col = if played { col.gamma_multiply(0.45) } else { col };
-                bars.column(x, base, base - h.min(1.0) * full_h, col);
-            }
-        }
-        bars.paint(&p);
+        let columns = app.deck.x.overview_cache.prepared(app.deck.track, w, n, app.prefs.wave_color, app.deck.rb_wave.as_ref());
+        overview_bars(columns, r, base, dur, pos).paint(&p);
     } else if app.deck.track.is_some() {
         p.text(r.center(), Align2::CENTER_CENTER, "Analyzing…", FontId::proportional(11.0), DIM);
     }
@@ -584,10 +871,10 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                         // half-height per unit in a 147 pt tall waveform, so full scale (127)
                         // reaches 0.68 of half the area.
                         let s = |v: u8| (v as f32 / 127.0).min(1.0) * DETAIL_FULL_SCALE;
-                        vec![(s(lo), WAVE_LOW), (s(mi), WAVE_MID), (s(hi), WAVE_HIGH)]
+                        WaveBars::three([(s(lo), WAVE_LOW), (s(mi), WAVE_MID), (s(hi), WAVE_HIGH)])
                     } else {
                         // BLUE and RGB use the same share of the area as 3Band.
-                        wave_bars(app.prefs.wave_color, Waveform::disp(&m)).into_iter().map(|(h, c)| (h * DETAIL_FULL_SCALE, c)).collect()
+                        wave_bars(app.prefs.wave_color, Waveform::disp(&m)).scaled(DETAIL_FULL_SCALE)
                     };
                     // Heights are a share of half the waveform area (not of the area less
                     // its margins), as measured.
@@ -1095,35 +1382,59 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         }
     }
     // Status and actions.
-    let model = app.stem.model.as_deref().and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
+    let model_info = app.stem.status_model();
+    let model = model_info.map_or("checking this computer…", |m| m.name);
+    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
+    let loading = app.loading_stems();
+    let error = app.stem.error_for(app.deck.track).filter(|_| !busy && !loading);
+    let retry_cpu = error.is_some_and(|e| e.retry_model.is_some());
     let status = if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
-    } else if let Some((_, pr)) = app.stem.separating {
-        format!("Separating with {model}: {:.0}%", pr * 100.0)
-    } else if app.stem.loading.is_some() {
-        "Loading stems…".to_string()
-    } else if let Some(e) = &app.stem.error {
-        e.clone()
+    } else if loading {
+        "Loading saved stems…".to_owned()
+    } else if let Some(status) = app.stem.separation_status() {
+        if app.stem.separating.map(|(id, _)| id) == app.deck.track {
+            status
+        } else {
+            "Separating another track…".to_owned()
+        }
+    } else if retry_cpu {
+        "GPU separation failed · Click to copy details".to_owned()
+    } else if error.is_some() {
+        "STEMS failed · Click to copy details".to_owned()
     } else if have {
-        String::new()
+        "Parts ready".to_owned()
     } else if !loaded {
-        "Load a track to separate it into parts.".to_string()
+        "Load a track to separate it into parts.".to_owned()
+    } else if crate::stems::backend_hold().is_some() {
+        format!("GPU separation paused · {model} is available on CPU.")
     } else {
         format!("Not separated yet. Model: {model}.")
     };
-    p.text(pos2(sx(main, 700.0), y), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if app.stem.error.is_some() { CAUTION_TX } else { DIM2 });
-    // Where the model comes from and its licence, on hover over the status line.
-    if let Some(m) = app.stem.model.as_deref().and_then(crate::stems::spec) {
-        let sr = Rect::from_min_size(pos2(sx(main, 700.0), y - 9.0), vec2(360.0, 18.0));
-        ui.interact(sr, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
+    let status_rect = Rect::from_min_max(pos2(sx(main, 700.0), y - 10.0), pos2(at(1150.0, 84.0).left() - 4.0, y + 10.0));
+    p.with_clip_rect(status_rect).text(status_rect.left_center(), Align2::LEFT_CENTER, status, FontId::proportional(11.5), if error.is_some() { CAUTION_TX } else { DIM2 });
+    if let Some(error) = error {
+        let response = ui.interact(status_rect, ui.id().with("stem_failure_details"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_ui(|ui| { ui.set_max_width(460.0); ui.label(&error.detail); });
+        if response.clicked() {
+            ui.ctx().copy_text(error.detail.clone());
+            app.toast("Copied STEMS error details.");
+        }
+    } else if let Some(reason) = crate::stems::backend_hold() {
+        ui.interact(status_rect, ui.id().with("stem_driver_status"), Sense::hover()).on_hover_text(reason);
+    } else if let Some(m) = model_info {
+        ui.interact(status_rect, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
-    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
     if busy {
         if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {
             app.stop_separation();
         }
-    } else if !have && loaded {
-        if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", "SEPARATE"), app, "Split this track into vocal, instrument, bass and drum parts").clicked() {
+    } else if !have && loaded && !loading {
+        let (label, help) = if retry_cpu { ("RETRY CPU", "Retry this track on the CPU with the same model") }
+            else if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu { ("SEPARATE ON CPU", "Separate this track on the CPU while GPU separation is paused") }
+            else { ("SEPARATE", "Split this track into vocal, instrument, bass and drum parts") };
+        if tip(bold_button(ui, at(1150.0, 84.0), "stem_go", label), app, help).clicked() {
             app.separate_loaded();
         }
     }

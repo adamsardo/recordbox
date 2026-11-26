@@ -13,8 +13,6 @@ use egui::{pos2, vec2, Color32, Context, Rect, RichText, Ui};
 
 // Settings another part of the app has to act on. While one is false its control is shown
 // switched off with the reason, so nothing in the window pretends to work.
-/// Analysis reads `prefs.high_precision_grid`.
-const HIGH_PRECISION_WIRED: bool = false;
 /// The device writer deletes an imported history (reads `prefs.delete_history_after_import`).
 const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.
@@ -37,6 +35,7 @@ const ABSENT: [(u8, &str, &str); 2] = [(100, "PLAN", "recordbox has no subscript
 // Extensions is where rekordbox keeps its STEMS page (in Performance mode).
 // Controller holds the Performance mixer's settings, as in rekordbox.
 const PAGES: [(u8, &str); 8] = [(0, "View"), (5, "Audio"), (1, "Analysis"), (7, "Controller"), (2, "DJ System"), (3, "Keyboard"), (4, "Advanced"), (6, "Extensions")];
+const SHORTCUT_WAIT_ID: &str = "key_wait";
 
 fn tabs_of(page: u8) -> &'static [&'static str] {
     match page {
@@ -52,7 +51,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
 }
 
 /// Every setting by name, for the search field: (page, tab, name).
-const SETTINGS: [(u8, usize, &str); 113] = [
+const SETTINGS: [(u8, usize, &str); 118] = [
     (7, 2, "Apply CFX to Sampler using MIC COLOR control knob."),
     (7, 3, "SLOT"),
     (7, 3, "Do not overwrite the loaded Slot."),
@@ -164,6 +163,11 @@ const SETTINGS: [(u8, usize, &str); 113] = [
     (6, 0, "MUTE / SOLO"),
     (6, 0, "Reset the MUTE/SOLO state while loading"),
     (6, 0, "Stem separation model"),
+    (6, 0, "Allow automatic separation on CPU"),
+    (6, 0, "Keep all saved stems"),
+    (6, 0, "STEMS storage budget"),
+    (0, 0, "Playback animation"),
+    (1, 0, "Analysis workers"),
     (2, 6, "Supported devices"),
     (0, 0, "Tooltips"),
 ];
@@ -311,6 +315,8 @@ const WIN: egui::Vec2 = vec2(800.0, 800.0);
 
 pub fn prefs_window(app: &mut App, ctx: &Context) {
     if !app.dialogs.prefs_open {
+        app.dialogs.confirm_clear_stems = false;
+        app.stem.cache_usage = None;
         return;
     }
     // Preferences opens in its own window, like the original. Screenshot mode (and backends
@@ -325,6 +331,12 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
         if class == egui::ViewportClass::Embedded {
             prefs_embedded(app, vctx);
             return;
+        }
+        crate::menus::apply_edit_commands(app, vctx);
+        let assigning_key = app.dialogs.prefs_tab == 3 && app.dialogs.ext.prefs_search.trim().is_empty()
+            && vctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SHORTCUT_WAIT_ID))).flatten().is_some();
+        if !assigning_key {
+            crate::window_fullscreen(&app.prefs, vctx, None);
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(vctx, |ui| {
             let h = ui.available_height();
@@ -352,7 +364,7 @@ fn prefs_embedded(app: &mut App, ctx: &Context) {
     let frame = egui::Frame::window(&ctx.style()).fill(BG).inner_margin(0.0);
     let h = (ctx.screen_rect().height() - 90.0).clamp(480.0, WIN.y);
     egui::Window::new("Preferences").open(&mut open).default_size(vec2(WIN.x, h)).collapsible(false).resizable(false).frame(frame).show(ctx, |ui| prefs_body(app, ui, h));
-    app.dialogs.prefs_open = open;
+    app.dialogs.prefs_open &= open;
 }
 
 fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
@@ -398,6 +410,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
     let key = format!("prefs_subtab_{page}");
     let mut sub_tab: usize = ui.ctx().data_mut(|d| *d.get_temp_mut_or(egui::Id::new(&key), 0usize)).min(tabs.len() - 1);
     let searching = !app.dialogs.ext.prefs_search.trim().is_empty();
+    if page != 6 || searching {
+        app.dialogs.confirm_clear_stems = false;
+        app.stem.cache_usage = None;
+    }
     // Tab strip on black, 30 pt tall: the active tab blue, the others #1E1E1E with #AAAAAA text.
     let mut x = 164.0;
     let names: Vec<&str> = if searching { vec!["Search results"] } else { tabs.to_vec() };
@@ -588,6 +604,15 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                 }
             });
             card(ui, "Waveform", |ui| {
+                kit::labeled(ui, "Playback animation", |ui| {
+                    let choices = [(15, "15 frames/s"), (30, "30 frames/s"), (0, "Display rate")];
+                    let current = choices.iter().find(|(n, _)| *n == app.prefs.playback_fps).map_or("Display rate", |v| v.1);
+                    kit::combo("playback_fps", 170.0, current, 14.0).show_ui(ui, |ui| {
+                        for (fps, name) in choices {
+                            ui.selectable_value(&mut app.prefs.playback_fps, fps, name);
+                        }
+                    });
+                });
                 sub(ui, "Full/Preview Waveform");
                 kit::indent(ui, 88.0);
                 if radio(ui, !app.prefs.wave_half, "Full Waveform") {
@@ -1052,19 +1077,10 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
     }
     let no_cloud = "recordbox has no cloud service: nothing is collected or uploaded.";
     card(ui, "Track Analysis", |ui| {
-        let why = "recordbox has one beat grid analysis so far; this switch has nothing to choose between yet.";
-        let mut refused = false;
         kit::row(ui, 16.0, |ui| {
-            if HIGH_PRECISION_WIRED {
-                kit::toggle_raw(ui, &mut app.prefs.high_precision_grid, "Use high precision BeatGrid analysis");
-            } else {
-                refused = kit::toggle_off_raw(ui, "Use high precision BeatGrid analysis", why);
-            }
-            kit::help(ui, 37.5, if HIGH_PRECISION_WIRED { "A more precise beat grid, at the cost of a longer analysis." } else { why });
+            kit::toggle_raw(ui, &mut app.prefs.refine_beatgrid_transients, "Use high precision BeatGrid analysis");
+            kit::help(ui, 37.5, "Refine beat timing and tempo against repeated attacks in the audio. Works with Normal and Dynamic. Use Analyze Track to update an existing unlocked grid.");
         });
-        if refused {
-            app.toast(why);
-        }
         separator(ui);
         kit::sub_help(ui, "Track Analysis Mode", Some("Normal: optimized for tracks which have a constant BPM.\nDynamic: for tracks whose tempo changes, the beat grid follows the tempo."));
         kit::labeled(ui, "Analysis Mode", |ui| {
@@ -1077,6 +1093,20 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
                     }
                 }
             });
+        });
+        kit::labeled(ui, "Analysis workers", |ui| {
+            let before = app.prefs.analysis_threads;
+            let label = if before == 0 { format!("Automatic ({})", app.pool.thread_count()) } else { app.pool.thread_count().to_string() };
+            let busy = app.pool.pending.load(std::sync::atomic::Ordering::Acquire) != 0;
+            ui.add_enabled_ui(!busy, |ui| {
+                kit::combo("analysis_workers", 170.0, label, 14.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.prefs.analysis_threads, 0, "Automatic");
+                    for n in 1..=app.pool.available_cpus.min(12) {
+                        ui.selectable_value(&mut app.prefs.analysis_threads, n, n.to_string());
+                    }
+                });
+            }).response.on_hover_text("Automatic leaves one processor available for playback when possible. Change this between analysis batches.");
+            if app.prefs.analysis_threads != before { app.pool.set_threads(app.prefs.analysis_threads); }
         });
         kit::labeled(ui, "BPM Range", |ui| {
             let (lo, hi) = BPM_RANGES[app.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
@@ -1116,7 +1146,7 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         }
     });
     card(ui, "Key Analysis", |ui| {
-        let why = "recordbox never changes your audio files; the key is kept in its own library.";
+        let why = "Track analysis saves the key in recordbox. To review it for write-back to AlphaTheta Rekordbox, open library sync.";
         if kit::toggle_off(ui, "Write the value to the ID3 tag", why) {
             app.toast(why);
         }
@@ -1409,7 +1439,8 @@ pub(crate) fn page_dj_system(app: &mut App, ui: &mut Ui, tab: usize) {
             card(ui, "Supported devices", |ui| {
                 kit::line(ui, "Drive formats: FAT32, exFAT (some players), HFS+ (USB only).");
                 kit::line(ui, "Files: MP3, AAC/M4A, WAV, AIFF, FLAC.");
-                note(ui, "Device library: export.pdb + exportExt.pdb with analysis files (DAT / EXT / 2EX) and the music in /Contents.");
+                note(ui, "Classic Device Library uses export.pdb and exportExt.pdb, analysis files (DAT, EXT and 2EX), and music in /Contents.");
+                note(ui, "OneLibrary (Device Library Plus) is detected. On drives with both catalogs, recordbox browses and updates the classic catalog and preserves existing shared files.");
             });
         }
     }
@@ -1424,7 +1455,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
     let cat = ACTION_CATEGORIES[tab.min(ACTION_CATEGORIES.len() - 1)];
     card(ui, cat, |ui| {
         kit::line(ui, "Click a shortcut, then press the new key for that action, with Ctrl, Opt, Shift or ⌘ if you like (Esc cancels, Delete clears).");
-        let wait_id = egui::Id::new("key_wait");
+        let wait_id = egui::Id::new(SHORTCUT_WAIT_ID);
         let waiting: Option<String> = ui.ctx().data(|d| d.get_temp(wait_id)).flatten();
         if let Some(action) = &waiting {
             let got = ui.input(|i| {
@@ -1493,6 +1524,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
             }
         }));
         note(ui, "⌘ and Ctrl shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
+        note(ui, "F11 toggles full screen for the main window and detached library together unless you assign it to another action.");
     });
 }
 
@@ -1502,12 +1534,12 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
     match tab {
         0 => {
             card(ui, "Database management", |ui| {
-                sub(ui, "Location");
-                kit::block(ui, |ui| path_row(ui, &Some(crate::db::data_dir().display().to_string()), ""));
-                note(ui, "Your music files are only read. Edits (tags, cues, grids) are kept in this private library.");
+                sub(ui, "Active recordbox library");
+                ui.add(egui::Label::new(app.db.active_library_path()).selectable(true).wrap());
+                note(ui, "Edits are saved in this recordbox library. Library sync lets you review supported changes for write-back to AlphaTheta Rekordbox.");
                 kit::block(ui, |ui| {
-                    if ui.add(btn("Show in Finder")).clicked() {
-                        let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+                    if ui.add(btn("Show library folder")).clicked() {
+                        crate::menus::handle(app, "library_folder");
                     }
                 });
                 separator(ui);
@@ -1518,7 +1550,7 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
                         if ui.add_enabled(!busy, btn("Backup Library").min_size(vec2(150.0, 22.0))).clicked() {
                             crate::menus::handle(app, "backup");
                         }
-                        if ui.add_enabled(!busy, btn("Restore Library").min_size(vec2(150.0, 22.0))).clicked() {
+                        if ui.add_enabled(!busy && app.dialogs.library_sync_review.is_none() && app.rb_job.is_none(), btn("Restore Library").min_size(vec2(150.0, 22.0))).clicked() {
                             crate::menus::handle(app, "restore");
                         }
                     });
@@ -1629,11 +1661,14 @@ fn page_advanced(app: &mut App, ui: &mut Ui, tab: usize) {
         }
         _ => {
             card(ui, "rekordbox Library", |ui| {
-                toggle(ui, &mut app.prefs.rekordbox_sync, "Load and sync the rekordbox library when recordbox starts");
-                note(ui, "recordbox copies rekordbox's library into its own folder and reads the copy. rekordbox's own files are never opened by a database or changed.");
+                kit::line(ui, "Active recordbox library");
+                ui.label(app.db.active_library_path());
+                toggle(ui, &mut app.prefs.import_rekordbox_at_startup, "Import the installed AlphaTheta Rekordbox library at startup");
+                note(ui, "Startup import reads the AlphaTheta Rekordbox library into recordbox. To write changes back, use the sync arrows, select changes and confirm the backup.");
                 kit::block(ui, |ui| {
-                    if ui.add_enabled(app.rb_job.is_none(), btn("Sync now")).clicked() {
-                        crate::menus::handle(app, "sync_rekordbox");
+                    if ui.add_enabled(app.can_review_library_sync(), btn("Review library sync…")).clicked() {
+                        app.dialogs.prefs_open = false;
+                        app.review_rekordbox_sync();
                     }
                 });
             });
@@ -1853,23 +1888,22 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
     let tip = format!("Prioritize sound quality: {} — {}\nPrioritize speed: {} — {}", quality.name, quality.about, speed.name, speed.about);
     kit::card_help(ui, "STEMS Analysis Process", Some(&tip), |ui| {
         ui.add_space(-2.0);
-        let able = app.stem.hw.as_ref().map(|hw| crate::stems::runs_on(quality, hw)).unwrap_or(true);
+        let able = app.stem.hw.as_ref().is_none_or(|hw| hw.ram_gb >= quality.min_ram_gb && crate::stems::backend_status().0);
         let mut pick = None;
         if able || cur == quality.id {
             if radio(ui, cur == quality.id, "Prioritize sound quality") {
                 pick = Some(quality);
             }
         } else {
-            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} needs a GPU and {:.0} GB of memory, which this computer does not have.", quality.name, quality.min_ram_gb));
+            let ram = app.stem.hw.as_ref().map_or(0.0, |hw| hw.ram_gb);
+            kit::radio_off(ui, false, "Prioritize sound quality", &format!("{} requires GPU separation and {:.0} GB of system RAM. Detected {:.0} GB of system RAM. STEMS backend: {}", quality.name, quality.min_ram_gb, ram, crate::stems::backend_status().1));
         }
         if radio(ui, cur != quality.id, "Prioritize speed") {
             pick = Some(speed);
         }
         ui.add_space(2.0);
         if let Some(m) = pick.filter(|m| m.id != cur) {
-            app.prefs.stem_model = Some(m.id.to_string());
-            app.stem.model = Some(m.id.to_string());
-            app.stem.model_ready = crate::stems::model_ready(m);
+            app.select_stem_model(m);
         }
     });
     card(ui, "Layout", |ui| {
@@ -1907,11 +1941,11 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
             kit::line(
                 ui,
                 &format!(
-                    "This computer: {}{} cores, {:.0} GB memory, {}.",
+                    "{}{} CPU threads{} · STEMS backend: {}",
                     if hw.cpu.is_empty() { String::new() } else { format!("{}, ", hw.cpu) },
                     hw.cores,
-                    hw.ram_gb,
-                    if hw.gpu { "GPU (Metal) available" } else { "no usable GPU, separation runs on the CPU" }
+                    if hw.ram_gb > 0.0 { format!(", {:.0} GB system RAM", hw.ram_gb) } else { String::new() },
+                    crate::stems::backend_status().1
                 ),
             );
             note(ui, &format!("Recommended model: {}", crate::stems::choose(hw).name));
@@ -1929,12 +1963,98 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         if let Some((d, t)) = app.stem.downloading {
             kit::line(ui, &if t > 0 { format!("Downloading… {:.0}%", d as f64 / t as f64 * 100.0) } else { "Downloading…".into() });
         }
-        toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
-        note(ui, "As rekordbox does while its STEMS function is on. The original plays until the parts are ready. Off: a track is separated when you first press one of its part buttons.");
-        note(ui, &format!("Separated stems are kept so each track is only split once: {:.1} of at most {} GB in use (the ones used longest ago make room).", crate::stems::cache_size() as f64 / 1e9, app.prefs.stem_cache_gb));
+        let automatic_available = !crate::app::MANUAL_STEMS_PREVIEW && crate::stems::backend_hold().is_none();
+        ui.add_enabled_ui(automatic_available, |ui| {
+            toggle(ui, &mut app.prefs.stems_auto_separate, "Separate tracks when they are loaded");
+            ui.add_enabled_ui(app.prefs.stems_auto_separate, |ui| {
+                toggle(ui, &mut app.prefs.stems_auto_cpu, "Allow automatic separation on CPU");
+            });
+        });
+        if automatic_available {
+            note(ui, "CPU separation can use several cores for minutes. Cached parts load immediately.");
+        } else if crate::app::MANUAL_STEMS_PREVIEW && crate::stems::backend_hold().is_none() {
+            note(ui, "In the Vulkan preview, load a track and choose Separate to start a job. Cached parts load automatically.");
+        } else {
+            note(ui, "Automatic separation is paused. Cached parts still load. You can separate one loaded track on the CPU.");
+        }
+        if let Some(status) = app.stem.separation_status() {
+            kit::line(ui, &status);
+            if app.stem.separating.map(|(id, _)| id) == app.deck.track
+                && kit::block(ui, |ui| ui.add(btn("Stop separation")).clicked()) {
+                app.stop_separation();
+            }
+        } else if !app.prefs.show_stems {
+            note(ui, "Enable the STEMS Function above to separate a track from the active deck.");
+        } else if app.stem.downloading.is_none() {
+            if let Some(id) = app.deck.track {
+                if let Some(error) = app.stem.error_for(Some(id)) {
+                    note(ui, &error.detail);
+                }
+                if app.loading_stems() {
+                    note(ui, "Loading saved parts for the active deck…");
+                } else if app.player.state.lock().stems.is_some() {
+                    note(ui, "Separated parts are ready on the active deck.");
+                } else if app.stem.model.is_some() {
+                    let action = if app.manual_stem_device() == crate::stems::SeparationDevice::Cpu {
+                        "Separate on CPU"
+                    } else {
+                        "Separate"
+                    };
+                    let label = format!("{action} · Deck {}", app.px.active + 1);
+                    if kit::block(ui, |ui| ui.add(btn(label)).clicked()) {
+                        app.separate_loaded();
+                    }
+                }
+            } else {
+                note(ui, "Load a track on the active deck to separate it.");
+            }
+        }
+    });
+    card(ui, "Saved stems", |ui| {
+        note(ui, "Speed and quality each save four stereo parts, about 42 MB per minute per model. Export and Performance share these files.");
+        toggle(ui, &mut app.prefs.keep_all_stems, "Keep all saved stems");
         kit::block(ui, |ui| {
-            if ui.add(btn("Clear separated stems")).clicked() {
-                crate::stems::clear_cache();
+            ui.add_enabled_ui(!app.prefs.keep_all_stems, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("STEMS storage budget");
+                    ui.add(egui::DragValue::new(&mut app.prefs.stem_cache_gb).update_while_editing(false).suffix(" GB"));
+                });
+            });
+        });
+        if app.prefs.keep_all_stems {
+            note(ui, "New saves can use all available disk space. Saved parts stay on disk until you clear them.");
+        } else if app.prefs.stem_cache_gb == 0 {
+            note(ui, "With a zero budget, each new save removes all other saved parts.");
+        } else {
+            note(ui, "After a new result is saved, the least recently used parts are removed until storage fits the budget. The new result is always kept.");
+        }
+        match app.stem.cache_usage(ui.ctx()) {
+            Some(Ok(bytes)) => kit::line(ui, &format!("{:.2} GB in use", *bytes as f64 / 1e9)),
+            Some(Err(error)) => kit::line(ui, &format!("Could not measure the saved stems. {error}")),
+            None => kit::line(ui, "Checking space in use…"),
+        }
+        let path = crate::db::data_dir_for_inspection().join("stems");
+        kit::block(ui, |ui| {
+            ui.add(egui::Label::new(format!("Cache folder · {}", path.display())).selectable(true).wrap());
+            if let Some(warning) = app.stem.cache_warning() {
+                ui.add(egui::Label::new(RichText::new(warning).color(CAUTION_TX)).selectable(true).wrap());
+            }
+            if app.dialogs.confirm_clear_stems {
+                ui.label("Clear all saved speed and quality parts? Rebuilding them requires running separation again.");
+                ui.horizontal(|ui| {
+                    if ui.add(btn("Cancel")).clicked() {
+                        app.dialogs.confirm_clear_stems = false;
+                    }
+                    if ui.add(btn("Clear saved parts")).clicked() {
+                        app.dialogs.confirm_clear_stems = false;
+                        app.stem.cache_usage = None;
+                        if let Err(error) = crate::stems::clear_cache() {
+                            app.toast_err(format!("Could not clear all saved stems. {error:#}"));
+                        }
+                    }
+                });
+            } else if ui.add(btn("Clear separated stems")).clicked() {
+                app.dialogs.confirm_clear_stems = true;
             }
         });
     });

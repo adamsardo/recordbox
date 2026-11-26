@@ -7,21 +7,28 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
-pub fn data_dir() -> PathBuf {
+fn data_locations() -> (PathBuf, Option<PathBuf>) {
     if let Ok(d) = std::env::var("PREPDECK_DATA") {
-        let p = PathBuf::from(d);
-        let _ = std::fs::create_dir_all(&p);
-        return p;
+        return (PathBuf::from(d), None);
     }
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let p = base.join("Recordbox");
+    (base.join("Recordbox"), Some(base.join("PrepDeck")))
+}
+
+/// Locate existing files without creating or migrating the application's data directory.
+pub fn data_dir_for_inspection() -> PathBuf {
+    let (path, legacy) = data_locations();
+    legacy.filter(|old| !path.exists() && old.is_dir()).unwrap_or(path)
+}
+
+pub fn data_dir() -> PathBuf {
+    let (path, legacy) = data_locations();
     // The app was called PrepDeck before: its library folder moves over once, unchanged.
-    let old = base.join("PrepDeck");
-    if !p.exists() && old.is_dir() {
-        let _ = std::fs::rename(&old, &p);
+    if let Some(old) = legacy.filter(|old| !path.exists() && old.is_dir()) {
+        let _ = std::fs::rename(old, &path);
     }
-    let _ = std::fs::create_dir_all(&p);
-    p
+    let _ = std::fs::create_dir_all(&path);
+    path
 }
 
 pub fn artwork_dir() -> PathBuf {
@@ -37,10 +44,15 @@ pub struct Db {
 const TRACK_COLS: &str = "id,path,title,artist,album,album_artist,genre,label,remixer,original_artist,composer,lyricist,mix_name,comment,grouping,message,year,track_no,disc_no,release_date,duration,sample_rate,bitrate,bit_depth,file_size,file_type,bpm,key,rating,color,date_added,date_created,play_count,analyzed,grid_locked,autoload_hotcue,gain_db,artwork,raw_samples,key_manual,key_text";
 
 /// Library schema version (SQLite user_version). Version 0 is a library from before
-/// versioning; 2 is the current layout.
-pub const SCHEMA_VERSION: i64 = 3;
+/// versioning. Version 4 records the origin of new direct file imports for cleanup review.
+pub const SCHEMA_VERSION: i64 = 4;
 
 impl Db {
+    /// The main database attached to this connection (including a custom library directory).
+    pub fn active_library_path(&self) -> &str {
+        self.conn.path().filter(|path| !path.is_empty()).unwrap_or("Path unavailable")
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Db> {
         // Refuse a library from a newer Recordbox; back up an older one before upgrading it.
         let existed = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
@@ -90,6 +102,12 @@ impl Db {
             CREATE TABLE IF NOT EXISTS track_tags(track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                 tag_id INTEGER NOT NULL REFERENCES mytags(id) ON DELETE CASCADE, PRIMARY KEY(track_id, tag_id));
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS native_edit_baseline(
+                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, field TEXT NOT NULL,
+                source TEXT NOT NULL, native_id TEXT NOT NULL, uuid TEXT NOT NULL, path TEXT NOT NULL,
+                value TEXT NOT NULL, proof TEXT NOT NULL, PRIMARY KEY(track_id,field));
+            CREATE TRIGGER IF NOT EXISTS forget_deleted_rekordbox_mirror AFTER DELETE ON playlists
+            BEGIN DELETE FROM settings WHERE key='rb_folder_id' AND value=CAST(OLD.id AS TEXT); END;
             CREATE TABLE IF NOT EXISTS peaks(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, peak REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS media_stamps(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, size INTEGER NOT NULL, mtime INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS vocals(track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, data BLOB NOT NULL);
@@ -108,6 +126,13 @@ impl Db {
         // an interrupted upgrade leaves the library as it was (a backup was taken above).
         conn.execute_batch("BEGIN")?;
         let migrate = (|| -> Result<()> {
+            // Older rows have no proof of origin. Deliberately leave them out.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS direct_file_imports(
+                    track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE);
+                 CREATE TRIGGER IF NOT EXISTS protect_changed_import AFTER UPDATE ON tracks
+                 BEGIN DELETE FROM direct_file_imports WHERE track_id=OLD.id; END;"
+            )?;
             if conn.prepare("SELECT raw_samples FROM tracks LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE tracks ADD COLUMN raw_samples INTEGER DEFAULT 0;")?;
             }
@@ -159,10 +184,16 @@ impl Db {
     }
 
     pub fn setting(&self, key: &str) -> Option<String> {
-        self.conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional().ok().flatten()
+        self.setting_checked(key).ok().flatten()
+    }
+    pub fn setting_checked(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()
     }
     pub fn set_setting(&self, key: &str, value: &str) {
-        let _ = self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)", params![key, value]);
+        let _ = self.set_setting_checked(key, value);
+    }
+    pub fn set_setting_checked(&self, key: &str, value: &str) -> rusqlite::Result<usize> {
+        self.conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)", params![key, value])
     }
 
     fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<Track> {
@@ -226,6 +257,16 @@ impl Db {
         self.conn.query_row("SELECT id FROM tracks WHERE path=?1", [path], |r| r.get(0)).optional().ok().flatten()
     }
 
+    pub fn track_at_path(&self, path: &str) -> rusqlite::Result<Option<Track>> {
+        self.conn.query_row(&format!("SELECT {TRACK_COLS} FROM tracks WHERE path=?1"), [path], Self::row_to_track).optional()
+    }
+
+    pub fn set_track_path(&self, id: i64, path: &str) -> Result<()> {
+        let changed = self.conn.execute("UPDATE tracks SET path=?1 WHERE id=?2", params![path, id])?;
+        anyhow::ensure!(changed == 1, "The track is no longer in the collection");
+        Ok(())
+    }
+
     /// Insert a track; returns its new id.
     pub fn insert_track(&self, t: &Track) -> Result<i64> {
         self.conn.execute(
@@ -240,6 +281,26 @@ impl Db {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The file importer actually read this track on this computer. Imported library rows,
+    /// restored trash and preexisting collection records have no such evidence.
+    pub fn insert_local_file(&self, t: &Track) -> Result<i64> {
+        if t.file_size == 0 || t.sample_rate == 0 {
+            // The file importer can keep an unparsed or inaccessible file by name alone.
+            return self.insert_track(t);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_track(t)?;
+        anyhow::ensure!(self.conn.changes() == 1, "The file did not create a new track.");
+        self.conn.execute("INSERT INTO direct_file_imports(track_id) VALUES(?1)", [id])?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn protect_imported_track(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM direct_file_imports WHERE track_id=?1", [id])?;
+        Ok(())
     }
 
     pub fn update_track(&self, t: &Track) -> Result<()> {
@@ -456,6 +517,24 @@ impl Db {
         self.conn.execute("DELETE FROM cues WHERE id=?1", [id])?;
         Ok(())
     }
+    /// A hot-cue slot is one pad even when an older library contains duplicate rows.
+    /// Capture Undo and replace (or clear) the slot in one transaction.
+    pub fn edit_hot_cue(&self, track: i64, slot: i32, replacement: Option<&Cue>) -> Result<(Vec<Cue>, Vec<Cue>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let before = self.cues(track)?;
+        let count = before.iter().filter(|c| c.kind == CueKind::Hot && c.slot == slot).count();
+        if count > 0 {
+            let removed = tx.execute("DELETE FROM cues WHERE track_id=?1 AND kind=1 AND slot=?2", params![track, slot])?;
+            anyhow::ensure!(removed == count, "The hot cue could not be removed");
+        }
+        if let Some(cue) = replacement {
+            self.save_cue(cue)?;
+        }
+        let after = self.cues(track)?;
+        anyhow::ensure!(after.iter().filter(|c| c.kind == CueKind::Hot && c.slot == slot).count() == usize::from(replacement.is_some()), "The hot cue could not be saved");
+        tx.commit()?;
+        Ok((before, after))
+    }
     pub fn replace_cues(&self, track: i64, cues: &[Cue]) -> Result<()> {
         self.conn.execute("DELETE FROM cues WHERE track_id=?1", [track])?;
         for c in cues {
@@ -467,10 +546,24 @@ impl Db {
         Ok(())
     }
 
+    /// Undo/Redo needs the inverse edit and the new row IDs from the same committed write.
+    pub fn restore_cues(&self, track: i64, cues: &[Cue]) -> Result<(Vec<Cue>, Vec<Cue>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = self.cues(track)?;
+        self.replace_cues(track, cues)?;
+        let restored = self.cues(track)?;
+        anyhow::ensure!(restored.len() == cues.len(), "Could not restore every cue");
+        tx.commit()?;
+        Ok((previous, restored))
+    }
+
     // ---- grid & waveform
     pub fn grid(&self, track: i64) -> Option<BeatGrid> {
-        let s: Option<String> = self.conn.query_row("SELECT json FROM grids WHERE track_id=?1", [track], |r| r.get(0)).optional().ok().flatten();
-        s.and_then(|s| serde_json::from_str(&s).ok())
+        self.grid_checked(track).ok().flatten()
+    }
+    pub fn grid_checked(&self, track: i64) -> Result<Option<BeatGrid>> {
+        let s: Option<String> = self.conn.query_row("SELECT json FROM grids WHERE track_id=?1", [track], |r| r.get(0)).optional()?;
+        Ok(s.map(|s| serde_json::from_str(&s)).transpose()?)
     }
     pub fn save_grid(&self, track: i64, g: &BeatGrid) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO grids(track_id,json) VALUES(?1,?2)", params![track, serde_json::to_string(g)?])?;
@@ -543,7 +636,7 @@ impl Db {
     pub fn delete_node(&self, id: i64) -> Result<()> {
         let kids: Vec<i64> = {
             let mut st = self.conn.prepare("SELECT id FROM playlists WHERE parent=?1")?;
-            let v = st.query_map([id], |r| r.get(0))?.flatten().collect();
+            let v = st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             v
         };
         for k in kids {
@@ -649,6 +742,9 @@ struct TrashEntry {
     #[serde(default)]
     stamp: Option<(i64, i64)>,
 }
+
+#[cfg(test)]
+mod sqlcipher_tests;
 
 #[cfg(test)]
 mod schema_tests {

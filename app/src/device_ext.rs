@@ -264,6 +264,7 @@ impl App {
     /// Add one imported device track to the collection (or find it there already).
     fn add_imported(&mut self, it: ImportedTrack) -> Option<(i64, bool)> {
         if let Some(id) = self.db.track_by_path(&it.track.path) {
+            self.db.protect_imported_track(id).ok()?;
             return Some((id, false));
         }
         let id = self.db.insert_track(&it.track).ok()?;
@@ -437,7 +438,7 @@ impl App {
         }
         let counts: HashMap<String, usize> = self.db.setting("imported_history_counts").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let mut doomed: Vec<(String, u32)> = vec![];
-        for d in &self.devices {
+        for d in self.devices.iter().filter(|d| d.write_blocker.is_none()) {
             let Some(lib) = &d.lib else { continue };
             for h in &lib.histories {
                 let head = h.entries.first().and_then(|e| lib.tracks.get(e)).map(|t| t.file_path.clone()).unwrap_or_default();
@@ -479,6 +480,9 @@ impl App {
             return self.toast_err("An export is already running.");
         }
         let Some(dev) = self.devices.iter().find(|d| d.root == root) else { return self.toast_err("The device is no longer connected.") };
+        if let Some(reason) = dev.write_blocker.as_deref() {
+            return self.toast_err(reason.to_owned());
+        }
         let lib = dev.lib.clone().unwrap_or_default();
         let (tree, keep) = sync_tree(self, cfg);
         let remove = sync_removals(&usb::read_node_record(Path::new(root)), &keep, &lib);
@@ -542,7 +546,11 @@ impl App {
             return false;
         }
         let root = PathBuf::from(&st.root);
-        let files: Vec<(PathBuf, Vec<u8>)> = st.settings.files().into_iter().map(|(n, b)| (root.join("PIONEER").join(n), b)).collect();
+        let files = if st.settings == st.opened.1 && matches!(usb::check_export_target(&root), Ok(usb::DeviceLayout::Mixed)) {
+            vec![]
+        } else {
+            st.settings.files().into_iter().map(|(n, b)| (root.join("PIONEER").join(n), b)).collect()
+        };
         let (name, browse, colors) = (st.name.clone(), st.browse.clone(), st.colors.clone());
         let r = usb::change_device_with(&root, |lib| {
             lib.device_name = name.trim().chars().take(63).collect();
@@ -550,14 +558,13 @@ impl App {
             lib.color_names = colors.iter().enumerate().map(|(i, c)| if c.trim().is_empty() { COLOR_NAMES[i + 1].to_string() } else { c.trim().to_string() }).collect();
             Ok((vec![], files))
         });
-        let props = device_import::write_props(&root, &DeviceProps { bg_color: st.bg });
-        match (r, props) {
-            (Ok(_), Ok(_)) => {
+        match r.and_then(|_| device_import::write_props(&root, &DeviceProps { bg_color: st.bg })) {
+            Ok(()) => {
                 self.toast("Device settings written to the device.");
                 self.scan_devices();
                 true
             }
-            (Err(e), _) | (_, Err(e)) => {
+            Err(e) => {
                 self.toast_err(format!("Could not write the device settings: {e}"));
                 false
             }
@@ -629,7 +636,7 @@ impl App {
     /// Automatic synchronisation: a newly connected device whose Sync Manager has it switched
     /// on (for this library) is offered once per connection.
     pub fn offer_auto_sync(&mut self) {
-        let roots: HashSet<String> = self.devices.iter().map(|d| d.root.clone()).collect();
+        let roots: HashSet<String> = self.devices.iter().filter(|d| d.write_blocker.is_none()).map(|d| d.root.clone()).collect();
         self.device_ui.auto_offered.retain(|r| roots.contains(r));
         self.device_ui.bg = roots.iter().map(|r| (r.clone(), device_import::read_props(Path::new(r)).bg_color)).collect();
         if !roots.contains(&self.device_ui.sel_root) {
@@ -688,7 +695,14 @@ pub fn device_track_menu(app: &mut App, ui: &mut Ui, root: &str, ids: &[u32]) {
         ui.close_menu();
     }
     ui.separator();
-    if ui.button(if ids.len() == 1 { "Delete Track" } else { "Delete Tracks" }).on_hover_text("Remove from the device: its playlists, play histories and files.").clicked() {
+    let dev = app.devices.iter().find(|d| d.root == root);
+    let blocker = dev.and_then(|d| d.write_blocker.as_deref());
+    let hint = if dev.is_some_and(|d| d.layout == Some(usb::DeviceLayout::Mixed)) {
+        "Remove from classic playlists and histories. Shared files stay on the drive."
+    } else {
+        "Remove from device playlists and histories, and delete unused media."
+    };
+    if ui.add_enabled(blocker.is_none(), egui::Button::new(if ids.len() == 1 { "Delete Track" } else { "Delete Tracks" })).on_disabled_hover_text(blocker.unwrap_or_default()).on_hover_text(hint).clicked() {
         app.device_ui.confirm_delete = Some((root.to_string(), ids.to_vec()));
         ui.close_menu();
     }
@@ -724,7 +738,8 @@ pub fn device_node_menu(app: &mut App, ui: &mut Ui, root: &str, node: &usb::DevN
         }
     }
     ui.separator();
-    if ui.button(if node.folder { "Delete Folder" } else { "Delete Playlist" }).clicked() {
+    let blocker = app.devices.iter().find(|d| d.root == root).and_then(|d| d.write_blocker.as_deref());
+    if ui.add_enabled(blocker.is_none(), egui::Button::new(if node.folder { "Delete Folder" } else { "Delete Playlist" })).on_disabled_hover_text(blocker.unwrap_or_default()).clicked() {
         app.dialogs.device_remove = Some((root.to_string(), node.id, node.name.clone()));
         ui.close_menu();
     }
@@ -747,26 +762,32 @@ fn device_entry(root: &str, t: &usb::DevTrack) -> crate::playlist_files::Entry {
 
 /// Items of a device row's context menu that belong to this file (the rest is in ui_browser).
 pub fn device_row_menu(app: &mut App, ui: &mut Ui, root: &str) {
-    if ui.button("Sync Manager").on_hover_text("Synchronize playlists with a device").clicked() {
+    let Some(dev) = app.devices.iter().find(|d| d.root == root) else { return };
+    let blocker = dev.write_blocker.clone();
+    let mixed = dev.layout == Some(usb::DeviceLayout::Mixed);
+    let known = dev.layout.is_some();
+    let catalog_blocker = blocker.clone().or_else(|| dev.lib.is_none().then(|| "This action needs a classic Device Library.".to_string()));
+    if ui.add_enabled(blocker.is_none(), egui::Button::new("Sync Manager")).on_disabled_hover_text(blocker.as_deref().unwrap_or_default()).on_hover_text("Synchronize playlists with a device").clicked() {
         open_sync_manager(app, root);
         ui.close_menu();
     }
-    if ui.button("Update Collection").on_hover_text("Export again every track on this device that came from your collection, so the device has your latest cues, grids and track details.").clicked() {
+    if ui.add_enabled(catalog_blocker.is_none(), egui::Button::new("Update Collection")).on_disabled_hover_text(catalog_blocker.as_deref().unwrap_or_default()).on_hover_text("Export again every track on this device that came from your collection, so the device has your latest cues, grids and track details.").clicked() {
         app.update_device_collection(root);
         ui.close_menu();
     }
     ui.separator();
-    let has = device_import::has_my_settings(Path::new(root));
+    let has = known && device_import::has_my_settings(Path::new(root));
     if ui.add_enabled(has, egui::Button::new("Import My Settings")).on_disabled_hover_text("My Settings file is not available.").clicked() {
         app.import_my_settings(root);
         ui.close_menu();
     }
-    if ui.add_enabled(has, egui::Button::new("Delete My Settings")).on_disabled_hover_text("My Settings file is not available.").clicked() {
+    let delete_blocker = blocker.as_deref().or(mixed.then_some("Player settings on this drive are shared with OneLibrary.")).or((!has).then_some("My Settings file is not available."));
+    if ui.add_enabled(delete_blocker.is_none(), egui::Button::new("Delete My Settings")).on_disabled_hover_text(delete_blocker.unwrap_or_default()).clicked() {
         app.device_ui.confirm_delete_settings = Some(root.to_string());
         ui.close_menu();
     }
     ui.separator();
-    if ui.button("Property").clicked() {
+    if ui.add_enabled(blocker.is_none(), egui::Button::new("Property")).on_disabled_hover_text(blocker.as_deref().unwrap_or_default()).clicked() {
         app.open_device_property(root);
         ui.close_menu();
     }
@@ -809,10 +830,13 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
     if let Some((root, ids)) = app.device_ui.confirm_delete.clone() {
         egui::Window::new(if ids.len() == 1 { "Delete Track" } else { "Delete Tracks" }).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("Delete {} track(s) from the device?", ids.len()));
-            ui.label(RichText::new("They are removed from the device's playlists and play histories, and their music, analysis and artwork files are deleted from the device. Your collection is not changed.").size(11.0).color(DIM));
-            if usb::has_onelibrary(Path::new(&root)) {
-                ui.label(RichText::new("This drive also has a OneLibrary database that recordbox can't read: the files are left in place, only the standard device library is changed.").size(11.0).color(CAUTION_TX));
-            }
+            let mixed = app.devices.iter().find(|d| d.root == root).is_some_and(|d| d.layout == Some(usb::DeviceLayout::Mixed));
+            let detail = if mixed {
+                "The tracks are removed from classic playlists and histories. Their music, analysis and artwork stay on the drive for OneLibrary."
+            } else {
+                "The tracks are removed from the device's playlists and histories. Their unused music, analysis and artwork files are deleted."
+            };
+            ui.label(RichText::new(detail).size(11.0).color(DIM));
             ui.horizontal(|ui| {
                 if ui.button("Delete").clicked() {
                     app.device_ui.confirm_delete = None;
@@ -831,8 +855,10 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                 if ui.button("Yes").clicked() {
                     app.device_ui.confirm_delete_settings = None;
                     if !app.device_busy() {
-                        let n = device_import::delete_my_settings(Path::new(&root));
-                        app.toast(format!("{n} My Settings file(s) deleted from the device."));
+                        match device_import::delete_my_settings(Path::new(&root)) {
+                            Ok(n) => app.toast(format!("{n} My Settings file(s) deleted from the device.")),
+                            Err(e) => app.toast_err(format!("Could not delete My Settings: {e}")),
+                        }
                     }
                 }
                 if ui.button("No").clicked() {
@@ -866,7 +892,7 @@ const PROPERTY_TABS: [&str; 5] = ["General", "Category", "Sort", "Column", "My S
 
 fn property_window(app: &mut App, ctx: &Context) {
     let Some(mut st) = app.device_ui.property.take() else { return };
-    let Some(dev) = app.devices.iter().find(|d| d.root == st.root).map(|d| (d.name.clone(), d.fs.clone())) else { return };
+    let Some(dev) = app.devices.iter().find(|d| d.root == st.root).map(|d| (d.name.clone(), d.fs.clone(), d.layout, d.write_blocker.clone())) else { return };
     let mut open = true;
     let mut close = false;
     egui::Window::new("Property").id(egui::Id::new("device_property")).open(&mut open).collapsible(false).default_size([640.0, 560.0]).show(ctx, |ui| {
@@ -911,9 +937,14 @@ fn property_window(app: &mut App, ctx: &Context) {
             }
         });
         ui.separator();
+        let mixed_settings = dev.2 == Some(usb::DeviceLayout::Mixed) && st.settings != st.opened.1;
+        let blocker = dev.3.as_deref().or(mixed_settings.then_some("Player settings are shared with OneLibrary. Leave them as saved to apply classic catalog properties."));
+        if let Some(reason) = blocker {
+            ui.label(RichText::new(reason).color(CAUTION_TX));
+        }
         let changed = (st.name.clone(), st.settings.clone(), st.browse.clone(), st.colors.clone(), st.bg) != st.opened;
         ui.horizontal(|ui| {
-            if ui.add_enabled(changed, egui::Button::new(RichText::new("Apply").strong())).on_disabled_hover_text("Nothing has been changed.").on_hover_text("Press to apply the customized setting to the DJ equipment").clicked() && app.apply_device_property(&st) {
+            if ui.add_enabled(changed && blocker.is_none(), egui::Button::new(RichText::new("Apply").strong())).on_disabled_hover_text(blocker.unwrap_or("Nothing has been changed.")).on_hover_text("Press to apply the customized setting to the DJ equipment").clicked() && app.apply_device_property(&st) {
                 st.opened = (st.name.clone(), st.settings.clone(), st.browse.clone(), st.colors.clone(), st.bg);
             }
             if ui.button("Close").clicked() {
@@ -928,11 +959,24 @@ fn property_window(app: &mut App, ctx: &Context) {
 
 fn sync_window(app: &mut App, ctx: &Context) {
     let Some(mut st) = app.device_ui.sync.take() else { return };
-    let Some(dev) = app.devices.iter().find(|d| d.root == st.root).map(|d| (d.name.clone(), d.lib.clone())) else { return };
+    let Some(device) = app.devices.iter().find(|d| d.root == st.root) else { return };
+    let name = device.name.clone();
+    let format = device.catalog_label();
+    let blocker = device.write_blocker.clone();
+    let mixed = device.layout == Some(usb::DeviceLayout::Mixed);
     let mut open = true;
     let mut close = false;
     egui::Window::new("Sync Manager").id(egui::Id::new("sync_manager")).open(&mut open).collapsible(false).default_width(520.0).show(ctx, |ui| {
-        ui.label(RichText::new(format!("Synchronize playlists with a device: {}", dev.0)).strong());
+        ui.label(RichText::new(format!("Synchronize playlists with a device: {name}")).strong());
+        ui.label(RichText::new(format!("{format} · {}", st.root)).size(11.0).color(DIM));
+        if let Some(reason) = &blocker {
+            ui.label(RichText::new(reason).color(CAUTION_TX));
+            close = ui.button("Close").clicked();
+            return;
+        }
+        if mixed {
+            ui.label(RichText::new("Synchronizes the classic catalog. Files already shared with OneLibrary are preserved.").size(11.0).color(CAUTION_TX));
+        }
         if st.other_computer {
             ui.label(RichText::new("This device is synchronized with another computer.").color(CAUTION_TX));
             ui.label("Are you sure you want to synchronize this with this computer?");
@@ -998,17 +1042,17 @@ fn sync_window(app: &mut App, ctx: &Context) {
         ui.checkbox(&mut st.cfg.auto, "Automatic synchronization").on_hover_text("The selected lists are synchronized automatically at each connection (recordbox asks first).");
         // What "Synchronize" will do.
         let (tree, keep) = sync_tree(app, &st.cfg);
-        let lib = dev.1.clone().unwrap_or_default();
-        let remove = sync_removals(&usb::read_node_record(Path::new(&st.root)), &keep, &lib);
+        let lib = app.devices.iter().find(|d| d.root == st.root).and_then(|d| d.lib.as_ref());
+        let remove = lib.map(|l| sync_removals(&usb::read_node_record(Path::new(&st.root)), &keep, l)).unwrap_or_default();
         fn count(n: &ExportNode) -> usize {
             (!n.folder) as usize + n.children.iter().map(count).sum::<usize>()
         }
         let lists: usize = tree.iter().map(count).sum();
         let mut summary = format!("{lists} playlist(s) will be on the device");
         if !remove.is_empty() {
-            let names: Vec<String> = remove.iter().filter_map(|id| lib.nodes.iter().find(|n| n.id == *id)).map(|n| n.name.clone()).collect();
+            let names: Vec<&str> = remove.iter().filter_map(|id| lib?.nodes.iter().find(|n| n.id == *id)).map(|n| n.name.as_str()).collect();
             summary.push_str(&format!("; removed from the device: {}", names.join(", ")));
-            summary.push_str(if app.prefs.delete_device_tracks { " (with their tracks that no other playlist uses)" } else { " (their tracks stay on the device)" });
+            summary.push_str(if mixed && app.prefs.delete_device_tracks { " (unlisted tracks leave the classic catalog, and their files stay on the drive)" } else if app.prefs.delete_device_tracks { " (with their tracks that no other playlist uses)" } else { " (their tracks stay on the device)" });
         }
         ui.label(RichText::new(summary).size(11.0).color(DIM));
         ui.separator();
@@ -1080,7 +1124,7 @@ pub fn shot_setup(app: &mut App, what: &str) {
     let _ = std::fs::create_dir_all(&root);
     let r = root.to_string_lossy().to_string();
     let mut report = None;
-    if !usb::pdb_path(&root).exists() || what == "devicereport" {
+    if usb::check_export_target(&root).is_ok_and(|layout| layout == usb::DeviceLayout::Empty || what == "devicereport") {
         let ids: Vec<i64> = app.tracks.iter().filter(|t| !t.missing && usb::player_supported(&t.file_type)).take(6).map(|t| t.id).collect();
         let mut tracks = HashMap::new();
         for id in &ids {

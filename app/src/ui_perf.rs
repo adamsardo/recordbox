@@ -114,11 +114,6 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
             app.activate_deck((((pp.y - t) / lane) as u8).min(count - 1));
         }
     }
-    read_meters(app, ui);
-    let any = app.player.decks.iter().any(|s| s.lock().playing) || app.px.parked.iter().any(|d| d.loading.is_some()) || app.deck.loading.is_some() || app.searching() != 0;
-    if any {
-        ui.ctx().request_repaint();
-    }
 }
 
 /// Zoom in / RST / zoom out over the left end of the waveforms (one zoom for both decks).
@@ -786,8 +781,7 @@ fn repeat(ui: &Ui, resp: &egui::Response) -> bool {
 
 /// A rotary knob 24 pt across: drag up or down to turn (a full sweep over 150 pt), double
 /// click for `reset`. Returns the new value when it changed.
-pub(crate) fn knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, reset: f32, colour: Color32) -> Option<f32> {
-    let p = ui.painter().clone();
+pub(crate) fn turn_knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, reset: f32) -> (egui::Response, Option<f32>) {
     let r = Rect::from_center_size(c, vec2(24.0, 24.0));
     let resp = ui.interact(r, ui.id().with(id), Sense::click_and_drag());
     let mut out = None;
@@ -799,6 +793,12 @@ pub(crate) fn knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, r
             out = Some((value - dy / 150.0).clamp(0.0, 1.0));
         }
     }
+    (resp, out)
+}
+
+pub(crate) fn knob(ui: &mut Ui, c: Pos2, id: impl std::hash::Hash, value: f32, reset: f32, colour: Color32) -> Option<f32> {
+    let (resp, out) = turn_knob(ui, c, id, value, reset);
+    let p = ui.painter();
     let v = out.unwrap_or(value);
     // The track: a 270 degree arc open at the bottom; the pointer: a short line.
     let ang = |x: f32| (-225.0 + 270.0 * x).to_radians();
@@ -1010,31 +1010,34 @@ fn meter_bar(p: &Painter, r: Rect, db: f32, vertical: bool) {
 
 /// Read the level meters from the audio thread about every 36 ms: a higher peak shows at
 /// once, otherwise the level falls 2 dB per reading.
-fn read_meters(app: &mut App, ui: &Ui) {
+pub(crate) fn read_meters(app: &mut App, ui: &Ui) {
     let now = ui.input(|i| i.time);
-    let key = egui::Id::new("perf_meter_time");
-    let last = ui.ctx().data(|d| d.get_temp::<f64>(key)).unwrap_or(0.0);
-    let dt = (now - last) as f32;
-    if dt < 0.036 {
-        return;
-    }
-    ui.ctx().data_mut(|d| d.insert_temp(key, now));
-    let dt = dt.min(0.5);
-    let act = app.px.active as usize;
-    let _ = act;
-    for n in 0..4usize {
-        let peak = std::mem::take(&mut app.player.decks[n].lock().peak);
-        for c in 0..2 {
-            app.px.mix[n].shown_db[c] = crate::mixer::meter_fall(app.px.mix[n].shown_db[c], peak[c], dt);
+    let key = egui::Id::new("master_meter_time");
+    let last = ui.ctx().data(|d| d.get_temp::<f64>(key)).unwrap_or(now - 0.036);
+    let elapsed = (now - last) as f32;
+    let mut next = 0.036;
+    if elapsed >= next {
+        ui.ctx().data_mut(|d| d.insert_temp(key, now));
+        if app.performance() {
+            for (n, deck) in app.player.decks.iter().enumerate() {
+                let peaks = std::mem::take(&mut deck.lock().peak);
+                for (db, peak) in app.px.mix[n].shown_db.iter_mut().zip(peaks) {
+                    *db = crate::mixer::meter_fall(*db, peak, elapsed);
+                }
+            }
         }
+        for (db, peak) in app.px.master_db.iter_mut().zip(crate::audio::take_master_peak()) {
+            *db = crate::mixer::meter_fall(*db, peak, elapsed);
+        }
+    } else {
+        next -= elapsed;
     }
-    let mp = crate::audio::take_master_peak();
-    for c in 0..2 {
-        app.px.master_db[c] = crate::mixer::meter_fall(app.px.master_db[c], mp[c], dt);
-    }
-    let moving = app.px.master_db.iter().chain(app.px.mix.iter().flat_map(|m| m.shown_db.iter())).any(|d| *d > -100.0);
-    if moving {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(36));
+    // Playback schedules its own frames. Only wake a paused window while a
+    // visible meter is falling or the sampler is still producing sound.
+    let visible = app.px.master_db.iter().any(|db| *db > -40.0)
+        || (app.performance() && app.px.mix.iter().any(|strip| strip.shown_db.iter().any(|db| *db > -100.0)));
+    if visible && !app.player.transport_running() {
+        ui.ctx().request_repaint_after_secs(next + ui.input(|i| i.predicted_dt));
     }
 }
 

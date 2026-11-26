@@ -11,6 +11,7 @@ pub struct AnalysisSettings {
     pub bpm_min: f64,
     pub bpm_max: f64,
     pub do_grid: bool,
+    pub high_precision: bool,
     pub do_key: bool,
     /// Loudness the auto gain aims for (LUFS).
     pub target_lufs: f64,
@@ -19,10 +20,11 @@ pub struct AnalysisSettings {
 }
 
 pub mod dynamic;
+mod precision;
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
-        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, do_key: true, target_lufs: -10.0, dynamic: false }
+        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, high_precision: false, do_key: true, target_lufs: -10.0, dynamic: false }
     }
 }
 
@@ -60,16 +62,44 @@ pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> 
 }
 
 pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
+    analyze_passes(dec, s, false)
+}
+
+/// Called inside the batch's bounded Rayon pool; nested passes share its workers.
+pub(super) fn analyze_file_on_worker(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> {
+    let dec = decode_file(path)?;
+    Ok(analyze_passes(&dec, s, true))
+}
+
+fn analyze_grid(mono: &[f32], sr: f64, settings: &AnalysisSettings) -> (f64, Option<BeatGrid>) {
+    if !settings.do_grid { return (0.0, None); }
+    let detect = if settings.dynamic { dynamic::tempo_and_grid_dynamic } else { tempo_and_grid };
+    let (bpm, mut grid) = detect(mono, sr, settings.bpm_min, settings.bpm_max);
+    if settings.high_precision {
+        if let Some(grid) = &mut grid {
+            precision::refine(mono, sr, grid, settings.bpm_min, settings.bpm_max);
+        }
+    }
+    (grid.as_ref().map_or(bpm, BeatGrid::first_bpm), grid)
+}
+
+fn analyze_passes(dec: &Decoded, s: &AnalysisSettings, parallel: bool) -> AnalysisResult {
     let mono = dec.mono();
     let sr = dec.sr as f64;
-    let wave = waveform(&mono, sr);
-    let (bpm, grid) = match (s.do_grid, s.dynamic) {
-        (false, _) => (0.0, None),
-        (true, false) => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
-        (true, true) => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
+    // Key detection uses the measured tempo/grid. The waveform and loudness passes
+    // are independent and only borrow the decoded samples.
+    let timing = || {
+        let (bpm, grid) = analyze_grid(&mono, sr, s);
+        let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
+        (bpm, grid, key)
     };
-    let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
-    let (lufs, peak) = loudness_and_peak(dec);
+    let wave = || waveform(&mono, sr);
+    let level = || loudness_and_peak(dec);
+    let ((bpm, grid, key), (wave, (lufs, peak))) = if parallel {
+        rayon::join(timing, || rayon::join(wave, level))
+    } else {
+        (timing(), (wave(), level()))
+    };
     // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
     AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak }
@@ -187,7 +217,7 @@ struct Onsets {
 
 fn onsets(mono: &[f32], sr: f64) -> Onsets {
     let nfft = 1024usize;
-    let hop = (sr / ONSET_FPS).round() as usize;
+    let hop = (sr / ONSET_FPS).round().max(1.0) as usize;
     let fps = sr / hop as f64;
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(nfft);
@@ -296,6 +326,7 @@ pub fn tempo_and_grid(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64) -> (f64
     normalize(&mut o.all);
     normalize(&mut o.low);
     let env: Vec<f32> = o.all.iter().zip(&o.low).map(|(a, l)| a + 0.6 * l).collect();
+    if !env.iter().any(|&strength| strength > 0.0) { return (0.0, None); }
     let fps = o.fps;
 
     // 1) Autocorrelation over the allowed range, with harmonics.
@@ -524,7 +555,7 @@ fn attack_fraction() -> f32 {
 fn refine_phase(mono: &[f32], sr: f64, first: f64, period: f64) -> f64 {
     let mut lp1 = Biquad::new("lp", 150.0, 0.707, sr, 0.0);
     let mut lp2 = Biquad::new("lp", 150.0, 0.707, sr, 0.0);
-    let ms = (sr / 1000.0) as usize;
+    let ms = (sr / 1000.0).max(1.0) as usize;
     let mut env = Vec::with_capacity(mono.len() / ms + 1);
     let mut acc = 0f32;
     for (i, &x) in mono.iter().enumerate() {
@@ -909,6 +940,32 @@ mod tests {
             let beats = g.beats(40.0);
             let b1 = beats.iter().find(|b| (b.time - off).abs() < 0.02).unwrap();
             assert_eq!(b1.beat, 1, "downbeat for {bpm}");
+        }
+    }
+
+    #[test]
+    fn high_precision_tracks_fractional_tempo_and_attack_times() {
+        for (sr, bpm, offset) in [(44_100.0, 127.137, 0.2137), (48_000.0, 121.043, 0.0573)] {
+            let seconds = 64.0;
+            let music = click_track(bpm, seconds, sr, offset);
+            let mut settings = AnalysisSettings::default();
+            let (_, standard) = analyze_grid(&music, sr, &settings);
+            settings.high_precision = true;
+            let (found, precise) = analyze_grid(&music, sr, &settings);
+            let precise = precise.unwrap();
+            let (base, beats) = (standard.unwrap().beats(seconds), precise.beats(seconds));
+            let error = |grid: &[crate::model::Beat]| {
+                let mut errors: Vec<_> = (0..).map(|i| offset + f64::from(i) * 60.0 / bpm)
+                    .take_while(|&t| t < seconds - 1.0)
+                    .map(|t| (crate::model::nearest_beat(grid, t).unwrap().time - t).abs() * 1000.0).collect();
+                errors.sort_unstable_by(f64::total_cmp);
+                errors[errors.len() * 95 / 100]
+            };
+            let (before, after) = (error(&base), error(&beats));
+            eprintln!("precision grid {sr} Hz, {bpm} BPM: 95th percentile {before:.3} -> {after:.3} ms, measured tempo {found:.4}");
+            assert_eq!(precise.anchors.len(), 1);
+            assert!((found - bpm).abs() < 0.004 && after < 2.0 && after < before, "{bpm}: {before} -> {after}, BPM {found}");
+            assert_eq!(crate::model::nearest_beat(&beats, offset).unwrap().beat, 1);
         }
     }
 

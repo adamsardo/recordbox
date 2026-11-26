@@ -13,6 +13,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+mod stem_cache_tests;
+#[cfg(test)]
+mod hot_cue_persistence_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Col {
     Num,
@@ -170,6 +175,19 @@ impl Col {
     }
 }
 
+/// The experimental hybrid backend is exercised by an explicit separation request.
+pub(crate) const MANUAL_STEMS_PREVIEW: bool = cfg!(all(target_os = "linux", feature = "vulkan"));
+
+impl Prefs {
+    pub(crate) fn auto_stems_on_load(&self, gpu: bool) -> bool {
+        !MANUAL_STEMS_PREVIEW && self.show_stems && self.stems_auto_separate && (gpu || self.stems_auto_cpu) && crate::stems::backend_hold().is_none()
+    }
+
+    fn stem_cache_limit(&self) -> Option<u64> {
+        (!self.keep_all_stems).then_some(u64::from(self.stem_cache_gb) * 1_000_000_000)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -197,7 +215,8 @@ pub struct Prefs {
     pub widths: HashMap<String, f32>,
     pub browser_only: bool,
     /// Copy and sync the installed rekordbox library (master.db) every time Recordbox starts.
-    pub rekordbox_sync: bool,
+    // Before 0.6 startup sync was enabled even without a deliberate opt-in.
+    pub import_rekordbox_at_startup: bool,
     /// Player settings written to every exported USB (Preferences > DJ System).
     pub usb_settings: crate::export::settings::UsbSettings,
     /// Which field the track-list search looks in (0 = all; see SEARCH_SCOPES).
@@ -233,8 +252,12 @@ pub struct Prefs {
     pub ch_fader_curve: u8,
     /// Separate a track when it is loaded, as rekordbox does while its STEMS function is on.
     pub stems_auto_separate: bool,
-    /// Most disk space the kept stems may use, in GB (the least recently used go first).
+    /// Also start uncached model inference on Load when no accelerator is available.
+    pub stems_auto_cpu: bool,
+    /// Storage budget in decimal GB. At zero, each new save keeps only its own result.
     pub stem_cache_gb: u32,
+    /// Skip automatic eviction and retain the budget in case the user switches back.
+    pub keep_all_stems: bool,
     /// Import play histories from connected devices automatically.
     pub import_device_history: bool,
     /// Keyboard shortcuts changed from their defaults: action id -> key name.
@@ -285,7 +308,7 @@ pub struct Prefs {
     /// View > Color > Customize Color Comments: names of the 8 track colours (Pink..Purple).
     pub color_names: [String; 8],
     /// Analysis: "Use high precision BeatGrid analysis".
-    pub high_precision_grid: bool,
+    pub refine_beatgrid_transients: bool,
     /// CUE Analysis: "Set Memory Cue at the first beat of track when analyzing".
     pub memory_cue_first_beat: bool,
     /// Audio: buffer size in frames (0 = the device's default), sample rate (0 = the
@@ -337,6 +360,8 @@ pub struct Prefs {
     pub wave_click_play_cue: bool,
     /// Player layout: 0 = 1 Player, 1 = 2 Players, 2 = Simple Player (`browser_only` hides it).
     pub player_layout: u8,
+    /// Maximum automatic playback animation rate. Zero follows the display.
+    pub playback_fps: u8,
     /// Metronome volume step 1–3.
     pub metronome_vol: u8,
     /// Beat jump length shown and chosen in bars (`beat_jump` stays in beats).
@@ -347,6 +372,8 @@ pub struct Prefs {
     pub show_phrase_bar: bool,
     /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
     pub analysis_mode: u8,
+    /// Maximum CPU workers for library analysis. Zero selects the automatic budget.
+    pub analysis_threads: usize,
     /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
     /// track is first analysed; Analyze Key still replaces it.
     pub keep_tag_key: bool,
@@ -480,10 +507,211 @@ impl Default for RelatedRules {
     }
 }
 
-/// Distance between two keys on the key wheel: steps around the wheel plus one when the
-/// mode differs (0 same key, 1 neighbour or relative major/minor, 2 diagonal or two steps…).
+/// An explicit reanalysis can replace the grid it saw when queued. Edits made
+/// while its audio was being analyzed take precedence over the worker's result.
+fn keep_saved_grid(locked: bool, saved: &Option<BeatGrid>, queued: Option<&Option<BeatGrid>>, measured: bool) -> bool {
+    locked || match queued {
+        Some(before) => before != saved || !measured,
+        None => saved.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod reanalysis_tests {
+    use super::{keep_saved_grid, BeatGrid};
+
+    #[test]
+    fn replacing_a_saved_grid_requires_a_successful_explicit_analysis_and_no_intervening_edit() {
+        let imported = Some(BeatGrid::constant(0.125, 122.0, 2));
+        let edited = Some(BeatGrid::constant(0.181, 122.0, 1));
+        assert!(keep_saved_grid(false, &imported, None, true));
+        assert!(keep_saved_grid(false, &imported, Some(&imported), false));
+        assert!(keep_saved_grid(true, &imported, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&imported), true));
+        assert!(keep_saved_grid(false, &edited, Some(&None), true));
+        assert!(keep_saved_grid(false, &None, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &imported, Some(&imported), true));
+        assert!(!keep_saved_grid(false, &None, None, true));
+    }
+}
+
 #[cfg(test)]
 mod prefs_tests {
+    fn cache_key(track: i64, model: &'static str) -> super::StemCacheKey {
+        super::StemCacheKey { track, model, path: "example.stems".into() }
+    }
+
+    #[test]
+    fn stem_storage_preferences_preserve_legacy_budgets_and_opt_in() {
+        let default: super::Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.stem_cache_limit(), Some(20_000_000_000));
+        for gb in [0, 7, u32::MAX] {
+            let mut prefs: super::Prefs = serde_json::from_value(serde_json::json!({"stem_cache_gb": gb})).unwrap();
+            assert_eq!(prefs.stem_cache_limit(), Some(u64::from(gb) * 1_000_000_000));
+            prefs.keep_all_stems = true;
+            let saved: super::Prefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(saved.stem_cache_limit(), None);
+            assert_eq!(saved.stem_cache_gb, gb);
+        }
+    }
+
+    #[test]
+    fn a_running_stem_job_uses_the_budget_in_effect_after_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("000000000000000000000001-htdemucs.stems");
+        let new = dir.path().join("000000000000000000000001-htdemucs_ft.stems");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        let mut prefs = super::Prefs { stem_cache_gb: 0, ..Default::default() };
+        let state = super::StemState::new();
+        state.update_cache_limit(&prefs);
+        let worker_limit = state.cache_limit.clone();
+        let finish_save = || crate::stems::trim_cache(&new, || *worker_limit.lock());
+
+        prefs.keep_all_stems = true;
+        state.update_cache_limit(&prefs);
+        finish_save();
+        assert!(old.exists() && new.exists());
+
+        prefs.keep_all_stems = false;
+        prefs.stem_cache_gb = 1;
+        state.update_cache_limit(&prefs);
+        finish_save();
+        assert!(old.exists() && new.exists());
+
+        prefs.stem_cache_gb = 0;
+        state.update_cache_limit(&prefs);
+        assert!(old.exists(), "changing the budget must not run eviction");
+        finish_save();
+        assert!(!old.exists());
+        assert!(new.exists(), "even a zero budget keeps the result just saved");
+    }
+
+    #[test]
+    fn cache_save_warning_survives_unload_until_the_same_parts_are_saved() {
+        let mut state = super::StemState::new();
+        let key = cache_key(7, "htdemucs");
+        state.record_cache_write(key.clone(), Err("Disk full".into()));
+        state.retain_deck_tracks([None; 4]);
+        state.record_cache_write(cache_key(8, "htdemucs"), Ok(()));
+        state.record_cache_write(cache_key(7, "htdemucs_ft"), Ok(()));
+        assert_eq!(state.cache_warning(), Some("Disk full"));
+        state.record_cache_write(key, Ok(()));
+        assert!(state.cache_warning().is_none());
+    }
+
+    #[test]
+    fn startup_import_requires_an_opt_in_after_upgrading() {
+        for legacy in [r#"{}"#, r#"{"rekordbox_sync":true}"#, r#"{"rekordbox_sync":false}"#] {
+            let prefs: super::Prefs = serde_json::from_str(legacy).unwrap();
+            assert!(!prefs.import_rekordbox_at_startup);
+        }
+        let mut prefs = super::Prefs::default();
+        assert!(!prefs.import_rekordbox_at_startup);
+        prefs.import_rekordbox_at_startup = true;
+        let saved = serde_json::to_string(&prefs).unwrap();
+        assert!(serde_json::from_str::<super::Prefs>(&saved).unwrap().import_rekordbox_at_startup);
+    }
+
+    #[test]
+    fn the_old_inactive_precision_switch_does_not_opt_users_into_new_work() {
+        let old: super::Prefs = serde_json::from_str(r#"{"high_precision_grid":true}"#).unwrap();
+        assert!(!old.refine_beatgrid_transients);
+        let saved: super::Prefs = serde_json::from_str(r#"{"refine_beatgrid_transients":true}"#).unwrap();
+        assert!(saved.refine_beatgrid_transients);
+    }
+
+    #[test]
+    fn cpu_retry_belongs_to_the_deck_with_the_provider_failure() {
+        let mut state = super::StemState::new();
+        let failure = anyhow::Error::new(crate::stems::DirectMlFailure("provider HRESULT".into())).context("Separation segment 2 of 4");
+        state.errors.insert(Some(7), super::StemError::separation(Some("htdemucs_ft"), failure));
+        let problem = state.error_for(Some(7)).unwrap();
+        assert_eq!(problem.retry_model, Some("htdemucs_ft"));
+        state.model = Some("htdemucs".into());
+        use crate::stems::SeparationDevice::{Cpu, Selected};
+        assert_eq!(state.manual_device(Some(7), false), Cpu);
+        assert_eq!(state.manual_device(Some(8), false), Selected);
+        assert_eq!(state.manual_device(Some(8), true), Cpu);
+        assert_eq!(state.model_for(Some(7), crate::stems::SeparationDevice::Cpu).unwrap().id, "htdemucs_ft");
+        assert_eq!(state.model_for(Some(7), crate::stems::SeparationDevice::Selected).unwrap().id, "htdemucs");
+        let problem = state.error_for(Some(7)).unwrap();
+        assert!(problem.detail.contains("provider HRESULT") && problem.detail.contains("2 of 4"));
+        assert!(state.error_for(Some(8)).is_none() && state.error_for(None).is_none());
+        for reason in ["stopped", "invalid checkpoint", "provider HRESULT"] {
+            state.errors.insert(Some(8), super::StemError::separation(Some("htdemucs"), anyhow::anyhow!(reason)));
+            assert!(state.error_for(Some(8)).unwrap().retry_model.is_none());
+            assert!(state.error_for(Some(7)).unwrap().retry_model.is_some());
+        }
+        state.retain_deck_tracks([Some(8), None, None, None]);
+        assert!(state.error_for(Some(7)).is_none());
+        assert!(state.error_for(Some(8)).is_some());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    #[test]
+    fn vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model() {
+        let failure = anyhow::Error::new(crate::stems::VulkanFailure("Vulkan dispatch timed out".into()))
+            .context("Separation segment 1 of 2");
+        let error = super::StemError::separation(Some("htdemucs"), failure);
+        assert_eq!(error.retry_model, Some("htdemucs"));
+        assert!(error.detail.contains("Vulkan dispatch timed out"));
+    }
+
+    #[test]
+    fn manual_cpu_progress_identifies_startup_before_any_segment_finishes() {
+        let mut state = super::StemState::new();
+        state.execution = crate::stems::SeparationDevice::Cpu;
+        state.active_key = Some(cache_key(7, "htdemucs"));
+        assert!(state.separation_status().is_none());
+        state.separating = Some((7, 0.0));
+        assert_eq!(state.separation_status().as_deref(), Some("Starting HTDemucs on CPU · waiting for the first segment"));
+        state.separating = Some((7, 0.25));
+        assert_eq!(state.separation_status().as_deref(), Some("Separating with HTDemucs on CPU: 25%"));
+    }
+
+    #[test]
+    fn model_details_follow_the_running_job_when_the_preference_changes() {
+        let mut state = super::StemState::new();
+        state.active_key = Some(cache_key(7, "htdemucs"));
+        state.model = Some("htdemucs_ft".into());
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs");
+        state.active_key = None;
+        assert_eq!(state.status_model().unwrap().name, "HTDemucs fine-tuned");
+    }
+
+    #[test]
+    fn legacy_preferences_require_opt_in_for_automatic_cpu_separation() {
+        let mut p: super::Prefs = serde_json::from_str(r#"{"show_stems":true,"stems_auto_separate":true}"#).unwrap();
+        assert!(!p.auto_stems_on_load(false));
+        assert_eq!(p.auto_stems_on_load(true), !super::MANUAL_STEMS_PREVIEW);
+        p.stems_auto_cpu = true;
+        assert_eq!(p.auto_stems_on_load(false), !super::MANUAL_STEMS_PREVIEW);
+        p.stems_auto_separate = false;
+        assert!(!p.auto_stems_on_load(false));
+        assert!(!p.auto_stems_on_load(true));
+        p.show_stems = false;
+        p.stems_auto_separate = true;
+        assert!(!p.auto_stems_on_load(false));
+    }
+
+    #[test]
+    fn separation_is_cancelled_when_the_last_deck_releases_its_track() {
+        use std::sync::atomic::Ordering;
+        let mut state = super::StemState::new();
+        state.separating = Some((4, 0.25));
+        state.pending = Some((cache_key(9, "htdemucs"), crate::stems::SeparationDevice::Cpu));
+        state.retain_deck_tracks([None, Some(9), None, Some(4)]);
+        assert!(!state.cancel.load(Ordering::Relaxed));
+        state.retain_deck_tracks([None, Some(9), None, None]);
+        assert!(state.cancel.load(Ordering::Relaxed));
+        assert_eq!(state.pending, Some((cache_key(9, "htdemucs"), crate::stems::SeparationDevice::Cpu)));
+        assert!(state.separating.is_some(), "another model must wait until the cancelled worker exits");
+        state.retain_deck_tracks([None; 4]);
+        assert!(state.pending.is_none());
+        assert!(!state.download_cancel.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn unknown_settings_survive_a_save() {
         let json = r#"{"tooltips": false, "future_setting": {"a": 1}, "another": [1, 2]}"#;
@@ -497,16 +725,21 @@ mod prefs_tests {
 
 #[cfg(test)]
 mod relocation_tests {
-    use std::path::PathBuf;
     #[test]
     fn picks_only_unambiguous_files() {
-        let p = |s: &str| PathBuf::from(s);
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100)], 100), Some(p("/a/x.mp3")));
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 100), None, "lone file of another size");
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99)], 0), Some(p("/a/x.mp3")), "size unknown");
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 99), (p("/b/x.mp3"), 100)], 100), Some(p("/b/x.mp3")));
-        assert_eq!(super::pick_relocation(&[(p("/a/x.mp3"), 100), (p("/b/x.mp3"), 100)], 100), None, "two with the same size");
-        assert_eq!(super::pick_relocation(&[], 100), None);
+        use super::RelocationMatch::*;
+        use std::path::Path;
+        let a = Path::new("/a/x.mp3");
+        let b = Path::new("/b/x.mp3");
+        assert_eq!(super::pick_relocation(&[(a, Some(100))], 100), Found(a, 100));
+        assert_eq!(super::pick_relocation(&[(a, Some(99))], 100), SizeMismatch);
+        assert_eq!(super::pick_relocation(&[(a, Some(99))], 0), Found(a, 99));
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(100))], 100), Found(b, 100));
+        assert_eq!(super::pick_relocation(&[(a, Some(100)), (b, Some(100))], 100), Multiple);
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(98))], 100), SizeMismatch);
+        assert_eq!(super::pick_relocation(&[(a, Some(99)), (b, Some(98))], 0), Multiple);
+        assert_eq!(super::pick_relocation(&[(a, None)], 0), Unverified);
+        assert_eq!(super::pick_relocation(&[(a, None), (b, Some(100))], 100), Unverified);
     }
 }
 
@@ -679,11 +912,16 @@ mod related_tests {
     }
 }
 
-/// Two grids describe the same beats (same anchors within 1 ms and 0.01 BPM).
+/// Reuse the original ANLZ beat sections only when the saved anchors still
+/// match the import. Allow floating-point round trips through the library.
+/// Sub-millisecond timing and fractional BPM edits belong to the saved grid.
 pub fn grids_match(a: &BeatGrid, b: &BeatGrid) -> bool {
-    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| (x.time - y.time).abs() < 0.001 && (x.bpm - y.bpm).abs() < 0.01 && x.beat == y.beat)
+    a.anchors.len() == b.anchors.len() && a.anchors.iter().zip(&b.anchors).all(|(x, y)| {
+        x.beat == y.beat && (x.time - y.time).abs() <= 1e-9 && (x.bpm - y.bpm).abs() <= 1e-9
+    })
 }
 
+/// Distance between keys around the wheel, plus one when the mode differs.
 pub fn key_distance(a: i32, b: i32) -> Option<i32> {
     if !(0..24).contains(&a) || !(0..24).contains(&b) {
         return None;
@@ -713,7 +951,7 @@ impl Default for Prefs {
             columns: vec![Col::Status, Col::Preview, Col::Artwork, Col::Title, Col::Artist, Col::Album, Col::Genre, Col::Bpm, Col::Rating, Col::Time, Col::Key, Col::DateAdded],
             sort_col: Col::DateAdded,
             sort_asc: false,
-            rekordbox_sync: true,
+            import_rekordbox_at_startup: false,
             usb_settings: Default::default(),
             search_scope: 0,
             related: Default::default(),
@@ -731,7 +969,9 @@ impl Default for Prefs {
             eq_isolator: false,
             ch_fader_curve: 1,
             stems_auto_separate: true,
+            stems_auto_cpu: false,
             stem_cache_gb: 20,
+            keep_all_stems: false,
             import_device_history: true,
             keymap: Default::default(),
             column_browser: false,
@@ -756,7 +996,7 @@ impl Default for Prefs {
             cue_markers_on_preview: true,
             wave_half: false,
             color_names: crate::prefs_ext::default_color_names(),
-            high_precision_grid: true,
+            refine_beatgrid_transients: false,
             memory_cue_first_beat: false,
             audio_buffer: 0,
             audio_rate: 0,
@@ -782,12 +1022,14 @@ impl Default for Prefs {
             beat_count_mode: 0,
             wave_click_play_cue: false,
             player_layout: 0,
+            playback_fps: if cfg!(target_os = "linux") { 30 } else { 0 },
             metronome_vol: 2,
             beat_jump_bars: false,
             show_stems: true,
             // As rekordbox: "Phrase (Full Waveform)" is not ticked until the user ticks it.
             show_phrase_bar: false,
             analysis_mode: 0,
+            analysis_threads: 0,
             keep_tag_key: true,
             palette_enabled: true,
             playlist_search_filter: true,
@@ -826,12 +1068,37 @@ pub enum Edit {
     Phrases { track: i64, before: Option<crate::phrase::Structure> },
 }
 
+#[derive(Debug)]
+pub struct StemError {
+    pub detail: String,
+    pub retry_model: Option<&'static str>,
+}
+
+impl StemError {
+    fn separation(model: Option<&'static str>, error: anyhow::Error) -> Self {
+        let provider_failure = error.is::<crate::stems::DirectMlFailure>();
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let provider_failure = provider_failure || error.is::<crate::stems::VulkanFailure>();
+        Self { retry_model: model.filter(|_| provider_failure),
+            detail: format!("Stem separation failed: {error:#}") }
+    }
+}
+
 pub enum StemMsg {
     Hardware(crate::stems::Hardware, String),
     Download(u64, u64),
     DownloadDone(Result<(), String>),
     Progress(i64, f32),
-    Done(i64, Result<std::sync::Arc<crate::stems::Stems>, String>),
+    CacheWrite(StemCacheKey, Result<(), String>),
+    Cached(StemCacheKey, anyhow::Result<Arc<crate::stems::Stems>>),
+    Done(i64, anyhow::Result<std::sync::Arc<crate::stems::Stems>>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StemCacheKey {
+    track: i64,
+    model: &'static str,
+    path: std::path::PathBuf,
 }
 
 /// Stem separation status: hardware, model, download and the current separation.
@@ -841,19 +1108,127 @@ pub struct StemState {
     pub model_ready: bool,
     pub downloading: Option<(u64, u64)>,
     pub separating: Option<(i64, f32)>,
-    pub loading: Option<i64>,
-    pub error: Option<String>,
+    // An explicit request can arrive while a deck is already reading the same cache file.
+    // Only that request may start separation after the read fails in the manual preview.
+    loading: HashMap<StemCacheKey, Option<crate::stems::SeparationDevice>>,
+    // None is a shared model download error. Deck errors and retries belong to their track.
+    errors: HashMap<Option<i64>, StemError>,
+    last_cache_warning: Option<(StemCacheKey, String)>,
+    // Read by the worker after saving and during eviction. Preferences may change during inference.
+    cache_limit: Arc<parking_lot::Mutex<Option<u64>>>,
+    pub(crate) cache_usage: Option<Arc<std::sync::OnceLock<std::io::Result<u64>>>>,
+    active_key: Option<StemCacheKey>,
+    pub execution: crate::stems::SeparationDevice,
     /// Track to separate as soon as the model download finishes.
-    pub pending: Option<i64>,
-    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending: Option<(StemCacheKey, crate::stems::SeparationDevice)>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub download_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub tx: crossbeam_channel::Sender<StemMsg>,
     pub rx: crossbeam_channel::Receiver<StemMsg>,
 }
 
 impl StemState {
+    fn update_cache_limit(&self, prefs: &Prefs) {
+        *self.cache_limit.lock() = prefs.stem_cache_limit();
+    }
+
+    pub(crate) fn cache_usage(&mut self, ctx: &egui::Context) -> Option<&std::io::Result<u64>> {
+        let usage = self.cache_usage.get_or_insert_with(|| {
+            let slot = Arc::new(std::sync::OnceLock::new());
+            let result = slot.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = result.set(crate::stems::cache_size());
+                ctx.request_repaint();
+            });
+            slot
+        });
+        usage.get()
+    }
+
+    pub(crate) fn reading_cache(&self) -> bool {
+        !self.loading.is_empty()
+    }
+
+    fn gpu_available(&self) -> bool {
+        self.hw.is_some() && crate::stems::backend_status().0
+    }
+
+    pub fn error_for(&self, track: Option<i64>) -> Option<&StemError> {
+        self.errors.get(&track).or_else(|| self.errors.get(&None))
+    }
+
+    pub fn cache_warning(&self) -> Option<&str> {
+        self.last_cache_warning.as_ref().map(|(_, warning)| warning.as_str())
+    }
+
+    fn record_cache_write(&mut self, key: StemCacheKey, result: Result<(), String>) {
+        if result.is_ok() {
+            self.cache_usage = None;
+        }
+        match result {
+            Err(warning) => self.last_cache_warning = Some((key, warning)),
+            Ok(()) if self.last_cache_warning.as_ref().is_some_and(|(failed, _)| failed == &key) => {
+                self.last_cache_warning = None;
+            }
+            Ok(()) => {}
+        }
+    }
+
+    fn manual_device(&self, track: Option<i64>, gpu_paused: bool) -> crate::stems::SeparationDevice {
+        if gpu_paused || self.error_for(track).is_some_and(|e| e.retry_model.is_some()) {
+            crate::stems::SeparationDevice::Cpu
+        } else {
+            crate::stems::SeparationDevice::Selected
+        }
+    }
+
+    pub fn status_model(&self) -> Option<&'static crate::stems::ModelSpec> {
+        self.active_key.as_ref().map(|key| key.model).or(self.model.as_deref()).and_then(crate::stems::spec)
+    }
+
+    pub fn separation_status(&self) -> Option<String> {
+        let (_, progress) = self.separating?;
+        let model = self.status_model()?.name;
+        let backend = if self.execution == crate::stems::SeparationDevice::Cpu || !self.gpu_available() {
+            " on CPU"
+        } else if MANUAL_STEMS_PREVIEW {
+            " with Vulkan + CPU"
+        } else {
+            ""
+        };
+        Some(if progress == 0.0 {
+            format!("Starting {model}{backend} · waiting for the first segment")
+        } else {
+            format!("Separating with {model}{backend}: {:.0}%", progress * 100.0)
+        })
+    }
+
+    fn model_for(&self, track: Option<i64>, execution: crate::stems::SeparationDevice) -> Option<&'static crate::stems::ModelSpec> {
+        if execution == crate::stems::SeparationDevice::Cpu {
+            if let Some(id) = self.error_for(track).and_then(|e| e.retry_model) {
+                return crate::stems::spec(id);
+            }
+        }
+        self.model.as_deref().and_then(crate::stems::spec)
+    }
+
+    fn retain_deck_tracks(&mut self, tracks: [Option<i64>; 4]) {
+        self.errors.retain(|id, _| id.is_none() || tracks.contains(id));
+        for (key, request) in &mut self.loading {
+            if !tracks.contains(&Some(key.track)) { *request = None; }
+        }
+        if self.separating.is_some_and(|(id, _)| !tracks.contains(&Some(id))) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.pending.as_ref().is_some_and(|(key, _)| !tracks.contains(&Some(key.track))) {
+            self.pending = None;
+        }
+    }
+
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        StemState { hw: None, model: None, model_ready: false, downloading: None, separating: None, loading: None, error: None, pending: None, cancel: Default::default(), tx, rx }
+        StemState { hw: None, model: None, active_key: None, model_ready: false, downloading: None, separating: None, loading: HashMap::new(), errors: HashMap::new(), last_cache_warning: None, cache_limit: Default::default(), cache_usage: None, execution: crate::stems::SeparationDevice::Selected, pending: None, cancel: Default::default(), download_cancel: Default::default(), tx, rx }
     }
 }
 
@@ -902,6 +1277,7 @@ pub enum SideMode {
 }
 
 pub struct Deck {
+    pub cancel_work: Arc<std::sync::atomic::AtomicBool>,
     /// Phrase structure shown under the overview (rekordbox's own, or Recordbox's).
     pub phrases: Option<crate::phrase::Structure>,
     /// Phrase analysis running in the background for (track id).
@@ -912,6 +1288,8 @@ pub struct Deck {
     /// Vocal activity (rekordbox's PVDI, else Recordbox's): (seconds per entry, level 0–4).
     pub vocal: Option<std::sync::Arc<(f64, Vec<u8>)>>,
     pub vocal_rx: Option<Receiver<(i64, Option<Vec<u8>>)>>,
+    // Identifies the parts requested by this deck, including during an asynchronous load.
+    pub(crate) stem_cache_key: Option<StemCacheKey>,
     pub track: Option<i64>,
     pub audio: Option<Arc<Decoded>>,
     pub loading: Option<Receiver<(i64, Result<Arc<Decoded>, String>)>>,
@@ -947,11 +1325,13 @@ pub struct Deck {
 impl Default for Deck {
     fn default() -> Self {
         Deck {
+            cancel_work: Default::default(),
             phrases: None,
             phrases_rx: None,
             rb_wave: None,
             vocal: None,
             vocal_rx: None,
+            stem_cache_key: None,
             track: None,
             audio: None,
             loading: None,
@@ -990,6 +1370,8 @@ pub struct Toast {
 #[derive(Default)]
 pub struct Dialogs {
     pub prefs_open: bool,
+    pub confirm_clear_stems: bool,
+    pub library_sync_review: Option<crate::ui_sync::Review>,
     pub prefs_tab: u8,
     /// Shortcuts window, backup/restore, reset confirmations (prefs_ext.rs).
     pub ext: crate::prefs_ext::DialogsExt,
@@ -1033,16 +1415,112 @@ pub struct DeviceInfo {
     pub root: String,
     pub name: String,
     pub fs: String,
+    pub layout: Option<crate::export::usb::DeviceLayout>,
     pub lib: Option<crate::export::usb::DeviceLibrary>,
-    pub error: Option<String>,
+    pub write_blocker: Option<String>,
     pub total: Option<u64>,
     pub free: Option<u64>,
 }
 
+impl DeviceInfo {
+    pub fn catalog_label(&self) -> &'static str {
+        use crate::export::usb::DeviceLayout::*;
+        match self.layout {
+            Some(Classic) => "Classic Device Library",
+            Some(Mixed) => "Classic Device Library + OneLibrary",
+            Some(OneLibrary) => "OneLibrary / Device Library Plus",
+            Some(Empty) => "No device catalog",
+            None => "Unrecognized device folder",
+        }
+    }
+}
+
+/// Immutable Collection rows, prepared only for the categories the user opens.
+/// These values depend on library metadata, never on the currently loaded deck.
+#[derive(Default)]
+pub(crate) struct CollectionCategories {
+    rows: [Option<Arc<[(String, usize)]>>; 4],
+}
+
+impl CollectionCategories {
+    fn clear(&mut self) {
+        self.rows.fill(None);
+    }
+
+    pub(crate) fn rows(&mut self, tracks: &[Track], field: usize) -> Arc<[(String, usize)]> {
+        self.rows[field].get_or_insert_with(|| {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for t in tracks {
+                *counts.entry(App::category_value(t, field as u8)).or_default() += 1;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            if field == 0 {
+                rows.reverse(); // Date Added: newest day first, as before.
+            }
+            rows.into()
+        }).clone()
+    }
+}
+
+#[cfg(test)]
+mod collection_category_tests {
+    use super::*;
+
+    #[test]
+    fn collection_categories_match_existing_grouping_and_order() {
+        let tracks = vec![
+            Track { date_added: "2025-02-03T09:00".into(), genre: " House ".into(), artist: "B".into(), album: " a ".into(), ..Default::default() },
+            Track { date_added: "2025-02-03T10:00".into(), genre: "House".into(), artist: "b".into(), album: "A".into(), ..Default::default() },
+            Track { date_added: "2026-01-01".into(), genre: "\t".into(), artist: "é".into(), album: "".into(), ..Default::default() },
+            Track::default(),
+        ];
+        let expected = [
+            vec![("2026-01-01", 1), ("2025-02-03", 2), ("", 1)],
+            vec![("", 2), ("House", 2)],
+            vec![("", 1), ("B", 1), ("b", 1), ("é", 1)],
+            vec![("", 2), ("A", 1), ("a", 1)],
+        ];
+        let mut cache = CollectionCategories::default();
+        for (field, want) in expected.into_iter().enumerate() {
+            let rows = cache.rows(&tracks, field);
+            assert_eq!(&*rows, want.iter().map(|(s, n)| (s.to_string(), *n)).collect::<Vec<_>>());
+            assert!(Arc::ptr_eq(&rows, &cache.rows(&tracks, field)), "unchanged frames share immutable rows");
+        }
+    }
+
+    #[test]
+    fn collection_categories_rebuild_after_metadata_and_library_changes() {
+        let mut tracks = vec![Track { artist: "old".into(), album: "old".into(), genre: "old".into(), date_added: "2024-01-01".into(), ..Default::default() }];
+        let mut cache = CollectionCategories::default();
+        let old: Vec<_> = (0..4).map(|field| cache.rows(&tracks, field)).collect();
+        // The same invalidation used by track_mut covers metadata edits and Undo/Redo.
+        cache.clear();
+        tracks[0].artist = "new artist".into();
+        tracks[0].album = "new album".into();
+        tracks[0].genre = "new genre".into();
+        tracks[0].date_added = "2026-02-03T12:00".into();
+        for field in 0..4 {
+            let rows = cache.rows(&tracks, field);
+            assert!(!Arc::ptr_eq(&rows, &old[field]));
+            assert_eq!(&*rows, &[(App::category_value(&tracks[0], field as u8), 1)]);
+        }
+        // Reloads can add or remove tracks while old row snapshots remain alive.
+        cache.clear();
+        tracks.push(tracks[0].clone());
+        assert_eq!(cache.rows(&tracks, 2)[0].1, 2);
+        cache.clear();
+        tracks.clear();
+        assert!(cache.rows(&tracks, 2).is_empty());
+        assert_eq!(&*old[2], &[("old".into(), 1)]);
+    }
+}
+
 pub struct App {
+    pub deck_options: crate::DeckOptions,
     pub db: Db,
     pub prefs: Prefs,
     pub tracks: Vec<Track>,
+    pub(crate) collection_categories: CollectionCategories,
     pub index: HashMap<i64, usize>,
     pub previews: HashMap<i64, Vec<u8>>,
     pub cue_counts: HashMap<i64, (usize, usize)>,
@@ -1100,6 +1578,8 @@ pub struct App {
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
     pub pool: AnalysisPool,
+    /// Hot slots the user cleared while this track's library analysis was outstanding.
+    cleared_analysis_hot_slots: HashMap<i64, HashSet<i32>>,
     pub analysis_total: usize,
     pub analysis_done: usize,
     pub importing: Option<Receiver<Option<Track>>>,
@@ -1122,14 +1602,19 @@ pub struct App {
     /// Last attempt to reopen a lost audio device, and whether the loss was reported.
     pub audio_retry: Option<(Instant, bool)>,
     /// Folder scan for Relocate Missing Files: file names (folded) to paths.
-    pub relocate_rx: Option<Receiver<HashMap<String, Vec<std::path::PathBuf>>>>,
+    pub relocate_rx: Option<RelocationSearch>,
     /// Tracks whose key was asked for with Analyze Key (their next result replaces the key).
     pub key_requested: HashSet<i64>,
+    /// Unlocked grids explicitly requested for replacement by Analyze Track.
+    pub grid_requested: HashMap<i64, Option<BeatGrid>>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
+    pub(crate) library_window: Option<crate::DetachedLibrary>,
+    /// A track being dragged between the decks or sampler while the library is in another window.
+    detached_player_drag: Option<Vec<i64>>,
     pub textures: HashMap<String, Option<egui::TextureHandle>>,
     pub ctx: egui::Context,
     pub screenshot: Option<(String, u32)>,
@@ -1139,18 +1624,28 @@ pub struct App {
     pub list_scroll_to: Option<f32>,
     /// Native menu bar (kept alive for the app's lifetime).
     pub menu: Option<muda::Menu>,
-    /// Edit menu commands waiting to be handed to egui as input events on the next frame:
-    /// 0 cut, 1 copy, 2 paste, 3 select all.
-    pub edit_cmds: Vec<u8>,
+    /// Native Edit menu actions waiting for the focused window's text field or track list.
+    pub edit_events: Vec<egui::Event>,
     /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
     pub ext: crate::library_ext::LibExt,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>) -> App {
-        crate::theme::apply(&cc.egui_ctx);
+    /// Native windows have independent pointer positions and releases. Keep the decks' drag
+    /// available to the sampler in their window and the browser drag available in the library.
+    pub fn with_detached_player_drag(&mut self, ctx: &egui::Context, draw: impl FnOnce(&mut App)) {
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+        draw(self);
+        if ctx.input(|i| !i.focused || !i.pointer.any_down()) {
+            self.drag = None;
+        }
+        std::mem::swap(&mut self.drag, &mut self.detached_player_drag);
+    }
+
+    fn open_library(ctx: &egui::Context, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
+        crate::theme::apply(ctx);
         // SVG images (the recordbox logo).
-        egui_extras::install_image_loaders(&cc.egui_ctx);
+        egui_extras::install_image_loaders(ctx);
         let db_path = crate::db::data_dir().join("library.db");
         let db = Db::open(&db_path).expect("open library database");
         // Removed tracks stay restorable for 30 days.
@@ -1179,11 +1674,15 @@ impl App {
         }
         crate::prefs_ext::set_stream_opts(&prefs);
         let audio_device = prefs.audio_device.clone();
-        let pool = AnalysisPool::new(cc.egui_ctx.clone());
-        let mut app = App {
+        let pool = AnalysisPool::new(ctx.clone(), prefs.analysis_threads);
+        let stem = StemState::new();
+        stem.update_cache_limit(&prefs);
+        App {
+            deck_options,
             db,
             prefs,
             tracks: vec![],
+            collection_categories: CollectionCategories::default(),
             index: HashMap::new(),
             previews: HashMap::new(),
             cue_counts: HashMap::new(),
@@ -1204,7 +1703,7 @@ impl App {
             related_built_for: None,
             load_after_import: None,
             node_drag: None,
-            stem: StemState::new(),
+            stem,
             undo: vec![],
             redo: vec![],
             search: String::new(),
@@ -1220,11 +1719,12 @@ impl App {
             filter_color: 0,
             filter_tags: HashSet::new(),
             filter_tags_all: false,
-            player: Player::with_device(audio_device.as_deref()),
+            player: Player::with_device(audio_device.as_deref(), !deck_options.disable_play),
             px: Default::default(),
             load_target: 0,
             deck: Deck::default(),
             pool,
+            cleared_analysis_hot_slots: HashMap::new(),
             analysis_total: 0,
             analysis_done: 0,
             importing: None,
@@ -1240,20 +1740,27 @@ impl App {
             key_job: None,
             vocal_failed: HashSet::new(),
             key_requested: HashSet::new(),
+            grid_requested: HashMap::new(),
             relocate_rx: None,
             audio_retry: None,
             dialogs: Dialogs::default(),
             toasts: vec![],
             drag: None,
+            library_window: None,
+            detached_player_drag: None,
             textures: HashMap::new(),
-            ctx: cc.egui_ctx.clone(),
+            ctx: ctx.clone(),
             screenshot: screenshot.map(|s| (s, 0)),
             scroll_to_selected: false,
             list_scroll_to: None,
             menu: None,
-            edit_cmds: vec![],
+            edit_events: vec![],
             ext: Default::default(),
-        };
+        }
+    }
+
+    pub fn new(cc: &eframe::CreationContext, screenshot: Option<String>, deck_options: crate::DeckOptions) -> App {
+        let mut app = Self::open_library(&cc.egui_ctx, screenshot, deck_options);
         app.menu = crate::menus::build();
         crate::menus::wake_on_menu(&app.ctx);
         app.reload_all();
@@ -1262,7 +1769,7 @@ impl App {
             app.toast_err(format!("Audio output unavailable: {e}"));
         }
         // First start: add original demo loops (like the bundled demo tracks of the original).
-        let rb_library = app.prefs.rekordbox_sync && crate::rbimport::library_dir().is_some();
+        let rb_library = app.prefs.import_rekordbox_at_startup && crate::rbimport::library_dir().is_some();
         if app.tracks.is_empty() && app.db.setting("demo_added").is_none() && (!rb_library || (app.screenshot.is_some() && std::env::var("PREPDECK_SHOT_SYNC").is_err())) {
             app.db.set_setting("demo_added", "1");
             let files = crate::demo::ensure_demo_files();
@@ -1294,7 +1801,7 @@ impl App {
         if std::env::var("PREPDECK_OPEN_PREFS").is_ok() {
             app.dialogs.prefs_open = true;
         }
-        if app.prefs.rekordbox_sync && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
+        if rb_library && (app.screenshot.is_none() || std::env::var("PREPDECK_SHOT_SYNC").is_ok()) {
             app.start_rekordbox_sync();
         }
         if app.screenshot.is_some() {
@@ -1578,7 +2085,9 @@ impl App {
                             match r {
                                 Ok(st) => {
                                     eprintln!("separated {} ({:.0} s of audio) in {:.1} s", tr.display_title(), st.len as f64 / 44100.0, t0.elapsed().as_secs_f64());
-                                    let _ = crate::stems::save(&crate::stems::cache_path(&tr.path, m.id), &st);
+                                    let key = app.stem_cache_key(t, m.id).unwrap();
+                                    let _ = crate::stems::save(&key.path, &st);
+                                    app.deck.stem_cache_key = Some(key);
                                     let mut ps = app.player.state.lock();
                                     ps.stems = Some(std::sync::Arc::new(st));
                                     ps.stem_on = [true, true, true, false];
@@ -1619,6 +2128,7 @@ impl App {
     }
 
     pub fn save_prefs(&self) {
+        self.stem.update_cache_limit(&self.prefs);
         // While the sub-browser's own columns and sort are swapped in, nothing is written
         // (ui_browser_ext.rs saves afterwards).
         if self.ext.in_sub {
@@ -1643,7 +2153,7 @@ impl App {
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
+        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, high_precision: self.prefs.refine_beatgrid_transients, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
     }
 
     // ------------------------------------------------------------------ loading
@@ -1656,6 +2166,7 @@ impl App {
         self.reload_tags();
     }
     pub fn reload_tracks(&mut self) {
+        self.collection_categories.clear();
         let queued: HashSet<i64> = self.tracks.iter().filter(|t| t.analyzed == 3).map(|t| t.id).collect();
         self.tracks = self.db.all_tracks().unwrap_or_default();
         let mut replaced: Vec<i64> = vec![];
@@ -1738,6 +2249,9 @@ impl App {
     }
     pub fn track_mut(&mut self, id: i64) -> Option<&mut Track> {
         let i = *self.index.get(&id)?;
+        // Metadata dialogs, inline edits, tag reloads and Undo/Redo can update a track
+        // without reloading the library. Invalidate before handing out mutable access.
+        self.collection_categories.clear();
         Some(&mut self.tracks[i])
     }
     /// Save a track without recording an undo step (analysis, sync and other system updates).
@@ -2138,15 +2652,17 @@ impl App {
         let beats = self.deck.beats.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
             let from_rb = base.and_then(|b| {
-                let same = crate::rbimport::read_pqtz_grid(&b.with_extension("DAT")).map(|r| grids_match(&r, &grid)).unwrap_or(false);
-                if !same {
+                let dat = b.with_extension("DAT");
+                let same = crate::rbimport::read_pqtz_grid(&dat).map(|r| grids_match(&r, &grid)).unwrap_or(false);
+                if !same || !crate::rbimport::pqtz_beat_indices_match(&dat, &beats) {
                     return None;
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
             });
-            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
+            let r = from_rb.or_else(|| if beats.is_empty() || cancel.load(std::sync::atomic::Ordering::Relaxed) { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2156,22 +2672,25 @@ impl App {
 /// Vocal detection for the loaded track when neither rekordbox nor an earlier run has it:
     /// the vocal stem of an already-downloaded separation model, in the background.
     fn start_deck_vocal(&mut self, a: Arc<Decoded>) {
-        if !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
+        if MANUAL_STEMS_PREVIEW || !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
             return;
         }
         // Only with a downloaded model and a GPU (about a minute per track there; much slower on
         // the CPU).
-        if !crate::stems::CATALOG.iter().any(crate::stems::model_ready) || !self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false) {
+        if !crate::stems::CATALOG.iter().any(crate::stems::model_ready) || !self.stem.gpu_available() {
             return;
         }
         let Some(id) = self.deck.track else { return };
-        if self.vocal_failed.contains(&id) {
+        if self.vocal_failed.contains(&id) || self.loading_stems() || self.stem.separating.is_some_and(|(track, _)| track == id) {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
+        let cancel = self.deck.cancel_work.clone();
         std::thread::spawn(move || {
-            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
+            let r = if !cancel.load(std::sync::atomic::Ordering::Relaxed) && crate::stems::gpu_active() {
+                crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| !cancel.load(std::sync::atomic::Ordering::Relaxed)).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)))
+            } else { None };
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2182,7 +2701,7 @@ impl App {
     /// mix without its drums (the drums stem subtracted), which agrees with rekordbox more
     /// often; otherwise with the ordinary analysis.
     pub fn analyze_key_tracks(&mut self, ids: &[i64]) {
-        let stems_ok = crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false);
+        let stems_ok = !MANUAL_STEMS_PREVIEW && crate::stems::CATALOG.iter().any(crate::stems::model_ready) && self.stem.gpu_available();
         // Locked tracks keep their key (Analysis Lock).
         let ids: Vec<i64> = ids.iter().copied().filter(|id| self.track(*id).map(|t| !(t.grid_locked && t.analyzed == 1)).unwrap_or(false)).collect();
         let ids = &ids[..];
@@ -2204,7 +2723,12 @@ impl App {
                 let key = (|| {
                     let d = crate::audio::decode_file(&path).ok()?;
                     let mono = crate::stems::mono_44k(&d.samples, d.sr);
-                    let drums = crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true).ok()?;
+                    if !crate::stems::gpu_active() { return Some(crate::key::detect_key(&mono, 44100.0)); }
+                    let drums = match crate::stems::separate_one(0, &d.samples, d.sr, &mut |_| true) {
+                        Ok(drums) => drums,
+                        Err(_) if crate::stems::backend_hold().is_some() => return Some(crate::key::detect_key(&mono, 44100.0)),
+                        Err(_) => return None,
+                    };
                     let harm: Vec<f32> = mono.iter().zip(&drums).map(|(m, dr)| m - dr).collect();
                     Some(crate::key::detect_key(&harm, 44100.0))
                 })()
@@ -2385,7 +2909,7 @@ impl App {
                     }
                     // Preferences > DJ System > Others: Hot Cue Auto Load for imported tracks.
                     t.autoload_hotcue = self.prefs.hot_cue_auto_load_on_import;
-                    if let Ok(id) = self.db.insert_track(&t) {
+                    if let Ok(id) = self.db.insert_local_file(&t) {
                         added.push(id);
                         self.import_count += 1;
                     }
@@ -2428,41 +2952,29 @@ impl App {
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
         let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
-        let auto = self.prefs.stems_auto_download;
-        let cancel = self.stem.cancel.clone();
         std::thread::spawn(move || {
             let hw = crate::stems::assess();
             let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
             let _ = tx.send(StemMsg::Hardware(hw, m.id.to_string()));
             ctx.request_repaint();
-            if auto && !crate::stems::model_ready(m) {
-                let tx2 = tx.clone();
-                let ctx2 = ctx.clone();
-                let mut last = std::time::Instant::now();
-                let r = crate::stems::download(m, &mut |d, t, _| {
-                    if last.elapsed().as_millis() > 200 {
-                        let _ = tx2.send(StemMsg::Download(d, t));
-                        ctx2.request_repaint();
-                        last = std::time::Instant::now();
-                    }
-                }, &cancel);
-                let _ = tx.send(StemMsg::DownloadDone(r.map_err(|e| e.to_string())));
-                ctx.request_repaint();
-            }
         });
     }
 
     pub fn stems_download(&mut self) {
         let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else { return };
+        self.stems_download_for(m);
+    }
+
+    fn stems_download_for(&mut self, m: &'static crate::stems::ModelSpec) {
         if self.stem.downloading.is_some() {
             return;
         }
-        self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stem.download_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stem.downloading = Some((0, 0));
-        self.stem.error = None;
+        self.stem.errors.remove(&None);
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
-        let cancel = self.stem.cancel.clone();
+        let cancel = self.stem.download_cancel.clone();
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
@@ -2484,86 +2996,192 @@ impl App {
     /// the background, during which the original plays. A separation still running for a
     /// track that is no longer on a deck is stopped.
     fn stems_for_loaded(&mut self, id: i64) {
-        if let Some((sid, _)) = self.stem.separating {
-            if sid != id && !(0..self.deck_count()).any(|n| self.deck_of(n).track == Some(sid)) {
-                self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                self.stem.separating = None;
-            }
-        }
-        if self.load_cached_stems(id) {
-            return;
-        }
+        if self.deck.audio.is_none() { return; }
+        let Some(model) = self.stem.model.as_deref().and_then(crate::stems::spec) else { return };
+        // An early Separate or Retry CPU click has already chosen the model for this deck.
+        let Some(key) = self.deck.stem_cache_key.clone().or_else(|| self.stem_cache_key(id, model.id)) else { return };
+        if self.load_cached_stems(&key, None) { return; }
         let quiet = self.screenshot.is_some() && std::env::var("PREPDECK_SHOT_STEMS").is_err();
-        let ready = self.stem.model.as_deref().and_then(crate::stems::spec).map(crate::stems::model_ready).unwrap_or(false);
-        if self.prefs.show_stems && self.prefs.stems_auto_separate && ready && !quiet && self.deck.track == Some(id) {
-            self.separate_loaded();
+        let ready = crate::stems::spec(key.model).is_some_and(crate::stems::model_ready);
+        if self.prefs.auto_stems_on_load(self.stem.gpu_available()) && ready && !quiet && self.deck.track == Some(id) {
+            let execution = if self.prefs.stems_auto_cpu { crate::stems::SeparationDevice::Selected } else { crate::stems::SeparationDevice::GpuOnly };
+            self.start_stem_separation(key, execution);
         }
     }
 
-    /// Start reading a track's kept stems, if it has any (false: it has none).
-    fn load_cached_stems(&mut self, id: i64) -> bool {
-        let (Some(model), Some(t)) = (self.stem.model.clone(), self.track(id).cloned()) else { return false };
-        let path = crate::stems::cache_path(&t.path, &model);
-        if !path.exists() {
-            return false;
+    /// Keep work shared by two decks until the last one releases the track.
+    pub(crate) fn cancel_orphaned_stems(&mut self) {
+        let tracks = std::array::from_fn(|n| self.deck_of(n as u8).track);
+        self.stem.retain_deck_tracks(tracks);
+    }
+
+    fn resume_pending_stems(&mut self) {
+        let Some((key, execution)) = self.stem.pending.take() else { return };
+        if let Some(deck) = (0..4).find(|&n| self.deck_of(n).stem_cache_key.as_ref() == Some(&key)) {
+            self.with_deck(deck, |app| {
+                if !app.load_cached_stems(&key, Some(execution))
+                    && (execution == crate::stems::SeparationDevice::Cpu || crate::stems::backend_hold().is_none()) {
+                    app.start_stem_separation(key, execution);
+                }
+            });
         }
-        self.stem.loading = Some(id);
+    }
+
+    fn stem_cache_key(&self, id: i64, model: &'static str) -> Option<StemCacheKey> {
+        let path = crate::stems::cache_path(&self.track(id)?.path, model);
+        Some(StemCacheKey { track: id, model, path })
+    }
+
+    pub(crate) fn loading_stems(&self) -> bool {
+        self.deck.stem_cache_key.as_ref().is_some_and(|key| self.stem.loading.contains_key(key))
+    }
+
+    pub(crate) fn separating_stems(&self) -> bool {
+        self.deck.stem_cache_key.as_ref().is_some_and(|key| self.stem.active_key.as_ref() == Some(key))
+    }
+
+    // A model change can complete while reads or inference for the previous model are in flight.
+    pub(crate) fn select_stem_model(&mut self, model: &'static crate::stems::ModelSpec) {
+        self.prefs.stem_model = Some(model.id.to_owned());
+        self.stem.model = self.prefs.stem_model.clone();
+        self.stem.model_ready = crate::stems::model_ready(model);
+        for n in 0..4 {
+            self.with_deck(n, |app| {
+                if let Some(key) = app.deck.track.and_then(|id| app.stem_cache_key(id, model.id)) {
+                    app.load_cached_stems(&key, None);
+                }
+            });
+        }
+    }
+
+    /// A cache hit or an in-flight read satisfies the request without a model download or inference.
+    fn load_cached_stems(&mut self, key: &StemCacheKey, on_failure: Option<crate::stems::SeparationDevice>) -> bool {
+        if self.deck.stem_cache_key.as_ref() != Some(key) {
+            self.deck.stem_cache_key = Some(key.clone());
+            if self.stem.errors.get(&Some(key.track)).is_some_and(|error| error.retry_model.is_none()) {
+                self.stem.errors.remove(&Some(key.track));
+            }
+            self.player.state.lock().stems = None;
+            self.deck.x.stem_wave = None;
+            self.deck.x.stem_wave_rx = None;
+        }
+        if self.player.state.lock().stems.is_some() { return true; }
+        if let Some(parts) = (0..4).filter(|&n| self.deck_of(n).stem_cache_key.as_ref() == Some(key))
+            .find_map(|n| self.player.decks[n as usize].lock().stems.clone()) {
+            self.player.state.lock().stems = Some(parts);
+            return true;
+        }
+        if let Some(request) = self.stem.loading.get_mut(key) {
+            if on_failure.is_some() { *request = on_failure; }
+            return true;
+        }
+        if !key.path.exists() { return false; }
+        let key = key.clone();
+        self.stem.loading.insert(key.clone(), on_failure);
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let r = crate::stems::load(&path).map(std::sync::Arc::new).map_err(|e| e.to_string());
-            let _ = tx.send(StemMsg::Done(id, r));
+            let r = crate::stems::load(&key.path).map(Arc::new);
+            let _ = tx.send(StemMsg::Cached(key, r));
             ctx.request_repaint();
         });
         true
     }
 
+    pub fn manual_stem_device(&self) -> crate::stems::SeparationDevice {
+        self.stem.manual_device(self.deck.track, crate::stems::backend_hold().is_some())
+    }
+
     /// Separate the loaded track (downloading the model first if it is missing).
     pub fn separate_loaded(&mut self) {
+        self.separate_loaded_on(self.manual_stem_device());
+    }
+
+    pub fn separate_loaded_on(&mut self, execution: crate::stems::SeparationDevice) {
         let Some(id) = self.deck.track else { return };
-        if self.stem.separating.is_some() || self.stem.loading == Some(id) {
-            return;
-        }
-        let Some(m) = self.stem.model.as_deref().and_then(crate::stems::spec) else {
+        let Some(m) = self.stem.model_for(Some(id), execution) else {
             self.toast_err("Checking this computer for stem separation; try again in a moment.");
             return;
         };
+        let Some(key) = self.stem_cache_key(id, m.id) else { return };
+        if !self.load_cached_stems(&key, Some(execution)) {
+            self.start_stem_separation(key, execution);
+        }
+    }
+
+    fn start_stem_separation(&mut self, key: StemCacheKey, execution: crate::stems::SeparationDevice) {
+        if self.stem.separating.is_some() {
+            if self.stem.active_key.as_ref() != Some(&key) || self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                self.stem.pending = Some((key, execution));
+            }
+            return;
+        }
+        let id = key.track;
+        let Some(m) = crate::stems::spec(key.model) else { return };
         if !crate::stems::model_ready(m) {
-            self.stem.pending = Some(id);
-            self.stems_download();
+            self.stem.pending = Some((key, execution));
+            self.stems_download_for(m);
             return;
         }
         let Some(t) = self.track(id).cloned() else { return };
         self.stem.separating = Some((id, 0.0));
-        self.stem.error = None;
+        self.stem.active_key = Some(key.clone());
+        self.stem.execution = execution;
+        self.stem.errors.remove(&None);
+        self.stem.errors.remove(&Some(id));
         let tx = self.stem.tx.clone();
         let ctx = self.ctx.clone();
         // Each separation has its own stop flag, so stopping one (its track left the deck)
         // cannot stop the next.
         let cancel: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
         self.stem.cancel = cancel.clone();
-        let cache_limit = self.prefs.stem_cache_gb as u64 * 1_000_000_000;
-        std::thread::spawn(move || {
+        let audio = self.deck.audio.clone();
+        let cache_limit = self.stem.cache_limit.clone();
+        let worker = std::thread::Builder::new().name("rb-stems".into()).spawn(move || {
             let run = || -> anyhow::Result<std::sync::Arc<crate::stems::Stems>> {
-                let dec = crate::audio::decode_file(&t.path)?;
-                let tx2 = tx.clone();
-                let ctx2 = ctx.clone();
-                let st = crate::stems::separate(m, &dec.samples, dec.sr, &mut |p| {
-                    let _ = tx2.send(StemMsg::Progress(id, p));
-                    ctx2.request_repaint();
-                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
-                })?;
-                let kept = crate::stems::cache_path(&t.path, m.id);
-                let _ = crate::stems::save(&kept, &st);
-                crate::stems::trim_cache(cache_limit, &kept);
+                let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+                let dec = match audio {
+                    Some(audio) => audio,
+                    None => Arc::new(crate::audio::decode_until(&t.path, cancelled)?),
+                };
+                let mut last_progress = 0.0;
+                let st = crate::stems::separate_with_device(m, &dec.samples, dec.sr, &mut |p| {
+                    if cancelled() { return false; }
+                    if p > last_progress {
+                        last_progress = p;
+                        let _ = tx.send(StemMsg::Progress(id, p));
+                        ctx.request_repaint();
+                    }
+                    true
+                }, execution)?;
+                if cancelled() { anyhow::bail!("stopped"); }
+                let saved = match crate::stems::save(&key.path, &st) {
+                    Ok(()) => {
+                        crate::stems::trim_cache(&key.path, || *cache_limit.lock());
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "Could not cache {} parts for “{}”. The deck can play them until the track is unloaded. Check free space and write access to {} ({error:#}).",
+                        m.name, t.display_title(), key.path.display()
+                    )),
+                };
+                let _ = tx.send(StemMsg::CacheWrite(key, saved));
                 Ok(std::sync::Arc::new(st))
             };
-            let _ = tx.send(StemMsg::Done(id, run().map_err(|e| e.to_string())));
+            let _ = tx.send(StemMsg::Done(id, run()));
             ctx.request_repaint();
         });
+        if let Err(e) = worker {
+            self.stem.separating = None;
+            self.stem.active_key = None;
+            self.stem.errors.insert(Some(id), StemError { retry_model: None, detail: format!("Could not start stem separation: {e}") });
+        }
     }
 
     pub fn stop_separation(&mut self) {
+        self.stem.pending = None;
+        for request in self.stem.loading.values_mut() { *request = None; }
+        self.stem.download_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         self.stem.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -2582,6 +3200,8 @@ impl App {
         while let Ok(m) = self.stem.rx.try_recv() {
             match m {
                 StemMsg::Hardware(hw, model) => {
+                    // Preferences can select a model while device detection is still running.
+                    let model = self.stem.model.clone().unwrap_or(model);
                     self.stem.model_ready = crate::stems::spec(&model).map(crate::stems::model_ready).unwrap_or(false);
                     if self.prefs.stem_model.is_none() {
                         self.prefs.stem_model = Some(model.clone());
@@ -2590,10 +3210,12 @@ impl App {
                     self.stem.model = Some(model);
                     self.stem.hw = Some(hw);
                     if !self.stem.model_ready && self.prefs.stems_auto_download {
-                        self.stem.downloading = Some((0, 0));
+                        self.stems_download();
                     }
-                    if let Some(id) = self.deck.track {
-                        self.stems_for_loaded(id);
+                    for n in 0..4 {
+                        if let Some(id) = self.deck_of(n).track {
+                            self.with_deck(n, |app| app.stems_for_loaded(id));
+                        }
                     }
                 }
                 StemMsg::Download(d, t) => self.stem.downloading = Some((d, t)),
@@ -2601,22 +3223,21 @@ impl App {
                     self.stem.downloading = None;
                     match r {
                         Ok(()) => {
-                            self.stem.model_ready = true;
-                            if let Some(id) = self.stem.pending.take() {
-                                if self.deck.track == Some(id) {
-                                    self.separate_loaded();
-                                }
-                            }
+                            self.stem.model_ready = self.stem.model.as_deref().and_then(crate::stems::spec).is_some_and(crate::stems::model_ready);
+                            self.resume_pending_stems();
                         }
                         Err(e) if e == "stopped" => {
                             self.stem.pending = None;
-                            self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
-                            self.stem.error = Some(format!("Model download failed: {e}"));
+                            self.stem.errors.insert(None, StemError { retry_model: None, detail: format!("Model download failed: {e}") });
                             self.stem.pending = None;
                         }
                     }
+                }
+                StemMsg::CacheWrite(key, result) => {
+                    if let Err(warning) = &result { self.toast_err(warning.as_str()); }
+                    self.stem.record_cache_write(key, result);
                 }
                 StemMsg::Progress(id, p) => {
                     // (Not for a separation that was stopped because its track left the deck.)
@@ -2624,63 +3245,107 @@ impl App {
                         self.stem.separating = Some((id, p));
                     }
                 }
-                StemMsg::Done(id, r) => {
-                    if self.stem.separating.map(|s| s.0) == Some(id) {
-                        self.stem.separating = None;
-                    }
-                    if self.stem.loading == Some(id) {
-                        self.stem.loading = None;
-                    }
-                    match r {
-                        Ok(st) => {
-                            // Separated stems give vocal detection for free.
-                            if self.db.vocal(id).is_none() && st.len > 0 {
-                                let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
-                                let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
-                                // The mix is the sum of the four stems.
-                                let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
-                                let levels = crate::stems::vocal_levels(&mono, &mix);
-                                let _ = self.db.save_vocal(id, &levels);
-                                if self.deck.track == Some(id) && self.deck.vocal.is_none() {
-                                    self.deck.vocal = Some(std::sync::Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels)));
-                                }
-                            }
-                            if self.deck.track == Some(id) {
-                                self.player.state.lock().stems = Some(st);
-                            }
+                StemMsg::Cached(key, result) => {
+                    let request = self.stem.loading.remove(&key).flatten();
+                    let Some(deck) = (0..4).find(|&n| self.deck_of(n).stem_cache_key.as_ref() == Some(&key)) else { continue };
+                    match (result, request) {
+                        (Ok(st), _) => self.apply_stems(&key, Ok(st)),
+                        (Err(_), Some(execution)) => {
+                            self.with_deck(deck, |app| app.start_stem_separation(key, execution));
                         }
-                        Err(e) if e == "stopped" => self.stem.cancel.store(false, std::sync::atomic::Ordering::Relaxed),
-                        Err(e) => self.stem.error = Some(format!("Stem separation failed: {e}")),
+                        (Err(e), None) => {
+                            self.stem.errors.insert(Some(key.track), StemError { retry_model: None,
+                                detail: format!("Could not load saved stems from {}: {e:#}. Choose Separate to rebuild them.", key.path.display()) });
+                        }
                     }
                 }
+                StemMsg::Done(id, result) => {
+                    self.stem.separating = None;
+                    if let Some(key) = self.stem.active_key.take() {
+                        debug_assert_eq!(id, key.track);
+                        if !self.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            self.apply_stems(&key, result);
+                        }
+                    }
+                    self.resume_pending_stems();
+                }
             }
+        }
+    }
+
+    fn apply_stems(&mut self, key: &StemCacheKey, result: anyhow::Result<Arc<crate::stems::Stems>>) {
+        let id = key.track;
+        if !(0..4).any(|n| self.deck_of(n).stem_cache_key.as_ref() == Some(key)) { return; }
+        match result {
+            Ok(st) => {
+                self.stem.errors.remove(&Some(id));
+                // Separated stems give vocal detection for free.
+                if self.db.vocal(id).is_none() && st.len > 0 {
+                    let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
+                    let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+                    // The mix is the sum of the four stems.
+                    let mix: Vec<f32> = (0..st.len).map(|i| (0..8).map(|c| st.data[c * st.len + i]).sum::<f32>() * 0.5).collect();
+                    let levels = crate::stems::vocal_levels(&mono, &mix);
+                    let _ = self.db.save_vocal(id, &levels);
+                    let vocal = Arc::new((crate::stems::VOCAL_HOP as f64 / 44100.0, levels));
+                    for n in 0..4 {
+                        let deck = self.deck_of_mut(n);
+                        if deck.track == Some(id) && deck.vocal.is_none() { deck.vocal = Some(vocal.clone()); }
+                    }
+                }
+                for n in 0..4 {
+                    if self.deck_of(n).stem_cache_key.as_ref() == Some(key) { self.player.decks[n as usize].lock().stems = Some(st.clone()); }
+                }
+            }
+            Err(e) => { self.stem.errors.insert(Some(id), StemError::separation(Some(key.model), e)); }
+        }
+    }
+
+    pub fn can_review_library_sync(&self) -> bool {
+        self.rb_job.is_none() && self.dialogs.ext.restore_ask.is_none()
+            && !self.dialogs.ext.backup_job.as_ref().is_some_and(|job| job.restore)
+    }
+
+    pub fn review_rekordbox_sync(&mut self) {
+        if self.can_review_library_sync() && self.dialogs.library_sync_review.is_none() {
+            self.dialogs.library_sync_review = Some(crate::ui_sync::Review::new(&self.db));
         }
     }
 
     /// Copy rekordbox's library into Recordbox's data folder and read the copy, off the UI thread.
     /// rekordbox's own files are only read (byte copy), never opened by a database or written.
     pub fn start_rekordbox_sync(&mut self) {
-        if self.rb_job.is_some() {
+        if !self.can_review_library_sync() || self.dialogs.library_sync_review.is_some() {
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         let dest = crate::db::data_dir().join("rekordbox-copy");
-        std::thread::spawn(move || {
+        match std::thread::Builder::new().name("rb-library-sync".into()).spawn(move || {
             let _ = tx.send(crate::rbimport::load_installed(&dest));
             ctx.request_repaint();
-        });
-        self.rb_job = Some(rx);
+        }) {
+            Ok(_) => self.rb_job = Some(rx),
+            Err(e) => self.toast_err(format!("Could not start desktop library sync: {e}")),
+        }
     }
 
     pub fn poll_rekordbox_sync(&mut self) {
         let Some(rx) = &self.rb_job else { return };
-        let Ok(r) = rx.try_recv() else { return };
+        let r = match rx.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.rb_job = None;
+                self.toast_err("Desktop library sync stopped before the source snapshot could be imported.");
+                return;
+            }
+        };
         self.rb_job = None;
         match r {
             Ok(Some(lib)) => self.apply_rekordbox(lib),
-            Ok(None) => {}
-            Err(e) => self.toast_err(format!("Could not read the rekordbox library: {e}. It was not changed.")),
+            Ok(None) => self.toast_err("The rekordbox source database could not be found."),
+            Err(e) => self.toast_err(format!("Could not import the desktop rekordbox library: {e:#}")),
         }
     }
 
@@ -2689,196 +3354,14 @@ impl App {
     /// one it did not change keeps any edits made in Recordbox. The playlist tree is mirrored
     /// into the "rekordbox" folder, which is rebuilt on every sync.
     pub fn apply_rekordbox(&mut self, lib: crate::rbimport::RbLibrary) {
-        // One transaction for the whole sync (much faster, and all-or-nothing).
-        let _ = self.db.conn.execute_batch("BEGIN");
-        let mut seen: HashMap<String, String> = self.db.setting("rb_sync_fingerprints").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let first = seen.is_empty();
-        // My Tag categories and tags, matched by name.
-        let mut tag_id: HashMap<(String, String), i64> = HashMap::new();
-        let mut rb_tag_ids: HashSet<i64> = HashSet::new();
-        let existing = self.db.mytags().unwrap_or_default();
-        for (cat, tags) in &lib.tag_categories {
-            let cid = match existing.iter().find(|t| t.parent == 0 && &t.name == cat) {
-                Some(t) => t.id,
-                None => self.db.add_mytag(0, cat).unwrap_or(0),
-            };
-            for tg in tags {
-                let tid = match existing.iter().find(|t| t.parent == cid && &t.name == tg) {
-                    Some(t) => t.id,
-                    None => self.db.add_mytag(cid, tg).unwrap_or(0),
-                };
-                tag_id.insert((cat.clone(), tg.clone()), tid);
-                rb_tag_ids.insert(tid);
+        let result = match crate::rbimport::merge::apply(&self.db, &lib) {
+            Ok(summary) => summary,
+            Err(e) => {
+                self.toast_err(format!("Could not sync the Recordbox collection: {e:#}"));
+                return;
             }
-        }
-        let (mut added, mut updated) = (0, 0);
-        let mut idmap: HashMap<String, i64> = HashMap::new();
-        // Where rekordbox's own analysis of each audio file lives (used by the USB export).
-        let mut rb_anlz: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        for rt in lib.tracks.iter() {
-            if let Some(b) = &rt.anlz_base {
-                rb_anlz.insert(rt.xt.track.path.clone(), b.to_string_lossy().to_string());
-            }
-        }
-        self.db.set_setting("rb_anlz", &serde_json::to_string(&rb_anlz).unwrap_or_default());
-        // Tracks the user removed from Recordbox stay removed.
-        let removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let mut failed: Option<String> = None;
-        for rt in lib.tracks {
-            if removed.contains(&rt.xt.track.path) {
-                continue;
-            }
-            // known: synced before; changed: rekordbox edited it since the last sync.
-            let known = seen.contains_key(&rt.rb_id);
-            let changed = known && seen.get(&rt.rb_id) != Some(&rt.fingerprint);
-            let existing = self.db.track_by_path(&rt.xt.track.path);
-            // Libraries synced before the key's spelling was kept: fill it in once, where the
-            // stored key is still rekordbox's own (not analysed over or chosen by the user).
-            if let Some(mut t) = existing.and_then(|id| self.db.track(id)) {
-                let rb = &rt.xt.track;
-                if t.key_text.is_empty() && !rb.key_text.is_empty() && !t.key_manual && t.key == rb.key {
-                    t.key_text = rb.key_text.clone();
-                    let _ = self.db.update_track(&t);
-                    if let Some(m) = self.track_mut(t.id) {
-                        m.key_text = t.key_text.clone();
-                    }
-                }
-            }
-            let (id, fresh) = match existing {
-                None => {
-                    let mut t = rt.xt.track.clone();
-                    if t.sample_rate == 0 || t.duration <= 0.0 {
-                        let real = crate::importer::read_track(std::path::Path::new(&t.path));
-                        t.sample_rate = real.sample_rate;
-                        t.bit_depth = real.bit_depth;
-                        if t.duration <= 0.0 {
-                            t.duration = real.duration;
-                        }
-                        if t.artwork.is_empty() {
-                            t.artwork = real.artwork;
-                        }
-                    }
-                    match self.db.insert_track(&t) {
-                        Ok(id) => {
-                            added += 1;
-                            (id, true)
-                        }
-                        Err(e) => {
-                            failed.get_or_insert(e.to_string());
-                            continue;
-                        }
-                    }
-                }
-                Some(id) => (id, false),
-            };
-            let cur = self.track(id).cloned();
-            let locked = cur.as_ref().map(|t| t.grid_locked).unwrap_or(false);
-            if changed {
-                if let Some(cur) = &cur {
-                    let r = &rt.xt.track;
-                    let t = Track {
-                        id,
-                        analyzed: cur.analyzed,
-                        grid_locked: cur.grid_locked,
-                        gain_db: cur.gain_db,
-                        raw_samples: cur.raw_samples,
-                        missing: cur.missing,
-                        artwork: if r.artwork.is_empty() { cur.artwork.clone() } else { r.artwork.clone() },
-                        sample_rate: if r.sample_rate > 0 { r.sample_rate } else { cur.sample_rate },
-                        bit_depth: if r.bit_depth > 0 { r.bit_depth } else { cur.bit_depth },
-                        duration: if r.duration > 0.0 { r.duration } else { cur.duration },
-                        // A locked grid keeps its tempo.
-                        bpm: if locked { cur.bpm } else { r.bpm },
-                        ..r.clone()
-                    };
-                    if let Err(e) = self.db.update_track(&t) {
-                        failed.get_or_insert(e.to_string());
-                    }
-                    updated += 1;
-                }
-            }
-            let my_cues = if fresh { vec![] } else { self.db.cues(id).unwrap_or_default() };
-            let my_grid = if fresh { None } else { self.db.grid(id).filter(|g| !g.is_empty()) };
-            // Grid: new tracks and tracks without one get rekordbox's; a changed track gets it
-            // unless the grid is locked.
-            if let Some(g) = &rt.xt.grid {
-                if fresh || my_grid.is_none() || (changed && !locked) {
-                    if let Err(e) = self.db.save_grid(id, g) {
-                        failed.get_or_insert(e.to_string());
-                    }
-                }
-            }
-            // Cues: new tracks and tracks without cues get rekordbox's; a changed track gets
-            // them only when rekordbox has some (Recordbox's are never wiped by an empty list).
-            if (fresh || my_cues.is_empty() || changed) && !(rt.xt.cues.is_empty() && !my_cues.is_empty()) {
-                if let Err(e) = self.db.replace_cues(id, &rt.xt.cues) {
-                    failed.get_or_insert(e.to_string());
-                }
-            }
-            // My Tags: rekordbox's are added; on a change in rekordbox, ones it removed are too.
-            let mine: HashSet<i64> = rt.tags.iter().filter_map(|k| tag_id.get(k).copied()).collect();
-            for t in &rb_tag_ids {
-                if mine.contains(t) {
-                    let _ = self.db.set_track_tag(id, *t, true);
-                } else if changed {
-                    let _ = self.db.set_track_tag(id, *t, false);
-                }
-            }
-            seen.insert(rt.rb_id.clone(), rt.fingerprint.clone());
-            idmap.insert(rt.rb_id, id);
-        }
-        self.db.set_setting("rb_sync_fingerprints", &serde_json::to_string(&seen).unwrap_or_default());
-        // Playlists: rebuild the mirrored folder.
-        if let Some(old) = self.db.setting("rb_folder_id").and_then(|s| s.parse::<i64>().ok()) {
-            if self.db.playlists().map(|v| v.iter().any(|n| n.id == old)).unwrap_or(false) {
-                let _ = self.db.delete_node(old);
-            }
-        }
-        fn add_nodes(app: &mut App, parent: i64, nodes: &[crate::importer::XmlNode], idmap: &HashMap<String, i64>, tag_id: &HashMap<(String, String), i64>) {
-            for n in nodes {
-                if n.folder {
-                    let id = app.db.create_node(parent, &n.name, NodeKind::Folder, None).unwrap_or(0);
-                    add_nodes(app, id, &n.children, idmap, tag_id);
-                } else if let Some(rule) = &n.smart {
-                    // Intelligent playlist: My Tag conditions name their tag until now.
-                    let mut rule = rule.clone();
-                    let mut ok = true;
-                    for c in rule.conditions.iter_mut().filter(|c| c.field == crate::smart::Field::MyTag) {
-                        let found = c.value.strip_prefix('\u{1}').and_then(|v| v.split_once('\u{1f}')).and_then(|(cat, t)| tag_id.get(&(cat.to_string(), t.to_string())));
-                        match found {
-                            Some(id) => c.value = id.to_string(),
-                            None => ok = false,
-                        }
-                    }
-                    if ok {
-                        let _ = app.db.create_node(parent, &n.name, NodeKind::Smart, Some(&rule));
-                    }
-                } else {
-                    let id = app.db.create_node(parent, &n.name, NodeKind::Playlist, None).unwrap_or(0);
-                    let tr: Vec<i64> = n.track_keys.iter().filter_map(|k| idmap.get(k).copied()).collect();
-                    let _ = app.db.set_playlist_tracks(id, &tr);
-                }
-            }
-        }
-        if !lib.playlists.is_empty() || !lib.histories.is_empty() {
-            let root = self.db.create_node(0, "rekordbox", NodeKind::Folder, None).unwrap_or(0);
-            self.db.set_setting("rb_folder_id", &root.to_string());
-            add_nodes(self, root, &lib.playlists, &idmap, &tag_id);
-            if !lib.histories.is_empty() {
-                let h = self.db.create_node(root, "Histories", NodeKind::Folder, None).unwrap_or(0);
-                add_nodes(self, h, &lib.histories, &idmap, &tag_id);
-            }
-        }
-        if let Some(e) = failed {
-            let _ = self.db.conn.execute_batch("ROLLBACK");
-            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
-            return;
-        }
-        if let Err(e) = self.db.conn.execute_batch("COMMIT") {
-            let _ = self.db.conn.execute_batch("ROLLBACK");
-            self.toast_err(format!("The rekordbox library could not be synced ({e}). Nothing was changed."));
-            return;
-        }
+        };
+        let (added, updated, first) = (result.added, result.updated, result.first);
         self.reload_all();
         // The loaded track may have new cues or a new grid now.
         if let Some(t) = self.deck.track {
@@ -2893,17 +3376,15 @@ impl App {
         } else if added + updated > 0 {
             format!("Synced from rekordbox: {added} new, {updated} updated.")
         } else {
-            String::new()
+            "Sync complete. No new or updated tracks.".to_string()
         };
-        if first && lib.not_local > 0 {
-            msg.push_str(&format!(" {} track(s) without a local file (streaming) were left out.", lib.not_local));
+        if lib.not_local > 0 {
+            msg.push_str(&format!(" {} track(s) without an accessible local file were left out.", lib.not_local));
         }
         if first && lib.smart_lists > 0 {
             msg.push_str(&format!(" {} intelligent playlist(s) use a condition recordbox doesn't have and were not copied.", lib.smart_lists));
         }
-        if !msg.is_empty() {
-            self.toast(msg);
-        }
+        self.toast(msg);
         if added > 0 && self.prefs.auto_analysis {
             // Waveforms and loudness are Recordbox's own; grids and keys from rekordbox are kept.
             let todo: Vec<i64> = self.tracks.iter().filter(|t| t.analyzed == 0 && !t.missing).map(|t| t.id).collect();
@@ -2969,6 +3450,7 @@ impl App {
             if !xt.cues.is_empty() {
                 note(self.db.replace_cues(id, &xt.cues));
             }
+            note(self.db.protect_imported_track(id));
             // What the imported TEMPO/POSITION_MARK elements became, to tell later whether they
             // were edited.
             let mut extra = xt.extra.clone();
@@ -3065,18 +3547,26 @@ impl App {
             self.analysis_done += 1;
             self.apply_analysis(id, r);
         }
-        if self.pool.pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        if self.analysis_done == self.analysis_total {
             self.analysis_total = 0;
             self.analysis_done = 0;
         }
     }
 
+    pub(crate) fn suppress_pending_analysis_hot_slot(&mut self, track: i64, slot: i32) {
+        if (0..8).contains(&slot) && self.track(track).is_some_and(|t| t.analyzed == 3) {
+            self.cleared_analysis_hot_slots.entry(track).or_default().insert(slot);
+        }
+    }
+
     pub fn apply_analysis(&mut self, id: i64, r: Result<crate::analysis::AnalysisResult, String>) {
+        let cleared_hot_slots = self.cleared_analysis_hot_slots.remove(&id).unwrap_or_default();
         let existing_grid = self.db.grid(id).filter(|g| !g.is_empty());
         // Earlier analysis means a stored waveform (a grid alone can come from an import).
         let had_analysis = self.db.wave(id).is_some();
         let keep_tag_key = self.prefs.keep_tag_key;
         let key_requested = self.key_requested.remove(&id);
+        let requested_grid = self.grid_requested.remove(&id);
         let mut locked_peak: Option<f32> = None;
         let Some(t) = self.track_mut(id) else { return };
         match r {
@@ -3099,8 +3589,7 @@ impl App {
                 t.raw_samples = res.raw_samples;
                 t.gain_db = res.gain_db;
                 let measured_peak = res.peak;
-                // A locked grid, or one that came with an imported library, is kept as it is.
-                let keep_grid = t.grid_locked || existing_grid.is_some();
+                let keep_grid = keep_saved_grid(t.grid_locked, &existing_grid, requested_grid.as_ref(), res.grid.is_some());
                 // A key the user set (or one from an imported library) is only replaced when the
                 // track had no key, or on its first analysis when the key came from tags.
                 if res.key >= 0 && (key_requested || (!t.key_manual && (t.key < 0 || (first_analysis && !keep_grid && !keep_tag_key)))) {
@@ -3130,46 +3619,32 @@ impl App {
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
                 self.previews.insert(id, preview);
-                let new_grid = save_grid.clone();
-                if let Some(g) = save_grid {
-                    let _ = self.db.save_grid(id, &g);
+                if let Some(g) = &save_grid {
+                    let _ = self.db.save_grid(id, g);
                 }
-                // CUE Analysis Playlist: cues of the personal CUE tendency (browser_ext.rs).
-                if first_analysis {
-                    if let Some(g) = &new_grid {
-                        self.apply_cue_tendency(id, g);
-                    }
-                }
-                // rekordbox sets hot cue A, named "1.1Bars", on the first downbeat when it first
-                // analyses a track (seen on every analysed track of the user's library, created
-                // during analysis). Only on a fresh grid and for a track with no cues yet.
-                if self.prefs.auto_first_downbeat_cue && first_analysis {
-                    if let Some(g) = &new_grid {
+                if let Some(g) = save_grid.as_ref().filter(|_| first_analysis) {
+                    let mut added_cues = self.apply_cue_tendency(id, g, &cleared_hot_slots);
+                    // Rekordbox's default Hot Cue A ("1.1Bars") applies to a track without cues.
+                    if self.prefs.auto_first_downbeat_cue && !cleared_hot_slots.contains(&0)
+                        && !added_cues && self.db.cues(id).is_ok_and(|cues| cues.is_empty())
+                    {
                         let dur = self.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
                         if let Some(b) = g.beats(dur).into_iter().find(|b| b.beat == 1) {
-                            if self.db.cues(id).map(|c| c.is_empty()).unwrap_or(false) {
-                                let c = Cue { id: 0, track_id: id, kind: CueKind::Hot, slot: 0, start: b.time, end: None, color: 0, comment: "1.1Bars".into(), active_loop: false };
-                                let _ = self.db.save_cue(&c);
-                                if let Some(e) = self.cue_counts.get_mut(&id) {
-                                    e.0 += 1;
-                                } else {
-                                    self.cue_counts.insert(id, (1, 0));
-                                }
-                                self.hot_positions.entry(id).or_default().push((b.time, 0, 0));
-                                if self.deck.track == Some(id) {
-                                    self.deck.cues = self.db.cues(id).unwrap_or_default();
-                                }
-                            }
+                            let c = Cue { id: 0, track_id: id, kind: CueKind::Hot, slot: 0, start: b.time, end: None, color: 0, comment: "1.1Bars".into(), active_loop: false };
+                            added_cues = self.db.save_cue(&c).is_ok();
+                        }
+                    }
+                    if self.prefs.memory_cue_first_beat {
+                        added_cues |= crate::prefs_ext::memory_cue_at_first_beat(self, id, g);
+                    }
+                    if added_cues {
+                        if let Ok(cues) = self.db.cues(id) {
+                            self.set_track_cues(id, cues);
                         }
                     }
                 }
-                // Preferences > Analysis > CUE Analysis: memory cue at the first beat.
-                if self.prefs.memory_cue_first_beat && first_analysis {
-                    if let Some(g) = &new_grid {
-                        crate::prefs_ext::memory_cue_at_first_beat(self, id, g);
-                    }
-                }
                 if self.deck.track == Some(id) {
+                    self.deck.x.overview_cache.clear();
                     self.deck.wave = Some(res.wave);
                     if self.deck.audio.is_none() {
                         self.deck.duration = res.duration;
@@ -3187,15 +3662,16 @@ impl App {
         self.save_track_quiet(id);
     }
 
-    /// Re-analyse ignoring the stored grid (explicit "Analyze Track" from the menu).
+    /// Explicitly request a new grid when the user selects BPM / Grid and Analyze Track.
     pub fn reanalyze(&mut self, ids: &[i64]) {
-        for id in ids {
-            let locked = self.track(*id).map(|t| t.grid_locked).unwrap_or(true);
-            if !locked {
-                let _ = self.db.conn.execute("DELETE FROM grids WHERE track_id=?1", [id]);
+        let settings = self.analysis_settings();
+        let with_grid = settings.do_grid;
+        let submitted = self.analyze_with(ids, true, settings);
+        if with_grid {
+            for id in submitted {
+                self.grid_requested.insert(id, self.db.grid(id).filter(|g| !g.is_empty()));
             }
         }
-        self.analyze(ids, true);
     }
 
     // ------------------------------------------------------------------ player
@@ -3206,6 +3682,50 @@ impl App {
             None => 0.0,
         }
     }
+    /// egui subtracts predicted_dt from nonzero repaint delays. Account for it
+    /// so a 30 Hz preference does not request another frame after just 16 ms.
+    pub fn repaint_playback(&self, ctx: &egui::Context) {
+        match self.prefs.playback_fps {
+            fps @ (15 | 30) => {
+                let delay = 1.0 / f32::from(fps) + ctx.input(|i| i.predicted_dt);
+                ctx.request_repaint_after_secs(delay);
+            }
+            _ => ctx.request_repaint(),
+        }
+    }
+
+    pub fn update_transport(&mut self, ctx: &egui::Context, decks_visible: bool) {
+        let running = self.player.transport_running();
+        #[cfg(target_os = "linux")]
+        {
+            // Performance mode, including an initialized sampler's independent
+            // sequencer/quantization clock, always keeps its low-latency output.
+            let keep_ready = self.performance() || crate::sampler::SAMPLER.lock().is_some();
+            match self.player.service_output(keep_ready, running, self.prefs.audio_device.as_deref()) {
+                Ok(Some(delay)) => ctx.request_repaint_after_secs(delay.as_secs_f32() + ctx.input(|i| i.predicted_dt)),
+                Err(error) => {
+                    self.player.error = Some(error.to_string());
+                    self.player.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for deck in &self.player.decks {
+                        let mut s = deck.lock();
+                        s.playing = false;
+                        s.search = 0.0;
+                    }
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
+        if running {
+            if decks_visible {
+                self.repaint_playback(ctx);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+
     pub fn playing(&self) -> bool {
         self.player.state.lock().playing
     }
@@ -3217,7 +3737,7 @@ impl App {
         }
     }
     pub fn set_playing(&mut self, p: bool) {
-        self.player.state.lock().playing = p && self.deck.audio.is_some();
+        self.player.state.lock().playing = p && !self.deck_options.disable_play && self.deck.audio.is_some();
     }
 
     /// Load a track into the load-target deck (`load_target`; deck A outside 2 Players).
@@ -3227,6 +3747,9 @@ impl App {
 
     /// Load a track into the active deck.
     pub fn load_track_here(&mut self, id: i64) {
+        if self.deck_options.disable_load {
+            return self.toast_err("Deck loading is disabled for this session (--disable-load).");
+        }
         // Eject/Load Lock (Performance): not while the deck plays, unless it stands at the end.
         if self.performance() && self.prefs.deck_load_lock && self.playing() && self.pos() < self.deck.duration - 0.05 {
             self.toast_err("Load Lock. Not available during playback.");
@@ -3259,6 +3782,7 @@ impl App {
             s.gain = g;
             keep
         };
+        self.deck.cancel_work.store(true, std::sync::atomic::Ordering::Relaxed);
         let ctrl = self.deck.ctrl_tab;
         let panel = self.deck.panel_tab;
         let metronome = self.deck.metronome;
@@ -3279,7 +3803,7 @@ impl App {
         self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         let first_mem = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).fold(f64::NAN, f64::min);
         self.deck.cue_point = if first_mem.is_nan() { self.deck.beats.first().map(|b| b.time).unwrap_or(0.0) } else { first_mem };
-        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone()));
+        self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone(), self.deck.cancel_work.clone()));
         {
             let mut st = self.player.state.lock();
             st.stems = None;
@@ -3288,7 +3812,7 @@ impl App {
                 st.stem_on = [true; 4];
             }
         }
-        self.stems_for_loaded(id);
+        self.cancel_orphaned_stems();
         if t.analyzed == 0 {
             self.analyze(&[id], false);
         }
@@ -3319,18 +3843,27 @@ impl App {
                     let g = self.deck.grid.clone();
                     self.set_deck_grid(g, false);
                     self.deck.phrases = None;
+                    self.stems_for_loaded(id);
                     self.start_deck_phrases(a.clone());
                     self.start_deck_vocal(a.clone());
                     self.instant_double();
                 }
                 Err(e) => {
-                    if let Some((old, pos, gain)) = self.deck_backup.take() {
+                    let backup = self.deck_backup.take();
+                    self.unload_track();
+                    if let Some((old, pos, gain)) = backup {
                         let mut s = self.player.state.lock();
                         s.audio = old.audio.clone();
                         s.pos = pos;
                         s.gain = gain;
                         drop(s);
                         self.deck = old;
+                        self.deck.cancel_work = Default::default();
+                        if let (Some(id), Some(audio)) = (self.deck.track, self.deck.audio.clone()) {
+                            self.stems_for_loaded(id);
+                            if self.deck.phrases.is_none() { self.start_deck_phrases(audio.clone()); }
+                            if self.deck.vocal.is_none() { self.start_deck_vocal(audio); }
+                        }
                     }
                     self.toast_err(format!("This file cannot be played: {e}"));
                 }
@@ -3340,17 +3873,22 @@ impl App {
 
     pub fn set_deck_grid(&mut self, g: BeatGrid, save: bool) {
         let dur = if self.deck.duration > 0.0 { self.deck.duration } else { self.deck.track.and_then(|id| self.track(id)).map(|t| t.duration).unwrap_or(0.0) };
+        let bpm = g.first_bpm();
+        let tempo_changed = bpm != self.deck.grid.first_bpm();
         self.deck.beats = g.beats(dur);
+        self.deck.bpm_text = format!("{bpm:.2}");
         self.deck.grid = g;
-        self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         if save {
             if let Some(id) = self.deck.track {
-                let _ = self.db.save_grid(id, &self.deck.grid);
-                let bpm = self.deck.grid.first_bpm();
-                if let Some(t) = self.track_mut(id) {
-                    t.bpm = bpm;
+                if let Err(err) = self.db.save_grid(id, &self.deck.grid) {
+                    self.toast_err(format!("Could not save the beat grid: {err}"));
+                } else if tempo_changed {
+                    // Native tracks can have a summary BPM distinct from their first beat.
+                    if let Some(t) = self.track_mut(id) {
+                        t.bpm = bpm;
+                    }
+                    self.save_track(id);
                 }
-                self.save_track(id);
             }
         }
         self.update_metronome();
@@ -3402,6 +3940,7 @@ impl App {
         } else {
             let p = self.pos();
             if (p - self.deck.cue_point).abs() < 0.01 {
+                if self.deck_options.disable_play { return; }
                 self.deck.cue_preview = true;
                 self.set_playing(true);
             } else {
@@ -3420,6 +3959,9 @@ impl App {
         }
     }
     pub fn play_pause(&mut self) {
+        if self.deck_options.disable_play {
+            return self.toast_err("Playback is disabled for this session (--disable-play).");
+        }
         if self.deck.audio.is_none() {
             return;
         }
@@ -3432,8 +3974,7 @@ impl App {
     }
 
     pub fn hot_cue_down(&mut self, slot: i32) {
-        let Some(tid) = self.deck.track else { return };
-        if self.deck.audio.is_none() {
+        if self.deck.track.is_none() || self.deck.audio.is_none() {
             return;
         }
         if let Some(c) = self.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned() {
@@ -3457,17 +3998,11 @@ impl App {
             }
         } else {
             let lr = self.player.state.lock().loop_range;
-            let (start, end, color) = match lr {
-                Some((a, b)) => (a, Some(b), hotcue_default_color(slot, true)),
-                None => (self.quantized(self.pos()), None, hotcue_default_color(slot, false)),
+            let (start, end) = match lr {
+                Some((a, b)) => (a, Some(b)),
+                None => (self.quantized(self.pos()), None),
             };
-            let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
-            self.snapshot_cues();
-            if let Ok(id) = self.db.save_cue(&c) {
-                c.id = id;
-                self.deck.cues.push(c);
-                self.refresh_cue_counts(tid);
-            }
+            self.set_hot(slot, start, end);
         }
     }
     pub fn hot_cue_up(&mut self) {
@@ -3494,16 +4029,6 @@ impl App {
         self.redo.clear();
     }
 
-    /// The current state matching `e` (what Redo/Undo will need to go back to).
-    fn current_of(&self, e: &Edit) -> Option<Edit> {
-        match e {
-            Edit::Cues { track, .. } => Some(Edit::Cues { track: *track, before: self.db.cues(*track).unwrap_or_default() }),
-            Edit::Track { before } => self.db.track(before.id).map(|t| Edit::Track { before: t }),
-            Edit::Grid { track, .. } => Some(Edit::Grid { track: *track, before: self.db.grid(*track).unwrap_or_default() }),
-            Edit::Phrases { track, .. } => Some(Edit::Phrases { track: *track, before: self.stored_phrases(*track) }),
-        }
-    }
-
     /// Remember a track's edited phrases before a PHRASE EDIT change (for Undo).
     pub fn record_phrases(&mut self, track: i64) {
         let before = self.stored_phrases(track);
@@ -3518,47 +4043,42 @@ impl App {
         }
     }
 
-    fn restore(&mut self, e: Edit) {
-        match e {
-            Edit::Phrases { track, before } => self.store_phrases(track, before),
+    /// Apply a history entry and capture its inverse. A failed cue write leaves the entry retryable.
+    fn restore(&mut self, edit: &Edit) -> anyhow::Result<Option<Edit>> {
+        Ok(match edit {
+            Edit::Phrases { track, before } => {
+                let previous = self.stored_phrases(*track);
+                self.store_phrases(*track, before.clone());
+                Some(Edit::Phrases { track: *track, before: previous })
+            }
             Edit::Cues { track, before } => {
-                let _ = self.db.replace_cues(track, &before);
-                if self.deck.track == Some(track) {
-                    self.deck.cues = self.db.cues(track).unwrap_or_default();
-                }
-                for d in self.px.parked.iter_mut() {
-                    if d.track == Some(track) {
-                        d.cues = self.db.cues(track).unwrap_or_default();
+                let (previous, restored) = self.db.restore_cues(*track, before)?;
+                for cue in previous.iter().filter(|cue| cue.kind == CueKind::Hot) {
+                    if !restored.iter().any(|other| other.kind == CueKind::Hot && other.slot == cue.slot) {
+                        self.suppress_pending_analysis_hot_slot(*track, cue.slot);
                     }
                 }
-                let cues = self.db.cues(track).unwrap_or_default();
-                let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
-                if hp.is_empty() {
-                    self.hot_positions.remove(&track);
-                } else {
-                    self.hot_positions.insert(track, hp);
-                }
-                let (h, m) = (cues.iter().filter(|c| c.kind == CueKind::Hot).count(), cues.iter().filter(|c| c.kind == CueKind::Memory).count());
-                if h + m == 0 {
-                    self.cue_counts.remove(&track);
-                } else {
-                    self.cue_counts.insert(track, (h, m));
-                }
+                self.set_track_cues(*track, restored);
+                Some(Edit::Cues { track: *track, before: previous })
             }
             Edit::Track { before } => {
-                let _ = self.db.update_track(&before);
+                let previous = self.db.track(before.id);
+                let _ = self.db.update_track(before);
                 if let Some(t) = self.track_mut(before.id) {
-                    *t = before;
+                    t.clone_from(before);
                 }
                 self.list_dirty = true;
+                previous.map(|before| Edit::Track { before })
             }
             Edit::Grid { track, before } => {
+                let track = *track;
+                let previous = Some(Edit::Grid { track, before: self.db.grid(track).unwrap_or_default() });
                 // Analysis Lock also holds against Undo/Redo.
                 if self.track(track).map(|t| t.grid_locked).unwrap_or(false) {
                     self.toast_err("This track's analysis is locked; unlock it to change its grid.");
-                    return;
+                    return Ok(previous);
                 }
-                let _ = self.db.save_grid(track, &before);
+                let _ = self.db.save_grid(track, before);
                 for n in 0..4u8 {
                     if n != self.px.active && self.px.parked[n as usize].track == Some(track) {
                         let g = before.clone();
@@ -3566,10 +4086,11 @@ impl App {
                     }
                 }
                 if self.deck.track == Some(track) {
-                    self.set_deck_grid(before, false);
+                    self.set_deck_grid(before.clone(), false);
                 }
+                previous
             }
-        }
+        })
     }
 
     pub fn undo_len(&self) -> usize {
@@ -3578,27 +4099,59 @@ impl App {
 
     pub fn undo_edit(&mut self) {
         let Some(e) = self.undo.pop() else { return };
-        if let Some(cur) = self.current_of(&e) {
-            self.redo.push(cur);
+        match self.restore(&e) {
+            Ok(Some(inverse)) => self.redo.push(inverse),
+            Ok(None) => {}
+            Err(error) => {
+                self.undo.push(e);
+                self.toast_err(format!("Could not undo cue edit: {error}"));
+            }
         }
-        self.restore(e);
     }
 
     pub fn redo_edit(&mut self) {
         let Some(e) = self.redo.pop() else { return };
-        if let Some(cur) = self.current_of(&e) {
-            self.undo.push(cur);
+        match self.restore(&e) {
+            Ok(Some(inverse)) => self.undo.push(inverse),
+            Ok(None) => {}
+            Err(error) => {
+                self.redo.push(e);
+                self.toast_err(format!("Could not redo cue edit: {error}"));
+            }
         }
-        self.restore(e);
+    }
+
+    pub fn clear_hot_cue(&mut self, slot: i32) {
+        self.edit_hot_cue(slot, None);
+    }
+
+    pub(crate) fn edit_hot_cue(&mut self, slot: i32, replacement: Option<&Cue>) {
+        if !(0..8).contains(&slot) { return; }
+        let Some(track) = self.deck.track else { return };
+        let (before, after) = match self.db.edit_hot_cue(track, slot, replacement) {
+            Ok(cues) => cues,
+            Err(error) => return self.toast_err(format!("Could not change hot cue: {error}")),
+        };
+        if replacement.is_some() || after.len() != before.len() {
+            self.record(Edit::Cues { track, before });
+            if replacement.is_none() {
+                self.suppress_pending_analysis_hot_slot(track, slot);
+            }
+        }
+        self.set_track_cues(track, after);
     }
 
     pub fn delete_cue(&mut self, cue_id: i64) {
-        self.snapshot_cues();
-        let _ = self.db.delete_cue(cue_id);
-        self.deck.cues.retain(|c| c.id != cue_id);
-        if let Some(t) = self.deck.track {
-            self.refresh_cue_counts(t);
+        let Some(cue) = self.deck.cues.iter().find(|c| c.id == cue_id) else { return };
+        if cue.kind == CueKind::Hot {
+            return self.clear_hot_cue(cue.slot);
         }
+        if let Err(error) = self.db.delete_cue(cue_id) {
+            return self.toast_err(format!("Could not remove cue: {error}"));
+        }
+        self.snapshot_cues();
+        self.deck.cues.retain(|c| c.id != cue_id);
+        if let Some(t) = self.deck.track { self.refresh_cue_counts(t); }
     }
     pub fn update_cue(&mut self, c: Cue) {
         self.snapshot_cues();
@@ -3623,18 +4176,36 @@ impl App {
         }
     }
     pub fn refresh_cue_counts(&mut self, tid: i64) {
-        let hp: Vec<(f64, i32, u8)> = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
+        self.set_track_cues(tid, self.deck.cues.clone());
+    }
+
+    fn set_track_cues(&mut self, tid: i64, cues: Vec<Cue>) {
+        // A track has one set of cues, even when it is loaded on more than one deck.
+        for deck in &mut self.px.parked {
+            if deck.track == Some(tid) {
+                deck.cues.clone_from(&cues);
+            }
+        }
+        for (deck, _, _) in self.deck_backup.iter_mut().chain(self.px.parked_backup.iter_mut().flatten()) {
+            if deck.track == Some(tid) {
+                deck.cues.clone_from(&cues);
+            }
+        }
+        let hp: Vec<(f64, i32, u8)> = cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start, c.slot, c.color)).collect();
         if hp.is_empty() {
             self.hot_positions.remove(&tid);
         } else {
             self.hot_positions.insert(tid, hp);
         }
-        let h = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).count();
-        let m = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).count();
+        let h = cues.iter().filter(|c| c.kind == CueKind::Hot).count();
+        let m = cues.iter().filter(|c| c.kind == CueKind::Memory).count();
         if h + m == 0 {
             self.cue_counts.remove(&tid);
         } else {
             self.cue_counts.insert(tid, (h, m));
+        }
+        if self.deck.track == Some(tid) {
+            self.deck.cues = cues;
         }
     }
 
@@ -4014,11 +4585,7 @@ impl App {
         let _ = self.db.conn.execute_batch("COMMIT");
         for id in ids {
             if self.deck.track == Some(*id) {
-                let mut s = self.player.state.lock();
-                s.playing = false;
-                s.audio = None;
-                drop(s);
-                self.deck = Deck::default();
+                self.unload_track();
             }
         }
         self.selected.clear();
@@ -4141,22 +4708,31 @@ impl App {
         let mut devices = vec![];
         for (root, name, fs) in found {
             let p = std::path::Path::new(&root);
-            // An export that was cut short (crash, power loss, drive pulled) is finished or
-            // undone from the drive's journal before anything reads the drive.
-            if self.export_job.is_none() {
-                if let Some(msg) = crate::export::usb::recover_device(p) {
-                    self.toast(format!("{name}: {msg}"));
+            use crate::export::usb::{self, DeviceLayout};
+            let mut target = usb::inspect_target(p);
+            // A different catalog may now occupy a previously connected mount point.
+            // Resolve any unfinished write before displaying the catalog as usable.
+            let mut recovery_error = None;
+            if self.export_job.is_none() && matches!(target, Ok((_, None))) {
+                match usb::recover_checked(p) {
+                    Ok(Some(msg)) => {
+                        self.toast(format!("{name}: {msg}"));
+                        target = usb::inspect_target(p);
+                    }
+                    Ok(None) => {}
+                    Err(e) => recovery_error = Some(format!("USB recovery paused: {e:#}")),
                 }
             }
-            let (lib, error) = if crate::export::usb::pdb_path(p).exists() {
-                match crate::export::usb::read_device(p) {
-                    Ok(l) => (Some(l), None),
-                    Err(e) => (None, Some(format!("Device library is corrupted. ({e})"))),
-                }
-            } else {
-                (None, None)
+            let (layout, lib, write_blocker) = match target {
+                Ok((layout, _)) if recovery_error.is_some() => (Some(layout), None, recovery_error),
+                Ok((layout @ (DeviceLayout::Classic | DeviceLayout::Mixed), blocker)) => match usb::read_device(p) {
+                    Ok(lib) => (Some(layout), Some(lib), blocker),
+                    Err(e) => (Some(layout), None, Some(format!("Could not read the classic device catalog: {e}"))),
+                },
+                Ok((layout, blocker)) => (Some(layout), None, blocker),
+                Err(e) => (None, None, Some(format!("{e}"))),
             };
-            devices.push(DeviceInfo { total: crate::export::usb::total_space(p), free: crate::export::usb::free_space(p), root, name, fs, lib, error });
+            devices.push(DeviceInfo { total: usb::total_space(p), free: usb::free_space(p), root, name, fs, layout, lib, write_blocker });
         }
         self.devices = devices;
         self.devices_scanned = Some(Instant::now());
@@ -4164,8 +4740,14 @@ impl App {
             self.import_device_histories();
             // "Delete from the device after importing the play history".
             if self.delete_imported_histories() > 0 {
-                for d in self.devices.iter_mut() {
-                    d.lib = crate::export::usb::read_device(std::path::Path::new(&d.root)).ok().filter(|_| crate::export::usb::pdb_path(std::path::Path::new(&d.root)).exists());
+                for d in self.devices.iter_mut().filter(|d| d.lib.is_some()) {
+                    match crate::export::usb::read_device(std::path::Path::new(&d.root)) {
+                        Ok(lib) => d.lib = Some(lib),
+                        Err(e) => {
+                            d.lib = None;
+                            d.write_blocker = Some(e.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -4234,7 +4816,9 @@ impl App {
                 n += 1;
             }
         }
-        let _ = crate::export::usb::write_cue_record(root, &record);
+        if crate::export::usb::check_export_target(root).is_ok() {
+            let _ = crate::export::usb::write_cue_record(root, &record);
+        }
         self.dismiss_player_edits(pe, false);
         self.cue_counts = self.db.tracks_with_cues().unwrap_or_default();
         self.hot_positions = self.db.hot_positions().unwrap_or_default();
@@ -4416,11 +5000,22 @@ impl App {
             self.toast_err(format!("That file already belongs to \"{name}\" in your collection."));
             return false;
         }
+        let Some(before) = self.db.track(id) else {
+            self.toast_err("The original track could not be read.");
+            return false;
+        };
+        if let Err(error) = self.db.set_track_path(id, path) {
+            self.toast_err(format!("Could not save the new location ({error})."));
+            return false;
+        }
+        if before.path != path {
+            self.record(Edit::Track { before });
+        }
         if let Some(t) = self.track_mut(id) {
             t.path = path.to_string();
             t.missing = false;
         }
-        self.save_track(id);
+        self.list_dirty = true;
         true
     }
 
@@ -4431,59 +5026,35 @@ impl App {
         if !self.tracks.iter().any(|t| t.missing) {
             return self.toast("No tracks are missing.");
         }
+        self.start_relocation_scan(vec![folder.to_path_buf()], None);
+    }
+
+    pub(crate) fn start_relocation_scan(&mut self, folders: Vec<std::path::PathBuf>, selected: Option<Vec<i64>>) {
         if self.relocate_rx.is_some() {
             return self.toast_err("Already searching for missing files.");
         }
-        // The folder is scanned off the window's thread (it can be large or on a network).
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let folder = folder.to_path_buf();
+        let (tx, result) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let mut by_name: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
-            for e in walkdir::WalkDir::new(&folder).into_iter().flatten() {
-                if e.file_type().is_file() {
-                    if let Some(n) = e.file_name().to_str() {
-                        by_name.entry(crate::smart::fold(n)).or_default().push(e.path().to_path_buf());
-                    }
-                }
-            }
-            let _ = tx.send(by_name);
+            let _ = tx.send(crate::library_ext::scan_file_names(&folders));
             ctx.request_repaint();
         });
-        self.relocate_rx = Some(rx);
-        self.toast("Searching the folder for the missing files…");
+        self.relocate_rx = Some(RelocationSearch { result, selected });
+        self.toast("Searching for missing files…");
     }
 
     pub fn poll_relocate(&mut self) {
-        let Some(rx) = &self.relocate_rx else { return };
-        let Ok(by_name) = rx.try_recv() else { return };
-        self.relocate_rx = None;
-        let missing: Vec<(i64, String, u64)> = self.tracks.iter().filter(|t| t.missing).map(|t| (t.id, t.file_name(), t.file_size)).collect();
-        let (mut moved, mut ambiguous, mut not_found) = (0, 0, 0);
-        for (id, name, size) in missing {
-            let cands = by_name.get(&crate::smart::fold(&name)).cloned().unwrap_or_default();
-            let cands: Vec<std::path::PathBuf> = cands.into_iter().filter(|p| self.db.track_by_path(&p.to_string_lossy()).is_none()).collect();
-            let sized: Vec<(std::path::PathBuf, u64)> = cands.into_iter().map(|p| { let l = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX); (p, l) }).collect();
-            let pick = pick_relocation(&sized, size);
-            match pick {
-                Some(p) => {
-                    if self.relocate_track(id, &p.to_string_lossy()) {
-                        moved += 1;
-                    }
-                }
-                None if by_name.contains_key(&crate::smart::fold(&name)) => ambiguous += 1,
-                None => not_found += 1,
+        let Some(search) = &self.relocate_rx else { return };
+        let by_name = match search.result.try_recv() {
+            Ok(index) => index,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.relocate_rx = None;
+                return self.toast_err("The folder search stopped. Run it again to retry.");
             }
-        }
-        self.list_dirty = true;
-        let mut msg = format!("Relocated {moved} track(s).");
-        if ambiguous > 0 {
-            msg.push_str(&format!(" {ambiguous} had several files with the same name; relocate those one by one."));
-        }
-        if not_found > 0 {
-            msg.push_str(&format!(" {not_found} were not found in that folder."));
-        }
-        self.toast(msg);
+        };
+        let search = self.relocate_rx.take().unwrap();
+        self.apply_relocation(&by_name, search.selected.as_deref());
     }
 
     pub fn start_export(&mut self, root: &str, playlist_ids: &[i64], extra_tracks: &[i64]) {
@@ -4531,6 +5102,11 @@ impl App {
     pub fn start_export_nodes(&mut self, root: &str, nodes: Vec<crate::export::usb::ExportNode>, extra_tracks: &[i64]) {
         if self.export_job.is_some() {
             self.toast_err("An export is already running.");
+            return;
+        }
+        if let Err(e) = crate::export::usb::check_export_target(std::path::Path::new(root)) {
+            self.device_ui.pending = None;
+            self.toast_err(format!("Cannot export to {root}: {e}"));
             return;
         }
         let mut track_ids: HashSet<i64> = extra_tracks.iter().copied().collect();
@@ -4595,7 +5171,11 @@ impl App {
             }
         }
         for (id, r) in analyzed {
-            self.apply_analysis(id, r);
+            // The library worker owns any explicit grid/key request for this track.
+            // An overlapping USB export uses its own analysis settings.
+            if self.track(id).is_some_and(|t| t.analyzed != 3) {
+                self.apply_analysis(id, r);
+            }
         }
         if let Some(r) = report {
             self.export_report = Some(r);
@@ -4634,16 +5214,36 @@ pub fn compatible_key(a: i32, b: i32) -> bool {
     }
 }
 
-/// Which same-named file a missing track moves to: a lone candidate only if its size matches
-/// (when the track's size is known), several only if exactly one has the track's size.
-pub fn pick_relocation(cands: &[(std::path::PathBuf, u64)], size: u64) -> Option<std::path::PathBuf> {
-    match cands {
-        [] => None,
-        [(p, l)] => (size == 0 || *l == size).then(|| p.clone()),
-        _ => {
-            let same: Vec<_> = cands.iter().filter(|(_, l)| size > 0 && *l == size).collect();
-            if same.len() == 1 { Some(same[0].0.clone()) } else { None }
-        }
+pub struct RelocationSearch {
+    result: Receiver<HashMap<String, Vec<std::path::PathBuf>>>,
+    selected: Option<Vec<i64>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RelocationMatch<'a> {
+    Found(&'a std::path::Path, u64),
+    Shared,
+    NoMatch,
+    InUse,
+    Multiple,
+    SizeMismatch,
+    Unverified,
+}
+
+/// Classify the available same-named candidates. An unreadable candidate could
+/// still share the saved size, so the user must resolve that case manually.
+pub fn pick_relocation<'a>(candidates: &[(&'a std::path::Path, Option<u64>)], size: u64) -> RelocationMatch<'a> {
+    if candidates.is_empty() {
+        return RelocationMatch::NoMatch;
+    }
+    if candidates.iter().any(|(_, length)| length.is_none()) {
+        return RelocationMatch::Unverified;
+    }
+    let mut matching = candidates.iter().filter(|(_, length)| size == 0 || *length == Some(size));
+    match (matching.next(), matching.next()) {
+        (Some((path, Some(length))), None) => RelocationMatch::Found(path, *length),
+        (None, _) => RelocationMatch::SizeMismatch,
+        _ => RelocationMatch::Multiple,
     }
 }
 

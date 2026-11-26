@@ -88,6 +88,11 @@ pub fn mp3_timing_class(path: &str) -> Mp3Timing {
 
 /// Decode a whole file. The source file is only read.
 pub fn decode_file(path: &str) -> Result<Decoded> {
+    decode_until(path, || false)
+}
+
+pub fn decode_until(path: &str, cancelled: impl Fn() -> bool) -> Result<Decoded> {
+    if cancelled() { anyhow::bail!("stopped"); }
     let file = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -119,6 +124,7 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     let mut sbuf: Option<SampleBuffer<f32>> = None;
     let mut damaged = 0usize;
     loop {
+        if cancelled() { anyhow::bail!("stopped"); }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(symphonia::core::errors::Error::IoError(_)) => break,
@@ -298,13 +304,15 @@ pub struct PlayState {
     dsp: Box<DeckDsp>,
 }
 
+pub const DEFAULT_VOLUME: f32 = 0.9;
+
 impl Default for PlayState {
     fn default() -> Self {
         PlayState {
             audio: None,
             pos: 0.0,
             playing: false,
-            volume: 0.9,
+            volume: DEFAULT_VOLUME,
             gain: 1.0,
             loop_range: None,
             metronome: None,
@@ -354,7 +362,11 @@ pub struct Player {
     pub decks: [Arc<Mutex<PlayState>>; 4],
     /// Set by the stream when its device stops working (unplugged, switched off).
     pub lost: Arc<std::sync::atomic::AtomicBool>,
-    _stream: Option<cpal::Stream>,
+    stream: Option<cpal::Stream>,
+    output_enabled: bool,
+    buffer_load: Arc<std::sync::atomic::AtomicU32>,
+    idle_since: Option<std::time::Instant>,
+    parked: bool,
     pub device_rate: u32,
     pub error: Option<String>,
 }
@@ -362,18 +374,19 @@ pub struct Player {
 impl Player {
     #[allow(dead_code)]
     pub fn new() -> Player {
-        Self::with_device(None)
+        Self::with_device(None, true)
     }
 
     /// Open the named output device (None: the system's default output).
-    pub fn with_device(device: Option<&str>) -> Player {
+    pub fn with_device(device: Option<&str>, output_enabled: bool) -> Player {
         let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
         let state = decks[0].clone();
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        match Self::open_stream(decks.clone(), device, lost.clone()) {
-            Ok((s, rate)) => Player { state, decks, lost, _stream: Some(s), device_rate: rate, error: None },
-            Err(e) => Player { state, decks, lost, _stream: None, device_rate: 44100, error: Some(e.to_string()) },
+        let mut player = Player { state, decks, lost, stream: None, output_enabled, buffer_load: Default::default(), idle_since: None, parked: false, device_rate: 44100, error: None };
+        if let Err(e) = player.switch_device(device) {
+            player.error = Some(e.to_string());
         }
+        player
     }
 
     /// Names of the output devices this Mac offers. Listing devices can block indefinitely on
@@ -403,15 +416,57 @@ impl Player {
 
     /// Switch to another output device, keeping what is loaded and playing.
     pub fn switch_device(&mut self, device: Option<&str>) -> Result<()> {
-        let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone())?;
+        if !self.output_enabled { return Ok(()); }
+        let buffer_load = Arc::default();
+        let (s, rate) = Self::open_stream(self.decks.clone(), device, self.lost.clone(), Arc::clone(&buffer_load))?;
+        self.buffer_load = buffer_load;
         self.lost.store(false, std::sync::atomic::Ordering::Relaxed);
-        self._stream = Some(s);
+        self.stream = Some(s);
+        self.parked = false;
+        self.idle_since = None;
         self.device_rate = rate;
         self.error = None;
         Ok(())
     }
 
-    fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>) -> Result<(cpal::Stream, u32)> {
+    pub fn transport_running(&self) -> bool {
+        self.decks.iter().any(|deck| {
+            let s = deck.lock();
+            s.playing || s.search != 0.0
+        })
+    }
+
+    /// Linux ALSA plugins can keep servicing a silent stream after the decks stop.
+    /// Keep a short cue/resume window before actually releasing the device.
+    #[cfg(target_os = "linux")]
+    pub fn service_output(&mut self, keep_ready: bool, running: bool, device: Option<&str>) -> Result<Option<std::time::Duration>> {
+        use std::time::{Duration, Instant};
+        if !self.output_enabled { return Ok(None); }
+        if keep_ready || running {
+            self.idle_since = None;
+            if self.parked || (running && self.stream.is_none() && !self.lost.load(std::sync::atomic::Ordering::Relaxed)) {
+                self.parked = false;
+                self.switch_device(device)?;
+            }
+            return Ok(None);
+        }
+        if self.stream.is_none() { return Ok(None); }
+        let since = self.idle_since.get_or_insert_with(Instant::now);
+        let remaining = Duration::from_secs(2).saturating_sub(since.elapsed());
+        if !remaining.is_zero() { return Ok(Some(remaining)); }
+        self.stream = None;
+        self.parked = true;
+        HP_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    }
+
+    /// Elapsed time in the most recent output callback as a percentage of its buffer period.
+    pub fn buffer_load_percent(&self) -> Option<f32> {
+        self.stream.as_ref()?;
+        Some(f32::from_bits(self.buffer_load.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn open_stream(state: [Arc<Mutex<PlayState>>; 4], device: Option<&str>, lost: Arc<std::sync::atomic::AtomicBool>, buffer_load: Arc<std::sync::atomic::AtomicU32>) -> Result<(cpal::Stream, u32)> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let named = device.and_then(|want| Self::find_device(want, std::time::Duration::from_secs(3)));
@@ -424,6 +479,13 @@ impl Player {
         let (cfg, config, first_ch) = crate::prefs_ext::stream_config(&dev)?;
         let rate = cfg.sample_rate().0;
         let channels = cfg.channels() as usize;
+        let record_time = move |start: std::time::Instant, samples: usize| {
+            let frames = samples / channels;
+            if frames > 0 {
+                let percent = start.elapsed().as_secs_f64() * f64::from(rate) * 100.0 / frames as f64;
+                buffer_load.store((percent as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        };
         let st = state.clone();
         let stream = match cfg.sample_format() {
             cpal::SampleFormat::F32 => {
@@ -436,24 +498,28 @@ impl Player {
                 HP_ACTIVE.store(hp.is_some(), std::sync::atomic::Ordering::Relaxed);
                 dev.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| match hp {
-                    Some(h) => {
-                        let frames = data.len() / channels.max(1);
-                        pair.clear();
-                        pair.resize(frames * 2, 0.0);
-                        phones.clear();
-                        phones.resize(frames * 2, 0.0);
-                        render_cue(&st, &mut pair, &mut phones, 2, rate);
-                        data.fill(0.0);
-                        for ((f, m), c) in data.chunks_mut(channels).zip(pair.chunks(2)).zip(phones.chunks(2)) {
-                            f[first_ch] = m[0];
-                            f[first_ch + 1] = m[1];
-                            f[h] = c[0].clamp(-1.0, 1.0);
-                            f[h + 1] = c[1].clamp(-1.0, 1.0);
+                move |data: &mut [f32], _| {
+                    let start = std::time::Instant::now();
+                    match hp {
+                        Some(h) => {
+                            let frames = data.len() / channels.max(1);
+                            pair.clear();
+                            pair.resize(frames * 2, 0.0);
+                            phones.clear();
+                            phones.resize(frames * 2, 0.0);
+                            render_cue(&st, &mut pair, &mut phones, 2, rate);
+                            data.fill(0.0);
+                            for ((f, m), c) in data.chunks_mut(channels).zip(pair.chunks(2)).zip(phones.chunks(2)) {
+                                f[first_ch] = m[0];
+                                f[first_ch + 1] = m[1];
+                                f[h] = c[0].clamp(-1.0, 1.0);
+                                f[h + 1] = c[1].clamp(-1.0, 1.0);
+                            }
                         }
+                        None if first_ch == 0 => render(&st, data, channels, rate),
+                        None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
                     }
-                    None if first_ch == 0 => render(&st, data, channels, rate),
-                    None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
+                    record_time(start, data.len());
                 },
                 move |e| {
                     eprintln!("audio error: {e}");
@@ -472,11 +538,13 @@ impl Player {
                 dev.build_output_stream(
                     &config,
                     move |data: &mut [i16], _| {
+                        let start = std::time::Instant::now();
                         tmp.resize(data.len(), 0.0);
                         render(&st2, &mut tmp, channels, rate);
                         for (d, s) in data.iter_mut().zip(tmp.iter().copied()) {
                             *d = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                         }
+                        record_time(start, data.len());
                     },
                     move |e| {
                         eprintln!("audio error: {e}");
@@ -1165,6 +1233,16 @@ fn search_grain(rate: u32) -> usize {
     (rate as usize * 60 / 1000).max(1)
 }
 
+/// A zero-target one-pole gain can get stuck at a subnormal value indefinitely. Clear
+/// only that tail, keeping all normal values and nonzero targets unchanged. Doing this
+/// once per buffer adds no checks to the sample loop and bounds the tail to one buffer.
+#[inline]
+fn clear_zero_gain_tail(gain: &mut f32, target: f32) {
+    if target == 0.0 && gain.is_subnormal() {
+        *gain = target;
+    }
+}
+
 /// Add one deck's audio to `out` (which the caller has cleared) and advance its position.
 pub fn render_deck(s: &mut PlayState, out: &mut [f32], channels: usize, rate: u32) {
     render_deck_cue(s, out, &mut [], channels, rate)
@@ -1303,8 +1381,9 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
             r = r * w + or * (1.0 - w);
             s.dsp.xf = if left > 1 { Some((op + step * speed, left - 1)) } else { None };
         }
-        if smooth {
-            // Raised cosine over the play / pause fade.
+        if smooth && s.dsp.gate != 1.0 {
+            // Raised cosine only while the play / pause fade is moving. A settled
+            // gate is exactly unity; avoid a cosine for every audible sample.
             let g = 0.5 - 0.5 * (std::f32::consts::PI * s.dsp.gate).cos();
             l *= g;
             r *= g;
@@ -1385,6 +1464,16 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
         }
     }
     s.peak = peak;
+    clear_zero_gain_tail(&mut s.dsp.ch_fader, s.ch_fader);
+    clear_zero_gain_tail(&mut s.dsp.fader, s.fader);
+    if strip != 0 {
+        clear_zero_gain_tail(&mut s.dsp.trim, s.trim);
+    }
+    if eq_on {
+        for (gain, target) in s.dsp.eq.g.iter_mut().zip(iso_gain) {
+            clear_zero_gain_tail(gain, target);
+        }
+    }
 }
 
 /// Metronome click level for the three volume steps of the GRID panel (1 = quiet … 3 = loud).
@@ -1483,6 +1572,17 @@ mod deck_mix_tests {
     }
     fn playing(level: f32) -> PlayState {
         PlayState { audio: Some(dc(level, 44100)), playing: true, volume: 1.0, gain: 1.0, ..Default::default() }
+    }
+
+    #[test]
+    fn playback_disabled_never_opens_an_output() {
+        let mut player = super::Player::with_device(None, false);
+        assert!(player.buffer_load_percent().is_none());
+        player.switch_device(None).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(player.service_output(true, true, None).unwrap().is_none());
+        assert!(player.stream.is_none());
+        assert!(player.buffer_load_percent().is_none());
     }
 
     #[test]
@@ -1984,6 +2084,263 @@ mod smooth_tests {
 
     fn max_step(x: &[f32]) -> f32 {
         x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn settled_play_fade_preserves_every_output_sample() {
+        for rate in [22050, 44100, 48000, 96000] {
+            for channels in [1, 2, 4] {
+                let (mut smooth, mut plain) = (deck(), deck());
+                smooth.dsp.gate = 1.0;
+                plain.smooth = false;
+                for frames in [1, 33, 512, 1025] {
+                    let (mut a, mut b) = (vec![0.0; frames * channels], vec![0.0; frames * channels]);
+                    render_deck(&mut smooth, &mut a, channels, rate);
+                    render_deck(&mut plain, &mut b, channels, rate);
+                    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "rate {rate}, channels {channels}, frames {frames}");
+                    assert_eq!(smooth.pos, plain.pos);
+                    assert_eq!(smooth.dsp.gate, 1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gain_cleanup_preserves_normal_values_and_nonzero_targets() {
+        for target in [0.0f32, -0.0] {
+            for bits in [1u32, 0x007f_ffff, 0x8000_0001, 0x807f_ffff] {
+                let mut gain = f32::from_bits(bits);
+                clear_zero_gain_tail(&mut gain, target);
+                assert_eq!(gain.to_bits(), target.to_bits());
+            }
+            for bits in [0u32, 0x8000_0000, f32::MIN_POSITIVE.to_bits(), (-f32::MIN_POSITIVE).to_bits(),
+                1.0f32.to_bits(), f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0x7fc0_0123] {
+                let mut gain = f32::from_bits(bits);
+                clear_zero_gain_tail(&mut gain, target);
+                assert_eq!(gain.to_bits(), bits);
+            }
+        }
+        for target in [f32::from_bits(1), -f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::INFINITY, f32::NAN] {
+            let mut gain = f32::from_bits(0x007f_ffff);
+            clear_zero_gain_tail(&mut gain, target);
+            assert_eq!(gain.to_bits(), 0x007f_ffff);
+        }
+    }
+
+    #[test]
+    fn normal_fader_response_matches_the_original_envelope() {
+        // Keep the pre-cleanup one-pole envelope as an independent output expectation.
+        // This includes a zero target, but remains far above underflow for this interval.
+        for channel in [false, true] {
+            for target in [0.0, -0.0, 0.1, 0.7, 1.0] {
+                let mut s = deck();
+                s.dsp.gate = 1.0;
+                if channel { s.ch_fader = target; } else { s.fader = target; }
+                let audio = s.audio.clone().unwrap();
+                let (mut gain, mut frame) = (1.0f32, 0usize);
+                let k = 1.0 / (0.005 * 44100.0f32);
+                for frames in [1, 7, 64, 512] {
+                    let mut out = vec![0.0f32; frames * 2];
+                    render_deck(&mut s, &mut out, 2, 44100);
+                    for stereo in out.chunks_exact(2) {
+                        gain += (target - gain) * k;
+                        for ch in 0..2 {
+                            assert_eq!(stereo[ch].to_bits(), (audio.samples[frame * 2 + ch] * gain).to_bits());
+                        }
+                        frame += 1;
+                    }
+                    let rendered = if channel { s.dsp.ch_fader } else { s.dsp.fader };
+                    assert_eq!(rendered.to_bits(), gain.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_gain_tails_settle_silently_and_controls_recover() {
+        for rate in [44100u32, 48000, 96000] {
+            for control in 0..5 {
+                let mut s = deck();
+                match control {
+                    0 => s.ch_fader = 0.0,
+                    1 => s.fader = 0.0,
+                    2 => { s.strip = 1; s.trim = 0.0; }
+                    3 => { s.eq_on = true; s.eq_gain = [0.0; 3]; }
+                    _ => { s.strip = 2; s.eq_pos = [0.0; 3]; }
+                }
+                let mut out = [0.0f32; 1024];
+                for _ in 0..(rate as usize * 2).div_ceil(512) {
+                    out.fill(0.0);
+                    render_deck(&mut s, &mut out, 2, rate);
+                }
+                let gains: &[f32] = match control {
+                    0 => std::slice::from_ref(&s.dsp.ch_fader),
+                    1 => std::slice::from_ref(&s.dsp.fader),
+                    2 => std::slice::from_ref(&s.dsp.trim),
+                    _ => &s.dsp.eq.g,
+                };
+                assert!(gains.iter().all(|g| g.to_bits() == 0), "rate {rate}, control {control}, {gains:?}");
+                let pos = s.pos;
+                out.fill(0.0);
+                render_deck(&mut s, &mut out, 2, rate);
+                assert!(s.playing && s.pos > pos);
+                assert!(out.iter().all(|v| *v == 0.0));
+                match control {
+                    0 => s.ch_fader = 1.0,
+                    1 => s.fader = 1.0,
+                    2 => s.trim = 1.0,
+                    3 => s.eq_gain = [1.0; 3],
+                    _ => s.eq_pos = [0.5; 3],
+                }
+                out.fill(0.0);
+                render_deck(&mut s, &mut out, 2, rate);
+                assert!(out.iter().all(|v| v.is_finite()) && out.iter().any(|v| v.abs() > 0.01));
+            }
+        }
+    }
+
+    /// Run with a clocked ALSA output (a PulseAudio null sink is sufficient).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working Linux audio output"]
+    fn linux_output_parks_only_after_idle_and_resumes_the_same_deck() {
+        use std::time::{Duration, Instant};
+        let mut player = Player::new();
+        assert!(player.stream.is_some(), "{:?}", player.error);
+        let audio = Arc::new(Decoded { sr: 44100, samples: vec![0.2; 44100 * 2 * 4],
+            raw_frames: 44100 * 4, damaged: 0, truncated: false });
+        player.decks[1].lock().audio = Some(audio.clone());
+        player.decks[1].lock().pos = 4410.0;
+        let keep = player.service_output(false, false, None).unwrap().unwrap();
+        assert!(keep > Duration::ZERO);
+        player.idle_since = Some(Instant::now() - Duration::from_secs(3));
+        player.service_output(false, false, None).unwrap();
+        assert!(player.parked && player.stream.is_none());
+        assert_eq!(player.decks[1].lock().pos, 4410.0);
+        player.decks[1].lock().playing = true;
+        let running = player.transport_running();
+        assert!(running);
+        player.service_output(false, running, None).unwrap();
+        assert!(player.stream.is_some() && !player.parked);
+        let until = Instant::now() + Duration::from_secs(3);
+        while player.decks[1].lock().pos == 4410.0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut deck = player.decks[1].lock();
+        assert!(Arc::ptr_eq(deck.audio.as_ref().unwrap(), &audio));
+        assert!(deck.pos > 4410.0);
+        deck.playing = false;
+        deck.search = 1.0;
+        drop(deck);
+        assert!(player.transport_running());
+        player.decks[1].lock().search = 0.0;
+        player.idle_since = Some(Instant::now() - Duration::from_secs(3));
+        player.service_output(true, false, None).unwrap();
+        assert!(player.stream.is_some() && !player.parked);
+    }
+
+    /// Opt-in CPU report using the actual callback, synthetic audio and no device.
+    /// `cargo test --release cpu_playback_cost -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn cpu_playback_cost() {
+        use std::hint::black_box;
+        // The first three cases reproduce one deck with default playback controls,
+        // including a common 44.1 kHz file on a 48 kHz Linux output.
+        for (label, source_rate, rate, decks, smooth, strip, kind, color) in [
+            ("default-44k", 44100u32, 44100u32, 1, true, 0, 0, 0.5),
+            ("default-44k-to-48k", 44100, 48000, 1, true, 0, 0, 0.5),
+            ("default-48k", 48000, 48000, 1, true, 0, 0, 0.5),
+            ("plain-control", 48000, 48000, 1, false, 0, 0, 0.5),
+            ("two-decks", 44100, 48000, 2, true, 0, 0, 0.5),
+            ("four-decks", 44100, 48000, 4, true, 0, 0, 0.5),
+            ("filter", 48000, 48000, 1, true, 1, 0, 0.17),
+            ("gate-left", 48000, 48000, 1, true, 1, 8, 0.17),
+            ("gate-right", 48000, 48000, 1, true, 1, 8, 0.83),
+        ] {
+            let n = source_rate as usize * 21;
+            let samples = (0..n).flat_map(|i| {
+                let v = (i as f32 * 330.0 * std::f32::consts::TAU / source_rate as f32).sin() * 0.3;
+                [v, v * 0.8]
+            }).collect();
+            let audio = Arc::new(Decoded { sr: source_rate, samples, raw_frames: n, damaged: 0, truncated: false });
+            let mut elapsed = Vec::new();
+            let mut checksum = 0.0f64;
+            for _ in 0..5 {
+                let states: Vec<_> = (0..decks).map(|deck_no| Arc::new(Mutex::new(PlayState {
+                    audio: Some(audio.clone()), playing: true, volume: 1.0, gain: 1.0,
+                    smooth, strip, cfx_kind: kind, cfx_color: color, cfx_param: 0.63,
+                    deck_no, ..Default::default() }))).collect();
+                let mut out = [0.0f32; 1024];
+                // Settle the play fade, knob glide and filter coefficients before timing.
+                for _ in 0..16 { render(black_box(&states), black_box(&mut out), 2, rate); }
+                let start = std::time::Instant::now();
+                let blocks = rate as usize * 20 / 512;
+                for _ in 0..blocks { render(black_box(&states), black_box(&mut out), 2, rate); }
+                elapsed.push(start.elapsed().as_secs_f64());
+                checksum += out.iter().map(|v| *v as f64).sum::<f64>();
+            }
+            elapsed.sort_by(f64::total_cmp);
+            println!("cpu playback: {label}, source_rate {source_rate}, rate {rate}, decks {decks}, frames 512, median_seconds {:.9}, checksum {:.12}", elapsed[2], checksum);
+        }
+    }
+
+    /// Actual callback cost after a zero fader has had time to decay below normal f32.
+    /// The same benchmark runs before and after gain cleanup; the gain bits show whether
+    /// the old subnormal plateau or an exact zero was timed.
+    /// `cargo test --release cpu_zero_gain_cost -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn cpu_zero_gain_cost() {
+        use std::hint::black_box;
+        let source_rate = 44100u32;
+        let n = source_rate as usize * 23;
+        let samples = (0..n).flat_map(|i| {
+            let v = (i as f32 * 330.0 * std::f32::consts::TAU / source_rate as f32).sin() * 0.3;
+            [v, v * 0.8]
+        }).collect();
+        let audio = Arc::new(Decoded { sr: source_rate, samples, raw_frames: n, damaged: 0, truncated: false });
+        for rate in [44100u32, 48000] {
+            for (label, ch_fader, fader) in [("unity", 1.0, 1.0), ("channel-zero", 0.0, 1.0), ("cross-zero", 1.0, 0.0)] {
+                let mut elapsed = Vec::new();
+                let mut checksum = 0.0f64;
+                let mut gain_bits = (0, 0);
+                for _ in 0..5 {
+                    let states: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|deck_no| Arc::new(Mutex::new(if deck_no == 0 {
+                        PlayState { audio: Some(audio.clone()), playing: true, volume: 1.0, gain: 1.0,
+                            smooth: true, ch_fader, fader, ..Default::default() }
+                    } else {
+                        PlayState { deck_no: deck_no as u8, ..Default::default() }
+                    })));
+                    let mut out = [0.0f32; 1024];
+                    // Two seconds settle even the old one-pole subnormal plateau. The source
+                    // lasts 23 seconds so it keeps playing throughout the 20 timed seconds.
+                    for _ in 0..(rate as usize * 2).div_ceil(512) {
+                        render(black_box(&states), black_box(&mut out), 2, rate);
+                    }
+                    let start_pos = {
+                        let s = states[0].lock();
+                        gain_bits = (s.dsp.ch_fader.to_bits(), s.dsp.fader.to_bits());
+                        if ch_fader == 0.0 { assert!(s.dsp.ch_fader.abs() < f32::MIN_POSITIVE); }
+                        if fader == 0.0 { assert!(s.dsp.fader.abs() < f32::MIN_POSITIVE); }
+                        s.pos
+                    };
+                    let blocks = rate as usize * 20 / 512;
+                    let start = std::time::Instant::now();
+                    for _ in 0..blocks {
+                        render(black_box(&states), black_box(&mut out), 2, rate);
+                    }
+                    elapsed.push(start.elapsed().as_secs_f64());
+                    black_box(&out);
+                    checksum += out.iter().map(|v| *v as f64).sum::<f64>();
+                    let s = states[0].lock();
+                    assert!(s.playing && s.pos > start_pos + source_rate as f64 * 19.0);
+                }
+                elapsed.sort_by(f64::total_cmp);
+                println!("cpu zero gain: {label}, source_rate {source_rate}, rate {rate}, frames 512, median_seconds {:.9}, gain_bits {gain_bits:?}, checksum {:.12}", elapsed[2], checksum);
+            }
+        }
     }
 
     #[test]

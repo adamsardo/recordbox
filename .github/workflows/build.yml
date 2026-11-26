@@ -1,0 +1,661 @@
+name: Build and package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 3
+  RUST_BACKTRACE: 1
+
+jobs:
+  version:
+    name: Version and release metadata
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse_run_id: ${{ steps.reuse.outputs.reuse_run_id }}
+      package_ids: ${{ steps.reuse.outputs.package_ids }}
+      smoke_ids: ${{ steps.reuse.outputs.smoke_ids }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Check VERSION, Cargo files, tag and notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          args=(--check-version)
+          if [ -n "$RELEASE_TAG" ]; then args+=(--tag "$RELEASE_TAG"); fi
+          python packaging/build_archive.py "${args[@]}"
+          python - <<'PY'
+          from pathlib import Path
+          version = Path('VERSION').read_text().strip()
+          notes = Path('docs/releases') / (version + '.md')
+          if not notes.is_file(): raise SystemExit(f'Missing release notes: {notes}')
+          PY
+          if [ -n "$RELEASE_TAG" ]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" "origin/$RELEASE_DEFAULT_BRANCH"
+          fi
+
+      - name: Select an exact-source validated main build for tags
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python packaging/select_release_build.py
+
+  tests:
+    name: Tests and lint report
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app -> target
+          shared-key: linux-tests-1.100.0
+          cache-on-failure: true
+      - name: Tooling tests
+        run: python -m unittest discover -s packaging -p 'test_*.py' -v
+      - name: Application tests
+        run: python packaging/run_tests.py --output reports
+      - name: Fetch public rekordbox 6 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/pyrekordbox
+          ref: 50b4604d98dfd52740aa9e76d80c3a32dfa451ba
+          path: fixtures/pyrekordbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.testdata/empty.mp3
+            /.testdata/rekordbox 6/master_locked.db
+            /.testdata/rekordbox 6/backup/share/
+            /.testdata/export/PIONEER/
+      - name: Fetch public rekordbox 7 test data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dylanljones/rbox
+          ref: 9677e21448fe3a8462111b7df099b5608efcba90
+          path: fixtures/rbox
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.testdata/RBv7/demo/rekordbox/
+            /.testdata/RBv7/demo/export/PIONEER/
+      - name: Verify desktop write-back and USB compatibility on disposable v6 and v7 exports
+        env:
+          RECORDBOX_TEST_PYREKORDBOX: ${{ github.workspace }}/fixtures/pyrekordbox
+          RECORDBOX_TEST_RBOX: ${{ github.workspace }}/fixtures/rbox
+        run: |
+          cargo test --manifest-path app/Cargo.toml --locked rbimport::writeback:: -- --ignored --test-threads=1
+          cargo test --manifest-path app/Cargo.toml --locked export::public_device_tests:: -- --ignored --test-threads=1
+      - name: Formatting report (existing formatting debt is advisory)
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          cargo fmt --manifest-path app/Cargo.toml --all -- --check > reports/rustfmt.txt 2>&1
+          status=$?
+          set -e
+          if [ "$status" -gt 1 ]; then cat reports/rustfmt.txt; exit "$status"; fi
+          echo "### Formatting report" >> "$GITHUB_STEP_SUMMARY"
+          echo "rustfmt exit status: $status. See rustfmt.txt; formatting debt is not a passing formatting check." >> "$GITHUB_STEP_SUMMARY"
+      - name: Clippy (warnings reported; compile errors fail)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --manifest-path app/Cargo.toml --locked --all-targets -- --cap-lints warn 2>&1 | tee reports/clippy.txt
+          echo '### Clippy' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Completed without compilation errors. All lint findings are advisory and retained in clippy.txt, including existing deny-by-default Clippy lints.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checks-${{ github.sha }}
+          path: reports/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  audit:
+    name: No new dependency advisories
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app -> target
+          shared-key: cargo-audit-0.23.0
+          cache-on-failure: true
+      - name: Install pinned cargo-audit
+        run: cargo install --locked cargo-audit --version 0.23.0
+      - name: Audit and compare the explicit baseline
+        shell: bash
+        run: |
+          mkdir -p reports
+          set +e
+          (cd app && cargo audit --json) > reports/cargo-audit.json 2> reports/cargo-audit.stderr
+          status=$?
+          set -e
+          echo "$status" > reports/cargo-audit.exit-code
+          python packaging/check_advisories.py --audit reports/cargo-audit.json --audit-exit-code "$status" --report reports/advisories.md
+      - name: Publish the full advisory report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f reports/advisories.md ]; then cat reports/advisories.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Preserve raw audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: audit-${{ github.sha }}
+          path: reports/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  packages:
+    name: Package (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: version
+    if: needs.version.outputs.reuse_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-26, retry_os: macos-15, platform: macos, arch: arm64, binary: recordbox}
+          - {os: macos-15-intel, platform: macos, arch: x86_64, binary: recordbox}
+          - {os: windows-2022, platform: windows, arch: x86_64, binary: recordbox.exe}
+          - {os: ubuntu-22.04, platform: linux, arch: x86_64, binary: recordbox}
+    # Both macOS images are free native Apple Silicon runners. A targeted rerun can try the other queue.
+    runs-on: ${{ github.run_attempt == '2' && matrix.retry_os || matrix.os }}
+    timeout-minutes: ${{ matrix.platform == 'macos' && 60 || 100 }}
+    env:
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+      VCPKG_DISABLE_METRICS: '1'
+      VCPKG_BINARY_SOURCES: clear
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: 1.100.0
+      - name: Linux build and graphical test dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libssl-dev
+          pkg-config xvfb xauth libgl1 libgl1-mesa-dri libegl1 libx11-6
+          libx11-xcb1 libxcursor1 libxi6 libxkbcommon-x11-0
+      - name: Fetch pinned Windows OpenSSL build tooling
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:RUNNER_TEMP 'recordbox-vcpkg'
+          git init $vcpkg
+          git -C $vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg fetch failed' }
+          git -C $vcpkg checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg checkout failed' }
+          "RECORDBOX_VCPKG=$vcpkg" >> $env:GITHUB_ENV
+      - name: Cache the pinned Windows OpenSSL installation
+        if: runner.os == 'Windows'
+        id: windows-openssl-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/recordbox-vcpkg/installed
+            ${{ runner.temp }}/recordbox-vcpkg/downloads
+          key: vcpkg-windows-2022-x64-windows-${{ env.VCPKG_COMMIT }}
+      - name: Build Windows OpenSSL and locate native tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:RECORDBOX_VCPKG/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & "$env:RECORDBOX_VCPKG/vcpkg.exe" install openssl:x64-windows --disable-metrics
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL build failed' }
+          "OPENSSL_LIB_DIR=$env:RECORDBOX_VCPKG/installed/x64-windows/lib" >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$env:RECORDBOX_VCPKG/installed/x64-windows/include" >> $env:GITHUB_ENV
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual C++ tools are missing' }
+          $tools = (Get-Content "$vs/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt").Trim()
+          $toolsBin = "$vs/VC/Tools/MSVC/$tools/bin/Hostx64/x64"
+          if (-not (Test-Path "$toolsBin/dumpbin.exe")) { throw 'dumpbin is missing' }
+          "$toolsBin" >> $env:GITHUB_PATH
+          $redist = (Get-Content "$vs/VC/Auxiliary/Build/Microsoft.VCRedistVersion.default.txt").Trim()
+          $crt = "$vs/VC/Redist/MSVC/$redist/x64/Microsoft.VC143.CRT"
+          if (-not (Test-Path $crt)) { throw "Missing official VC runtime: $crt" }
+          if (-not (Test-Path "$env:RECORDBOX_VCPKG/installed/x64-windows/lib/libcrypto.lib")) { throw 'OpenSSL import library is missing' }
+          if (-not (Test-Path "$env:RECORDBOX_VCPKG/installed/x64-windows/include/openssl")) { throw 'OpenSSL headers are missing' }
+          "RECORDBOX_VC_CRT=$crt" >> $env:GITHUB_ENV
+          "$env:RECORDBOX_VCPKG/installed/x64-windows/bin" >> $env:GITHUB_PATH
+      - name: Save OpenSSL independently of later Rust or GUI failures
+        if: runner.os == 'Windows' && steps.windows-openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/recordbox-vcpkg/installed
+            ${{ runner.temp }}/recordbox-vcpkg/downloads
+          key: vcpkg-windows-2022-x64-windows-${{ env.VCPKG_COMMIT }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app -> target
+          shared-key: package-${{ github.run_attempt == '2' && matrix.retry_os || matrix.os }}-${{ matrix.arch }}-1.100.0
+          env-vars: ${{ runner.os == 'Windows' && 'VCPKG_COMMIT OPENSSL_' || '' }}
+          cache-on-failure: true
+      - name: Compile the release executable
+        run: cargo build --manifest-path app/Cargo.toml --release --locked
+      - name: Database, backup and import integrity regressions
+        shell: bash
+        run: |
+          for test_filter in backup::tests collection_cleanup:: db::sqlcipher_tests:: export::device_import::tests:: \
+            export::pdb::tests:: export::anlz::tests:: export::usb_target::tests:: \
+            rbimport::snapshot_tests:: rbimport::schema_tests:: rbimport::merge::tests:: rbimport::writeback:: \
+            export::usb_fix_test::a1_a_row_too_big_for_a_page_is_an_error_not_a_panic \
+            export::usb_fix_test::a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap; do
+            cargo test --manifest-path app/Cargo.toml --release --locked "$test_filter" -- --test-threads=1
+          done
+      - name: Create macOS app bundle
+        if: runner.os == 'macOS'
+        run: python packaging/build_archive.py --binary app/target/release/recordbox --platform macos --arch ${{ matrix.arch }} --source-commit ${{ github.sha }} --output dist
+      - name: Create Linux archive
+        if: runner.os == 'Linux'
+        run: >-
+          python packaging/build_archive.py --binary app/target/release/recordbox
+          --platform linux --arch x86_64 --source-commit ${{ github.sha }} --output dist
+          --runtime-notice /usr/share/doc/libssl3/copyright
+          --runtime-notice /usr/share/doc/libasound2/copyright
+      - name: Create Windows portable ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          python packaging/build_archive.py --binary app/target/release/recordbox.exe
+          --platform windows --arch x86_64 --source-commit ${{ github.sha }} --output dist
+          --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin"
+          --runtime-dir "$env:RECORDBOX_VC_CRT"
+          --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
+      - name: Prepare software OpenGL for the Windows CI display
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'recordbox-mesa.7z'
+          $driver = Join-Path $env:RUNNER_TEMP 'recordbox-test-opengl'
+          Invoke-WebRequest 'https://github.com/pal1000/mesa-dist-win/releases/download/26.2.7/mesa3d-26.2.7-release-mingw.7z' -OutFile $archive
+          $expected = '19c74aad7b09e682473b8de4c35b47e6498de97b71cae5511a231b8eb02f2b22'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Mesa checksum mismatch' }
+          & 7z.exe e $archive 'x64/opengl32.dll' 'x64/libgallium_wgl.dll' "-o$driver" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Mesa extraction failed' }
+          if (-not (Test-Path "$driver/opengl32.dll") -or -not (Test-Path "$driver/libgallium_wgl.dll")) { throw 'Mesa desktop OpenGL libraries are missing' }
+          "RECORDBOX_TEST_OPENGL_DIR=$driver" >> $env:GITHUB_ENV
+      - name: Smoke-test the extracted macOS archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          archives=(dist/*.zip)
+          test "${#archives[@]}" -eq 1
+          python packaging/smoke_app.py --archive "${archives[0]}" --output smoke --timeout 240
+      - name: Smoke-test the extracted Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem dist -Filter '*.zip')
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows archive' }
+          python packaging/smoke_app.py --archive $archives[0].FullName --output smoke --timeout 240 --windows-opengl-dir "$env:RECORDBOX_TEST_OPENGL_DIR"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke-test the extracted Linux archive
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          archives=(dist/*.tar.gz)
+          test "${#archives[@]}" -eq 1
+          xvfb-run -a -s '-screen 0 1280x960x24' python packaging/smoke_app.py --archive "${archives[0]}" --output smoke --timeout 240
+      - name: Cache the public HTDemucs validation checkpoints
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/recordbox-radeon-test/models/*.th
+          key: recordbox-htdemucs-8726e21a-ba3fe64a-e57c48e6-ef3bcb9c-f3cf25b2
+      - name: Build and test the Windows Radeon DirectML preview
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP 'recordbox-directml'
+          python packaging/directml_runtime.py "$runtime"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:ORT_DYLIB_PATH = Join-Path $runtime 'onnxruntime.dll'
+          $env:PATH = "$runtime;$env:PATH"
+          $env:PREPDECK_DATA = Join-Path $env:RUNNER_TEMP 'recordbox-radeon-test'
+          $modelDir = New-Item -ItemType Directory -Force (Join-Path $env:PREPDECK_DATA 'models')
+          $env:RECORDBOX_TEST_CHECKPOINT = Join-Path $modelDir '955717e8-8726e21a.th'
+          if (-not (Test-Path $env:RECORDBOX_TEST_CHECKPOINT)) {
+            Invoke-WebRequest 'https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th' -OutFile $env:RECORDBOX_TEST_CHECKPOINT
+          }
+          if ((Get-FileHash $env:RECORDBOX_TEST_CHECKPOINT).Hash.ToLowerInvariant() -ne '8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4') { throw 'HTDemucs checkpoint checksum mismatch' }
+          $messages = cargo test --manifest-path app/Cargo.toml --release --locked --features directml --no-run --message-format=json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $testExe = @($messages | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'recordbox' -and $_.profile.test -and $_.executable } | ForEach-Object { $_.executable })
+          if ($testExe.Count -ne 1) { throw 'Expected one native Recordbox test executable' }
+          $testDir = Split-Path $testExe[0]
+          Copy-Item (Join-Path $runtime '*.dll') -Destination $testDir -Force
+          # Use Microsoft's maintained software driver only for headless DirectML tests.
+          $warp = Join-Path $env:RUNNER_TEMP 'recordbox-warp.zip'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg' -OutFile $warp
+          if ((Get-FileHash $warp).Hash.ToLowerInvariant() -ne 'afc058f4d1066edc4231a38f3ab3592b1930f7287d4ac700e6a056e0874bb0be') { throw 'Microsoft WARP checksum mismatch' }
+          $warpDir = Join-Path $env:RUNNER_TEMP 'recordbox-warp'
+          Expand-Archive -LiteralPath $warp -DestinationPath $warpDir
+          Copy-Item (Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll') -Destination $testDir
+          & $testExe[0] 'idle_radeon_assessment_does_not_open_a_compute_backend' --ignored --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'stems::directml::device::tests' --include-ignored --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'stems::directml::tests' --include-ignored --test-threads=1 --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'deck_separates_with_both_radeon_models_and_releases_the_gpu_graph' --ignored --test-threads=1 --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $testExe[0] 'driver_failure_on_second_segment' --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --manifest-path app/Cargo.toml --release --locked --features directml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python packaging/build_archive.py --binary app/target/release/recordbox.exe --directml-runtime "$runtime" --platform windows --arch x86_64 --source-commit ${{ github.sha }} --output dist --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin" --runtime-dir "$env:RECORDBOX_VC_CRT" --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Check the extracted Radeon ZIP and CPU selection
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Get-Item -Path 'dist/*-windows-x86_64-directml.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'recordbox-directml-smoke'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest
+          $exe = Join-Path $dest "$($zip.BaseName)/recordbox.exe"
+          $status = & $exe --stems-status
+          if ($LASTEXITCODE -ne 0 -or "$status" -notmatch 'Windows DirectML build' -or "$status" -notmatch 'DirectML runtime files: present') { throw "Radeon archive diagnostics failed: $status" }
+          $cpu = & $exe --stems-cpu --stems-device
+          if ($LASTEXITCODE -ne 0 -or "$cpu" -notmatch 'CPU .*selected for this session') { throw "CPU selection failed: $cpu" }
+          $device = & $exe --stems-device
+          Write-Host "$device"
+          if ($LASTEXITCODE -ne 0 -or "$device" -notmatch 'DirectML .*DXGI adapter|no hardware AMD Radeon adapter') { throw "Radeon archive failed its device check: $device" }
+      - name: Install CUDA 12.9 build components
+        if: runner.os != 'macOS'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: ${{ runner.os == 'Windows' && '["nvcc","cudart","nvrtc","nvrtc_dev","cublas","cublas_dev","curand","curand_dev"]' || '["nvcc","cudart-dev","nvrtc-dev","driver-dev","cccl"]' }}
+          non-cuda-sub-packages: ${{ runner.os == 'Linux' && '["libcublas-dev","libcurand-dev"]' || '[]' }}
+      - name: Build and package Linux CUDA STEMS preview
+        if: runner.os == 'Linux'
+        run: |
+          export LIBRARY_PATH="$CUDA_PATH/lib64/stubs:$CUDA_PATH/lib64"
+          python packaging/build_cuda12.py --target-dir app/target --output cuda-bin
+          python packaging/build_archive.py --binary cuda-bin/recordbox-cuda12 --cuda12 \
+            --platform linux --arch x86_64 --source-commit "$GITHUB_SHA" --output dist \
+            --runtime-notice /usr/share/doc/libssl3/copyright --runtime-notice /usr/share/doc/libasound2/copyright
+      - name: Build Windows CUDA STEMS preview with MSVC
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%V in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%V\VC\Auxiliary\Build\vcvars64.bat"
+          python packaging/build_cuda12.py --target-dir app/target --output cuda-bin
+      - name: Package Windows CUDA STEMS preview
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          python packaging/build_archive.py --binary cuda-bin/recordbox-cuda12.exe --cuda12
+          --platform windows --arch x86_64 --source-commit ${{ github.sha }} --output dist
+          --runtime-dir "$env:RECORDBOX_VCPKG/installed/x64-windows/bin"
+          --runtime-dir "$env:RECORDBOX_VC_CRT"
+          --runtime-notice "$env:RECORDBOX_VCPKG/installed/x64-windows/share/openssl/copyright"
+      - name: Validate and package the experimental Linux Vulkan build
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          test -f "${icds[0]}"
+          export VK_ICD_FILENAMES="${icds[0]}"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/vulkan-runtime"
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+
+          cargo_args=(--manifest-path app/Cargo.toml --release --locked --features vulkan)
+          for test_name in stems::vulkan::tests::projection_limits_bound_every_submission_and_buffer \
+                           stems::vulkan::tests::initialization_deadline_pauses_vulkan \
+                           stems::vulkan::tests::nonfinite_readback_pauses_vulkan \
+                           app::prefs_tests::vulkan_dispatch_failure_offers_cpu_retry_with_the_same_model \
+                           app::prefs_tests::legacy_preferences_require_opt_in_for_automatic_cpu_separation \
+                           stems::vulkan::tests::software_vulkan_linear_matches_reference \
+                           stems::htdemucs::vulkan_transformer_projections_match_cpu \
+                           stems::backend::vulkan_tests::passive_vulkan_detection_and_cpu_override \
+                           stems::backend::vulkan_tests::vulkan_loss_stops_gpu_requests_and_keeps_explicit_cpu_available; do
+            cargo test "${cargo_args[@]}" "$test_name" -- --exact --include-ignored | tee "$RUNNER_TEMP/vulkan-test.log"
+            grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/vulkan-test.log"
+          done
+
+          cargo build "${cargo_args[@]}"
+          python packaging/build_archive.py --binary app/target/release/recordbox --vulkan \
+            --platform linux --arch x86_64 --source-commit "$GITHUB_SHA" --output dist \
+            --runtime-notice /usr/share/doc/libssl3/copyright --runtime-notice /usr/share/doc/libasound2/copyright
+          (cd dist && sha256sum --check *-linux-x86_64-vulkan.tar.gz.sha256)
+          archive=(dist/*-linux-x86_64-vulkan.tar.gz)
+          dest="$RUNNER_TEMP/vulkan-smoke"
+          mkdir "$dest"
+          tar -xzf "${archive[0]}" -C "$dest"
+          launcher=("$dest"/*/recordbox)
+          "${launcher[0]}" --stems-status | tee "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'Linux Vulkan' "$RUNNER_TEMP/vulkan-status.log"
+          grep -F 'no physical Vulkan compute adapter detected' "$RUNNER_TEMP/vulkan-status.log"
+          "${launcher[0]}" --stems-device | grep -F 'STEMS backend: CPU ·'
+          "${launcher[0]}" --stems-cpu --stems-device | grep -F 'CPU · selected for this session'
+      - name: Upload archives and checksums
+        if: ${{ !cancelled() && hashFiles('dist/*.sha256') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: recordbox-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+      - name: Preserve smoke evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            smoke/*.png
+            smoke/*.log
+            smoke/*.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+      - name: Upload the Linux Vulkan preview
+        if: runner.os == 'Linux' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vulkan-preview-linux-x86_64-${{ github.sha }}
+          path: |
+            dist/*-vulkan.tar.gz
+            dist/*-vulkan.tar.gz.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  release_assets:
+    name: Verify release assets
+    needs: [version, tests, audit, packages]
+    if: >-
+      ${{ !cancelled() && needs.version.result == 'success' &&
+          needs.tests.result == 'success' && needs.audit.result == 'success' &&
+          ((needs.version.outputs.reuse_run_id == '' && needs.packages.result == 'success') ||
+           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+            needs.version.outputs.reuse_run_id != '' && needs.packages.result == 'skipped')) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Download this run's native archives
+        if: needs.version.outputs.reuse_run_id == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: recordbox-*-${{ github.sha }}
+          merge-multiple: true
+          path: release-input/packages
+      - name: Download this run's native smoke evidence
+        if: needs.version.outputs.reuse_run_id == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: smoke-*-${{ github.sha }}
+          path: release-input/smoke
+      # Immutable IDs prevent a replacement artifact or another run entering this set.
+      # Expiry/deletion fails closed. Rerun ALL jobs to select native fallback.
+      - name: Download the selected main build's native archives
+        if: needs.version.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.version.outputs.reuse_run_id }}
+          artifact-ids: ${{ needs.version.outputs.package_ids }}
+          merge-multiple: true
+          path: release-input/packages
+      - name: Download the same main build's native smoke evidence
+        if: needs.version.outputs.reuse_run_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.version.outputs.reuse_run_id }}
+          artifact-ids: ${{ needs.version.outputs.smoke_ids }}
+          path: release-input/smoke
+      - name: Verify every archive and smoke before staging publication
+        shell: bash
+        run: |
+          release_tag="v$(cat VERSION)"
+          python packaging/prepare_release.py --input release-input --output release --source-commit "$GITHUB_SHA" --tag "$release_tag" --repository "$GITHUB_REPOSITORY"
+      - name: Preserve the verified release bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  required:
+    name: Build and security checks
+    if: always()
+    needs: [version, tests, audit, packages, release_assets]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job
+        env:
+          VERSION_CHECK: ${{ needs.version.result }}
+          TESTS: ${{ needs.tests.result }}
+          AUDIT: ${{ needs.audit.result }}
+          PACKAGES: ${{ needs.packages.result }}
+          RELEASE_ASSETS: ${{ needs.release_assets.result }}
+          REUSE_RUN_ID: ${{ needs.version.outputs.reuse_run_id }}
+        run: |
+          test "$VERSION_CHECK" = success && test "$TESTS" = success && test "$AUDIT" = success && test "$RELEASE_ASSETS" = success || exit 1
+          if [ -n "$REUSE_RUN_ID" ]; then
+            test "$GITHUB_EVENT_NAME" = push && [[ "$GITHUB_REF" == refs/tags/v* ]] &&
+              [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]] && test "$PACKAGES" = skipped
+          else
+            test "$PACKAGES" = success
+          fi
+
+  publish:
+    name: Publish the validated version tag
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+          needs.required.result == 'success' && needs.release_assets.result == 'success' }}
+    needs: [required, release_assets]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    concurrency:
+      group: recordbox-release-publication-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Download the verified bundle from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundle-${{ github.sha }}
+          path: release
+      - name: Publish or verify the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/publish_release.py --repository "$GITHUB_REPOSITORY"
+          --tag "$GITHUB_REF_NAME" --source-commit "$GITHUB_SHA" --directory release --publish
+      - name: Link the completed release
+        shell: bash
+        run: echo "[Verified release $GITHUB_REF_NAME](https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME)" >> "$GITHUB_STEP_SUMMARY"

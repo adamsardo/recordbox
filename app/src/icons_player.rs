@@ -85,19 +85,16 @@ pub fn layout(p: &Painter, c: Pos2, col: Color32) {
     p.rect_filled(Rect::from_min_size(r.min + vec2(3.0, 3.0), vec2(3.0, 3.0)), 0.0, col);
 }
 
-/// The header's sync mark: an 18 pt ring, 2.7 thick, open at the bottom, with a white radial
-/// bar across its right end. `spin` (radians) turns it while work is running.
-pub fn sync_mark(p: &Painter, c: Pos2, spin: f32, col: Color32) {
-    let (a0, a1) = (133f32.to_radians() + spin, 410f32.to_radians() + spin);
-    let rad = 7.65;
-    let pts: Vec<Pos2> = (0..=48).map(|i| {
-        let a = a0 + (a1 - a0) * i as f32 / 48.0;
-        c + vec2(a.cos(), a.sin()) * rad
-    }).collect();
-    p.add(Shape::line(pts, Stroke::new(2.7, col)));
-    let at = 412f32.to_radians() + spin;
-    let d = vec2(at.cos(), at.sin());
-    p.line_segment([c + d * 5.3, c + d * 10.0], Stroke::new(2.6, Color32::WHITE));
+/// The blue arc and pointer show the master volume, from bottom left to bottom right.
+pub fn master_volume(p: &Painter, c: Pos2, volume: f32) {
+    let start = 135f32.to_radians();
+    let sweep = 270f32.to_radians();
+    let at = |angle: f32| vec2(angle.cos(), angle.sin());
+    let arc = |v: f32| (0..=28).map(|i| c + at(start + sweep * v * i as f32 / 28.0) * 8.2).collect();
+    p.add(Shape::line(arc(1.0), Stroke::new(2.7, Color32::from_gray(50))));
+    if volume > 0.0 { p.add(Shape::line(arc(volume), Stroke::new(2.7, crate::theme::BLUE))); }
+    let pointer = at(start + sweep * volume);
+    p.line_segment([c + pointer * 4.4, c + pointer * 9.4], Stroke::new(2.1, Color32::WHITE));
 }
 
 /// Call Previous / Next Memory Cue: an 8 × 8 triangle whose tip is at `tip`.

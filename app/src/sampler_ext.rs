@@ -320,6 +320,7 @@ impl App {
 
     /// Sequence Load: one pass of the pattern, as audio, onto a deck (1..4 = 0..3).
     pub fn sampler_sequence_load(&mut self, deck: u8) {
+        if self.deck_options.disable_load { return self.toast_err("Sequence Load is disabled for this session (--disable-load)."); }
         if deck >= self.deck_count() {
             return;
         }
@@ -363,7 +364,7 @@ impl App {
         self.reload_tracks();
         self.with_deck(deck, |a| a.load_track_here(id));
         // "Load the sequence and automatically play.": once the deck has read the file.
-        if self.prefs.sampler.seq.load_autoplay {
+        if self.prefs.sampler.seq.load_autoplay && !self.deck_options.disable_play {
             self.px.sampler.autoplay = Some((deck, id, 0));
         }
     }

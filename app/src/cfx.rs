@@ -117,6 +117,10 @@ pub struct Cfx {
     /// GATE COMP: the level follower and the gain in use.
     env: f32,
     gain: f32,
+    /// GATE COMP coefficients depend on the side, PARAM and device rate, not on
+    /// the sample or the gliding COLOR value. Decks call process one frame at a time.
+    gate_made: (bool, f32, u32),
+    gate_coeff: (f32, f32, f32),
 }
 
 const PS_LEN: usize = 4096;
@@ -131,7 +135,7 @@ impl Cfx {
                 combs.push(vec![0.0; l + ch * 31]);
             }
         }
-        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], combs, comb_pos: [0; 8], comb_lp: [0.0; 8], made: (-1.0, -1.0, 0), ps: vec![0.0; PS_LEN * 2], ps_w: 0, ps_ph: 0.0, env: 0.0, gain: 1.0 }
+        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], combs, comb_pos: [0; 8], comb_lp: [0.0; 8], made: (-1.0, -1.0, 0), ps: vec![0.0; PS_LEN * 2], ps_w: 0, ps_ph: 0.0, env: 0.0, gain: 1.0, gate_made: (false, -1.0, 0), gate_coeff: (0.0, 0.0, 0.0) }
     }
 
     fn reset(&mut self) {
@@ -337,7 +341,13 @@ impl Cfx {
                     // (0.24) and its make-up limit (3.6) are rekordbox's defaults; PARAM is
                     // the gate's closing time or the compressor's make-up.
                     let per = 44100.0 / r;
-                    let rel = if right { 0.99919f32 } else { 0.99964f32 }.powf(per);
+                    if self.gate_made != (right, p, rate) {
+                        self.gate_made = (right, p, rate);
+                        self.gate_coeff = (if right { 0.99919f32 } else { 0.99964f32 }.powf(per),
+                            0.99982f32.powf(per * (0.25 + 3.0 * (1.0 - p))),
+                            (0.0026571 * per * 4.0).min(1.0));
+                    }
+                    let (rel, close, attack) = self.gate_coeff;
                     for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
                         let a = f[0].abs().max(f[1].abs());
                         self.env = if a > self.env { a } else { self.env * rel };
@@ -352,9 +362,8 @@ impl Cfx {
                             0.0
                         };
                         if want > self.gain {
-                            self.gain += (want - self.gain) * (0.0026571 * per * 4.0).min(1.0);
+                            self.gain += (want - self.gain) * attack;
                         } else {
-                            let close = 0.99982f32.powf(per * (0.25 + 3.0 * (1.0 - p)));
                             self.gain = want + (self.gain - want) * close;
                         }
                         f[0] *= self.gain;
@@ -386,6 +395,34 @@ impl Cfx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_comp_cached_coefficients_preserve_parameter_and_rate_changes() {
+        let mut cached = Cfx::new();
+        let mut recalculated = Cfx::new();
+        let changes = [(8, 0.17, 0.63, 48000), (8, 0.83, 0.63, 48000),
+            (8, 0.83, 0.05, 48000), (8, 0.17, 1.0, 44100),
+            (8, 0.83, 0.6, 96000), (8, 0.5, 0.6, 96000),
+            (0, 0.17, 0.2, 48000), (8, 0.83, 0.63, 48000)];
+        // One-frame calls are the deck path; larger and uneven buffers cover the rack.
+        for frames in [1, 33, 512] {
+            for &(kind, color, param, rate) in &changes {
+                for repeat in 0..9 {
+                    let mut a: Vec<f32> = (0..frames * 2).map(|i| {
+                        if repeat % 3 == 0 { 0.0 } else { (i as f32 * 0.117).sin() * 0.8 }
+                    }).collect();
+                    let mut b = a.clone();
+                    // A forced miss recomputes the original formulas without changing
+                    // the envelope or gain state. Parameter transitions must agree exactly.
+                    recalculated.gate_made = (false, -1.0, 0);
+                    cached.process(kind, color, param, &mut a, rate);
+                    recalculated.process(kind, color, param, &mut b, rate);
+                    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "kind {kind}, color {color}, param {param}, rate {rate}, frames {frames}");
+                }
+            }
+        }
+    }
 
     fn level(kind: u8, color: f32, param: f32, freq: f32) -> f32 {
         let mut fx = Cfx::new();

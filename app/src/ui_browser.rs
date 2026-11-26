@@ -128,41 +128,70 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
         }
         let _ = resp.on_hover_text(if *built { format!("Show/Hide {name} panel") } else { format!("{name} panel: not built in recordbox yet.") });
     }
+}
+
+fn master_volume_control(ui: &mut Ui, center: egui::Pos2, volume: f32, tooltips: bool) -> Option<f32> {
+    let (dial, drag) = crate::ui_perf::turn_knob(ui, center, "master_volume", volume, crate::audio::DEFAULT_VOLUME);
+    // The dial sits against the top of the screen. A wheel can turn it through its full range.
+    let wheel = if dial.hovered() { ui.input(|i| i.raw_scroll_delta.y) } else { 0.0 };
+    let changed = drag.or_else(|| (wheel != 0.0).then(|| (volume + wheel * 0.001).clamp(0.0, 1.0)));
+    let level = changed.unwrap_or(volume);
+    crate::icons_player::master_volume(ui.painter(), center, level);
+    if tooltips {
+        dial.on_hover_ui(|ui| {
+            ui.label(format!("Master volume · {:.0}%", level * 100.0));
+            ui.label("Drag or scroll to adjust. Double-click to reset.");
+        });
+    }
+    changed
+}
+
+fn header_output(app: &mut App, ui: &mut Ui, r: Rect) {
+    crate::ui_perf::read_meters(app, ui);
+    let p = ui.painter().clone();
     let rx = r.max.x;
     let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
+    p.text(pos2(rx - 32.0, ty + 13.8), Align2::RIGHT_CENTER, chrono::Local::now().format("%H:%M").to_string(), FontId::proportional(10.7), WHITE);
     let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
     let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
     crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if gear.on_hover_text("Preferences").clicked() {
-        app.dialogs.prefs_open = true;
+    if crate::ui_player::tip(gear, app, "Preferences").clicked() { app.dialogs.prefs_open = true; }
+
+    let volume = app.player.state.lock().volume;
+    if let Some(volume) = master_volume_control(ui, pos2(rx - 223.0, ty + 14.0), volume, app.prefs.tooltips) {
+        for deck in &app.player.decks { deck.lock().volume = volume; }
     }
-    // Master level meter: two 3 pt bars (L over R), 80 pt wide.
-    for c in 0..2 {
-        let br = Rect::from_min_size(pos2(rx - 204.0, ty + 9.5 + 6.0 * c as f32), vec2(80.0, 3.0));
-        p.rect_filled(br, 0.0, hex(0x323232));
-        let db = app.px.master_db[c];
-        let f = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
-        if f > 0.0 {
-            p.rect_filled(Rect::from_min_size(br.min, vec2(br.width() * f, 3.0)), 0.0, if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) });
+    for (channel, &db) in app.px.master_db.iter().enumerate() {
+        let bar = Rect::from_min_size(pos2(rx - 204.0, ty + 9.0 + 6.0 * channel as f32), vec2(80.0, 3.0));
+        p.rect_filled(bar, 0.0, hex(0x323232));
+        let level = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
+        if level > 0.0 {
+            let color = if !app.performance() { hex(0xB0B0B0) } else if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) };
+            p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * level, 3.0)), 0.0, color);
         }
     }
-    // Master volume (the same slider as in EXPORT mode's top bar).
-    let vr = Rect::from_min_max(pos2(rx - 105.0, ty + 6.0), pos2(rx - 70.0, ty + 22.0));
-    let vresp = ui.interact(vr, ui.id().with("perfvol"), Sense::click_and_drag());
-    let mut vol = app.player.state.lock().volume;
-    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on() || vresp.clicked()) {
-        vol = ((pp.x - vr.min.x) / vr.width()).clamp(0.0, 1.0);
-        app.player.state.lock().volume = vol;
+    let bar = Rect::from_min_size(pos2(rx - 102.0, ty + 13.0), vec2(32.0, 3.0));
+    p.rect_filled(bar, 0.0, hex(0x323232));
+    let load = app.player.buffer_load_percent();
+    if let Some(percent) = load {
+        let width = bar.width() * (percent / 100.0).min(1.0);
+        p.rect_filled(Rect::from_min_size(bar.min, vec2(width, bar.height())), 0.0, if percent >= 100.0 { CAUTION_TX } else { BLUE });
     }
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.max.x, ty + 15.5)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.min.x + vr.width() * vol, ty + 15.5)), 0.0, BLUE);
-    let _ = vresp.on_hover_text("Master Volume");
+    if app.prefs.tooltips {
+        ui.interact(bar.expand2(vec2(3.0, 6.0)), ui.id().with("buffer_load"), Sense::hover()).on_hover_ui(|ui| {
+            if let Some(percent) = load {
+                ui.label(format!("Audio buffer load · {percent:.1}%"));
+                ui.label("100% means the output callback used its entire buffer period.");
+            } else {
+                ui.label("Audio buffer load · output idle");
+            }
+        });
+    }
 }
 
 /// right-hand items measured from the right edge of a 1512 pt window).
-pub fn header_bar(app: &mut App, ui: &mut Ui) {
+pub fn header_bar(app: &mut App, ui: &mut Ui) -> bool {
+    let library_detached = app.library_window.is_some();
     let r = ui.max_rect();
     let p = ui.painter().clone();
     p.rect_filled(r, 0.0, BG1);
@@ -188,9 +217,22 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
     });
+    let window_button = Rect::from_min_max(pos2(r.right() - 28.0, r.top()), r.max);
+    let label = if library_detached { "Reattach library browser" } else { "Detach library browser" };
+    let response = ui.interact(window_button, ui.id().with("detach_library"), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let bg = if response.hovered() { BTN } else { BG1 };
+    p.rect_filled(window_button, 0.0, bg);
+    let outline = Stroke::new(1.3, if library_detached { BLUE } else { WHITE });
+    for offset in [vec2(-2.0, 2.0), vec2(2.0, -2.0)] {
+        let pane = Rect::from_center_size(window_button.center() + offset, vec2(12.0, 9.0));
+        p.rect(pane, 1.0, bg, outline, egui::StrokeKind::Inside);
+    }
+    let toggle_library = tipf(response, label).clicked();
+    header_output(app, ui, r);
     if perf {
         performance_header(app, ui, r);
-        return;
+        return toggle_library;
     }
     // Layout selector: an 18 × 9 frame at x 136–154, y 9.5–18.5.
     let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
@@ -205,7 +247,8 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         // (App::set_player_layout: 0–3 player layouts, 4 = browser only).
         let cur = app.player_layout();
         for (i, name) in ["1 Player", "2 Players", "Dual Player", "Simple Player", "Full Browser"].iter().enumerate() {
-            let resp = ui.selectable_label(cur == i as u8, format!("        {name}"));
+            let resp = ui.add_enabled(!library_detached || i != 4, egui::SelectableLabel::new(cur == i as u8, format!("        {name}")))
+                .on_disabled_hover_text("Reattach the library to use Full Browser.");
             crate::icons_player::layout_mark(ui.painter(), pos2(resp.rect.min.x + 15.0, resp.rect.center().y), i as u8, WHITE);
             if resp.clicked() {
                 app.set_player_layout(i as u8);
@@ -223,54 +266,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
         app.prefs.auto_analysis = !app.prefs.auto_analysis;
         app.save_prefs();
     }
-    // Right side, measured from the right edge (1512 pt window): gear 14 pt centred at −261,
-    // sync mark 18 pt centred at −223, level meter −204..−124, volume −102..−70, clock ends −21.5.
-    let rx = r.max.x;
-    let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
-    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
-    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if tipf(gear, "Preferences").clicked() {
-        app.dialogs.prefs_open = true;
-    }
-    // Sync / analysis activity mark (turns while work is running).
-    let busy = app.analysis_total > 0 || app.export_job.is_some() || app.importing.is_some();
-    let spin = if busy { ui.input(|i| i.time) as f32 * 4.0 } else { 0.0 };
-    crate::icons_player::sync_mark(&p, pos2(rx - 223.0, ty + 14.0), spin, BLUE);
-    if busy {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-    }
-    // Level meter (left and right): two 80 × 3 pt bars at y 9–12 and 15–18.
-    let bars = [Rect::from_min_max(pos2(rx - 204.0, ty + 9.0), pos2(rx - 124.0, ty + 12.0)), Rect::from_min_max(pos2(rx - 204.0, ty + 15.0), pos2(rx - 124.0, ty + 18.0))];
-    for b in bars {
-        p.rect_filled(b, 0.0, hex(0x323232));
-    }
-    if app.playing() {
-        if let Some(w) = &app.deck.wave {
-            let f = (app.pos() * WAVE_FPS) as usize;
-            if let Some(fr) = w.frames.get(f) {
-                let lvl = (fr[0] as f32 / 255.0).min(1.0);
-                for b in bars {
-                    p.rect_filled(Rect::from_min_max(b.min, pos2(b.min.x + b.width() * lvl, b.max.y)), 0.0, hex(0xB0B0B0));
-                }
-            }
-        }
-    }
-    // Master volume slider: a 32 × 3 pt bar at y 13–16.
-    let sl = Rect::from_min_max(pos2(rx - 102.0, ty + 8.0), pos2(rx - 70.0, ty + 21.0));
-    let sresp = ui.interact(sl.expand2(vec2(3.0, 0.0)), ui.id().with("vol"), Sense::click_and_drag());
-    let mut v = app.player.state.lock().volume;
-    if sresp.dragged() || sresp.clicked() {
-        if let Some(pp) = sresp.interact_pointer_pos() {
-            v = ((pp.x - sl.min.x) / sl.width()).clamp(0.0, 1.0);
-            app.player.state.lock().volume = v;
-        }
-    }
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.max.x, ty + 16.0)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.min.x + (sl.width() * v).max(2.0), ty + 16.0)), 0.0, BLUE);
-    let _ = tipf(sresp, "Master volume (preview)");
+    toggle_library
 }
 
 fn menus(app: &mut App, ui: &mut Ui) {
@@ -310,16 +306,15 @@ fn menus(app: &mut App, ui: &mut Ui) {
         ui.separator();
         if ui.button("Display All Missing Files").clicked() {
             ui.close_menu();
-            app.set_view(View::Collection);
-            app.side = SideMode::Collection;
-            app.search.clear();
-            let missing: Vec<i64> = app.tracks.iter().filter(|t| t.missing).map(|t| t.id).collect();
-            app.toast(format!("{} missing file(s) in the collection", missing.len()));
-            app.selected = missing.into_iter().collect();
+            app.open_missing_file_manager();
         }
-        if ui.button("Show library folder in Finder").clicked() {
+        if ui.button("Review collection cleanup…").clicked() {
             ui.close_menu();
-            let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
+            crate::collection_cleanup::ui::open(app, None);
+        }
+        if ui.button("Show library folder").clicked() {
+            ui.close_menu();
+            crate::menus::handle(app, "library_folder");
         }
         if ui.button("Backup Library…").clicked() {
             ui.close_menu();
@@ -419,14 +414,17 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     // and their baseline 8 pt above the window's foot (0.169 pt per logo unit).
     crate::brand::paint_logo(ui, Rect::from_min_size(pos2(r.min.x + 9.66, r.max.y - 19.7), vec2(104.1, 14.0)), WHITE);
     // totals
-    let (n, secs, bytes) = if let View::Device { .. } = app.view {
-        (0usize, 0.0, 0u64)
-    } else {
-        app.list.iter().filter_map(|id| app.track(*id)).fold((0, 0.0, 0u64), |(n, s, b), t| (n + 1, s + t.duration, b + t.file_size))
+    let total = match &app.view {
+        View::Device { root, .. } | View::DeviceHistory { root, .. } => app.devices.iter().find(|d| d.root == *root).map(|d| {
+            if let Some(lib) = &d.lib { format!("Classic catalog · {} tracks", lib.tracks.len()) } else { d.catalog_label().to_string() }
+        }).unwrap_or_default(),
+        _ => {
+            let (n, secs, bytes) = app.list.iter().filter_map(|id| app.track(*id)).fold((0, 0.0, 0u64), |(n, s, b), t| (n + 1, s + t.duration, b + t.file_size));
+            let h = (secs / 3600.0).floor();
+            let m = ((secs - h * 3600.0) / 60.0).floor();
+            format!("{n} Tracks, {} hours {} minutes, {:.1} GB", h, m, bytes as f64 / 1e9)
+        }
     };
-    let h = (secs / 3600.0).floor();
-    let m = ((secs - h * 3600.0) / 60.0).floor();
-    let total = format!("{n} Tracks, {} hours {} minutes, {:.1} GB", h, m, bytes as f64 / 1e9);
     p.text(pos2(r.max.x - 34.5, r.center().y), Align2::RIGHT_CENTER, total, rb_bold(11.5), DIM);
     // status / messages
     let mid = Rect::from_min_max(pos2(r.min.x + 120.0, r.min.y + 3.0), pos2(r.max.x - 300.0, r.max.y - 3.0));
@@ -443,8 +441,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         let (d, t, txt) = &job.last;
         p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Exporting {}/{} · {}", d, t, txt), rb(11.5), TEXT);
     } else if app.analysis_total > 0 {
-        let pending = app.pool.pending.load(std::sync::atomic::Ordering::Relaxed);
-        p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Analyzing… {} of {}", app.analysis_total - pending, app.analysis_total), rb(11.5), TEXT);
+        p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Analyzing… {} of {}", app.analysis_done, app.analysis_total), rb(11.5), TEXT);
         let stop = ui.interact(Rect::from_min_size(pos2(mid.max.x - 120.0, mid.min.y), vec2(110.0, mid.height())), ui.id().with("stopan"), Sense::click());
         p.text(pos2(mid.max.x - 64.0, mid.center().y), Align2::CENTER_CENTER, "Stop Analyzing", rb(11.0), BLUE);
         if stop.clicked() {
@@ -452,18 +449,56 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
         }
     } else if app.importing.is_some() {
         p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Importing… {}", app.import_count), rb(11.5), TEXT);
+    } else if let Some((id, progress)) = app.stem.separating {
+        let title = app.track(id).map(|t| t.display_title()).unwrap_or_default();
+        let text = if app.stem.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            format!("Stopping stem separation · {title}")
+        } else {
+            format!("Stem separation · {:.0}% · {title}", progress * 100.0)
+        };
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
+    } else if let Some((done, total)) = app.stem.downloading {
+        let text = if total > 0 { format!("Downloading stem model · {:.0}%", 100.0 * done as f64 / total as f64) } else { "Downloading stem model…".to_owned() };
+        p.text(mid.left_center(), Align2::LEFT_CENTER, text, rb(11.5), TEXT);
+    } else if app.stem.reading_cache() {
+        p.text(mid.left_center(), Align2::LEFT_CENTER, "Reading cached stems…", rb(11.5), TEXT);
+    } else if let Some(status) = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status()) {
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, status, rb(11.5), TEXT);
+    } else if app.rb_job.is_some() {
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, "Reading the AlphaTheta Rekordbox library…", rb(11.5), TEXT);
+    } else if mid.width() > 0.0 {
+        let path = app.db.active_library_path();
+        p.with_clip_rect(mid).text(mid.left_center(), Align2::LEFT_CENTER, format!("Active library · {path}"), rb(11.5), DIM);
+        if app.prefs.tooltips {
+            ui.interact(mid, ui.id().with("active_library_path"), Sense::hover()).on_hover_text(path);
+        }
     }
 }
 
 // ------------------------------------------------------------------------------------ browser
+// CentralPanel includes the viewport in its ID. Give the browser a single widget tree so
+// egui keeps its scroll positions and text edit state when it moves between native windows.
+fn browser_ui(panel: &Ui) -> Ui {
+    let builder = egui::UiBuilder::new().max_rect(panel.max_rect()).layer_id(panel.layer_id()).layout(*panel.layout()).style(panel.style().clone());
+    let mut ui = Ui::new(panel.ctx().clone(), egui::Id::new("recordbox_browser_contents"), builder);
+    ui.set_clip_rect(panel.clip_rect());
+    ui
+}
+
 /// Browser geometry measured in the original (pt): icon strip 0..26.5, tree pane 26.5..247,
 /// track list 253..1485.5, right icon strip 1488..1512; top row of the tree area 20 pt high.
-pub fn browser(app: &mut App, ui: &mut Ui) {
+pub fn browser(app: &mut App, panel: &mut Ui) {
+    let ui = &mut browser_ui(panel);
     app.poll_library_ext();
+    if ui.input(|i| i.events.contains(&egui::Event::WindowFocused(false))) {
+        app.drag = None;
+        app.sub_drag = false;
+        app.node_drag = None;
+    }
     // rekordbox's browser starts 283 pt below the window top: one point above this panel (the
     // player's last point is empty), so the browser is drawn from there.
     let mut full = ui.max_rect();
-    if !app.prefs.browser_only {
+    if !app.prefs.browser_only && ui.ctx().viewport_id() == egui::ViewportId::ROOT {
         full.min.y -= 1.0;
         let mut clip = ui.clip_rect();
         clip.min.y = clip.min.y.min(full.min.y);
@@ -761,15 +796,19 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
             }
         }
     }
-    // Bottom of the strip: the library sync mark ("Sync rekordbox Library Now"), lit while a
-    // sync is running. (rekordbox's link-status mark above it has no counterpart here.)
+    // Desktop library sync. USB devices have their own Sync Manager.
     let sr = Rect::from_center_size(pos2(r.min.x + 20.0, r.max.y - 20.0), vec2(18.0, 12.0));
-    let busy = app.rb_job.is_some();
+    let status = app.dialogs.library_sync_review.as_ref().and_then(|review| review.status())
+        .or(app.rb_job.as_ref().map(|_| "Importing from the AlphaTheta Rekordbox library…"));
+    let busy = status.is_some();
     let resp = ui.interact(sr.expand(3.0), ui.id().with("strip_sync"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy && app.can_review_library_sync(), "Review desktop library sync"));
     src::sync_arrows(ui.painter(), sr, if busy { BLUE } else if resp.hovered() { WHITE } else { hex(0xDCDCDC) });
-    let resp = if app.prefs.tooltips { resp.on_hover_text("Sync rekordbox Library Now") } else { resp };
+    let resp = if app.prefs.tooltips {
+        resp.on_hover_text(status.unwrap_or("Choose a sync direction between AlphaTheta Rekordbox and recordbox."))
+    } else { resp };
     if resp.clicked() && !busy {
-        app.start_rekordbox_sync();
+        app.review_rekordbox_sync();
     }
 }
 
@@ -880,6 +919,15 @@ pub const TREE_FONT: f32 = 10.5;
 /// the pane's edge, the triangle is centred 9 pt in and the text starts 20 pt in (+`indent`).
 fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool, pitch: f32) -> egui::Response {
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
+    // Register every row, including its keyboard focus target. Only the painting and
+    // text layout can be omitted for rows outside the ScrollArea's clip rectangle.
+    if ui.is_rect_visible(rr) {
+        paint_collection_row(ui, rr, &resp, text, arrow, indent, count, selected);
+    }
+    resp
+}
+
+fn paint_collection_row(ui: &Ui, rr: Rect, resp: &egui::Response, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool) {
     let p = ui.painter();
     let bar = Rect::from_min_max(pos2(rr.min.x + 1.0, rr.min.y), pos2(rr.max.x - 1.0, rr.max.y));
     if selected {
@@ -896,7 +944,36 @@ fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, cou
     if let Some(c) = count {
         p.text(pos2(rr.max.x - 10.0, rr.center().y), Align2::RIGHT_CENTER, c.to_string(), rb(TREE_FONT), WHITE);
     }
-    resp
+}
+
+fn collection_leaves(ui: &mut Ui, field: u8, rows: &[(String, usize)], view: &View) -> Option<View> {
+    let mut pick = None;
+    for (value, count) in rows {
+        let selected = matches!(view, View::Category { field: f, value: v } if *f == field && v == value);
+        let label = if value.is_empty() { "(none)" } else { value.as_str() };
+        if collection_row(ui, label, None, 14.0, Some(*count), selected, 16.0).clicked() {
+            pick = Some(View::Category { field, value: value.clone() });
+        }
+    }
+    pick
+}
+
+fn collection_category_groups(ui: &mut Ui, categories: &mut CollectionCategories, tracks: &[Track], view: &View) -> Option<View> {
+    let mut pick = None;
+    for (field, label) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
+        let key = egui::Id::new(("cat_open", field));
+        let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+        if collection_row(ui, label, Some(open), 0.0, None, false, 18.0).clicked() {
+            ui.ctx().data_mut(|d| d.insert_temp(key, !open));
+        }
+        if open {
+            let rows = categories.rows(tracks, field);
+            if let Some(view) = collection_leaves(ui, field as u8, &rows, view) {
+                pick = Some(view);
+            }
+        }
+    }
+    pick
 }
 
 pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>) {
@@ -916,30 +993,8 @@ pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>)
                     app.set_view(View::Collection);
                 }
                 all.context_menu(|ui| crate::ui_library_ext::collection_menu(app, ui));
-                for (fi, f) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
-                    let key = egui::Id::new(("cat_open", fi));
-                    let open = ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
-                    let r = collection_row(ui, f, Some(open), 0.0, None, false, 18.0);
-                    if r.clicked() {
-                        ui.ctx().data_mut(|d| d.insert_temp(key, !open));
-                    }
-                    if open {
-                        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-                        for t in &app.tracks {
-                            *counts.entry(App::category_value(t, fi as u8)).or_default() += 1;
-                        }
-                        let mut items: Vec<(String, usize)> = counts.into_iter().collect();
-                        if fi == 0 {
-                            items.reverse(); // newest first
-                        }
-                        for (v, n) in items {
-                            let sel = app.view == View::Category { field: fi as u8, value: v.clone() };
-                            let label = if v.is_empty() { "(none)".to_string() } else { v.clone() };
-                            if collection_row(ui, &label, None, 14.0, Some(n), sel, 16.0).clicked() {
-                                app.set_view(View::Category { field: fi as u8, value: v });
-                            }
-                        }
-                    }
+                if let Some(view) = collection_category_groups(ui, &mut app.collection_categories, &app.tracks, &app.view) {
+                    app.set_view(view);
                 }
             });
         }
@@ -1224,7 +1279,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
     // Reference 05 shows only the "Devices" row; Recordbox's extras live in its context menu.
     let dr = if app.prefs.tooltips && app.devices.is_empty() { dr.on_hover_text("Connect a USB drive or SD card (FAT32, exFAT or HFS+). Right-click for more.") } else { dr };
     dr.context_menu(|ui| {
-        if ui.button("Add a folder as a device…").on_hover_text("Export into any folder, for example to prepare a drive image or test an export.").clicked() {
+        if ui.button("Add a folder as a device…").on_hover_text("Choose the drive root containing PIONEER, or a folder for a new classic export.").clicked() {
             ui.close_menu();
             if let Some(d) = rfd::FileDialog::new().pick_folder() {
                 let s = d.to_string_lossy().to_string();
@@ -1240,14 +1295,18 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
             open_export(app, vec![], vec![]);
         }
     });
-    let devs: Vec<(String, String, String, Option<Vec<crate::export::usb::DevNode>>, Option<String>, usize)> = app
-        .devices
-        .iter()
-        .map(|d| (d.root.clone(), d.name.clone(), d.fs.clone(), d.lib.as_ref().map(|l| l.nodes.clone()), d.error.clone(), d.lib.as_ref().map(|l| l.tracks.len()).unwrap_or(0)))
-        .collect();
-    for (root, name, fs, nodes, err, ntracks) in devs {
+    let roots: Vec<_> = app.devices.iter().map(|d| d.root.clone()).collect();
+    for root in roots {
+        let Some(dev) = app.devices.iter().find(|d| d.root == root) else { continue };
+        let (name, fs) = (dev.name.clone(), dev.fs.clone());
+        let nodes = dev.lib.as_ref().map(|lib| lib.nodes.clone());
+        let count = dev.lib.as_ref().filter(|_| fs == "folder").map(|lib| lib.tracks.len());
+        let catalog = dev.catalog_label();
+        let export_blocker = dev.write_blocker.clone();
+        let catalog_blocker = export_blocker.clone().or_else(|| nodes.is_none().then(|| "This action needs a classic Device Library.".to_owned()));
+        let mixed = dev.layout == Some(crate::export::usb::DeviceLayout::Mixed);
         let sel = app.view == View::Device { root: root.clone(), node: None };
-        let resp = tree_row(ui, 1, &format!("{name}  ({})", App::fs_label(&fs)), if fs == "folder" { Some(ntracks) } else { None }, sel, TreeIcon::Device, 15.0);
+        let resp = tree_row(ui, 1, &format!("{name}  ({})", App::fs_label(&fs)), count, sel, TreeIcon::Device, 15.0);
         // Eject button at the right end of a removable device's row (as in the original).
         let mut ejected = false;
         if fs != "folder" {
@@ -1298,23 +1357,21 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
         }
         let r2 = root.clone();
         resp.context_menu(|ui| {
-            if ui.button("Export to this device…").clicked() {
+            if ui.add_enabled(export_blocker.is_none(), egui::Button::new("Export to this device…")).on_disabled_hover_text(export_blocker.as_deref().unwrap_or_default()).clicked() {
                 app.dialogs.export_root = Some(r2.clone());
                 open_export(app, vec![], vec![]);
                 app.dialogs.export_root = Some(r2.clone());
                 ui.close_menu();
             }
-            if ui.button("Update Playlists on This Device").on_hover_text("Export again the playlists that are both on this device and in your library (same folder and name), so the device has your latest edits.").clicked() {
+            if ui.add_enabled(catalog_blocker.is_none(), egui::Button::new("Update Playlists on This Device")).on_disabled_hover_text(catalog_blocker.as_deref().unwrap_or_default()).on_hover_text("Export again the playlists that are both on this device and in your library (same folder and name), so the device has your latest edits.").clicked() {
                 app.update_device_playlists(&r2);
                 ui.close_menu();
             }
             crate::device_ext::device_row_menu(app, ui, &r2);
-            if ui.button("Clean Up Unused Files…").on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
+            let cleanup_blocker = catalog_blocker.as_deref().or(mixed.then_some("OneLibrary can reference files outside the classic catalog. Shared files are kept."));
+            if ui.add_enabled(cleanup_blocker.is_none(), egui::Button::new("Clean Up Unused Files…")).on_disabled_hover_text(cleanup_blocker.unwrap_or_default()).on_hover_text("Music, analysis and artwork files on the device that no track in its library uses.").clicked() {
                 let dev = app.devices.iter().find(|d| d.root == r2).map(|d| (d.name.clone(), d.lib.clone()));
                 match dev {
-                    Some((name, _)) if crate::export::usb::has_onelibrary(std::path::Path::new(&r2)) => {
-                        app.toast_err(format!("{name} also has rekordbox's OneLibrary database, which recordbox can't read yet, so it can't tell which files are unused."));
-                    }
                     Some((name, Some(lib))) => {
                         let files = crate::export::usb::unused_files(std::path::Path::new(&r2), &lib);
                         if files.is_empty() {
@@ -1327,7 +1384,7 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 }
                 ui.close_menu();
             }
-            if ui.button("Import Cue Changes from Players…").on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from recordbox.").clicked() {
+            if ui.add_enabled(nodes.is_some(), egui::Button::new("Import Cue Changes from Players…")).on_disabled_hover_text(catalog_blocker.as_deref().unwrap_or_default()).on_hover_text("Hot cues and memory cues set or moved on a DJ player since the last export from recordbox.").clicked() {
                 app.check_player_cue_edits(&r2, true);
                 ui.close_menu();
             }
@@ -1358,11 +1415,11 @@ fn devices_tree(app: &mut App, ui: &mut Ui) {
                 ui.close_menu();
             }
         });
-        if let Some(e) = err {
-            ui.label(RichText::new(e).size(10.5).color(CAUTION_TX));
-        }
-        if fs != "folder" && crate::export::usb::has_onelibrary(std::path::Path::new(&root)) {
-            ui.label(RichText::new("Has a OneLibrary database that recordbox does not update yet.").size(10.5).color(DIM)).on_hover_text("Written by rekordbox 7.2.11 or later. Players that read OneLibrary will not show changes made by recordbox.");
+        let format_row = ui.label(RichText::new(catalog).size(10.5).color(if export_blocker.is_some() { CAUTION_TX } else { DIM }));
+        if let Some(reason) = &export_blocker {
+            format_row.on_hover_text(reason);
+        } else if mixed {
+            format_row.on_hover_text("Only the classic catalog is shown here. Both catalogs can reference the audio and analysis.");
         }
         if let Some(nodes) = nodes {
             fn rows(app: &mut App, ui: &mut Ui, root: &str, nodes: &[crate::export::usb::DevNode], parent: u32, depth: usize) {
@@ -1522,7 +1579,7 @@ fn explorer_list(app: &mut App, ui: &mut Ui, dir: &str) {
             if resp.clicked() {
                 sel = Some(fs.clone());
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !app.deck_options.disable_load {
                 match in_col {
                     Some(id) => app.load_track(id),
                     None => {
@@ -1585,7 +1642,9 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let title = match (node, history, &dev.lib) {
         (_, Some(h), Some(l)) => l.histories.iter().find(|x| x.id == h).map(|x| x.name.clone()).unwrap_or_default(),
         (Some(n), _, Some(l)) => l.nodes.iter().find(|x| x.id == n).map(|x| x.name.clone()).unwrap_or_default(),
-        _ => format!("{} — All Tracks", dev.name),
+        _ if dev.layout == Some(crate::export::usb::DeviceLayout::Mixed) && dev.lib.is_some() => format!("{} — Classic Device Library", dev.name),
+        _ if dev.lib.is_some() => format!("{} — All Tracks", dev.name),
+        _ => dev.name.clone(),
     };
     let tracks: Vec<crate::export::usb::DevTrack> = match &dev.lib {
         None => vec![],
@@ -1598,7 +1657,7 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let r = ui.max_rect();
     let bar = Rect::from_min_size(r.min, vec2(r.width(), 26.0));
     ui.painter().rect_filled(bar, 0.0, BG2);
-    ui.painter().text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, format!("{title} ({} Tracks)", tracks.len()), rb(TITLE_FONT), WHITE);
+    ui.painter().text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, if dev.lib.is_some() { format!("{title} ({} Tracks)", tracks.len()) } else { title }, rb(TITLE_FONT), WHITE);
     let space = match (dev.free, dev.total) {
         (Some(f), Some(t)) => format!("Available Space {:.1} GB / Total Space {:.1} GB", f as f64 / 1e9, t as f64 / 1e9),
         _ => String::new(),
@@ -1607,8 +1666,16 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
     let mut body = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(r.min.x, r.min.y + 27.0), r.max)));
     if dev.lib.is_none() {
         body.add_space(30.0);
+        let catalog = dev.catalog_label();
+        let blocker = dev.write_blocker.clone();
         body.vertical_centered(|ui| {
-            ui.label(RichText::new("This device has no DJ library yet.").color(DIM));
+            ui.strong(catalog);
+            ui.label(RichText::new(root).size(11.0).color(DIM));
+            if let Some(reason) = blocker {
+                ui.label(RichText::new(reason).color(CAUTION_TX));
+                return;
+            }
+            ui.label("Export a playlist or track to create a classic Device Library here.");
             ui.add_space(6.0);
             if ui.button("Export playlists to this device…").clicked() {
                 let r = root.to_string();
@@ -2029,7 +2096,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                     sa = sa.vertical_scroll_offset((y - (h - rh) * 0.5).max(0.0));
                 } else {
                     // Scroll only as far as needed to show the row.
-                    let id = ui.make_persistent_id("vscroll");
+                    let id = ui.make_persistent_id(egui::Id::new("vscroll"));
                     let cur = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.offset.y).unwrap_or(0.0);
                     let view_h = (h - rh).max(rh);
                     if y < cur {
@@ -2579,4 +2646,277 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
 
 pub fn track_menu_items(app: &mut App, ui: &mut Ui, sel: &[i64]) {
     crate::ui_library_ext::track_menu(app, ui, sel);
+}
+
+#[cfg(test)]
+mod collection_render_tests {
+    use super::*;
+
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx
+    }
+
+    fn input() -> egui::RawInput {
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 240.0))), ..Default::default() }
+    }
+
+    #[test]
+    fn tree_and_track_offsets_follow_the_browser_between_windows() {
+        let ctx = context();
+        let library = egui::ViewportId::from_hash_of("recordbox_library");
+        let frame = |viewport_id, set: Option<[f32; 5]>| {
+            let mut raw = egui::RawInput { viewport_id, ..input() };
+            raw.viewports.entry(library).or_default();
+            let mut offsets = [0.0; 5];
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |panel| {
+                    let mut browser = browser_ui(panel);
+                    let mut tree = egui::ScrollArea::vertical().max_height(45.0);
+                    if let Some(values) = set {
+                        tree = tree.vertical_scroll_offset(values[0]);
+                    }
+                    offsets[0] = tree.show(&mut browser, |ui| ui.set_min_height(4000.0)).state.offset.y;
+                    for (index, name) in [(1, "main_list"), (3, "sub_list")] {
+                        let mut pane = browser.new_child(egui::UiBuilder::new().id_salt(name));
+                        let mut horizontal = egui::ScrollArea::horizontal().id_salt("hscroll");
+                        let mut vertical = egui::ScrollArea::vertical().id_salt("vscroll").max_height(45.0);
+                        if let Some(values) = set {
+                            horizontal = horizontal.horizontal_scroll_offset(values[index]);
+                            vertical = vertical.vertical_scroll_offset(values[index + 1]);
+                        }
+                        let tracks = horizontal.show(&mut pane, |ui| {
+                            ui.set_min_width(1500.0);
+                            vertical.show(ui, |ui| ui.set_min_height(4000.0)).state.offset.y
+                        });
+                        offsets[index] = tracks.state.offset.x;
+                        offsets[index + 1] = tracks.inner;
+                    }
+                });
+            });
+            offsets
+        };
+        let first = [108.0, 126.0, 977.0, 48.0, 313.0];
+        let second = [212.0, 58.0, 512.0, 152.0, 863.0];
+        assert_eq!(frame(egui::ViewportId::ROOT, Some(first)), first);
+        assert_eq!(frame(library, None), first);
+        assert_eq!(frame(library, Some(second)), second);
+        assert_eq!(frame(egui::ViewportId::ROOT, None), second);
+    }
+
+    /// The former row path, including offscreen painting/text layout. Keep this
+    /// independent of collection_row's visibility shortcut for parity and CPU reports.
+    fn original_collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, count: Option<usize>, selected: bool, pitch: f32) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
+        paint_collection_row(ui, rect, &response, text, arrow, indent, count, selected);
+        response
+    }
+
+    #[test]
+    fn collection_leaf_culling_preserves_visible_shapes_layout_and_ids() {
+        let rows: Vec<_> = (0..200).map(|i| (if i == 0 { String::new() } else { format!("Artist {i:03}") }, i + 1)).collect();
+        for offset in [0.0, 19.0, 400.0, 3000.0] {
+            let ctx = context();
+            let render = |culled: bool| {
+                let mut tail = None;
+                let output = ctx.run(input(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().vertical_scroll_offset(offset).auto_shrink([false, false]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            collection_row(ui, "All", None, 0.0, None, false, 17.0);
+                            collection_row(ui, "Artist", Some(true), 0.0, None, false, 18.0);
+                            let view = View::Category { field: 2, value: "Artist 025".into() };
+                            if culled {
+                                collection_leaves(ui, 2, &rows, &view);
+                            } else {
+                                for (value, count) in &rows {
+                                    let selected = matches!(&view, View::Category { value: v, .. } if v == value);
+                                    original_collection_row(ui, if value.is_empty() { "(none)" } else { value }, None, 14.0, Some(*count), selected, 16.0);
+                                }
+                            }
+                            let response = collection_row(ui, "Album", Some(false), 0.0, None, false, 18.0);
+                            tail = Some((response.id, response.rect, ui.min_rect()));
+                        });
+                    });
+                });
+                let visible: Vec<_> = output.shapes.into_iter().filter(|s| s.shape.visual_bounding_rect().intersects(s.clip_rect)).collect();
+                (tail.unwrap(), visible)
+            };
+            // Settle the ScrollArea geometry and warm the font atlas before comparing.
+            render(false);
+            render(false);
+            let original = render(false);
+            let optimized = render(true);
+            assert_eq!(original.0, optimized.0, "layout and the following header's ID at scroll offset {offset}");
+            assert_eq!(original.1, optimized.1, "visible labels, counts, selection and clipping at offset {offset}");
+        }
+    }
+
+    #[test]
+    fn collection_offscreen_rows_keep_tab_order_and_keyboard_focus() {
+        let ctx = context();
+        let rows: Vec<_> = (0..200).map(|i| (format!("Artist {i:03}"), 1)).collect();
+        let frame = |optimized: bool, raw: egui::RawInput| {
+            let mut leaves = vec![];
+            let mut tail = None;
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        collection_row(ui, "All", None, 0.0, None, false, 17.0);
+                        collection_row(ui, "Artist", Some(true), 0.0, None, false, 18.0);
+                        if optimized {
+                            collection_leaves(ui, 2, &rows, &View::Collection);
+                        } else {
+                            for (value, count) in &rows {
+                                let response = original_collection_row(ui, value, None, 14.0, Some(*count), false, 16.0);
+                                leaves.push((response.id, ui.is_rect_visible(response.rect)));
+                            }
+                        }
+                        tail = Some(collection_row(ui, "Album", Some(false), 0.0, None, false, 18.0).id);
+                    });
+                });
+            });
+            std::hint::black_box(output);
+            (leaves, tail.unwrap())
+        };
+        let tab = |shift| {
+            let mut raw = input();
+            let modifiers = egui::Modifiers { shift, ..Default::default() };
+            raw.modifiers = modifiers;
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed, repeat: false, modifiers });
+            }
+            raw
+        };
+        frame(false, input());
+        let (leaves, tail) = frame(false, input());
+        let last_visible = leaves.iter().rposition(|(_, visible)| *visible).unwrap();
+        assert!(last_visible + 1 < leaves.len() && !leaves[last_visible + 1].1);
+
+        // Tab must enter the next leaf even when it lies just outside the clip.
+        ctx.memory_mut(|m| m.request_focus(leaves[last_visible].0));
+        frame(true, input());
+        frame(true, tab(false));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[last_visible + 1].0));
+
+        // Keep an already-focused hidden row alive over multiple ordinary frames.
+        ctx.memory_mut(|m| m.request_focus(leaves[149].0));
+        for _ in 0..3 { frame(true, input()); }
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[149].0));
+        frame(true, tab(true));
+        frame(true, input()); // egui applies Shift+Tab's previous target next frame.
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[148].0));
+
+        // The following category header remains adjacent to the final hidden leaf.
+        ctx.memory_mut(|m| m.request_focus(leaves[199].0));
+        frame(true, input());
+        frame(true, tab(false));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(tail));
+        frame(true, tab(true));
+        frame(true, input());
+        assert_eq!(ctx.memory(|m| m.focused()), Some(leaves[199].0));
+    }
+
+    fn original_groups(ui: &mut Ui, tracks: &[Track], view: &View) {
+        for (field, label) in ["Date Added", "Genre", "Artist", "Album"].iter().enumerate() {
+            let open = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new(("cat_open", field)))).unwrap_or(false);
+            original_collection_row(ui, label, Some(open), 0.0, None, false, 18.0);
+            if open {
+                let mut counts = std::collections::BTreeMap::<String, usize>::new();
+                for t in tracks {
+                    *counts.entry(App::category_value(t, field as u8)).or_default() += 1;
+                }
+                let mut rows: Vec<_> = counts.into_iter().collect();
+                if field == 0 { rows.reverse(); }
+                for (value, count) in rows {
+                    let selected = *view == View::Category { field: field as u8, value: value.clone() };
+                    let label = if value.is_empty() { "(none)".to_string() } else { value.clone() };
+                    original_collection_row(ui, &label, None, 14.0, Some(count), selected, 16.0);
+                }
+            }
+        }
+    }
+
+    /// Real egui groups under a normal ScrollArea clip, including tessellation. No GPU,
+    /// audio or timing pass/fail limit. `cargo test --release cpu_collection_categories_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cpu_collection_categories_cost() {
+        let tracks: Vec<_> = (0..100_000).map(|i| Track {
+            id: i,
+            artist: format!("Artist {i:06}"), album: format!("Album {:05}", i % 5000),
+            genre: format!("Genre {:03}", i % 200), date_added: format!("2025-{:02}-{:02}", i % 12 + 1, i % 28 + 1),
+            ..Default::default()
+        }).collect();
+        for (name, open) in [("collapsed", [false; 4]), ("artist", [false, false, true, false]), ("all", [true; 4])] {
+            for legacy in [true, false] {
+                let ctx = context();
+                for (field, value) in open.into_iter().enumerate() {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("cat_open", field)), value));
+                }
+                let mut cache = CollectionCategories::default();
+                let mut frame = || {
+                    let mut output = ctx.run(input(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                if legacy { original_collection_row(ui, "All", None, 0.0, None, true, 17.0); }
+                                else { collection_row(ui, "All", None, 0.0, None, true, 17.0); }
+                                if legacy { original_groups(ui, &tracks, &View::Collection); }
+                                else { collection_category_groups(ui, &mut cache, &tracks, &View::Collection); }
+                            });
+                        });
+                    });
+                    let shapes = std::mem::take(&mut output.shapes);
+                    std::hint::black_box(ctx.tessellate(shapes, output.pixels_per_point));
+                    std::hint::black_box(output);
+                };
+                let cold = std::time::Instant::now();
+                frame();
+                let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
+                frame();
+                let mut times = vec![];
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    for _ in 0..5 { frame(); }
+                    times.push(start.elapsed().as_secs_f64() * 1000.0 / 5.0);
+                }
+                times.sort_by(f64::total_cmp);
+                eprintln!("cpu_collection_categories_cost tracks={} groups={name} legacy={legacy} cold_ms={cold_ms:.3} warm_median_ms={:.3} frames_per_run=5 runs=3 includes=egui_widgets_and_tessellation", tracks.len(), times[1]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod master_volume_tests {
+    use super::*;
+
+    #[test]
+    fn the_header_dial_requires_input_and_accepts_the_mouse_wheel() {
+        let ctx = egui::Context::default();
+        let center = pos2(100.0, 14.0);
+        let mut level = 0.5;
+        let mut frame = |time, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 60.0))),
+                time: Some(time), events, ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(v) = master_volume_control(ui, center, level, false) { level = v; }
+                });
+            });
+            level
+        };
+        assert_eq!(frame(0.0, vec![]), 0.5);
+        assert_eq!(frame(5.0, vec![egui::Event::PointerMoved(center)]), 0.5);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Default::default() };
+        let changed = frame(5.1, vec![wheel.clone()]);
+        assert!((changed - 0.55).abs() < 0.001);
+        assert_eq!(frame(15.0, vec![]), changed);
+        assert_eq!(frame(16.0, vec![egui::Event::PointerMoved(pos2(180.0, 45.0)), wheel]), changed);
+    }
 }

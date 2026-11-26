@@ -11,13 +11,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn oracles() -> PathBuf {
-    dirs::home_dir().unwrap().join("Developer/rekordbox-rea/analysis/format-oracles")
+    let path = std::env::var_os("RECORDBOX_TEST_ORACLES")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .expect("set RECORDBOX_TEST_ORACLES to a rekordcrate checkout containing data/ before running ignored oracle tests");
+    assert!(path.is_dir(), "oracle directory does not exist: {}", path.display());
+    path
 }
-fn demo_pdb() -> Option<Vec<u8>> {
-    std::fs::read(oracles().join("Holzhaus__rekordcrate/data/complete_export/demo_tracks/PIONEER/rekordbox/export.pdb")).ok()
+fn oracle_bytes(relative: &str) -> Vec<u8> {
+    let path = oracles().join(relative);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("could not read oracle {}: {e}", path.display()))
 }
-fn num_rows_pdb() -> Option<Vec<u8>> {
-    std::fs::read(oracles().join("Holzhaus__rekordcrate/data/pdb/num_rows/export.pdb")).ok()
+fn demo_pdb() -> Vec<u8> {
+    oracle_bytes("data/complete_export/demo_tracks/PIONEER/rekordbox/export.pdb")
+}
+fn num_rows_pdb() -> Vec<u8> {
+    oracle_bytes("data/pdb/num_rows/export.pdb")
 }
 fn scratch(name: &str) -> PathBuf {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("export_test");
@@ -82,22 +91,51 @@ fn a1_over_long_strings_are_cut_instead_of_breaking_the_database() {
     let e = pdb::dstr_ucs2(&"😀".repeat(40_000));
     assert_eq!(u16::from_le_bytes([e[1], e[2]]) as usize, e.len());
     assert_eq!(pdb::read_dstr(&e, 0).chars().count(), 255);
-    // In the real export the longest string is a 255-character comment.
-    if let Some(real) = num_rows_pdb() {
-        let lib = parse_pdb(real).unwrap();
-        assert_eq!(lib.tracks.values().map(|t| t.comment.chars().count()).max(), Some(255));
-    }
+}
+
+#[test]
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a1_real_export_longest_comment_is_255_characters() {
+    let lib = parse_pdb(num_rows_pdb()).unwrap();
+    assert_eq!(lib.tracks.values().map(|t| t.comment.chars().count()).max(), Some(255));
 }
 
 #[test]
 fn a1_a_row_too_big_for_a_page_is_an_error_not_a_panic() {
-    let rows = vec![vec![0u8; pdb::MAX_ROW_BYTES + 1]];
-    let r = pdb::write_database(&[pdb::TableSpec { page_type: 0, rows, ..Default::default() }], 5, 3);
-    assert!(r.unwrap_err().to_string().contains("more than a database page holds"));
+    assert_eq!(pdb::MAX_ROW_BYTES, 4048);
+    // 4049 and 4050 fit before padding, but their aligned 4052 bytes overlap the directory.
+    for len in [4049, 4050, 4051, 4052, pdb::PAGE] {
+        let rows = vec![vec![0u8; len]];
+        let r = pdb::write_database(&[pdb::TableSpec { page_type: 0, rows, ..Default::default() }], 5, 3);
+        assert!(r.unwrap_err().to_string().contains("more than a database page holds"), "{len}");
+    }
     // The largest row that fits is written and read back.
-    let rows = vec![vec![7u8; pdb::MAX_ROW_BYTES]];
-    let db = Database::parse(pdb::write_database(&[pdb::TableSpec { page_type: 0, rows, ..Default::default() }], 5, 3).unwrap()).unwrap();
-    assert_eq!(db.rows(0).len(), 1);
+    for len in [4045, 4046, 4047, 4048] {
+        let rows = vec![vec![7u8; len]];
+        let db = Database::parse(pdb::write_database(&[pdb::TableSpec { page_type: 0, rows, ..Default::default() }], 5, 3).unwrap()).unwrap();
+        let rows = db.rows(0);
+        assert_eq!(rows.len(), 1);
+        let start = rows[0].0 + rows[0].1;
+        assert_eq!(&db.bytes[start..start + len], vec![7u8; len]);
+    }
+}
+
+#[test]
+fn a1_aligned_rows_paginate_at_row_group_boundaries_without_overlap() {
+    // Crossing 16 rows adds another row-directory group as well as alignment padding.
+    for len in [117, 245, 249] {
+        for count in [15, 16, 17, 32, 33] {
+            let rows = (0..count).map(|i| vec![i as u8 + 1; len]).collect();
+            let bytes = pdb::write_database(&[pdb::TableSpec { page_type: 0, rows, ..Default::default() }], 5, 3).unwrap();
+            let db = Database::parse(bytes).unwrap();
+            let rows = db.rows(0);
+            assert_eq!(rows.len(), count);
+            for (i, &(heap, offset)) in rows.iter().enumerate() {
+                let start = heap + offset;
+                assert_eq!(&db.bytes[start..start + len], vec![i as u8 + 1; len]);
+            }
+        }
+    }
 }
 
 #[test]
@@ -158,8 +196,9 @@ fn all_rows(db: &Database, table: u32) -> Vec<(Vec<u8>, bool)> {
 }
 
 #[test]
-fn a2_rewrite_keeps_unmanaged_tables_and_history_rows() {
-    for bytes in [demo_pdb(), num_rows_pdb()].into_iter().flatten() {
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a2_rewrite_keeps_unmanaged_tables_and_history_rows() {
+    for bytes in [demo_pdb(), num_rows_pdb()] {
         let orig = Database::parse(bytes.clone()).unwrap();
         let mut lib = parse_pdb(bytes).unwrap();
         // No real export at hand has rows in tables 9, 10, 14 or 15, so pages are planted there
@@ -219,9 +258,9 @@ fn k_rows_present(_table: u32) -> usize {
 }
 
 #[test]
-fn a2_device_label_of_a_real_export_is_read_and_kept() {
-    let Some(bytes) = num_rows_pdb() else { return };
-    let lib = parse_pdb(bytes).unwrap();
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a2_device_label_of_a_real_export_is_read_and_kept() {
+    let lib = parse_pdb(num_rows_pdb()).unwrap();
     assert_eq!(lib.device_name, "ZAKS BACKUP");
     let back = parse_pdb(build_export_pdb(&lib)).unwrap();
     assert_eq!(back.device_name, "ZAKS BACKUP");
@@ -367,7 +406,12 @@ fn a5_isrc_strings_round_trip_byte_for_byte() {
     assert_eq!(pdb::dstr_isrc(""), vec![0x03]);
     // Ordinary UTF-16 text is not mistaken for an ISRC.
     assert!(!pdb::is_isrc_form(&pdb::dstr_ucs2("Ünïcødé"), 0));
-    let Some(bytes) = num_rows_pdb() else { return };
+}
+
+#[test]
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a5_real_isrc_and_string_slots_round_trip_byte_for_byte() {
+    let bytes = num_rows_pdb();
     let orig = Database::parse(bytes.clone()).unwrap();
     let lib = parse_pdb(bytes).unwrap();
     let ours = Database::parse(build_export_pdb(&lib)).unwrap();
@@ -401,22 +445,31 @@ fn a5_isrc_strings_round_trip_byte_for_byte() {
 
 fn real_anlz_bases() -> Vec<PathBuf> {
     let mut v = vec![];
-    let demo = oracles().join("Holzhaus__rekordcrate/data/complete_export/demo_tracks/PIONEER/USBANLZ");
+    let demo = oracles().join("data/complete_export/demo_tracks/PIONEER/USBANLZ");
     for p in ["P016/0000875E/ANLZ0000", "P053/0001D21F/ANLZ0000"] {
         v.push(demo.join(p));
     }
-    let pairs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../oracle/anlzpairs.tsv");
-    for l in std::fs::read_to_string(pairs).unwrap_or_default().lines() {
-        if let Some((_, base)) = l.split_once('\t') {
-            v.push(PathBuf::from(base));
+    if let Some(pairs) = std::env::var_os("RECORDBOX_TEST_ANLZ_PAIRS") {
+        let pairs = PathBuf::from(pairs);
+        let text = std::fs::read_to_string(&pairs)
+            .unwrap_or_else(|e| panic!("could not read oracle pairs {}: {e}", pairs.display()));
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let (_, base) = line.split_once('\t').expect("oracle pairs must contain audio<TAB>analysis-base");
+            assert!(!base.is_empty(), "oracle analysis base must not be empty");
+            let base = PathBuf::from(base);
+            v.push(if base.is_absolute() { base } else { pairs.parent().unwrap_or(Path::new(".")).join(base) });
         }
     }
-    v.retain(|b| b.with_extension("EXT").is_file() && b.with_extension("DAT").is_file());
+    for base in &v {
+        assert!(base.with_extension("EXT").is_file() && base.with_extension("DAT").is_file(),
+            "oracle DAT/EXT pair is missing: {}", base.display());
+    }
     v
 }
 
 #[test]
-fn a6_real_pqt2_sections_are_regenerated_from_their_pqtz() {
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a6_real_pqt2_sections_are_regenerated_from_their_pqtz() {
     let mut checked = 0;
     for base in real_anlz_bases() {
         let dat = anlz::read_sections(&base.with_extension("DAT"));
@@ -433,9 +486,7 @@ fn a6_real_pqt2_sections_are_regenerated_from_their_pqtz() {
         assert!(us.windows(2).all(|w| ((w[1] - w[0]) as f64 - beat).abs() < 1000.0));
         checked += 1;
     }
-    if demo_pdb().is_some() {
-        assert!(checked >= 2, "only {checked} real files checked");
-    }
+    assert!(checked >= 2, "only {checked} real files checked");
     eprintln!("PQT2 regenerated byte for byte for {checked} real files");
 }
 
@@ -548,26 +599,29 @@ fn a8_track_row_values() {
     tr.key = -1;
     tr.key_text.clear();
     assert_eq!(row_key_name(&tr), "");
-    // Real exports hold the stored spellings side by side, and date strings of 10 characters
-    // or none.
-    if let Some(bytes) = num_rows_pdb() {
-        let lib = parse_pdb(bytes).unwrap();
-        let keys: std::collections::HashSet<&str> = lib.tracks.values().map(|t| t.key_name.as_str()).collect();
-        for k in ["Emin", "Dm", "7m", "2d"] {
-            assert!(keys.contains(k), "{k}");
-        }
-        assert!(lib.tracks.values().all(|t| t.release_date.is_empty() || normalize_date(&t.release_date) == t.release_date));
-        assert!(lib.tracks.values().all(|t| normalize_date(&t.date_added) == t.date_added));
-        // Newest fixtures: slot 3 is "1" in all but one row, slot 6 is "ON" in every row.
-        assert!(lib.tracks.values().filter(|t| t.raw_strings[3] == "1").count() >= lib.tracks.len() - 1);
-        assert!(lib.tracks.values().all(|t| t.raw_strings[6] == "ON"));
-    }
     // A new row gets those defaults.
     let mut lib = DeviceLibrary::default();
     lib.tracks.insert(1, DevTrack { id: 1, title: "x".into(), file_path: "/Contents/a/b/x.mp3".into(), ..Default::default() });
     let back = parse_pdb(build_export_pdb(&lib)).unwrap();
     let s = &back.tracks[&1].raw_strings;
     assert_eq!((s[2].as_str(), s[3].as_str(), s[6].as_str()), ("1", "1", "ON"));
+}
+
+#[test]
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a8_real_track_key_date_and_string_values() {
+    // Real exports hold the stored spellings side by side, and date strings of 10 characters
+    // or none.
+    let lib = parse_pdb(num_rows_pdb()).unwrap();
+    let keys: std::collections::HashSet<&str> = lib.tracks.values().map(|t| t.key_name.as_str()).collect();
+    for k in ["Emin", "Dm", "7m", "2d"] {
+        assert!(keys.contains(k), "{k}");
+    }
+    assert!(lib.tracks.values().all(|t| t.release_date.is_empty() || normalize_date(&t.release_date) == t.release_date));
+    assert!(lib.tracks.values().all(|t| normalize_date(&t.date_added) == t.date_added));
+    // Newest fixtures: slot 3 is "1" in all but one row, slot 6 is "ON" in every row.
+    assert!(lib.tracks.values().filter(|t| t.raw_strings[3] == "1").count() >= lib.tracks.len() - 1);
+    assert!(lib.tracks.values().all(|t| t.raw_strings[6] == "ON"));
 }
 
 // ---- A9 ------------------------------------------------------------------------------------
@@ -713,16 +767,6 @@ fn a13_identical_artwork_is_shared_and_folders_roll_over() {
     assert_eq!(artwork_rel(19), "/PIONEER/Artwork/00001/a19.jpg");
     assert_eq!(artwork_rel(20), "/PIONEER/Artwork/00002/a20.jpg");
     assert_eq!(artwork_rel(2210), "/PIONEER/Artwork/00111/a2210.jpg");
-    // Every artwork path of the real 2,178-picture export follows the rule.
-    if let Some(bytes) = num_rows_pdb() {
-        let db = Database::parse(bytes).unwrap();
-        let rows = db.rows(13);
-        assert!(rows.len() > 2000);
-        for (h, o) in rows {
-            let r = db.row_bytes(h, o);
-            assert_eq!(pdb::read_dstr(r, 4), artwork_rel(pdb::rd_u32(r, 0)));
-        }
-    }
     let root = scratch("artwork");
     let mut tracks = demo_tracks(&src_dir(), 3);
     let (one, two) = (src_dir().join("a13-one.png"), src_dir().join("a13-two.png"));
@@ -747,4 +791,17 @@ fn a13_identical_artwork_is_shared_and_folders_roll_over() {
     export(request(&root, &tracks, vec![playlist(1, "Set", vec![1, 2, 3])]));
     assert_eq!(files_under(&root, "PIONEER/Artwork").len(), 4);
     assert_eq!(read_device(&root).unwrap().tracks.values().map(|t| t.artwork_path.clone()).collect::<Vec<_>>(), art);
+}
+
+#[test]
+#[ignore = "requires RECORDBOX_TEST_ORACLES fixtures"]
+fn oracle_a13_real_export_artwork_paths_follow_folder_rule() {
+    // Every artwork path of the real 2,178-picture export follows the rule.
+    let db = Database::parse(num_rows_pdb()).unwrap();
+    let rows = db.rows(13);
+    assert!(rows.len() > 2000);
+    for (h, o) in rows {
+        let r = db.row_bytes(h, o);
+        assert_eq!(pdb::read_dstr(r, 4), artwork_rel(pdb::rd_u32(r, 0)));
+    }
 }

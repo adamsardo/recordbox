@@ -6,9 +6,16 @@
 //! rekordbox's own (vendor) models are never used.
 
 pub mod htdemucs;
+mod backend;
+#[cfg(feature = "directml")]
+mod directml;
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+mod vulkan;
+mod compare;
+pub use backend::{backend_hold, backend_label, force_cpu, gpu_active, radeon_hold, status as backend_status};
+pub use compare::compare_track;
 
 use anyhow::{anyhow, Context, Result};
-use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -21,7 +28,7 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: f64,
     pub apple_silicon: bool,
-    /// A Metal GPU Candle can use.
+    /// A GPU is available for STEMS. DirectML and Vulkan detection is passive until first use.
     pub gpu: bool,
 }
 
@@ -31,35 +38,72 @@ fn sysctl(name: &str) -> Option<String> {
 }
 
 pub fn assess() -> Hardware {
+    system_hardware(backend_status().0)
+}
+
+fn system_hardware(gpu: bool) -> Hardware {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let (cpu, ram_gb) = if cfg!(target_os = "macos") {
         (sysctl("machdep.cpu.brand_string").unwrap_or_default(), sysctl("hw.memsize").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1e9)
+    } else if cfg!(windows) {
+        (String::new(), windows_ram_gb())
     } else {
         let mem = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("MemTotal")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())).unwrap_or(0.0);
-        (String::new(), mem / 1e6)
+        (String::new(), mem * 1024.0 / 1e9)
     };
     let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
-    let gpu = device().is_metal();
     Hardware { cpu, cores, ram_gb, apple_silicon, gpu }
 }
 
-fn metal_device() -> Option<Device> {
-    #[cfg(target_os = "macos")]
+/// Passive support report. In particular, do not call assess()/backend_status() here:
+/// a CUDA or Metal build would initialize its compute backend.
+pub fn status_report() -> String {
+    let hw = system_hardware(false);
+    let build = if cfg!(all(windows, feature = "directml")) { "Windows DirectML" }
+        else if cfg!(target_os = "macos") { "Apple Metal" }
+        else if cfg!(all(target_os = "linux", feature = "vulkan")) { "experimental Linux Vulkan + CPU" }
+        else if cfg!(feature = "cuda12") { "CUDA 12" }
+        else { "standard CPU" };
+    let ram = if hw.ram_gb > 0.0 { format!("{:.1} GB", hw.ram_gb) } else { "unknown".into() };
+    let mut lines = vec![
+        format!("Recordbox {} · {build} build", env!("CARGO_PKG_VERSION")),
+        format!("System RAM: {ram}"),
+    ];
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    lines.push(backend::vulkan_detection().1.to_owned());
+    #[cfg(all(windows, feature = "directml"))]
     {
-        Device::new_metal(0).ok()
+        lines.push(directml::adapter_status().unwrap_or_else(|e| format!("DXGI adapter status: {e:#}")));
+        if let Ok(executable) = std::env::current_exe() {
+            let missing: Vec<_> = ["onnxruntime.dll", "onnxruntime_providers_shared.dll", "directml.dll"]
+                .into_iter().filter(|dll| !executable.with_file_name(dll).is_file()).collect();
+            lines.push(if missing.is_empty() { "DirectML runtime files: present".into() }
+                else { format!("Missing packaged runtime files: {}", missing.join(", ")) });
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
+    let models = crate::db::data_dir_for_inspection().join("models");
+    let recommended = choose(&hw);
+    for model in &CATALOG {
+        let count = model.files.iter().filter(|file|
+            checkpoint_ready(&models.join(file), model.checkpoint_bytes).unwrap_or(false)).count();
+        let recommendation = if model.id == recommended.id { " (recommended)" } else { "" };
+        lines.push(format!("{}{recommendation}: {count}/{} checkpoint files at expected size", model.name, model.files.len()));
     }
+    lines.join("\n")
 }
 
-/// The device a model runs on: the Metal GPU when there is one, otherwise the CPU. Made
-/// once and kept, so loaded models and compiled GPU kernels stay usable between tracks.
-pub fn device() -> Device {
-    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
-    DEVICE.get_or_init(|| metal_device().unwrap_or(Device::Cpu)).clone()
+#[cfg(windows)]
+fn windows_ram_gb() -> f64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // The API writes to this correctly sized structure for the duration of the call.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 { 0.0 } else { status.ullTotalPhys as f64 / 1e9 }
 }
+
+#[cfg(not(windows))]
+fn windows_ram_gb() -> f64 { 0.0 }
+
+pub use backend::device;
 
 /// Share of each model segment that overlaps the next. Upstream's default; see
 /// checks/stem-speed-study.md for what lower values cost and save.
@@ -68,24 +112,111 @@ pub const OVERLAP: f64 = 0.25;
 /// segments; against known stems the separation quality is the same within 0.1 dB.
 pub const ANALYSIS_OVERLAP: f64 = 0.1;
 
-/// Loaded models stay in memory (about 170 MB each on the GPU) so that a second track, vocal
-/// detection or key analysis does not read and upload the checkpoint again.
-fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
-    static LOADED: std::sync::Mutex<Vec<(String, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+/// A provider failure can be retried on the CPU. Model, decoder and cancellation errors stay distinct.
+#[derive(Debug)]
+pub(crate) struct DirectMlFailure(pub(super) String);
+impl std::fmt::Display for DirectMlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for DirectMlFailure {}
+
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+#[derive(Debug)]
+pub(crate) struct VulkanFailure(pub(super) String);
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+impl std::fmt::Display for VulkanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+impl std::error::Error for VulkanFailure {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeparationDevice { Selected, GpuOnly, Cpu }
+
+impl SeparationDevice {
+    fn check_hold(self) -> Result<()> {
+        if self == Self::Cpu { return Ok(()); }
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        if let Some(reason) = backend::vulkan_hold() { return Err(VulkanFailure(reason.to_owned()).into()); }
+        if let Some(reason) = radeon_hold() { return Err(DirectMlFailure(reason.to_owned()).into()); }
+        Ok(())
+    }
+
+    fn device(self) -> Result<candle_core::Device> {
+        if self == Self::Cpu { return Ok(candle_core::Device::Cpu); }
+        let selected = device();
+        self.check_hold()?;
+        if self == Self::GpuOnly && !backend::gpu_active() {
+            #[cfg(all(windows, feature = "directml"))]
+            return Err(DirectMlFailure(format!("Checking the DirectML device\n{}", backend_label())).into());
+            #[cfg(all(target_os = "linux", feature = "vulkan"))]
+            return Err(VulkanFailure(format!("Checking the Vulkan device\n{}", backend_label())).into());
+            #[cfg(not(any(all(windows, feature = "directml"), all(target_os = "linux", feature = "vulkan"))))]
+            anyhow::bail!("GPU separation unavailable: {}", backend_label());
+        }
+        Ok(selected)
+    }
+
+    fn load(self, path: &Path) -> Result<htdemucs::Graph> {
+        match self {
+            Self::Selected | Self::GpuOnly => htdemucs::Graph::load_selected(path),
+            Self::Cpu => Ok(htdemucs::Graph::load(path, &candle_core::Device::Cpu)?),
+        }
+    }
+
+    fn reserve_gpu(self, progress: &mut dyn FnMut(f32) -> bool) -> Result<Option<parking_lot::MutexGuard<'static, ()>>> {
+        if self == Self::Cpu { return Ok(None); }
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let serialize = backend::vulkan_device().is_some();
+        #[cfg(not(all(target_os = "linux", feature = "vulkan")))]
+        let serialize = backend::gpu_uses_shared_memory();
+        if serialize {
+            let guard = wait_for_shared_gpu(&SHARED_GPU_JOB, progress)?;
+            self.check_hold()?;
+            Ok(Some(guard))
+        } else { Ok(None) }
+    }
+}
+
+// A deck, vocal detection and key analysis can request different checkpoints at the same time.
+static SHARED_GPU_JOB: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn wait_for_shared_gpu<'a>(slot: &'a parking_lot::Mutex<()>, progress: &mut dyn FnMut(f32) -> bool) -> Result<parking_lot::MutexGuard<'a, ()>> {
+    loop {
+        let available = slot.try_lock_for(std::time::Duration::from_millis(100));
+        if !progress(0.0) { anyhow::bail!("stopped"); }
+        if let Some(guard) = available {
+            return Ok(guard);
+        }
+    }
+}
+
+/// Shared-memory DirectML models live for one job. Other backends reuse recent checkpoints.
+fn graph(file: &str, execution: SeparationDevice) -> Result<std::sync::Arc<htdemucs::Graph>> {
+    static LOADED: std::sync::Mutex<Vec<(String, SeparationDevice, std::sync::Arc<htdemucs::Graph>)>> = std::sync::Mutex::new(Vec::new());
+    // A preceding job may have lost the GPU while this job waited for its turn.
+    execution.check_hold()?;
+    let execution = if execution == SeparationDevice::GpuOnly { SeparationDevice::Selected } else { execution };
+    let file_path = models_dir().join(file);
+    let load = || execution.load(&file_path).map(std::sync::Arc::new).with_context(|| format!("Loading {file}"));
+    // Let the last owner release the compiled model, command queue and driver allocations on UMA.
+    if execution == SeparationDevice::Selected && backend::gpu_uses_shared_memory() {
+        return load();
+    }
     let mut loaded = LOADED.lock().map_err(|_| anyhow!("model cache is unusable"))?;
-    if let Some(i) = loaded.iter().position(|(f, _)| f == file) {
+    if let Some(i) = loaded.iter().position(|(f, mode, _)| f == file && *mode == execution) {
         // Most recently used last.
         let entry = loaded.remove(i);
         loaded.push(entry);
     } else {
-        let g = htdemucs::Graph::load(&models_dir().join(file), &device()).map_err(|e| anyhow!("loading {file}: {e}"))?;
-        // Room for the four fine-tuned specialists.
-        while loaded.len() >= 4 {
+        // A compiled DirectML session also holds intermediate buffers in shared GPU memory.
+        let capacity = if execution == SeparationDevice::Selected && backend::uses_directml() { 1 } else { 4 };
+        while loaded.len() >= capacity {
             loaded.remove(0);
         }
-        loaded.push((file.to_string(), std::sync::Arc::new(g)));
+        loaded.push((file.to_string(), execution, load()?));
     }
-    Ok(loaded.last().unwrap().1.clone())
+    Ok(loaded.last().unwrap().2.clone())
 }
 
 /// Planar stereo (left samples, then right) at 44.1 kHz from interleaved stereo at `sr`.
@@ -116,6 +247,8 @@ pub struct ModelSpec {
     pub files: &'static [&'static str],
     /// true: one specialised model per source (file i provides source i).
     pub per_source: bool,
+    /// Byte length of each published checkpoint in this model.
+    pub checkpoint_bytes: u64,
     pub min_ram_gb: f64,
     pub needs_gpu: bool,
     pub about: &'static str,
@@ -136,6 +269,7 @@ pub const CATALOG: [ModelSpec; 2] = [
         name: "HTDemucs fine-tuned",
         files: &["f7e0c4bc-ba3fe64a.th", "d12395a8-e57c48e6.th", "92cfc3b6-ef3bcb9c.th", "04573f0d-f3cf25b2.th"],
         per_source: true,
+        checkpoint_bytes: 84_141_271,
         min_ram_gb: 15.0,
         needs_gpu: true,
         about: "Four models, each fine-tuned for one stem: a little better on benchmark music, 4× the time.",
@@ -154,10 +288,11 @@ pub const CATALOG: [ModelSpec; 2] = [
         name: "HTDemucs",
         files: &["955717e8-8726e21a.th"],
         per_source: false,
+        checkpoint_bytes: 84_141_911,
         min_ram_gb: 4.0,
         needs_gpu: false,
         about: "One model for all four stems: recommended. Four times faster, and the parts add back up to the track more exactly.",
-        sha256: &[None],
+        sha256: &[Some("8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4")],
         licence: "MIT",
         source: "facebookresearch/demucs (Hybrid Transformer Demucs)",
     },
@@ -195,7 +330,19 @@ pub fn stems_dir() -> PathBuf {
 }
 
 pub fn model_ready(m: &ModelSpec) -> bool {
-    m.files.iter().all(|f| models_dir().join(f).metadata().map(|x| x.len() > 1_000_000).unwrap_or(false))
+    let dir = models_dir();
+    m.files.iter().all(|f| checkpoint_ready(&dir.join(f), m.checkpoint_bytes).unwrap_or(false))
+}
+
+fn checkpoint_ready(path: &Path, expected_bytes: u64) -> Result<bool> {
+    match path.metadata() {
+        Ok(info) => {
+            anyhow::ensure!(info.is_file(), "Expected a model file at {}", path.display());
+            Ok(info.len() == expected_bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Checking {}", path.display())),
+    }
 }
 
 fn sha_prefix_ok(path: &Path, file_name: &str) -> Result<bool> {
@@ -221,44 +368,48 @@ fn sha_hex(path: &Path) -> Result<String> {
 /// Download any missing checkpoint of `m` into the models folder. Each file is written to a
 /// temporary name, checked against its SHA-256 prefix and only then renamed into place.
 pub fn download(m: &ModelSpec, progress: &mut dyn FnMut(u64, u64, &str), cancel: &std::sync::atomic::AtomicBool) -> Result<()> {
+    download_to(m, &models_dir(), progress, cancel, |file| {
+        let url = format!("{ROOT_URL}{file}");
+        ureq::get(&url).call().with_context(|| format!("downloading {url}"))
+    })
+}
+
+fn download_to(m: &ModelSpec, dir: &Path, progress: &mut dyn FnMut(u64, u64, &str),
+               cancel: &std::sync::atomic::AtomicBool, fetch: impl Fn(&str) -> Result<ureq::Response>) -> Result<()> {
     for (k, f) in m.files.iter().enumerate() {
-        let dest = models_dir().join(f);
-        if dest.exists() {
+        let dest = dir.join(f);
+        if checkpoint_ready(&dest, m.checkpoint_bytes)? {
             continue;
         }
-        let url = format!("{ROOT_URL}{f}");
-        let resp = ureq::get(&url).call().with_context(|| format!("downloading {url}"))?;
-        let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let tmp = dest.with_extension("part");
-        let mut out = std::fs::File::create(&tmp)?;
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { anyhow::bail!("stopped"); }
+        let resp = fetch(f)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         let mut reader = resp.into_reader();
         let mut buf = vec![0u8; 1 << 16];
         let mut done = 0u64;
         loop {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                drop(out);
-                let _ = std::fs::remove_file(&tmp);
                 return Err(anyhow!("stopped"));
             }
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            out.write_all(&buf[..n])?;
             done += n as u64;
-            progress(done, total, f);
+            anyhow::ensure!(done <= m.checkpoint_bytes, "{f} exceeds its expected model size");
+            tmp.write_all(&buf[..n])?;
+            progress(done, m.checkpoint_bytes, f);
         }
-        out.sync_all()?;
-        drop(out);
+        anyhow::ensure!(done == m.checkpoint_bytes, "Incomplete model {f}: received {done} of {} bytes", m.checkpoint_bytes);
+        tmp.as_file().sync_all()?;
         let ok = match m.sha256.get(k).copied().flatten() {
-            Some(full) => sha_hex(&tmp)? == full,
-            None => sha_prefix_ok(&tmp, f)?,
+            Some(full) => sha_hex(tmp.path())? == full,
+            None => sha_prefix_ok(tmp.path(), f)?,
         };
         if !ok {
-            let _ = std::fs::remove_file(&tmp);
             return Err(anyhow!("{f} did not match its published checksum; it was not used"));
         }
-        std::fs::rename(&tmp, &dest)?;
+        tmp.persist(&dest).with_context(|| format!("Installing model {f}"))?;
     }
     Ok(())
 }
@@ -299,22 +450,30 @@ fn resample_to_44k(samples: &[f32], sr: u32) -> Vec<f32> {
 
 /// Separate a decoded track with model `m` (which must be downloaded).
 pub fn separate(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Stems> {
-    let device = device();
+    separate_with_device(m, samples, sr, progress, SeparationDevice::Selected)
+}
+
+pub fn separate_with_device(m: &ModelSpec, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool, execution: SeparationDevice) -> Result<Stems> {
+    if !progress(0.0) { anyhow::bail!("stopped"); }
+    let device = execution.device()?;
+    let _job = execution.reserve_gpu(progress)?;
     let (planar, len) = planar_44k(samples, sr);
     let n_models = m.files.len();
     let run = |progress: &mut dyn FnMut(f32) -> bool| -> Result<Vec<f32>> {
         if !m.per_source {
-            let g = graph(m.files[0])?;
+            if !progress(0.0) { anyhow::bail!("stopped"); }
+            let g = graph(m.files[0], execution)?;
             let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb).map_err(|e| anyhow!("{e}"));
+            return htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut cb);
         }
         // Model k is the specialist for source k (upstream's weights matrix is the identity),
         // so only that source is taken from it.
         let mut out = Vec::with_capacity(8 * len);
         for (k, f) in m.files.iter().enumerate() {
-            let g = graph(f)?;
+            if !progress(k as f32 / n_models as f32) { anyhow::bail!("stopped"); }
+            let g = graph(f, execution)?;
             let mut cb = |done: usize, total: usize| progress((k as f32 + done as f32 / total as f32) / n_models as f32);
-            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb).map_err(|e| anyhow!("{e}"))?);
+            out.extend(htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: OVERLAP, source: Some(k) }, &mut cb)?);
         }
         Ok(out)
     };
@@ -332,13 +491,15 @@ pub fn separate_vocals(samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -
 /// One source (0 drums, 1 bass, 2 other, 3 vocals) as mono 44.1 kHz, running a single model:
 /// that source's specialist of HTDemucs fine-tuned when downloaded, else HTDemucs.
 pub fn separate_one(source: usize, samples: &[f32], sr: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<Vec<f32>> {
+    if !progress(0.0) { anyhow::bail!("stopped"); }
     let ft = &CATALOG[0];
     let file = if model_ready(ft) { ft.files[source] } else { CATALOG[1].files[0] };
-    let device = device();
+    let device = SeparationDevice::Selected.device()?;
+    let _job = SeparationDevice::Selected.reserve_gpu(progress)?;
     let (planar, len) = planar_44k(samples, sr);
-    let g = graph(file)?;
+    let g = graph(file, SeparationDevice::Selected)?;
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
-    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb).map_err(|e| anyhow!("{e}"));
+    let y = htdemucs::separate(&g, &device, &planar, len, &htdemucs::Options { overlap: ANALYSIS_OVERLAP, source: Some(source) }, &mut cb);
     htdemucs::release_scratch();
     let y = y?;
     Ok(y[..len].iter().zip(&y[len..]).map(|(a, b)| 0.5 * (a + b)).collect())
@@ -497,10 +658,10 @@ const MAGIC: &[u8; 8] = b"PDSTEMS1";
 
 /// Stored as 16-bit PCM (planar) to keep the cache small.
 pub fn save(path: &Path, s: &Stems) -> Result<()> {
-    let tmp = path.with_extension("part");
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    f.write_all(MAGIC)?;
-    f.write_all(&(s.len as u64).to_le_bytes())?;
+    anyhow::ensure!(s.len.checked_mul(8) == Some(s.data.len()), "incomplete separated stems");
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("missing STEMS cache directory")?)?;
+    tmp.write_all(MAGIC)?;
+    tmp.write_all(&(s.len as u64).to_le_bytes())?;
     // Converted a block at a time: one write per sample made this the slowest step after the
     // model itself.
     let mut block = Vec::with_capacity(2 << 16);
@@ -509,44 +670,86 @@ pub fn save(path: &Path, s: &Stems) -> Result<()> {
         for v in chunk {
             block.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
         }
-        f.write_all(&block)?;
+        tmp.write_all(&block)?;
     }
     // On disk before it gets its final name, so a crash can't leave a short cache file that
     // looks complete.
-    let file = f.into_inner().map_err(|e| anyhow!("{e}"))?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
     Ok(())
 }
 
 pub fn load(path: &Path) -> Result<Stems> {
-    let b = std::fs::read(path)?;
-    if b.len() < 16 || &b[..8] != MAGIC {
-        return Err(anyhow!("not a stems cache file"));
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0; 16];
+    file.read_exact(&mut header).context("reading the STEMS cache header")?;
+    anyhow::ensure!(&header[..8] == MAGIC, "not a stems cache file");
+    let frames = u64::from_le_bytes(header[8..].try_into()?);
+    let bytes = file.metadata()?.len().checked_sub(16).context("stems cache file is incomplete")?;
+    anyhow::ensure!(frames.checked_mul(16) == Some(bytes), "stems cache file is incomplete");
+    let len = usize::try_from(frames)?;
+    let samples = usize::try_from(bytes / 2)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(samples).context("allocating memory for saved stems")?;
+    // Decode directly into the playback allocation. A four-minute track has about 169 MB of PCM.
+    let mut block = vec![0; 128 * 1024];
+    while data.len() < samples {
+        let count = (samples - data.len()).min(block.len() / 2);
+        let part = &mut block[..count * 2];
+        file.read_exact(part)?;
+        data.extend(part.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0));
     }
-    let len = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
-    let body = &b[16..];
-    if body.len() != 8 * len * 2 {
-        return Err(anyhow!("stems cache file is incomplete"));
+    // Mounted volumes can suppress automatic access times. Restoring audio still works on
+    // read-only media even when the cache cannot record this use.
+    let accessed = std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now());
+    #[cfg(not(windows))]
+    let _ = file.set_times(accessed);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Windows requires FILE_WRITE_ATTRIBUTES even when only updating the access time.
+        if let Ok(attrs) = std::fs::OpenOptions::new().access_mode(0x100).open(path) {
+            let _ = attrs.set_times(accessed);
+        }
     }
-    let data = body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0).collect();
     Ok(Stems { len, data })
 }
 
-/// Total size of the stems cache in bytes.
-pub fn cache_size() -> u64 {
-    std::fs::read_dir(stems_dir()).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0)
+// Match only files produced by cache_path. Other files in a shared directory and
+// temporary files from an active separation must survive both trimming and clearing.
+fn saved_entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some((key, model)) = name.to_str().and_then(|n| n.strip_suffix(".stems")).and_then(|n| n.split_once('-')) else { continue };
+        if key.len() == 24 && key.bytes().all(|b| b.is_ascii_hexdigit())
+            && spec(model).is_some() && entry.file_type()?.is_file() {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
-/// Keep the cache within `limit` bytes by removing the stems used longest ago (never `keep`,
-/// the file just written). Separating on every load would otherwise fill the disk: a track's
-/// stems take about 250 MB.
-pub fn trim_cache(limit: u64, keep: &Path) {
-    let Ok(rd) = std::fs::read_dir(stems_dir()) else { return };
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
-        .flatten()
-        .filter(|e| e.path().extension().map(|x| x == "stems").unwrap_or(false))
+pub fn cache_size() -> std::io::Result<u64> {
+    let mut bytes = 0;
+    for entry in saved_entries(&stems_dir())? {
+        match entry.metadata() {
+            Ok(metadata) => bytes += metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(bytes)
+}
+
+/// Apply the current retention policy after a successful save. Always keep that result,
+/// including when a single track exceeds the whole budget.
+pub fn trim_cache(keep: &Path, limit: impl Fn() -> Option<u64>) {
+    if limit().is_none() { return; }
+    let Some(dir) = keep.parent() else { return };
+    let Ok(entries) = saved_entries(dir) else { return };
+    let mut files: Vec<_> = entries.into_iter()
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((m.accessed().or_else(|_| m.modified()).ok()?, m.len(), e.path()))
@@ -555,6 +758,7 @@ pub fn trim_cache(limit: u64, keep: &Path) {
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     files.sort();
     for (_, len, path) in files {
+        let Some(limit) = limit() else { break };
         if total <= limit {
             break;
         }
@@ -564,17 +768,102 @@ pub fn trim_cache(limit: u64, keep: &Path) {
     }
 }
 
-pub fn clear_cache() {
-    if let Ok(rd) = std::fs::read_dir(stems_dir()) {
-        for e in rd.flatten() {
-            let _ = std::fs::remove_file(e.path());
+pub fn clear_cache() -> Result<()> {
+    clear_saved_entries(&stems_dir())
+}
+
+fn clear_saved_entries(dir: &Path) -> Result<()> {
+    for entry in saved_entries(dir)? {
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).with_context(|| format!("Removing {}", path.display()));
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_uses_the_last_disk_load_and_keeps_other_files() -> Result<()> {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let folder = tempfile::tempdir()?;
+        let speed = folder.path().join("000000000000000000000001-htdemucs.stems");
+        let quality = folder.path().join("000000000000000000000001-htdemucs_ft.stems");
+        let newest = folder.path().join("000000000000000000000002-htdemucs.stems");
+        let parts = Stems { len: 1, data: vec![0.0; 8] };
+        for (index, path) in [&quality, &speed, &newest].into_iter().enumerate() {
+            save(path, &parts)?;
+            let then = UNIX_EPOCH + Duration::from_secs(1_000_000_000 + index as u64 * 300);
+            File::options().write(true).open(path)?.set_times(FileTimes::new().set_accessed(then).set_modified(then))?;
+        }
+        let foreign = folder.path().join("my-recording.stems");
+        let temp = folder.path().join(".in-progress");
+        std::fs::write(&foreign, b"recording")?;
+        std::fs::write(&temp, b"in progress")?;
+        load(&quality)?;
+        let result_bytes = std::fs::metadata(&quality)?.len();
+        trim_cache(&newest, || Some(result_bytes * 2));
+        assert!(!speed.exists());
+        assert!(quality.exists() && newest.exists());
+        trim_cache(&newest, || Some(0));
+        assert!(!quality.exists() && newest.exists());
+        clear_saved_entries(folder.path())?;
+        assert!(!newest.exists());
+        assert_eq!(std::fs::read(foreign)?, b"recording");
+        assert_eq!(std::fs::read(temp)?, b"in progress");
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_checkpoint_is_replaced_only_after_a_verified_download() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let m = ModelSpec {
+            files: &["test-ba7816bf.th"], sha256: &[None], checkpoint_bytes: 3,
+            ..CATALOG[1]
+        };
+        let dest = dir.path().join(m.files[0]);
+        std::fs::write(&dest, b"a")?;
+        let cancel = Default::default();
+        for (bytes, error) in [("a", "Incomplete model"), ("xyz", "checksum"), ("abcd", "exceeds")] {
+            let err = download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel,
+                |_| Ok(ureq::Response::new(200, "OK", bytes)?)).unwrap_err();
+            assert!(err.to_string().contains(error), "{err}");
+            assert_eq!(std::fs::read(&dest)?, b"a");
+            assert_eq!(dir.path().read_dir()?.count(), 1);
+        }
+        download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel,
+            |_| Ok(ureq::Response::new(200, "OK", "abc")?))?;
+        assert!(checkpoint_ready(&dest, m.checkpoint_bytes)?);
+        assert_eq!(std::fs::read(&dest)?, b"abc");
+        download_to(&m, dir.path(), &mut |_, _, _| {}, &cancel, |_| panic!("already complete"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_for_a_shared_gpu_can_be_cancelled_and_the_next_job_can_run() {
+        let slot = parking_lot::Mutex::new(());
+        let first_job = slot.lock();
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string());
+            assert_eq!(waiting.join().unwrap(), "stopped");
+        });
+        drop(first_job);
+        assert_eq!(wait_for_shared_gpu(&slot, &mut |_| false).unwrap_err().to_string(), "stopped");
+        assert!(wait_for_shared_gpu(&slot, &mut |_| true).is_ok());
+    }
+
+    #[test]
+    fn cancelled_separation_needs_no_weights_or_decoded_audio() {
+        let err = super::separate(&super::CATALOG[1], &[], 44_100, &mut |_| false).err().unwrap();
+        assert_eq!(err.to_string(), "stopped");
+    }
 
     #[test]
     fn chooses_best_model_for_hardware() {
@@ -588,6 +877,20 @@ mod tests {
         assert_eq!(choose(&no_gpu).id, "htdemucs");
         let ft = spec("htdemucs_ft").unwrap();
         assert!(runs_on(ft, &big) && !runs_on(ft, &small) && !runs_on(ft, &no_gpu));
+    }
+
+    #[test]
+    fn incomplete_stems_do_not_replace_a_saved_track() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let saved = dir.path().join("track.stems");
+        save(&saved, &Stems { len: 1, data: vec![0.; 8] })?;
+        assert!(save(&saved, &Stems { len: 2, data: vec![0.; 8] }).is_err());
+        assert_eq!(load(&saved)?.len, 1);
+        let mut header = MAGIC.to_vec();
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&saved, header)?;
+        assert!(load(&saved).is_err());
+        Ok(())
     }
 
     #[test]

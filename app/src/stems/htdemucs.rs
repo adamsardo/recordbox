@@ -5,8 +5,8 @@
 //! at 44.1 kHz, sources drums/bass/other/vocals, 343,980-frame segments with 25 % overlap and
 //! a triangular transition (power 1), no shifts. Research tracing/comparison code is removed.
 //!
-//! There are two implementations of the same network. `Graph::forward` is the reference,
-//! written with Candle's own operations; it runs on any device and is what the CPU uses. On
+//! `Graph::forward` is the reference used by the CPU. The experimental Linux Vulkan
+//! backend runs its transformer projections on the GPU and the remaining operations on the CPU. On
 //! Metal, `separate` uses the fused kernels in `metal_fast.rs` instead (about 7× faster on
 //! an M5 Pro; outputs agree with the reference to better than 100 dB, which the test
 //! `metal_kernels_match_reference_graph` guards) and overlaps the transforms on the CPU
@@ -17,6 +17,8 @@
 mod metal_fast;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
+#[cfg(any(target_os = "macos", feature = "directml"))]
+use anyhow::Context as _;
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::HashMap;
 use std::path::Path;
@@ -205,6 +207,10 @@ pub(crate) fn pos2(f: usize, t: usize, c: usize) -> Vec<f32> {
 
 /// One loaded HTDemucs network.
 pub struct Graph {
+    #[cfg(all(target_os = "linux", feature = "vulkan"))]
+    vulkan: Option<&'static super::vulkan::Engine>,
+    #[cfg(feature = "directml")]
+    directml: Option<super::directml::Engine>,
     /// The checkpoint's tensors by name: the reference graph (any device).
     weights: HashMap<String, Tensor>,
     /// Weights prepared for the fused Metal kernels; when present, `separate` uses them and
@@ -228,8 +234,45 @@ impl Graph {
     }
 
     fn load_as(path: &Path, device: &Device, fast: bool) -> Result<Self> {
-        // Uploading weights encodes GPU work too.
         let _gpu = GPU.lock();
+        Self::from_weights(Self::read_weights(path, device)?, fast)
+    }
+
+    pub fn load_selected(path: &Path) -> anyhow::Result<Self> {
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        {
+            let engine = super::backend::vulkan_device();
+            if let Some(reason) = super::backend::vulkan_hold() {
+                return Err(super::VulkanFailure(reason.to_owned()).into());
+            }
+            if let Some(engine) = engine {
+                let mut graph = Self::load(path, &Device::Cpu)?;
+                graph.vulkan = Some(engine);
+                return Ok(graph);
+            }
+        }
+        #[cfg(all(windows, feature = "directml"))]
+        {
+            let adapter = super::backend::directml_device();
+            if let Some(reason) = super::radeon_hold() {
+                return Err(super::DirectMlFailure(reason.to_owned()).into());
+            }
+            if let Some(adapter) = adapter { return Self::load_onnx(path, Some(adapter)); }
+        }
+        Ok(Self::load(path, &super::device())?)
+    }
+
+    #[cfg(feature = "directml")]
+    pub(super) fn load_onnx(path: &Path, adapter: Option<&super::directml::Binding>) -> anyhow::Result<Self> {
+        let _gpu = GPU.lock();
+        let weights = Self::read_weights(path, &Device::Cpu)?;
+        let engine = super::directml::Engine::new(weights, adapter)?;
+        let mut graph = Self::from_weights(HashMap::new(), false)?;
+        graph.directml = Some(engine);
+        Ok(graph)
+    }
+
+    pub(super) fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => candle_core::safetensors::load(path, device)?,
             _ => {
@@ -248,16 +291,20 @@ impl Graph {
         if weights.len() != 533 {
             candle_core::bail!("expected an HTDemucs checkpoint with 533 tensors, found {}", weights.len())
         }
-        Self::from_weights(weights, fast)
+        Ok(weights)
     }
 
     fn from_weights(weights: HashMap<String, Tensor>, fast: bool) -> Result<Self> {
         #[cfg(target_os = "macos")]
         if fast {
-            return Ok(Self { fast: Some(metal_fast::Fast::new(&weights)?), weights: HashMap::new() });
+            return Ok(Self { #[cfg(feature = "directml")] directml: None, fast: Some(metal_fast::Fast::new(&weights)?), weights: HashMap::new() });
         }
         let _ = fast;
         Ok(Self {
+            #[cfg(all(target_os = "linux", feature = "vulkan"))]
+            vulkan: None,
+            #[cfg(feature = "directml")]
+            directml: None,
             weights,
             #[cfg(target_os = "macos")]
             fast: None,
@@ -364,55 +411,68 @@ impl Graph {
             z.gelu_erf()
         }
     }
-    fn linear_weight(&self, x: &Tensor, w: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    fn linear_weight(&self, x: &Tensor, w: &Tensor, bias: &Tensor, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
+        checkpoint()?;
         let (b, t, c) = x.dims3()?;
-        let co = w.dim(0)?;
-        x.reshape((b * t, c))?.matmul(&w.t()?.contiguous()?)?.broadcast_add(bias)?.reshape((b, t, co))
+        let (co, inner) = w.dims2()?;
+        anyhow::ensure!(inner == c, "Transformer projection expects {inner} input channels, found {c}");
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        if let Some(engine) = self.vulkan {
+            let product = vulkan_linear(engine, x, w, b * t, c, co, checkpoint)?;
+            return Ok(Tensor::from_vec(product, (b, t, co), &Device::Cpu)?.broadcast_add(bias)?);
+        }
+        Ok(x.reshape((b * t, c))?.matmul(&w.t()?.contiguous()?)?.broadcast_add(bias)?.reshape((b, t, co))?)
     }
-    fn linear(&self, x: &Tensor, name: &str) -> Result<Tensor> {
-        self.linear_weight(x, &self.w(&format!("{name}.weight"))?, &self.w(&format!("{name}.bias"))?)
+    fn linear(&self, x: &Tensor, name: &str, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
+        self.linear_weight(x, &self.w(&format!("{name}.weight"))?, &self.w(&format!("{name}.bias"))?, checkpoint)
     }
-    fn attention(&self, q: &Tensor, k: &Tensor, name: &str) -> Result<Tensor> {
+    fn attention(&self, q: &Tensor, k: &Tensor, name: &str, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
         let (b, l, c) = q.dims3()?;
         let s = k.dim(1)?;
         let h = 8;
         let head = c / h;
         let w = self.w(&format!("{name}.in_proj_weight"))?;
         let bias = self.w(&format!("{name}.in_proj_bias"))?;
-        let q = self.linear_weight(q, &w.narrow(0, 0, c)?.contiguous()?, &bias.narrow(0, 0, c)?)?.reshape((b, l, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
-        let kp = self.linear_weight(k, &w.narrow(0, c, c)?.contiguous()?, &bias.narrow(0, c, c)?)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
-        let vp = self.linear_weight(k, &w.narrow(0, 2 * c, c)?.contiguous()?, &bias.narrow(0, 2 * c, c)?)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
-        let scores = (q.matmul(&kp.transpose(2, 3)?.contiguous()?)? / (head as f64).sqrt())?;
-        let y = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&vp)?.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, l, c))?;
-        self.linear(&y, &format!("{name}.out_proj"))
+        let q = self.linear_weight(q, &w.narrow(0, 0, c)?.contiguous()?, &bias.narrow(0, 0, c)?, checkpoint)?.reshape((b, l, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
+        let kp = self.linear_weight(k, &w.narrow(0, c, c)?.contiguous()?, &bias.narrow(0, c, c)?, checkpoint)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
+        let vp = self.linear_weight(k, &w.narrow(0, 2 * c, c)?.contiguous()?, &bias.narrow(0, 2 * c, c)?, checkpoint)?.reshape((b, s, h, head))?.permute((0, 2, 1, 3))?.contiguous()?;
+        // Limit temporary attention scores on CUDA and in the host portion of Vulkan inference.
+        // Each query still attends to every key, including across tile boundaries.
+        let rows = if q.device().is_cuda() { 256 } else { l };
+        #[cfg(all(target_os = "linux", feature = "vulkan"))]
+        let rows = if self.vulkan.is_some() { 256 } else { rows };
+        let attended = attention_rows(&q, &kp.transpose(2, 3)?.contiguous()?, &vp, rows, checkpoint)?;
+        let y = attended.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, l, c))?;
+        self.linear(&y, &format!("{name}.out_proj"), checkpoint)
     }
-    fn transformer_layer(&self, q: &Tensor, k: Option<&Tensor>, name: &str) -> Result<Tensor> {
+    fn transformer_layer(&self, q: &Tensor, k: Option<&Tensor>, name: &str, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
         let nq = self.ln(q, &format!("{name}.norm1"))?;
-        let attn = if let Some(k) = k { self.attention(&nq, &self.ln(k, &format!("{name}.norm2"))?, &format!("{name}.cross_attn"))? } else { self.attention(&nq, &nq, &format!("{name}.self_attn"))? };
+        let attn = if let Some(k) = k { self.attention(&nq, &self.ln(k, &format!("{name}.norm2"))?, &format!("{name}.cross_attn"), checkpoint)? } else { self.attention(&nq, &nq, &format!("{name}.self_attn"), checkpoint)? };
         let x = (q + attn.broadcast_mul(&self.w(&format!("{name}.gamma_1.scale"))?)?)?;
         let norm_name = if k.is_some() { "norm3" } else { "norm2" };
         let y = self.ln(&x, &format!("{name}.{norm_name}"))?;
-        let y = self.linear(&y, &format!("{name}.linear1"))?.gelu_erf()?;
-        let y = self.linear(&y, &format!("{name}.linear2"))?;
+        let y = self.linear(&y, &format!("{name}.linear1"), checkpoint)?.gelu_erf()?;
+        let y = self.linear(&y, &format!("{name}.linear2"), checkpoint)?;
         let x = (x + y.broadcast_mul(&self.w(&format!("{name}.gamma_2.scale"))?)?)?;
-        self.gn(&x.transpose(1, 2)?.contiguous()?, &format!("{name}.norm_out"))?.transpose(1, 2)?.contiguous()
+        Ok(self.gn(&x.transpose(1, 2)?.contiguous()?, &format!("{name}.norm_out"))?.transpose(1, 2)?.contiguous()?)
     }
-    fn transformer(&self, x: &Tensor, xt: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn transformer(&self, x: &Tensor, xt: &Tensor, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<(Tensor, Tensor)> {
         let (b, c, f, t) = x.dims4()?;
         let tt = xt.dim(2)?;
         let x = x.permute((0, 3, 2, 1))?.contiguous()?.reshape((b, t * f, c))?;
         let mut x = self.ln(&x, "crosstransformer.norm_in")?.broadcast_add(&Tensor::from_vec(pos2(f, t, c), (1, t * f, c), x.device())?)?;
         let mut xt = self.ln(&xt.transpose(1, 2)?.contiguous()?, "crosstransformer.norm_in_t")?.broadcast_add(&Tensor::from_vec(pos1(tt, c), (1, tt, c), xt.device())?)?;
         for i in 0..5 {
+            checkpoint()?;
             let prefix = format!("crosstransformer.layers.{i}");
             let tp = format!("crosstransformer.layers_t.{i}");
             if i % 2 == 0 {
-                x = self.transformer_layer(&x, None, &prefix)?;
-                xt = self.transformer_layer(&xt, None, &tp)?;
+                x = self.transformer_layer(&x, None, &prefix, checkpoint)?;
+                xt = self.transformer_layer(&xt, None, &tp, checkpoint)?;
             } else {
                 let old_x = x;
-                x = self.transformer_layer(&old_x, Some(&xt), &prefix)?;
-                xt = self.transformer_layer(&xt, Some(&old_x), &tp)?;
+                x = self.transformer_layer(&old_x, Some(&xt), &prefix, checkpoint)?;
+                xt = self.transformer_layer(&xt, Some(&old_x), &tp, checkpoint)?;
             }
         }
         Ok((x.reshape((b, t, f, c))?.permute((0, 3, 2, 1))?.contiguous()?, xt.transpose(1, 2)?.contiguous()?))
@@ -431,10 +491,11 @@ impl Graph {
     }
 
     /// One model pass: [1, 2, L] (L <= 343980) -> [1, 4, 2, L].
-    pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input: &Tensor, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
+        checkpoint()?;
         let (b, c, original_len) = input.dims3()?;
         if b != 1 || c != 2 || original_len == 0 || original_len > TRAINING_FRAMES {
-            candle_core::bail!("HTDemucs input must be [1, 2, L] with 1 <= L <= {TRAINING_FRAMES}")
+            anyhow::bail!("HTDemucs input must be [1, 2, L] with 1 <= L <= {TRAINING_FRAMES}")
         }
         let mix = input.pad_with_zeros(2, 0, TRAINING_FRAMES - original_len)?;
         let spectral = spec(&mix)?;
@@ -447,6 +508,7 @@ impl Graph {
         let mut saved_t = vec![];
         let mut lengths_t = vec![];
         for i in 0..4 {
+            checkpoint()?;
             lengths_t.push(xt.dim(2)?);
             xt = self.encode(&xt, &format!("tencoder.{i}"), false)?;
             x = self.encode(&x, &format!("encoder.{i}"), true)?;
@@ -460,10 +522,11 @@ impl Graph {
         let (_, co, f, t) = x.dims4()?;
         x = self.conv1(&x.reshape((b, co, f * t))?, "channel_upsampler", 0, 1, 1)?.reshape((b, 512, f, t))?;
         xt = self.conv1(&xt, "channel_upsampler_t", 0, 1, 1)?;
-        (x, xt) = self.transformer(&x, &xt)?;
+        (x, xt) = self.transformer(&x, &xt, checkpoint)?;
         x = self.conv1(&x.reshape((b, 512, f * t))?, "channel_downsampler", 0, 1, 1)?.reshape((b, co, f, t))?;
         xt = self.conv1(&xt, "channel_downsampler_t", 0, 1, 1)?;
         for i in 0..4 {
+            checkpoint()?;
             x = self.decode(&x, &saved.pop().unwrap(), &format!("decoder.{i}"), true, t, i == 3)?;
             xt = self.decode(&xt, &saved_t.pop().unwrap(), &format!("tdecoder.{i}"), false, lengths_t.pop().unwrap(), i == 3)?;
         }
@@ -471,8 +534,131 @@ impl Graph {
         let complex = x.reshape((b * 4, 2, 2, freq, frames))?.permute((0, 1, 3, 4, 2))?.contiguous()?;
         let spectral_wave = ispec(&complex, TRAINING_FRAMES)?.reshape((b, 4, 2, TRAINING_FRAMES))?;
         let temporal_wave = xt.reshape((b, 4, 2, TRAINING_FRAMES))?.broadcast_mul(&stdt.unsqueeze(1)?)?.broadcast_add(&meant.unsqueeze(1)?)?;
-        (spectral_wave + temporal_wave)?.narrow(3, 0, original_len)?.contiguous()
+        Ok((spectral_wave + temporal_wave)?.narrow(3, 0, original_len)?.contiguous()?)
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+fn vulkan_linear(engine: &super::vulkan::Engine, x: &Tensor, weights: &Tensor, rows: usize, inner: usize,
+    cols: usize, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Vec<f32>> {
+    if let Some(reason) = super::backend::vulkan_hold() {
+        return Err(super::VulkanFailure(reason.to_owned()).into());
+    }
+    // Q, K and V are contiguous views into different regions of the same checkpoint tensor.
+    // Borrow only the view's elements, including its starting offset.
+    fn elements<'a>(storage: &'a candle_core::Storage, layout: &candle_core::Layout) -> anyhow::Result<&'a [f32]> {
+        let candle_core::Storage::Cpu(cpu) = storage else { anyhow::bail!("Vulkan projections require host tensors") };
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| anyhow::anyhow!("Non-contiguous Vulkan input"))?;
+        cpu.as_slice::<f32>()?.get(start..end).ok_or_else(|| anyhow::anyhow!("Vulkan tensor view exceeds its storage"))
+    }
+    let (x, weights) = (x.contiguous()?, weights.contiguous()?);
+    let (a, a_layout) = x.storage_and_layout();
+    let (b, b_layout) = weights.storage_and_layout();
+    let mut stopped = false;
+    engine.linear(elements(&a, a_layout)?, elements(&b, b_layout)?, rows, inner, cols, &mut || {
+        let result = checkpoint();
+        stopped = result.is_err();
+        result
+    }).map_err(|err| {
+        if stopped { err } else {
+            let message = format!("Vulkan transformer projection on {}: {err:#}", engine.label());
+            err.context(super::VulkanFailure(message))
+        }
+    })
+}
+
+#[cfg(all(test, target_os = "linux", feature = "vulkan"))]
+#[test]
+#[ignore = "requires a software Vulkan ICD"]
+fn vulkan_transformer_projections_match_cpu() -> anyhow::Result<()> {
+    static ENGINE: std::sync::OnceLock<super::vulkan::Engine> = std::sync::OnceLock::new();
+    let engine = ENGINE.get_or_init(|| super::vulkan::Engine::new_for_test().expect("software Vulkan ICD"));
+    let (b, t, c, co) = (2, 19, 23, 17);
+    let samples = |n| (0..n).map(|i| ((i as f32 + 3.) * 0.1).sin()).collect();
+    let x = Tensor::from_vec(samples(b * c * t), (b, c, t), &Device::Cpu)?.transpose(1, 2)?;
+    // Model Q/K/V rows and their biases occupy different offsets within the fused weights.
+    let w = Tensor::from_vec(samples(3 * co * c), (3 * co, c), &Device::Cpu)?.narrow(0, 2 * co, co)?;
+    let bias = Tensor::from_vec(samples(3 * co), 3 * co, &Device::Cpu)?.narrow(0, co, co)?;
+    let mut graph = Graph::from_weights(HashMap::new(), false)?;
+    let project = |graph: &Graph| -> anyhow::Result<Vec<f32>> {
+        let y = graph.linear_weight(&x, &w, &bias, &mut || Ok(()))?;
+        assert_eq!(y.dims(), [b, t, co]);
+        Ok(y.flatten_all()?.to_vec1::<f32>()?)
+    };
+    let before = engine.completed_matmuls();
+    let cpu = project(&graph)?;
+    assert_eq!(engine.completed_matmuls(), before);
+    graph.vulkan = Some(engine);
+    let gpu = project(&graph)?;
+    assert_eq!(engine.completed_matmuls(), before + 1);
+    assert!(cpu.iter().zip(gpu).all(|(a, b)| (a - b).abs() < 1e-4));
+
+    let mut checks = 0;
+    let stopped = graph.linear_weight(&x, &w, &bias, &mut || {
+        checks += 1;
+        anyhow::ensure!(checks < 3, "stopped");
+        Ok(())
+    }).unwrap_err();
+    assert_eq!(stopped.to_string(), "stopped");
+    assert!(stopped.downcast_ref::<super::VulkanFailure>().is_none());
+    assert_eq!(engine.completed_matmuls(), before + 1);
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux", feature = "vulkan"))]
+#[test]
+#[ignore = "requires RECORDBOX_TEST_CHECKPOINT and a software Vulkan ICD"]
+fn vulkan_checkpoint_matches_cpu() -> anyhow::Result<()> {
+    static ENGINE: std::sync::OnceLock<super::vulkan::Engine> = std::sync::OnceLock::new();
+    let engine = ENGINE.get_or_init(|| super::vulkan::Engine::new_for_test().expect("software Vulkan ICD"));
+    let path = std::env::var_os("RECORDBOX_TEST_CHECKPOINT").expect("checkpoint path");
+    let len = SAMPLE_RATE as usize;
+    let audio = tests::signal(len);
+    let mut graph = Graph::load(Path::new(&path), &Device::Cpu)?;
+    let run = |graph: &Graph| separate(graph, &Device::Cpu, &audio, len, &Default::default(), &mut |_, _| true);
+    let before = engine.completed_matmuls();
+    let expected = run(&graph)?;
+    assert_eq!(engine.completed_matmuls(), before);
+    graph.vulkan = Some(engine);
+    let actual = run(&graph)?;
+    // Both transformer branches run six projections in each of the model's five layers.
+    assert_eq!(engine.completed_matmuls() - before, 60);
+    assert_eq!((expected.len(), actual.len()), (8 * len, 8 * len));
+    for ((name, reference), actual) in SOURCES.iter().zip(expected.chunks_exact(2 * len)).zip(actual.chunks_exact(2 * len)) {
+        let error = super::compare::relative_error(reference, actual)?;
+        println!("{name}: {:.4}% relative RMS difference", 100. * error);
+        assert!(error <= 0.03);
+    }
+    Ok(())
+}
+
+fn attention_rows(q: &Tensor, keys_t: &Tensor, values: &Tensor, rows: usize, checkpoint: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<Tensor> {
+    let (_, _, len, width) = q.dims4()?;
+    let attend = |q: &Tensor| {
+        let scores = (q.matmul(keys_t)? / (width as f64).sqrt())?;
+        candle_nn::ops::softmax_last_dim(&scores)?.matmul(values)
+    };
+    if len <= rows {
+        return Ok(attend(q)?);
+    }
+    let mut parts = Vec::new();
+    for start in (0..len).step_by(rows) {
+        checkpoint()?;
+        let block = q.narrow(2, start, rows.min(len - start))?.contiguous()?;
+        parts.push(attend(&block)?);
+    }
+    Ok(Tensor::cat(&parts, 2)?)
+}
+
+#[test]
+fn attention_tiles_include_all_keys_and_the_last_partial_tile() {
+    let q = Tensor::from_vec((0..60).map(|i| i as f32 / 30.).collect(), (1, 3, 5, 4), &Device::Cpu).unwrap();
+    let values = q.narrow(2, 0, 3).unwrap().contiguous().unwrap();
+    let keys_t = values.transpose(2, 3).unwrap().contiguous().unwrap();
+    let run = |rows| attention_rows(&q, &keys_t, &values, rows, &mut || Ok(())).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let (full, tiled) = (run(5), run(2));
+    assert_eq!(full.len(), tiled.len());
+    assert!(full.iter().zip(tiled).all(|(a, b)| (a - b).abs() < 1e-5));
 }
 
 /// How a track is cut up and what is returned.
@@ -528,18 +714,34 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// overlapping segments with triangular weights, chunks padded from the surrounding audio).
 /// `audio` is planar stereo: left samples then right samples, `len` frames each.
 /// Returns planar [source][channel][frame] (4 × 2 × len), or [channel][frame] of the one
-/// source asked for. `progress(done, total)` is called after each chunk; returning false
-/// cancels.
-pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+/// source asked for. The callback reports completed chunks and is also polled between model layers.
+pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> anyhow::Result<Vec<f32>> {
     if len == 0 || audio.len() != 2 * len {
-        candle_core::bail!("empty or malformed input")
+        anyhow::bail!("empty or malformed input")
     }
     if opts.source.is_some_and(|s| s >= 4) {
-        candle_core::bail!("no such source")
+        anyhow::bail!("no such source")
     }
+    if !progress(0, 1) { anyhow::bail!("stopped"); }
     #[cfg(target_os = "macos")]
     if let Some(fast) = &graph.fast {
-        return separate_fast(fast, device, audio, len, opts, progress);
+        return separate_accelerated(audio, len, opts, 2, progress, |spec, wave, source| {
+            let (freq, frames, segment) = (NFFT/2, Stft::frames(TRAINING_FRAMES), TRAINING_FRAMES);
+            let x = Tensor::from_vec(spec, (4, freq, frames), device)?;
+            let xt = Tensor::from_vec(wave, (2, 1, segment), device)?;
+            let (mut y, mut yt) = fast.forward(&x, &xt)?;
+            if let Some(s) = source {
+                y = y.narrow(0, s * 4, 4)?;
+                yt = yt.narrow(0, s * 2, 2)?;
+            }
+            Ok((metal_fast::read(&y)?, metal_fast::read(&yt)?))
+        });
+    }
+    #[cfg(feature = "directml")]
+    if let Some(engine) = &graph.directml {
+        return separate_accelerated(audio, len, opts, engine.buffered_segments(), progress, |spec, wave, source| {
+            engine.forward(spec, wave, source)
+        });
     }
     let segment = TRAINING_FRAMES;
     let (offsets, weight) = plan(len, opts.overlap);
@@ -551,7 +753,10 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
         let x = Tensor::from_vec(segment_at(audio, len, offset), (1, 2, segment), device)?;
         let y = {
             let _gpu = GPU.lock();
-            graph.forward(&x)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
+            graph.forward(&x, &mut || {
+                if !progress(k, offsets.len()) { anyhow::bail!("stopped"); }
+                Ok(())
+            })?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
         };
         let crop = (segment - chunk_len) / 2;
         for (n, &s) in sources.iter().enumerate() {
@@ -566,7 +771,7 @@ pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts:
             sums[offset + i] += weight[i];
         }
         if !progress(k + 1, offsets.len()) {
-            candle_core::bail!("stopped")
+            anyhow::bail!("stopped")
         }
     }
     for ch in out.chunks_mut(len) {
@@ -586,7 +791,7 @@ fn mean_std(x: &[f32]) -> (f32, f32) {
 }
 
 /// One segment ready for the GPU: normalised spectrogram and waveform with their statistics.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "directml"))]
 struct Prepared {
     offset: usize,
     spec: Vec<f32>,
@@ -596,7 +801,7 @@ struct Prepared {
 }
 
 /// The network's two outputs for one segment, still normalised.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "directml"))]
 struct Raw {
     offset: usize,
     spec: Vec<f32>,
@@ -604,11 +809,12 @@ struct Raw {
     stats: [(f32, f32); 2],
 }
 
-/// The Metal path: three stages run side by side so the GPU never waits for the CPU. A
+/// The accelerated path: three stages run side by side so the GPU never waits for the CPU. A
 /// thread prepares segments (normalisation and the forward transform), this thread runs the
 /// network, and a third does the inverse transform and the overlap-add.
-#[cfg(target_os = "macos")]
-fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+#[cfg(any(target_os = "macos", feature = "directml"))]
+fn separate_accelerated(audio: &[f32], len: usize, opts: &Options, buffered_segments: usize, progress: &mut dyn FnMut(usize, usize) -> bool,
+    mut forward: impl FnMut(Vec<f32>, Vec<f32>, Option<usize>) -> anyhow::Result<(Vec<f32>, Vec<f32>)>) -> anyhow::Result<Vec<f32>> {
     let segment = TRAINING_FRAMES;
     let freq = NFFT / 2;
     let frames = Stft::frames(segment);
@@ -621,9 +827,9 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
     let mut out = vec![0f32; n_src * 2 * len];
     let (stft, envelope, weight, offsets) = (&stft, &envelope, &weight, &offsets);
 
-    let result = std::thread::scope(|scope| -> Result<()> {
-        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(2);
-        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(2);
+    let result = std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(buffered_segments);
+        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(buffered_segments);
         scope.spawn(move || {
             for &offset in offsets {
                 let input = segment_at(audio, len, offset);
@@ -671,24 +877,18 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
                 });
             }
         });
-        let mut run = || -> Result<()> {
+        let mut run = || -> anyhow::Result<()> {
             for (k, p) in rx_in.iter().enumerate() {
+                if !progress(k, offsets.len()) { anyhow::bail!("stopped"); }
                 let (spec, wave) = {
                     let _gpu = GPU.lock();
-                    let x = Tensor::from_vec(p.spec, (4, freq, frames), device)?;
-                    let xt = Tensor::from_vec(p.wave, (2, 1, segment), device)?;
-                    let (mut y, mut yt) = fast.forward(&x, &xt)?;
-                    if let Some(s) = opts.source {
-                        y = y.narrow(0, s * 4, 4)?;
-                        yt = yt.narrow(0, s * 2, 2)?;
-                    }
-                    (metal_fast::read(&y)?, metal_fast::read(&yt)?)
+                    forward(p.spec, p.wave, opts.source).with_context(|| format!("Separation segment {} of {}", k + 1, offsets.len()))?
                 };
                 if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
-                    candle_core::bail!("stem post-processing stopped")
+                    anyhow::bail!("stem post-processing stopped")
                 }
                 if !progress(k + 1, offsets.len()) {
-                    candle_core::bail!("stopped")
+                    anyhow::bail!("stopped")
                 }
             }
             Ok(())
@@ -698,7 +898,7 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
         drop(rx_in);
         drop(tx_out);
         if post.join().is_err() {
-            candle_core::bail!("stem post-processing failed")
+            anyhow::bail!("stem post-processing failed")
         }
         r
     });
@@ -721,6 +921,28 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "directml")]
+    #[test]
+    fn driver_failure_on_second_segment_keeps_the_cause_and_returns_no_partial_stems() {
+        let len = TRAINING_FRAMES + 4096;
+        let audio = vec![0.; 2 * len];
+        let mut calls = 0;
+        let result = separate_accelerated(&audio, len, &Options { source: Some(3), ..Default::default() },
+            0, &mut |_, _| true, |spec, wave, _| {
+                calls += 1;
+                if calls == 2 { return Err(crate::stems::DirectMlFailure("simulated provider error".into()).into()); }
+                Ok((spec, wave))
+            });
+        let error = result.unwrap_err();
+        assert!(error.is::<crate::stems::DirectMlFailure>());
+        assert!(format!("{error:#}").contains("Separation segment 2 of 2"));
+        assert_eq!(calls, 2);
+
+        let stopped = separate_accelerated(&audio, len, &Default::default(), 0,
+            &mut |_, _| false, |_, _, _| panic!("Cancelled work called the provider")).unwrap_err();
+        assert!(!stopped.is::<crate::stems::DirectMlFailure>());
+    }
 
     /// Deterministic values in [-1, 1).
     struct Lcg(u64);
@@ -819,7 +1041,7 @@ mod tests {
     }
 
     /// Planar stereo test signal: tones, a sweep and noise, different in the two channels.
-    fn signal(len: usize) -> Vec<f32> {
+    pub(super) fn signal(len: usize) -> Vec<f32> {
         let mut rng = Lcg(3);
         (0..2 * len)
             .map(|n| {

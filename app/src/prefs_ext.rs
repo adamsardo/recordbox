@@ -7,7 +7,7 @@
 //! - `cue_markers_on_preview`: the Preview column in ui_browser.rs.
 //! - `wave_half`: the enlarged and overview waveforms in ui_player.rs.
 //! - `color_names`: every colour menu, through `Prefs::color_name`; the device colour table.
-//! - `high_precision_grid`, `analysis_mode`: the analysis code.
+//! - `refine_beatgrid_transients`, `analysis_mode`: the analysis code.
 //! - `memory_cue_first_beat`: `App::apply_analysis` calls `memory_cue_at_first_beat`.
 //! - `audio_buffer`, `audio_rate`, `audio_channel`: the output stream (audio.rs).
 //! - `device_bg_color`, `delete_history_after_import`: the USB code.
@@ -349,11 +349,7 @@ pub fn run_action(app: &mut App, act: Act) {
             app.save_prefs();
             app.toast(if app.prefs.quantize { "Quantize ON" } else { "Quantize OFF" });
         }
-        Act::ClearHot(slot) => {
-            if let Some(id) = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| c.id) {
-                app.delete_cue(id);
-            }
-        }
+        Act::ClearHot(slot) => app.clear_hot_cue(slot),
         Act::MemJump(d) => app.memory_jump(d),
         Act::MemCall(n) => {
             if let Some(c) = app.memory_cues().get(n).cloned() {
@@ -475,20 +471,14 @@ pub fn sync_mytag_comments(app: &mut App, ids: &[i64]) {
 
 /// "Set Memory Cue at the first beat of track when analyzing": for a track that has no
 /// memory cue yet.
-pub fn memory_cue_at_first_beat(app: &mut App, id: i64, grid: &BeatGrid) {
+pub fn memory_cue_at_first_beat(app: &App, id: i64, grid: &BeatGrid) -> bool {
     let dur = app.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
-    let Some(first) = grid.beats(dur).first().map(|b| b.time) else { return };
-    let cues = app.db.cues(id).unwrap_or_default();
-    if cues.iter().any(|c| c.kind == CueKind::Memory) {
-        return;
+    let Some(first) = grid.beats(dur).first().map(|b| b.time) else { return false };
+    if !app.db.cues(id).is_ok_and(|cues| cues.iter().all(|c| c.kind != CueKind::Memory)) {
+        return false;
     }
     let c = Cue { id: 0, track_id: id, kind: CueKind::Memory, slot: -1, start: first.max(0.0), end: None, color: 0, comment: String::new(), active_loop: false };
-    if app.db.save_cue(&c).is_ok() {
-        app.cue_counts.entry(id).or_insert((0, 0)).1 += 1;
-        if app.deck.track == Some(id) {
-            app.deck.cues = app.db.cues(id).unwrap_or_default();
-        }
-    }
+    app.db.save_cue(&c).is_ok()
 }
 
 // ------------------------------------------------------------------ audio output
@@ -568,7 +558,7 @@ pub fn stem_part_click(app: &mut App, srcs: &[usize]) {
         // rekordbox's status line for a part pressed before its data exists. recordbox also
         // starts the separation if it is not running yet (it is, when tracks are separated
         // on load).
-        if app.stem.separating.is_some() || app.stem.loading.is_some() {
+        if app.separating_stems() || app.loading_stems() {
             app.toast("There is no analysis data for the STEMS function.");
         } else {
             app.separate_loaded();
@@ -744,9 +734,6 @@ pub struct DialogsExt {
     pub backup_done: Option<(String, String)>,
     /// "Reset to defaults" waiting for confirmation: Some(page) for one page, Some(None) all.
     pub reset_ask: Option<Option<u8>>,
-    /// Full screen asked for from the menu or keyboard (applied by the main loop).
-    pub toggle_fullscreen: bool,
-    pub fullscreen: bool,
 }
 
 /// Playlist > Sort Items: the children of a folder (0 = the top level) by name.
@@ -828,7 +815,7 @@ mod tests {
     #[test]
     fn new_prefs_round_trip() {
         let mut p = Prefs::default();
-        assert!(p.tree_item("Devices") && p.cue_markers_on_preview && p.high_precision_grid && !p.wave_half);
+        assert!(p.tree_item("Devices") && p.cue_markers_on_preview && !p.refine_beatgrid_transients && !p.wave_half);
         p.tree_items.insert("Devices".into(), false);
         p.tree_items.insert("Collection".into(), false);
         p.mytag_to_comments = true;
@@ -836,7 +823,7 @@ mod tests {
         p.wave_half = true;
         p.color_names[2] = "Peak time".into();
         p.color_names[3] = "  ".into();
-        p.high_precision_grid = false;
+        p.refine_beatgrid_transients = true;
         p.memory_cue_first_beat = true;
         p.audio_buffer = 256;
         p.audio_rate = 48000;

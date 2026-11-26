@@ -237,7 +237,7 @@ fn b2_device_property_is_written_in_one_journaled_step() {
     write_props(&root, &DeviceProps { bg_color: 5 }).unwrap();
     assert_eq!(read_props(&root).bg_color, 5);
     assert!(has_my_settings(&root));
-    assert_eq!(delete_my_settings(&root), 3);
+    assert_eq!(delete_my_settings(&root).unwrap(), 3);
     assert!(!has_my_settings(&root) && root.join("PIONEER/DEVSETTING.DAT").is_file());
     assert_eq!(read_my_settings(&root, &UsbSettings::default()).1, ["DEVSETTING.DAT"]);
     // A damaged settings file is not imported.
@@ -273,43 +273,92 @@ fn b5_an_imported_history_is_deleted_from_the_device() {
 }
 
 #[test]
-fn b9_rekordbox_3ex_files_are_recognised_and_passed_through() {
-    assert!(is_3ex(&[&[0x81u8, 0xa9][..], b"embedding", &[0x8b]].concat()));
-    assert!(!is_3ex(b"PMAI\0\0\0\x1c"));
-    // A stand-in for rekordbox's own analysis set of a synced track (a real .3EX when one is
-    // on this machine, read only).
-    let real = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../oracle/anlzpairs.tsv"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once('\t').map(|x| PathBuf::from(x.1).with_extension("3EX")))
-        .find(|p| p.is_file())
-        .and_then(|p| std::fs::read(p).ok());
-    if let Some(r) = &real {
-        assert!(is_3ex(r), "rekordbox 7's .3EX is a MessagePack map keyed \"embedding\"");
-        assert!(super::anlz::validate(r).is_err(), "it is not a PMAI tagged-section file");
-    }
-    let bytes = real.unwrap_or_else(|| [&[0x81u8, 0xa9][..], b"embedding", &[0x80]].concat());
+fn native_embeddings_stay_on_their_device_track() {
     let root = scratch("threeex");
-    let mut tracks = demo_tracks(&src_dir(), 1);
-    // rekordbox's set for this track: our own files stand in for DAT/EXT/2EX.
-    let rb = scratch("threeex_rb");
-    let own = super::anlz::build("/x.wav", &tracks[&1].grid.as_ref().unwrap().beats(30.0), tracks[&1].wave.as_ref().unwrap(), &[], 0, 44100);
-    std::fs::write(rb.join("ANLZ0000.DAT"), &own.dat).unwrap();
-    std::fs::write(rb.join("ANLZ0000.EXT"), &own.ext).unwrap();
-    std::fs::write(rb.join("ANLZ0000.2EX"), &own.ex2).unwrap();
-    std::fs::write(rb.join("ANLZ0000.3EX"), &bytes).unwrap();
-    tracks.get_mut(&1).unwrap().rb_anlz = Some(rb.join("ANLZ0000"));
-    export(request(&root, &tracks, vec![playlist(1, "Set", vec![1])]));
-    let lib = read_device(&root).unwrap();
-    let t = lib.tracks.values().next().unwrap();
-    let on_drive = root.join(t.analyze_path.trim_start_matches('/')).with_extension("3EX");
-    assert_eq!(std::fs::read(&on_drive).unwrap(), bytes, "passed through unchanged");
-    // It belongs to the track: not "unused", and deleted with it.
-    assert!(unused_files(&root, &lib).is_empty());
-    delete_tracks(&root, &[t.id]).unwrap();
-    assert!(!on_drive.exists());
-    // A track Recordbox analysed itself gets no .3EX (its content can't be derived).
-    let plain = scratch("threeex_plain");
-    export(request(&plain, &demo_tracks(&src_dir(), 1), vec![playlist(1, "Set", vec![1])]));
-    assert_eq!(count_files(&plain, "PIONEER/USBANLZ"), 3);
+    let rb = scratch("threeex_source");
+    let mut tracks = demo_tracks(&rb, 1);
+    let native = [
+        b"\x81\xa9embedding".as_slice(),
+        &[0x81, 0xa2, b'd', b'2', 7],
+    ]
+    .concat();
+    let source_base = rb.join("ANLZ0000");
+    std::fs::write(source_base.with_extension("3EX"), &native).unwrap();
+    tracks.get_mut(&1).unwrap().rb_anlz = Some(source_base);
+    let set = || vec![playlist(1, "Set", vec![1])];
+    export(request(&root, &tracks, set()));
+
+    let original = read_device(&root).unwrap();
+    let track = original.tracks.values().next().unwrap();
+    let base = root.join(track.analyze_path.trim_start_matches('/'));
+    let fourth = base.with_extension("3EX");
+    assert!(
+        !fourth.exists(),
+        "the desktop embedding has a different identity"
+    );
+    let owned = b"opaque existing device embedding";
+    std::fs::write(&fourth, owned).unwrap();
+    tracks.get_mut(&1).unwrap().track.rating = 4;
+    export(request(&root, &tracks, set()));
+    let updated = read_device(&root).unwrap();
+    assert_eq!(updated.tracks[&track.id].rating, 4);
+    assert_eq!(std::fs::read(&fourth).unwrap(), owned);
+
+    let catalogs = [
+        pdb_path(&root),
+        base.clone(),
+        base.with_extension("EXT"),
+        base.with_extension("2EX"),
+        fourth.clone(),
+    ];
+    let reject = |items: &HashMap<i64, ExportTrack>| {
+        let before: Vec<_> = catalogs.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let req = request(&root, items, set());
+        let err = run_export(req, &|_| {}, &std::sync::atomic::AtomicBool::new(false)).unwrap_err();
+        assert!(err.to_string().contains(".3EX"), "{err:#}");
+        for (path, expected) in catalogs.iter().zip(&before) {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                *expected,
+                "{}",
+                path.display()
+            );
+        }
+    };
+    let mut shifted = tracks.clone();
+    shifted.get_mut(&1).unwrap().grid.as_mut().unwrap().anchors[0].time += 0.025;
+    reject(&shifted);
+
+    // Native list BPM and the extended grid can each diverge without a
+    // change to the DAT beat grid. Neither may bypass the embedding check.
+    let catalog = pdb_path(&root);
+    let original_bytes = std::fs::read(&catalog).unwrap();
+    let mut other_bpm = updated.clone();
+    other_bpm.tracks.get_mut(&track.id).unwrap().bpm100 += 1;
+    std::fs::write(&catalog, build_export_pdb(&other_bpm)).unwrap();
+    reject(&tracks);
+    std::fs::write(&catalog, original_bytes).unwrap();
+    let ext = base.with_extension("EXT");
+    let original_bytes = std::fs::read(&ext).unwrap();
+    let mut other_grid = original_bytes.clone();
+    let start = other_grid.windows(4).position(|tag| tag == b"PQT2").unwrap();
+    let size = u32::from_be_bytes(other_grid[start + 8..start + 12].try_into().unwrap()) as usize;
+    other_grid[start + size - 1] ^= 1;
+    std::fs::write(&ext, other_grid).unwrap();
+    reject(&tracks);
+    std::fs::write(&ext, original_bytes).unwrap();
+
+    // A same-size source replacement invalidates the old audio features too.
+    let source = Path::new(&tracks[&1].track.path);
+    let mut audio = std::fs::read(source).unwrap();
+    *audio.last_mut().unwrap() ^= 1;
+    std::fs::write(source, &audio).unwrap();
+    reject(&tracks);
+    assert_ne!(
+        std::fs::read(root.join(track.file_path.trim_start_matches('/'))).unwrap(),
+        audio
+    );
+    assert!(unused_files(&root, &updated).is_empty());
+    delete_tracks(&root, &[track.id]).unwrap();
+    assert!(!fourth.exists());
 }
