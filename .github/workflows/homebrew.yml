@@ -1,0 +1,46 @@
+name: Homebrew source install
+
+on:
+  pull_request:
+    paths:
+      - 'Formula/recordbox.rb'
+      - '.github/workflows/homebrew.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: Install and test the formula (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the checked-out formula from its pinned release source
+        run: |
+          set -euo pipefail
+          # The tap contains the proposed recipe, even before it reaches the default branch.
+          brew tap fantuz/recordbox "file://$GITHUB_WORKSPACE"
+          tap_dir="$(brew --repository fantuz/recordbox)"
+          test "$(git -C "$tap_dir" rev-parse HEAD)" = "$GITHUB_SHA"
+          brew install --build-from-source fantuz/recordbox/recordbox
+      - name: Test the installed app on this architecture
+        run: |
+          set -euo pipefail
+          brew test fantuz/recordbox/recordbox
+          app="$(brew --prefix fantuz/recordbox/recordbox)/libexec/Recordbox.app"
+          lipo "$app/Contents/MacOS/recordbox" -verify_arch "$(uname -m)"
