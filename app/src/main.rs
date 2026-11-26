@@ -52,6 +52,8 @@ mod ui_fx;
 mod ui_perf;
 mod ui_player2;
 mod xmlexport;
+#[cfg(target_os = "linux")]
+mod x11_fullscreen;
 
 use app::App;
 
@@ -66,9 +68,35 @@ struct DetachedLibrary {
     builder: egui::ViewportBuilder,
     docked_size: Option<egui::Vec2>,
     deck_window_height: f32,
+    pending_fullscreen: Option<PendingFullscreen>,
+}
+
+struct PendingFullscreen {
+    origin: egui::ViewportId,
+    fullscreen: bool,
+    root_pass: u64,
+}
+
+impl PendingFullscreen {
+    fn finish(self, ctx: &egui::Context) {
+        // In the immediate library callback, eframe has refreshed both native windows.
+        let still_active = ctx.input(|i| {
+            let Some(root) = i.raw.viewports.get(&egui::ViewportId::ROOT) else { return false };
+            let Some(library) = i.raw.viewports.get(&DetachedLibrary::id()) else { return false };
+            let origin = if self.origin == egui::ViewportId::ROOT { root } else { library };
+            (root.focused == Some(true) || library.focused == Some(true))
+                && !root.close_requested() && !library.close_requested()
+                && origin.minimized != Some(true) && origin.fullscreen != Some(self.fullscreen)
+        });
+        if still_active {
+            ctx.send_viewport_cmd_to(self.origin, egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+    }
 }
 
 impl DetachedLibrary {
+    const TITLE: &'static str = "recordbox — Library";
+
     fn id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("recordbox_library")
     }
@@ -82,12 +110,13 @@ impl DetachedLibrary {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.x, deck_window_height)));
         }
         Self {
-            builder: egui::ViewportBuilder::default().with_title("recordbox — Library")
+            builder: egui::ViewportBuilder::default().with_title(Self::TITLE)
                 .with_inner_size([size.x, (size.y - deck_window_height).max(400.0)])
                 .with_min_inner_size([900.0, 360.0])
-                .with_fullscreen(ctx.input(|i| i.viewport().fullscreen == Some(true))),
+                .with_fullscreen(main_fullscreen(ctx)),
             docked_size,
             deck_window_height,
+            pending_fullscreen: None,
         }
     }
 
@@ -124,12 +153,20 @@ fn restore_docked_size(ctx: &egui::Context, size: Option<egui::Vec2>) {
 }
 
 fn windowed(ctx: &egui::Context) -> bool {
-    ctx.input(|i| i.viewport().fullscreen != Some(true) && i.viewport().maximized != Some(true))
+    ctx.input(|i| i.viewport().maximized != Some(true)) && !main_fullscreen(ctx)
+}
+
+fn main_fullscreen(ctx: &egui::Context) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(fullscreen) = x11_fullscreen::main_fullscreen(ctx) {
+        return fullscreen;
+    }
+    ctx.input(|i| i.viewport().fullscreen == Some(true))
 }
 
 fn window_input(app: &mut App, ctx: &egui::Context) {
     menus::apply_edit_commands(app, ctx);
-    window_fullscreen(&app.prefs, ctx, app.library_window.is_some());
+    window_fullscreen(&app.prefs, ctx, app.library_window.as_mut());
     if ctx.input(|i| i.focused || i.events.contains(&egui::Event::WindowFocused(false))) {
         shortcuts(app, ctx);
     }
@@ -268,9 +305,20 @@ impl eframe::App for Gui {
         let deck_height = app.player_height();
         if let Some(window) = &mut app.library_window {
             window.fit_decks(ctx, deck_height);
+            // An egui layout retry still belongs to the same native update. Only a new update
+            // can finish a transition after the peer's fullscreen command has been delivered.
+            let root_pass = ctx.cumulative_pass_nr();
+            let mut pending = if ctx.output(|o| o.num_completed_passes == 0) {
+                window.pending_fullscreen.take_if(|request| request.root_pass < root_pass)
+            } else {
+                None
+            };
             let reattach = ctx.show_viewport_immediate(library_id, window.builder.clone(), |child, class| {
                 if class == egui::ViewportClass::Embedded || child.input(|i| i.viewport().close_requested()) {
                     return true;
+                }
+                if let Some(request) = pending.take() {
+                    request.finish(child);
                 }
                 window_input(app, child);
                 step!(library_panel(app, child));
@@ -387,7 +435,7 @@ fn recordbox_actions() -> Vec<&'static str> {
 }
 
 /// F11 also works inside a search field. An explicit key binding for another action wins.
-fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context, library_detached: bool) {
+fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context, library: Option<&mut DetachedLibrary>) {
     let fullscreen = ctx.input_mut(|i| {
         if !i.focused {
             return None;
@@ -405,19 +453,34 @@ fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context, library_detached: 
         toggle.then(|| !i.viewport().fullscreen.unwrap_or(false))
     });
     if let Some(fullscreen) = fullscreen {
-        set_window_fullscreen(ctx, ctx.viewport_id(), library_detached, fullscreen);
+        set_window_fullscreen(ctx, ctx.viewport_id(), library, fullscreen);
     }
 }
 
-fn set_window_fullscreen(ctx: &egui::Context, origin: egui::ViewportId, library_detached: bool, fullscreen: bool) {
-    let root = egui::ViewportId::ROOT;
-    let library = DetachedLibrary::id();
-    if library_detached && (origin == root || origin == library) {
-        ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Fullscreen(fullscreen));
-        ctx.send_viewport_cmd_to(library, egui::ViewportCommand::Fullscreen(fullscreen));
-    } else {
-        ctx.send_viewport_cmd_to(origin, egui::ViewportCommand::Fullscreen(fullscreen));
+fn set_window_fullscreen(ctx: &egui::Context, origin: egui::ViewportId, library: Option<&mut DetachedLibrary>, fullscreen: bool) {
+    #[cfg(target_os = "linux")]
+    if x11_fullscreen::toggle(ctx, origin, library.is_some()) {
+        if let Some(window) = library {
+            window.pending_fullscreen = None;
+        }
+        return;
     }
+    let root = egui::ViewportId::ROOT;
+    let library_id = DetachedLibrary::id();
+    if let Some(window) = library.filter(|_| origin == root || origin == library_id) {
+        let peer = if origin == root { library_id } else { root };
+        window.pending_fullscreen = None;
+        let peer_needs_change = ctx.input(|i| i.raw.viewports.get(&peer).is_some_and(|v| !v.close_requested() && v.fullscreen != Some(fullscreen)));
+        if peer_needs_change {
+            // Native backends can activate a window entering fullscreen. eframe does not order
+            // commands across viewports in one update, so transition the initiating window last.
+            ctx.send_viewport_cmd_to(peer, egui::ViewportCommand::Fullscreen(fullscreen));
+            window.pending_fullscreen = Some(PendingFullscreen { origin, fullscreen, root_pass: ctx.cumulative_pass_nr_for(root) });
+            ctx.request_repaint_of(root);
+            return;
+        }
+    }
+    ctx.send_viewport_cmd_to(origin, egui::ViewportCommand::Fullscreen(fullscreen));
 }
 
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
@@ -622,7 +685,7 @@ mod launch_tests {
         raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().maximized = Some(true);
         let mut pending = None;
         let output = ctx.run(raw, |ctx| {
-            let window = DetachedLibrary { builder: Default::default(), docked_size: Some(original), deck_window_height: 312.0 };
+            let window = DetachedLibrary { builder: Default::default(), docked_size: Some(original), deck_window_height: 312.0, pending_fullscreen: None };
             pending = window.reattach(ctx);
         });
         assert_eq!(pending, Some(original));
@@ -718,6 +781,8 @@ fn main() -> eframe::Result<()> {
     }
     let t0 = std::time::Instant::now();
     eframe::run_native("recordbox", options, Box::new(move |cc| {
+        #[cfg(target_os = "linux")]
+        x11_fullscreen::install(cc);
         let app = App::new(cc, screenshot, deck_options);
         if bench_on() {
             eprintln!("bench: ready to draw {:.0} ms after launch", t0.elapsed().as_secs_f32() * 1000.0);

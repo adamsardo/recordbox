@@ -272,15 +272,14 @@ pub fn owns_shortcut(app: &App, action: &str) -> bool {
 }
 
 /// The macOS menu bar is shared by all windows, including the detached library.
-fn fullscreen_viewport(ctx: &egui::Context) -> (egui::ViewportId, bool) {
+fn fullscreen_viewport(ctx: &egui::Context) -> Option<(egui::ViewportId, bool)> {
     ctx.input(|i| {
-        let current = (&i.raw.viewport_id, i.viewport());
         let (&id, window) = if i.focused {
-            current
+            (&i.raw.viewport_id, i.viewport())
         } else {
-            i.raw.viewports.iter().find(|(_, v)| v.focused == Some(true)).unwrap_or(current)
+            i.raw.viewports.iter().find(|(_, v)| v.focused == Some(true))?
         };
-        (id, window.fullscreen.unwrap_or(false))
+        Some((id, window.fullscreen.unwrap_or(false)))
     })
 }
 
@@ -306,7 +305,7 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
             "sync_rekordbox" => (app.can_review_library_sync(), false),
             "undo" => (!app.undo.is_empty(), false),
             "redo" => (!app.redo.is_empty(), false),
-            "fullscreen" => (true, fullscreen_viewport(&app.ctx).1),
+            "fullscreen" => (true, fullscreen_viewport(&app.ctx).is_some_and(|(_, fullscreen)| fullscreen)),
             "layout_player" => (true, layout == 0),
             "layout_2players" => (true, layout == 1),
             "layout_dual" => (true, layout == 2),
@@ -514,8 +513,9 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "fullscreen" => {
-            let (id, fullscreen) = fullscreen_viewport(&app.ctx);
-            crate::set_window_fullscreen(&app.ctx, id, app.library_window.is_some(), !fullscreen);
+            if let Some((id, fullscreen)) = fullscreen_viewport(&app.ctx) {
+                crate::set_window_fullscreen(&app.ctx, id, app.library_window.as_mut(), !fullscreen);
+            }
         }
         "layout_player" => app.set_player_layout(0),
         "layout_2players" => app.set_player_layout(1),
@@ -670,8 +670,17 @@ pub fn handle(app: &mut App, id: &str) {
 mod tests {
     use super::*;
 
+    fn fullscreen_commands(output: egui::FullOutput) -> Vec<(egui::ViewportId, bool)> {
+        output.viewport_output.iter().flat_map(|(&id, viewport)| {
+            viewport.commands.iter().filter_map(move |cmd| match cmd {
+                egui::ViewportCommand::Fullscreen(on) => Some((id, *on)),
+                _ => None,
+            })
+        }).collect()
+    }
+
     #[test]
-    fn f11_toggles_the_main_and_detached_library_together_even_when_editing_text() {
+    fn f11_toggles_the_focused_window_when_the_peer_is_already_in_the_target_state() {
         let root = egui::ViewportId::ROOT;
         let library = crate::DetachedLibrary::id();
         let preferences = egui::ViewportId::from_hash_of("recordbox_preferences");
@@ -698,28 +707,17 @@ mod tests {
                     }
                     egui::CentralPanel::default().show(ctx, |ui| ui.text_edit_singleline(&mut String::new()).request_focus());
                     assert!(ctx.wants_keyboard_input());
-                    crate::window_fullscreen(prefs, ctx, detached);
+                    let mut window = detached.then(|| crate::DetachedLibrary::open(ctx, 256.0));
+                    crate::window_fullscreen(prefs, ctx, window.as_mut());
                 });
-                output.viewport_output.iter().flat_map(|(&viewport, out)| {
-                    out.commands.iter().filter_map(move |cmd| match cmd {
-                        egui::ViewportCommand::Fullscreen(on) => Some((viewport, *on)),
-                        _ => None,
-                    })
-                }).collect::<std::collections::HashSet<_>>()
-            };
-            let expected = |fullscreen| {
-                let mut targets = std::collections::HashSet::from([(id, fullscreen)]);
-                if detached && id != preferences {
-                    targets.extend([(root, fullscreen), (library, fullscreen)]);
-                }
-                targets
+                fullscreen_commands(output)
             };
             let mut prefs = Prefs::default();
             let plain = egui::Modifiers::NONE;
-            assert_eq!(frame(&prefs, true, plain, true, false), expected(true));
+            assert_eq!(frame(&prefs, true, plain, true, false), [(id, true)]);
             assert!(frame(&prefs, true, plain, true, true).is_empty()); // OS key repeat
             assert!(frame(&prefs, false, plain, true, true).is_empty());
-            assert_eq!(frame(&prefs, true, plain, true, true), expected(false));
+            assert_eq!(frame(&prefs, true, plain, true, true), [(id, false)]);
             frame(&prefs, false, plain, true, false);
             assert!(frame(&prefs, true, plain, false, false).is_empty());
             frame(&prefs, false, plain, true, false);
@@ -731,11 +729,74 @@ mod tests {
     }
 
     #[test]
+    fn paired_fullscreen_changes_the_peer_then_the_origin_only_while_the_pair_is_active() {
+        let root = egui::ViewportId::ROOT;
+        let library = crate::DetachedLibrary::id();
+        let inputs = |focused, closing, root_fs, library_fs| {
+            let mut raw = egui::RawInput { focused: focused == Some(root), ..Default::default() };
+            for (id, fullscreen) in [(root, root_fs), (library, library_fs)] {
+                let info = raw.viewports.entry(id).or_default();
+                info.fullscreen = Some(fullscreen);
+                info.focused = Some(focused == Some(id));
+                if closing == Some(id) {
+                    info.events.push(egui::ViewportEvent::Close);
+                }
+            }
+            raw
+        };
+        for (origin, peer) in [(root, library), (library, root)] {
+            for target in [true, false] {
+                let cases = [
+                    (Some(origin), None, false),
+                    (Some(peer), None, false),
+                    (None, None, false),
+                    (Some(origin), Some(root), false),
+                    (Some(origin), Some(library), false),
+                    (Some(peer), None, true),
+                ];
+                for (focused, closing, origin_minimized) in cases {
+                    let ctx = egui::Context::default();
+                    ctx.set_embed_viewports(false);
+                    let mut window = None;
+                    let output = ctx.run(inputs(Some(origin), None, !target, !target), |ctx| {
+                        ctx.show_viewport_deferred(library, Default::default(), |_, _| {});
+                        let window = window.insert(crate::DetachedLibrary::open(ctx, 256.0));
+                        crate::set_window_fullscreen(ctx, origin, Some(window), target);
+                    });
+                    assert_eq!(fullscreen_commands(output), [(peer, target)]);
+                    let mut window = window.unwrap();
+
+                    let mut next_frame = |focused, closing, minimized| {
+                        let mut raw = inputs(focused, closing, if peer == root { target } else { !target }, if peer == library { target } else { !target });
+                        raw.viewports.get_mut(&origin).unwrap().minimized = Some(minimized);
+                        fullscreen_commands(ctx.run(raw, |ctx| {
+                            ctx.show_viewport_deferred(library, Default::default(), |_, _| {});
+                            if let Some(pending) = window.pending_fullscreen.take() {
+                                pending.finish(ctx);
+                            }
+                        }))
+                    };
+                    let completion = next_frame(focused, closing, origin_minimized);
+                    if focused.is_some() && closing.is_none() && !origin_minimized {
+                        assert_eq!(completion, [(origin, target)]);
+                    } else {
+                        assert!(completion.is_empty());
+                    }
+                    // Refocusing a window later must never replay a completed or cancelled F11.
+                    assert!(next_frame(Some(origin), None, false).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_menu_uses_the_focused_childs_state() {
         let library = crate::DetachedLibrary::id();
         let mut raw = egui::RawInput { focused: false, ..Default::default() };
         raw.viewports.insert(library, egui::ViewportInfo { focused: Some(true), fullscreen: Some(true), ..Default::default() });
-        let _ = egui::Context::default().run(raw, |ctx| assert_eq!(fullscreen_viewport(ctx), (library, true)));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(raw, |ctx| assert_eq!(fullscreen_viewport(ctx), Some((library, true))));
+        let _ = ctx.run(egui::RawInput { focused: false, ..Default::default() }, |ctx| assert_eq!(fullscreen_viewport(ctx), None));
     }
 
     #[test]

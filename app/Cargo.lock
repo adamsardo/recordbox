@@ -3932,6 +3932,7 @@ dependencies = [
  "windows 0.58.0",
  "windows-sys 0.61.2",
  "winit",
+ "x11rb",
  "zip",
 ]
 

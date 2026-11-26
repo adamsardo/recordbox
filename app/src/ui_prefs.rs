@@ -336,7 +336,7 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
         let assigning_key = app.dialogs.prefs_tab == 3 && app.dialogs.ext.prefs_search.trim().is_empty()
             && vctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SHORTCUT_WAIT_ID))).flatten().is_some();
         if !assigning_key {
-            crate::window_fullscreen(&app.prefs, vctx, app.library_window.is_some());
+            crate::window_fullscreen(&app.prefs, vctx, None);
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(vctx, |ui| {
             let h = ui.available_height();
