@@ -2,8 +2,8 @@ class Recordbox < Formula
   desc "Local DJ library, track analysis, set preparation and classic USB export"
   homepage "https://github.com/fantuz/recordbox"
   url "https://github.com/fantuz/recordbox.git",
-      tag:      "v0.8.0",
-      revision: "dc0dfa42904a1f346f007748ef8aa1991a77c21d"
+      tag:      "v0.8.1",
+      revision: "a063a3ae319b491873db8c5c5c95e60139e09ee2"
   license "MIT"
 
   depends_on "python@3.13" => :build
