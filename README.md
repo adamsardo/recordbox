@@ -21,7 +21,7 @@ This is being built in the open. An AI coding agent (Claude Code, run through Cr
 
 ## Scope
 
-The first version is deliberately limited to preparation: everything you do *before* the set. Performance features such as live mixing, effects, lighting and video aren't part of it.
+The project focuses on preparing music *before* the set. To rehearse transitions, PERFORMANCE offers two- and four-deck horizontal layouts with an on-screen mixer. Lighting and video are outside that scope.
 
 Once the first version has landed, extended features can be added if enough people ask for them. For example:
 
@@ -67,9 +67,17 @@ This is the request the agent is building from, word for word:
 >
 > The full app bundle is at /Applications/rekordbox 7/rekordbox.app; use its Contents/Resources folder (skins, layouts, text) as the reference for how screens look and are labelled.
 
+## Community downloads for macOS
+
+The independently maintained **fantuz/recordbox** fork builds on Adam Sardo’s MIT-licensed project and includes additional features. It publishes ready-to-run app bundles for Apple Silicon and Intel Macs.
+
+Choose the ZIP for your processor from the fork’s **Downloads** table, verify it against `SHA256SUMS`, then extract and open `Recordbox.app`. These community builds are unsigned and ship without Apple notarization. [Fork downloads](https://github.com/fantuz/recordbox/releases/latest) · [Fork installation guide](https://github.com/fantuz/recordbox#running-it)
+
 ## Feedback
 
 Ideas and bug reports are welcome in [Issues](https://github.com/adamsardo/recordbox/issues). The code changes quickly while the agent is working, so please open an issue rather than a pull request for now.
+
+For bugs in a community package or a feature added in the fork, please use the [fork’s issue tracker](https://github.com/fantuz/recordbox/issues).
 
 ## Licence
 
