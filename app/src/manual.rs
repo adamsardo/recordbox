@@ -96,7 +96,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 "#),
     ("cues", "Cues and loops", r#"
 <h3>Hot cues</h3>
-<p>Eight hot cues, A–H. Press an empty pad (or its key) to set it at the playhead; press a set one to jump there (hold while paused to preview). Clear with the × on the pad or the Clear Hot Cue shortcut. Right-click a pad for its colour and comment. Hot cue markers on the enlarged waveform can be dragged.</p>
+<p>The number keys <kbd>1</kbd> through <kbd>8</kbd> control hot cues A–H on the active deck. Press an empty pad or its key to set a cue at the playhead. Press it again to jump there, or hold it while paused to preview. To clear one cue, hold <kbd>Shift</kbd> and press its number, or click the × on its pad. For example, <kbd>Shift+1</kbd> clears A. Use <b>Edit &gt; Undo</b> to restore it. Right-click a pad for its colour and comment. Drag a hot cue marker on the enlarged waveform to move it.</p>
 <h3>Memory cues</h3>
 <p><b>Memory</b> stores the current cue point (or the active loop) as a memory cue. Call Next / Previous Memory Cue step through them; Memory Cue 1–10 call one directly; Delete Memory Cue removes the one at the cue point. The memory list in the side panel shows them with their comments and colours.</p>
 <h3>Loops</h3>

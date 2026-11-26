@@ -1267,18 +1267,8 @@ impl App {
         if self.deck.audio.is_none() {
             return;
         }
-        self.snapshot_cues();
-        let old: Vec<i64> = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| c.id).collect();
-        for id in old {
-            let _ = self.db.delete_cue(id);
-            self.deck.cues.retain(|c| c.id != id);
-        }
-        let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color: hotcue_default_color(slot, end.is_some()), comment: String::new(), active_loop: false };
-        if let Ok(id) = self.db.save_cue(&c) {
-            c.id = id;
-            self.deck.cues.push(c);
-        }
-        self.refresh_cue_counts(tid);
+        let cue = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color: hotcue_default_color(slot, end.is_some()), comment: String::new(), active_loop: false };
+        self.edit_hot_cue(slot, Some(&cue));
     }
 
     /// "Set Hot Cue A…": at a position of the waveform (quantized when Q is on).

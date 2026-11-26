@@ -349,11 +349,7 @@ pub fn run_action(app: &mut App, act: Act) {
             app.save_prefs();
             app.toast(if app.prefs.quantize { "Quantize ON" } else { "Quantize OFF" });
         }
-        Act::ClearHot(slot) => {
-            if let Some(id) = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).map(|c| c.id) {
-                app.delete_cue(id);
-            }
-        }
+        Act::ClearHot(slot) => app.clear_hot_cue(slot),
         Act::MemJump(d) => app.memory_jump(d),
         Act::MemCall(n) => {
             if let Some(c) = app.memory_cues().get(n).cloned() {
@@ -475,20 +471,14 @@ pub fn sync_mytag_comments(app: &mut App, ids: &[i64]) {
 
 /// "Set Memory Cue at the first beat of track when analyzing": for a track that has no
 /// memory cue yet.
-pub fn memory_cue_at_first_beat(app: &mut App, id: i64, grid: &BeatGrid) {
+pub fn memory_cue_at_first_beat(app: &App, id: i64, grid: &BeatGrid) -> bool {
     let dur = app.track(id).map(|t| t.duration).unwrap_or(0.0).max(1.0);
-    let Some(first) = grid.beats(dur).first().map(|b| b.time) else { return };
-    let cues = app.db.cues(id).unwrap_or_default();
-    if cues.iter().any(|c| c.kind == CueKind::Memory) {
-        return;
+    let Some(first) = grid.beats(dur).first().map(|b| b.time) else { return false };
+    if !app.db.cues(id).is_ok_and(|cues| cues.iter().all(|c| c.kind != CueKind::Memory)) {
+        return false;
     }
     let c = Cue { id: 0, track_id: id, kind: CueKind::Memory, slot: -1, start: first.max(0.0), end: None, color: 0, comment: String::new(), active_loop: false };
-    if app.db.save_cue(&c).is_ok() {
-        app.cue_counts.entry(id).or_insert((0, 0)).1 += 1;
-        if app.deck.track == Some(id) {
-            app.deck.cues = app.db.cues(id).unwrap_or_default();
-        }
-    }
+    app.db.save_cue(&c).is_ok()
 }
 
 // ------------------------------------------------------------------ audio output

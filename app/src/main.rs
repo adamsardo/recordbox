@@ -483,7 +483,87 @@ fn set_window_fullscreen(ctx: &egui::Context, origin: egui::ViewportId, library:
     ctx.send_viewport_cmd_to(origin, egui::ViewportCommand::Fullscreen(fullscreen));
 }
 
+const HOT_CUE_DIGITS: [egui::Key; 8] = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8];
+
+/// A supported logical symbol (e.g. `!` or `/`) can mask the shifted number key. Only
+/// fall back for a clear-cue binding, and let an existing logical binding take precedence.
+fn clear_hot_key(prefs: &app::Prefs, performance: bool, key: egui::Key, digit: egui::Key, mods: &egui::Modifiers) -> egui::Key {
+    if !mods.shift || HOT_CUE_DIGITS.contains(&key) || matches!(key, egui::Key::Num0 | egui::Key::Num9) {
+        return key;
+    }
+    let logical = app::Shortcut::from_event(key, mods);
+    let physical = app::Shortcut { key: digit, ..logical };
+    // Shift can turn a keypad number into its navigation key (e.g. keypad 2 => Down).
+    // The dedicated arrow keys have a different physical key. Honor explicit navigation bindings.
+    use egui::Key::*;
+    let keypad_navigation = matches!((digit, key), (Num1, End) | (Num2, ArrowDown) | (Num3, PageDown) | (Num4, ArrowLeft) | (Num6, ArrowRight) | (Num7, Home) | (Num8, ArrowUp));
+    let mut clear = false;
+    for (action, _, _, _) in app::ACTIONS {
+        if !performance && sampler_ext::is_sampler_action(action) {
+            continue;
+        }
+        let binding = prefs.shortcut_for(action);
+        if binding.is_some_and(|sc| sc.key == key && sc.mods_match(mods, matches!(action, "jump_back" | "jump_fwd")))
+            && (!keypad_navigation || prefs.keymap.contains_key(action)) {
+            return key;
+        }
+        if binding == Some(physical) {
+            if clear || !action.starts_with("clear_hot") {
+                return key;
+            }
+            clear = true;
+        }
+    }
+    if clear { digit } else { key }
+}
+
+/// egui reports repeats by logical key. Shift can change that key while a digit is held.
+/// Keep the original press through its repeat and release; raw input stays available to editors.
+fn shortcut_key_events(app: &App, ctx: &egui::Context) -> Vec<egui::Event> {
+    #[derive(Clone, Copy, Default)]
+    enum DigitState { #[default] Unknown, Released, Held(egui::Key, egui::Modifiers) }
+    type HeldDigits = [DigitState; 8];
+    let id = egui::Id::new((ctx.viewport_id(), "held_hot_cue_digits"));
+    let mut events: Vec<_> = ctx.input(|i| i.events.iter().filter(|e| matches!(e, egui::Event::Key { .. })).cloned().collect());
+    if !ctx.input(|i| i.focused) {
+        ctx.data_mut(|d| d.remove::<HeldDigits>(id));
+    } else if !events.is_empty() {
+        ctx.data_mut(|d| {
+            let held = d.get_temp_mut_or_default::<HeldDigits>(id);
+            for event in &mut events {
+                let egui::Event::Key { key, physical_key: Some(digit), modifiers, pressed, repeat } = event else { continue };
+                let Some(slot) = HOT_CUE_DIGITS.iter().position(|n| n == digit) else { continue };
+                if *pressed {
+                    match held[slot] {
+                        DigitState::Held(initial_key, initial_mods) => {
+                            *repeat = true;
+                            (*key, *modifiers) = (initial_key, initial_mods);
+                        }
+                        state => {
+                            // A known physical release starts a new press even if the old
+                            // logical symbol is still down in egui. After focus loss, honor repeat.
+                            if matches!(state, DigitState::Released) { *repeat = false; }
+                            *key = clear_hot_key(&app.prefs, app.performance(), *key, *digit, modifiers);
+                            held[slot] = DigitState::Held(*key, *modifiers);
+                        }
+                    }
+                } else if let DigitState::Held(initial_key, initial_mods) = std::mem::replace(&mut held[slot], DigitState::Released) {
+                    (*key, *modifiers) = (initial_key, initial_mods);
+                }
+            }
+        });
+    }
+    events
+}
+
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
+    let key_events = shortcut_key_events(app, ctx);
+    let was_released = |binding: Option<app::Shortcut>| binding.is_some_and(|sc| key_events.iter().any(|event| match event {
+        egui::Event::Key { key, physical_key, modifiers, pressed: false, .. } if *key == sc.key => {
+            !physical_key.is_some_and(|k| HOT_CUE_DIGITS.contains(&k)) || sc.mods_match(modifiers, false)
+        }
+        _ => false,
+    }));
     // Previews never outlive what holds them: losing the window's focus ends them (key-up
     // events are not delivered then), and a hot-cue preview ends once neither a hot-cue key nor
     // a mouse button is held.
@@ -523,7 +603,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     // Key releases end cue/hot-cue previews even while a text field has focus, so a preview
     // can never be left playing.
     if ctx.wants_keyboard_input() {
-        let rel = |p: &app::Prefs, a: &str| p.key_for(a).map(|k| ctx.input(|i| i.key_released(k))).unwrap_or(false);
+        let rel = |p: &app::Prefs, a: &str| was_released(p.shortcut_for(a));
         let cue_rel = rel(&app.prefs, "cue");
         let hot_rel = (1..=8).any(|n| rel(&app.prefs, &format!("hot{n}")));
         if app.deck.cue_preview && cue_rel {
@@ -536,7 +616,6 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     }
     use egui::Key;
     let shortcuts: std::collections::HashMap<&str, app::Shortcut> = recordbox_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
-    let key = |a: &str| shortcuts.get(a).map(|s| s.key);
     // A press of the action's key with exactly its modifiers (beat jumps also take Shift).
     // The sampler deck's keys work in PERFORMANCE mode only, and there they come before
     // another action on the same key (they are rekordbox's Performance preset).
@@ -546,10 +625,10 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         let Some(sc) = shortcuts.get(a) else { return false };
         if sampler_ext::is_sampler_action(a) { if !perf { return false; } } else if smp_keys.contains(sc) { return false; }
         let free_shift = a == "jump_back" || a == "jump_fwd";
-        ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat, modifiers, .. } if *key == sc.key && (repeats || !*repeat) && sc.mods_match(modifiers, free_shift))))
+        key_events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, repeat, modifiers, .. } if *key == sc.key && (repeats || !*repeat) && sc.mods_match(modifiers, free_shift)))
     };
     let pressed = |a: &str| hit(a, true);
-    let released = |a: &str| key(a).map(|k| ctx.input(|i| i.key_released(k))).unwrap_or(false);
+    let released = |a: &str| was_released(shortcuts.get(a).copied());
     let first = |a: &str| hit(a, false);
     let shift = ctx.input(|i| i.modifiers.shift);
     let cmd_a = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A));
