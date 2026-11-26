@@ -515,7 +515,7 @@ pub fn handle(app: &mut App, id: &str) {
         }
         "fullscreen" => {
             let (id, fullscreen) = fullscreen_viewport(&app.ctx);
-            app.ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(!fullscreen));
+            crate::set_window_fullscreen(&app.ctx, id, app.library_window.is_some(), !fullscreen);
         }
         "layout_player" => app.set_player_layout(0),
         "layout_2players" => app.set_player_layout(1),
@@ -671,34 +671,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn f11_toggles_only_the_focused_viewport_even_when_editing_text() {
-        let library = egui::ViewportId::from_hash_of("library");
-        for id in [egui::ViewportId::ROOT, library] {
+    fn f11_toggles_the_main_and_detached_library_together_even_when_editing_text() {
+        let root = egui::ViewportId::ROOT;
+        let library = crate::DetachedLibrary::id();
+        let preferences = egui::ViewportId::from_hash_of("recordbox_preferences");
+        for (id, detached) in [(root, false), (root, true), (library, true), (preferences, true)] {
             let ctx = egui::Context::default();
-            let frame = |prefs: &Prefs, pressed, modifiers, focused, fullscreen| {
+            ctx.set_embed_viewports(false);
+            let frame = |prefs: &Prefs, pressed, modifiers, focused, fullscreen: bool| {
                 let mut raw = egui::RawInput { viewport_id: id, focused, ..Default::default() };
+                // One window may have entered fullscreen through its native controls.
+                let peer = if id == root { library } else { root };
+                if detached {
+                    raw.viewports.entry(peer).or_default().fullscreen = Some(!fullscreen);
+                }
                 let window = raw.viewports.entry(id).or_default();
                 window.fullscreen = Some(fullscreen);
                 window.focused = Some(focused);
                 raw.events.push(egui::Event::Key { key: egui::Key::F11, physical_key: None, pressed, repeat: false, modifiers });
                 let output = ctx.run(raw, |ctx| {
+                    if id == root {
+                        // Keep outputs observable even for an unrelated or recently reattached window.
+                        for child in [library, preferences] {
+                            ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
+                        }
+                    }
                     egui::CentralPanel::default().show(ctx, |ui| ui.text_edit_singleline(&mut String::new()).request_focus());
                     assert!(ctx.wants_keyboard_input());
-                    crate::window_fullscreen(prefs, ctx);
+                    crate::window_fullscreen(prefs, ctx, detached);
                 });
                 output.viewport_output.iter().flat_map(|(&viewport, out)| {
                     out.commands.iter().filter_map(move |cmd| match cmd {
                         egui::ViewportCommand::Fullscreen(on) => Some((viewport, *on)),
                         _ => None,
                     })
-                }).collect::<Vec<_>>()
+                }).collect::<std::collections::HashSet<_>>()
+            };
+            let expected = |fullscreen| {
+                let mut targets = std::collections::HashSet::from([(id, fullscreen)]);
+                if detached && id != preferences {
+                    targets.extend([(root, fullscreen), (library, fullscreen)]);
+                }
+                targets
             };
             let mut prefs = Prefs::default();
             let plain = egui::Modifiers::NONE;
-            assert_eq!(frame(&prefs, true, plain, true, false), [(id, true)]);
+            assert_eq!(frame(&prefs, true, plain, true, false), expected(true));
             assert!(frame(&prefs, true, plain, true, true).is_empty()); // OS key repeat
             assert!(frame(&prefs, false, plain, true, true).is_empty());
-            assert_eq!(frame(&prefs, true, plain, true, true), [(id, false)]);
+            assert_eq!(frame(&prefs, true, plain, true, true), expected(false));
             frame(&prefs, false, plain, true, false);
             assert!(frame(&prefs, true, plain, false, false).is_empty());
             frame(&prefs, false, plain, true, false);
@@ -711,7 +732,7 @@ mod tests {
 
     #[test]
     fn fullscreen_menu_uses_the_focused_childs_state() {
-        let library = egui::ViewportId::from_hash_of("library");
+        let library = crate::DetachedLibrary::id();
         let mut raw = egui::RawInput { focused: false, ..Default::default() };
         raw.viewports.insert(library, egui::ViewportInfo { focused: Some(true), fullscreen: Some(true), ..Default::default() });
         let _ = egui::Context::default().run(raw, |ctx| assert_eq!(fullscreen_viewport(ctx), (library, true)));

@@ -57,17 +57,22 @@ use app::App;
 
 struct Gui {
     app: App,
+    pending_docked_size: Option<egui::Vec2>,
 }
 
 const MAIN_MIN_SIZE: egui::Vec2 = egui::vec2(1100.0, 700.0);
 
 struct DetachedLibrary {
-    initial_size: egui::Vec2,
+    builder: egui::ViewportBuilder,
     docked_size: Option<egui::Vec2>,
     deck_window_height: f32,
 }
 
 impl DetachedLibrary {
+    fn id() -> egui::ViewportId {
+        egui::ViewportId::from_hash_of("recordbox_library")
+    }
+
     fn open(ctx: &egui::Context, player_height: f32) -> Self {
         let size = ctx.screen_rect().size();
         let docked_size = windowed(ctx).then_some(size);
@@ -77,7 +82,10 @@ impl DetachedLibrary {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.x, deck_window_height)));
         }
         Self {
-            initial_size: egui::vec2(size.x, (size.y - deck_window_height).max(400.0)),
+            builder: egui::ViewportBuilder::default().with_title("recordbox — Library")
+                .with_inner_size([size.x, (size.y - deck_window_height).max(400.0)])
+                .with_min_inner_size([900.0, 360.0])
+                .with_fullscreen(ctx.input(|i| i.viewport().fullscreen == Some(true))),
             docked_size,
             deck_window_height,
         }
@@ -96,12 +104,22 @@ impl DetachedLibrary {
         }
     }
 
-    fn reattach(self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MAIN_MIN_SIZE));
-        if let Some(size) = self.docked_size.filter(|_| windowed(ctx)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        }
+    fn reattach(self, ctx: &egui::Context) -> Option<egui::Vec2> {
         ctx.request_repaint();
+        if self.docked_size.is_some() && !windowed(ctx) {
+            // The WM must first be allowed to restore its saved, deck-height window.
+            // Raising the minimum now can prevent it from leaving maximized mode on X11.
+            return self.docked_size;
+        }
+        restore_docked_size(ctx, self.docked_size);
+        None
+    }
+}
+
+fn restore_docked_size(ctx: &egui::Context, size: Option<egui::Vec2>) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MAIN_MIN_SIZE));
+    if let Some(size) = size {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
 }
 
@@ -111,7 +129,7 @@ fn windowed(ctx: &egui::Context) -> bool {
 
 fn window_input(app: &mut App, ctx: &egui::Context) {
     menus::apply_edit_commands(app, ctx);
-    window_fullscreen(&app.prefs, ctx);
+    window_fullscreen(&app.prefs, ctx, app.library_window.is_some());
     if ctx.input(|i| i.focused || i.events.contains(&egui::Event::WindowFocused(false))) {
         shortcuts(app, ctx);
     }
@@ -180,6 +198,9 @@ impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let bench_t0 = std::time::Instant::now();
         let app = &mut self.app;
+        if self.pending_docked_size.is_some() && windowed(ctx) {
+            restore_docked_size(ctx, self.pending_docked_size.take());
+        }
         // PREPDECK_BENCH: name any step that holds a frame up for more than 4 ms.
         macro_rules! step {
             ($e:expr) => {{
@@ -212,9 +233,11 @@ impl eframe::App for Gui {
         }).inner;
         if toggle_library {
             if let Some(window) = app.library_window.take() {
-                window.reattach(ctx);
+                self.pending_docked_size = window.reattach(ctx);
             } else if !ctx.embed_viewports() {
-                app.library_window = Some(DetachedLibrary::open(ctx, app.player_height()));
+                let mut window = DetachedLibrary::open(ctx, app.player_height());
+                window.docked_size = window.docked_size.or(self.pending_docked_size.take());
+                app.library_window = Some(window);
             }
         }
         egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
@@ -241,13 +264,11 @@ impl eframe::App for Gui {
                 draw_players(app);
             }
         }
-        let library_id = egui::ViewportId::from_hash_of("recordbox_library");
+        let library_id = DetachedLibrary::id();
         let deck_height = app.player_height();
         if let Some(window) = &mut app.library_window {
             window.fit_decks(ctx, deck_height);
-            let builder = egui::ViewportBuilder::default().with_title("recordbox — Library")
-                .with_inner_size(window.initial_size).with_min_inner_size([900.0, 360.0]);
-            let reattach = ctx.show_viewport_immediate(library_id, builder, |child, class| {
+            let reattach = ctx.show_viewport_immediate(library_id, window.builder.clone(), |child, class| {
                 if class == egui::ViewportClass::Embedded || child.input(|i| i.viewport().close_requested()) {
                     return true;
                 }
@@ -258,7 +279,7 @@ impl eframe::App for Gui {
             });
             if reattach {
                 if let Some(window) = app.library_window.take() {
-                    window.reattach(ctx);
+                    self.pending_docked_size = window.reattach(ctx);
                 }
             }
         }
@@ -366,7 +387,7 @@ fn recordbox_actions() -> Vec<&'static str> {
 }
 
 /// F11 also works inside a search field. An explicit key binding for another action wins.
-fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context) {
+fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context, library_detached: bool) {
     let fullscreen = ctx.input_mut(|i| {
         if !i.focused {
             return None;
@@ -384,7 +405,18 @@ fn window_fullscreen(prefs: &app::Prefs, ctx: &egui::Context) {
         toggle.then(|| !i.viewport().fullscreen.unwrap_or(false))
     });
     if let Some(fullscreen) = fullscreen {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+        set_window_fullscreen(ctx, ctx.viewport_id(), library_detached, fullscreen);
+    }
+}
+
+fn set_window_fullscreen(ctx: &egui::Context, origin: egui::ViewportId, library_detached: bool, fullscreen: bool) {
+    let root = egui::ViewportId::ROOT;
+    let library = DetachedLibrary::id();
+    if library_detached && (origin == root || origin == library) {
+        ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Fullscreen(fullscreen));
+        ctx.send_viewport_cmd_to(library, egui::ViewportCommand::Fullscreen(fullscreen));
+    } else {
+        ctx.send_viewport_cmd_to(origin, egui::ViewportCommand::Fullscreen(fullscreen));
     }
 }
 
@@ -582,6 +614,44 @@ mod launch_tests {
     use super::DeckOptions;
 
     #[test]
+    fn redocking_defers_size_constraints_until_the_window_manager_restores_the_player() {
+        use super::{egui, restore_docked_size, DetachedLibrary, MAIN_MIN_SIZE};
+        let ctx = egui::Context::default();
+        let original = egui::vec2(1440.0, 840.0);
+        let mut raw = egui::RawInput::default();
+        raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().maximized = Some(true);
+        let mut pending = None;
+        let output = ctx.run(raw, |ctx| {
+            let window = DetachedLibrary { builder: Default::default(), docked_size: Some(original), deck_window_height: 312.0 };
+            pending = window.reattach(ctx);
+        });
+        assert_eq!(pending, Some(original));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter().all(|cmd|
+            !matches!(cmd, egui::ViewportCommand::MinInnerSize(_) | egui::ViewportCommand::InnerSize(_))
+        ));
+        let output = ctx.run(Default::default(), |ctx| restore_docked_size(ctx, pending.take()));
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands.iter().any(|cmd| matches!(cmd, egui::ViewportCommand::MinInnerSize(size) if *size == MAIN_MIN_SIZE)));
+        assert!(commands.iter().any(|cmd| matches!(cmd, egui::ViewportCommand::InnerSize(size) if *size == original)));
+    }
+
+    #[test]
+    fn library_opens_in_the_main_windows_fullscreen_mode() {
+        use super::{egui, DetachedLibrary};
+        for (fullscreen, maximized) in [(true, false), (false, true), (false, false)] {
+            let mut raw = egui::RawInput::default();
+            let main = raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+            main.fullscreen = Some(fullscreen);
+            main.maximized = Some(maximized);
+            let _ = egui::Context::default().run(raw, |ctx| {
+                let library = DetachedLibrary::open(ctx, 256.0);
+                assert_eq!(library.builder.fullscreen, Some(fullscreen));
+                assert_eq!(library.builder.maximized, None);
+            });
+        }
+    }
+
+    #[test]
     fn deck_switches_are_independent_and_session_only() {
         for (args, load, play) in [
             (vec![], false, false), (vec!["--disable-load"], true, false),
@@ -652,6 +722,6 @@ fn main() -> eframe::Result<()> {
         if bench_on() {
             eprintln!("bench: ready to draw {:.0} ms after launch", t0.elapsed().as_secs_f32() * 1000.0);
         }
-        Ok(Box::new(Gui { app }))
+        Ok(Box::new(Gui { app, pending_docked_size: None }))
     }))
 }

@@ -20,7 +20,7 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 <h3>The window</h3>
 <p>Top: the player (waveforms, transport, cues, grid). Below: the browser with the Tree View on the left (Collection, Playlists, Related Tracks, Explorer, Devices, Histories) and the track list on the right. <i>View</i> switches between <b>1 Player</b>, <b>2 Players</b>, <b>Simple Player</b> and <b>Full Browser</b>.</p>
 <p>In <b>EXPORT</b> and <b>PERFORMANCE</b>, click the overlapping windows at the far right of the top bar to open the library browser in its own window. The decks, GRID and MEMORY controls stay in the main window. Everything below them moves together, including the collection tree, playlists, filters, search and track list. You keep your selection and place in the list. Close the library window or click the same icon again to continue browsing in the main window.</p>
-<p>Press <kbd>F11</kbd> to enter or leave fullscreen in the window you are using. This lets you put the library on a second monitor and make either window fullscreen independently.</p>
+<p>You can move, resize or maximize each window independently. To fill two monitors, move the library to the second monitor, then press <kbd>F11</kbd> in either window. Both windows enter fullscreen on their own monitors. Press <kbd>F11</kbd> again in either window to restore them. With the library attached, <kbd>F11</kbd> toggles the main window.</p>
 "#),
     ("import", "Importing music", r#"
 <ul>

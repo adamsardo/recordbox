@@ -336,7 +336,7 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
         let assigning_key = app.dialogs.prefs_tab == 3 && app.dialogs.ext.prefs_search.trim().is_empty()
             && vctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SHORTCUT_WAIT_ID))).flatten().is_some();
         if !assigning_key {
-            crate::window_fullscreen(&app.prefs, vctx);
+            crate::window_fullscreen(&app.prefs, vctx, app.library_window.is_some());
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(vctx, |ui| {
             let h = ui.available_height();
@@ -1524,7 +1524,7 @@ fn page_keyboard(app: &mut App, ui: &mut Ui, tab: usize) {
             }
         }));
         note(ui, "⌘ and Ctrl shortcuts of Import file, Import directory, Fullscreen mode and Preferences also appear in the menu bar.");
-        note(ui, "F11 toggles the focused window’s full screen mode unless you assign it to another action.");
+        note(ui, "F11 toggles full screen for the main window and detached library together unless you assign it to another action.");
     });
 }
 
