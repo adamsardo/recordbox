@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15-intel]
+        runner: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -30,6 +30,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the build interpreter alongside the runner's Python
+        if: runner.arch == 'X64'
+        # The Intel image provides Python.org symlinks. The formula uses Homebrew's private opt path.
+        run: brew install --skip-link python@3.13
       - name: Install the checked-out formula from its pinned release source
         run: |
           set -euo pipefail
