@@ -1035,7 +1035,8 @@ impl App {
     pub fn poll_stem_wave(&mut self) {
         let (stems, on) = {
             let s = self.player.state.lock();
-            (s.stems.clone(), s.stem_on)
+            // Not from stems still being separated: drawn once they are complete.
+            (s.stems.clone().filter(|_| s.stems_ready.as_ref().is_none_or(|r| r.complete())), s.stem_on)
         };
         let (Some(stems), Some(tid), true, false) = (stems, self.deck.track, self.prefs.stem_waveform, on.iter().all(|x| *x)) else {
             self.deck.x.stem_wave_rx = None;

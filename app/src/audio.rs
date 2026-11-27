@@ -234,6 +234,8 @@ pub struct PlayState {
     /// Separated stems of the loaded track (44.1 kHz) and which are audible, in source order
     /// drums, bass, other, vocals. With all on (or no stems) the original mix plays.
     pub stems: Option<Arc<crate::stems::Stems>>,
+    /// Set while `stems` are still being separated: which stretches are ready to play.
+    pub stems_ready: Option<Arc<crate::stems::Live>>,
     pub stem_on: [bool; 4],
     /// STEM ISO gain of each source (same order): 0 kills it, 1 leaves it, up to +6 dB
     /// (`stem_iso_gain` turns a knob position into this).
@@ -315,6 +317,7 @@ impl Default for PlayState {
             metronome: None,
             metronome_vol: 0.5,
             stems: None,
+            stems_ready: None,
             stem_on: [true; 4],
             stem_iso: [1.0; 4],
             search: 0.0,
@@ -1276,6 +1279,9 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     // Where the gains of the original and the parts are heading. The parts are used only
     // while one of them is muted or off unity; until then the original plays untouched.
     let use_parts = stems.is_some() && (0..4).any(|i| !s.stem_on[i] || s.stem_iso[i] != 1.0);
+    // Stems still being separated: where this buffer reads is not ready yet, the original
+    // plays (rekordbox's per-chunk rule), with the same fade as any other switch.
+    let use_parts = use_parts && s.stems_ready.as_ref().is_none_or(|r| r.ready_around([s.pos, s.dsp.snd], (out.len() / channels.max(1)) as f64 * step * 2.0, audio.sr));
     let mut stem_target = [if use_parts { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0, 0.0];
     if use_parts {
         for i in 0..4 {

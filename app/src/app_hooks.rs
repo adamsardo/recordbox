@@ -47,7 +47,7 @@ pub fn toggle_automix(app: &mut App) {
 /// library (sampler_lib.rs). The GROOVE CIRCUIT factory pack is unpacked from the installed
 /// rekordbox by itself the first time its panel is shown, so its Import item has nothing to do.
 pub fn pack_import_available(id: &str) -> bool {
-    id == "pack_sample_import"
+    id == "pack_sample_import" || id == "pack_gc_import"
 }
 
 pub fn pack_import(app: &mut App, id: &str) {
@@ -55,6 +55,9 @@ pub fn pack_import(app: &mut App, id: &str) {
         if let Some(f) = rfd::FileDialog::new().add_filter("Sampler pack", &["zip"]).set_title("Import Sampler Plus Pack").pick_file() {
             app.smplib_import_pack(&f);
         }
+    } else if id == "pack_gc_import" {
+        // (Asks for the pack file itself, starting in rekordbox's own pack folder.)
+        app.groove_import_pack(None);
     }
 }
 

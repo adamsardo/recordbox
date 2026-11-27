@@ -375,7 +375,9 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     // the track to where the parts are ready.
     if let (Some((sid, pr)), Some(tid)) = (app.stem.separating, app.deck.track) {
         if sid == tid && pr > 0.0 {
-            p.rect_filled(Rect::from_min_max(pos2(r.min.x, base + 1.5), pos2(r.min.x + r.width() * pr.clamp(0.0, 1.0), base + 2.5)), 0.0, hex(0x077DE1));
+            for (a, b) in app.stem_ready_ranges(tid, pr) {
+                p.rect_filled(Rect::from_min_max(pos2(r.min.x + r.width() * a, base + 1.5), pos2(r.min.x + r.width() * b, base + 2.5)), 0.0, hex(0x077DE1));
+            }
         }
     }
     // Vocal positions (rekordbox's vocal detection): a band along the top, brighter where the

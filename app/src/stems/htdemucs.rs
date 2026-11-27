@@ -11,6 +11,10 @@
 //! an M5 Pro; outputs agree with the reference to better than 100 dB, which the test
 //! `metal_kernels_match_reference_graph` guards) and overlaps the transforms on the CPU
 //! with the network on the GPU.
+//!
+//! `separate_with` runs one or more networks over a track in any segment order (the caller
+//! picks the next one) and reports frames as soon as every segment covering them is in, so
+//! the player can use the stems while they are made; the overlap-add is exact in any order.
 
 #[cfg(target_os = "macos")]
 #[path = "metal_fast.rs"]
@@ -203,6 +207,40 @@ pub(crate) fn pos2(f: usize, t: usize, c: usize) -> Vec<f32> {
     out
 }
 
+/// The tensors of an original Demucs checkpoint (`torch.save({"klass", "args", "kwargs",
+/// "state": state_dict, ...})`), on the CPU. Candle's `PthTensors::get` opens the archive and
+/// parses its directory again for every tensor (1.2-1.4 s for HTDemucs's 533); this opens it
+/// once and reads every tensor the same way (same bytes, same layout handling).
+fn read_th(path: &Path) -> Result<Vec<(String, Tensor)>> {
+    use std::io::Read;
+    let infos = candle_core::pickle::read_pth_tensor_info(path, false, Some("state"))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(std::fs::File::open(path)?)).map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+    let mut out = Vec::with_capacity(infos.len());
+    for info in infos {
+        let mut reader = zip.by_name(&info.path).map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        let fortran = info.layout.is_fortran_contiguous();
+        let rank = info.layout.shape().rank();
+        if !info.layout.is_contiguous() && !fortran {
+            candle_core::bail!("cannot read non-contiguous tensor {}", info.name)
+        }
+        // As Candle's reader does (it skips `start_offset` bytes).
+        let skip = info.layout.start_offset();
+        if skip > 0 {
+            std::io::copy(&mut reader.by_ref().take(skip as u64), &mut std::io::sink())?;
+        }
+        // Little-endian on disk, as in memory here.
+        let mut bytes = vec![0u8; info.layout.shape().elem_count() * info.dtype.size_in_bytes()];
+        reader.read_exact(&mut bytes)?;
+        let mut t = Tensor::from_raw_buffer(&bytes, info.dtype, info.layout.dims(), &Device::Cpu)?;
+        if rank > 1 && fortran {
+            let reversed: Vec<usize> = info.layout.dims().iter().rev().cloned().collect();
+            t = t.reshape(reversed)?.permute((0..rank).rev().collect::<Vec<_>>())?;
+        }
+        out.push((info.name, t));
+    }
+    Ok(out)
+}
+
 /// One loaded HTDemucs network.
 pub struct Graph {
     /// The checkpoint's tensors by name: the reference graph (any device).
@@ -233,13 +271,9 @@ impl Graph {
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
             Some("safetensors") => candle_core::safetensors::load(path, device)?,
             _ => {
-                // torch.save({"klass", "args", "kwargs", "state": state_dict, ...})
-                let pth = candle_core::pickle::PthTensors::new(path, Some("state"))?;
                 let mut m = HashMap::new();
-                for name in pth.tensor_infos().keys() {
-                    if let Some(t) = pth.get(name)? {
-                        m.insert(name.clone(), t.to_device(device)?);
-                    }
+                for (name, t) in read_th(path)? {
+                    m.insert(name, t.to_device(device)?);
                 }
                 m
             }
@@ -515,6 +549,37 @@ fn segment_at(audio: &[f32], len: usize, offset: usize) -> Vec<f32> {
     input
 }
 
+/// Profiling of the Metal path (see `metal_fast::profile_begin`); no effect elsewhere.
+#[cfg(test)]
+pub(crate) fn profile_begin(ops: bool) {
+    #[cfg(target_os = "macos")]
+    metal_fast::profile_begin(ops);
+}
+
+#[cfg(test)]
+pub(crate) fn profile_take() -> Vec<(String, f64, usize)> {
+    #[cfg(target_os = "macos")]
+    return metal_fast::profile_take();
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// Time of one empty profiling mark (a GPU round trip with nothing to do).
+#[cfg(test)]
+pub(crate) fn profile_mark_cost(device: &Device) -> f64 {
+    #[cfg(target_os = "macos")]
+    if let Ok(t) = Tensor::zeros(16, DType::F32, device) {
+        metal_fast::profile_begin(false);
+        for _ in 0..200 {
+            metal_fast::mark(&t, || "empty".into());
+        }
+        let rows = metal_fast::profile_take();
+        return rows.first().map(|r| r.1 / r.2 as f64).unwrap_or(0.0);
+    }
+    let _ = device;
+    0.0
+}
+
 /// Free the GPU memory kept for intermediates between segments (call when a job ends).
 pub fn release_scratch() {
     #[cfg(target_os = "macos")]
@@ -531,50 +596,209 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// source asked for. `progress(done, total)` is called after each chunk; returning false
 /// cancels.
 pub fn separate(graph: &Graph, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
-    if len == 0 || audio.len() != 2 * len {
-        candle_core::bail!("empty or malformed input")
-    }
     if opts.source.is_some_and(|s| s >= 4) {
         candle_core::bail!("no such source")
     }
-    #[cfg(target_os = "macos")]
-    if let Some(fast) = &graph.fast {
-        return separate_fast(fast, device, audio, len, opts, progress);
+    let planes = if opts.source.is_some() { 2 } else { 8 };
+    let mut out = vec![0f32; planes * len];
+    let sink = Sink { out: out.as_mut_ptr(), ready: &|_, _| {}, next: None };
+    separate_with(&[Part { graph, source: opts.source }], device, audio, len, opts.overlap, &sink, progress)?;
+    Ok(out)
+}
+
+/// One network and what is taken from it.
+pub struct Part<'a> {
+    pub graph: &'a Graph,
+    /// One source (0 drums, 1 bass, 2 other, 3 vocals), or all four.
+    pub source: Option<usize>,
+}
+
+impl Part<'_> {
+    fn sources(&self) -> Vec<usize> {
+        self.source.map(|s| vec![s]).unwrap_or_else(|| (0..4).collect())
     }
-    let segment = TRAINING_FRAMES;
-    let (offsets, weight) = plan(len, opts.overlap);
-    let sources: Vec<usize> = opts.source.map(|s| vec![s]).unwrap_or_else(|| (0..4).collect());
-    let mut out = vec![0f32; sources.len() * 2 * len];
-    let mut sums = vec![0f32; len];
-    for (k, &offset) in offsets.iter().enumerate() {
-        let chunk_len = (len - offset).min(segment);
-        let x = Tensor::from_vec(segment_at(audio, len, offset), (1, 2, segment), device)?;
-        let y = {
-            let _gpu = GPU.lock();
-            graph.forward(&x)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
-        };
-        let crop = (segment - chunk_len) / 2;
-        for (n, &s) in sources.iter().enumerate() {
-            for ch in 0..2 {
-                let (dst, src) = (&mut out[(n * 2 + ch) * len + offset..][..chunk_len], &y[(s * 2 + ch) * segment + crop..][..chunk_len]);
-                for i in 0..chunk_len {
-                    dst[i] += weight[i] * src[i];
+}
+
+/// Where a separation's results go and in which order its segments are made.
+pub struct Sink<'a> {
+    /// Output: one plane of `len` frames for each channel of each source taken, in the order
+    /// of the parts (planar [source][channel][frame]), zero at the start. Nothing else may
+    /// write it while the separation runs, and a frame's value is final only once `ready`
+    /// has reported it.
+    pub out: *mut f32,
+    /// Frames [a, b) are final. Called on a worker thread, once per frame, in no fixed order.
+    pub ready: &'a (dyn Fn(usize, usize) + Sync),
+    /// The next segment to make, given which are taken already; without it (or when it
+    /// answers None or a taken one) segments are made in order.
+    pub next: Option<&'a (dyn Fn(&[bool]) -> Option<usize> + Sync)>,
+}
+
+/// How a track is cut: the frames each segment's chunk covers, the triangular weight and the
+/// sum of weights at every frame.
+pub(crate) struct Plan {
+    pub spans: Vec<(usize, usize)>,
+    weight: Vec<f32>,
+    sums: Vec<f32>,
+}
+
+impl Plan {
+    pub fn new(len: usize, overlap: f64) -> Self {
+        let (offsets, weight) = plan(len, overlap);
+        let spans: Vec<(usize, usize)> = offsets.iter().map(|&o| (o, o + (len - o).min(TRAINING_FRAMES))).collect();
+        // Summed in segment order, as the whole-track division always was.
+        let mut sums = vec![0f32; len];
+        for &(a, b) in &spans {
+            for (s, w) in sums[a..b].iter_mut().zip(&weight) {
+                *s += w;
+            }
+        }
+        Self { spans, weight, sums }
+    }
+}
+
+/// The first segment `next` names that is not taken, else the first not taken.
+fn pick(next: Option<&(dyn Fn(&[bool]) -> Option<usize> + Sync)>, taken: &[bool]) -> Option<usize> {
+    next.and_then(|f| f(taken)).filter(|&k| k < taken.len() && !taken[k]).or_else(|| taken.iter().position(|t| !t))
+}
+
+#[derive(Clone, Copy)]
+struct OutPtr(*mut f32);
+// SAFETY: the pointer is only used while the separation that owns the output runs, and each
+// plane is written by one thread at a time (see `Assembly`).
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+
+/// Overlap-add of segment results in any order. Each output frame is the weighted sum of the
+/// (one or two) segments that cover it divided by the summed weights; it is divided and
+/// reported ready as soon as every segment covering it is in. With at most two segments per
+/// frame (overlap up to 50 %) the order of the two additions cannot change the sum, so the
+/// result is the same bit for bit whatever the order.
+struct Assembly<'a> {
+    plan: &'a Plan,
+    out: OutPtr,
+    planes: usize,
+    len: usize,
+    /// Parts still to come, per segment.
+    left: Vec<usize>,
+    done: Vec<bool>,
+    ready: &'a (dyn Fn(usize, usize) + Sync),
+}
+
+impl<'a> Assembly<'a> {
+    fn new(plan: &'a Plan, out: *mut f32, planes: usize, len: usize, parts: usize, ready: &'a (dyn Fn(usize, usize) + Sync)) -> Self {
+        Self { plan, out: OutPtr(out), planes, len, left: vec![parts; plan.spans.len()], done: vec![false; plan.spans.len()], ready }
+    }
+
+    /// Output plane `p`.
+    ///
+    /// SAFETY: the caller must be the only one using plane `p` until the returned slice is
+    /// dropped (planes are handed to one thread each, and `part_done` runs after they join).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn plane(&self, p: usize) -> &mut [f32] {
+        assert!(p < self.planes);
+        std::slice::from_raw_parts_mut(self.out.0.add(p * self.len), self.len)
+    }
+
+    /// One part of segment `k` has been added; when it was the last, finish what became final.
+    fn part_done(&mut self, k: usize) {
+        self.left[k] -= 1;
+        if self.left[k] > 0 {
+            return;
+        }
+        self.done[k] = true;
+        let (a, b) = self.plan.spans[k];
+        // The boundaries of the overlapping segments cut the chunk into pieces that each have
+        // one set of covering segments.
+        let mut cuts = vec![a, b];
+        for &(s, e) in &self.plan.spans {
+            for c in [s, e] {
+                if c > a && c < b {
+                    cuts.push(c);
                 }
             }
         }
-        for i in 0..chunk_len {
-            sums[offset + i] += weight[i];
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let (x, y) = (w[0], w[1]);
+            if self.plan.spans.iter().zip(&self.done).all(|(&(s, e), &d)| d || e <= x || s >= y) {
+                for p in 0..self.planes {
+                    // SAFETY: no plane is borrowed elsewhere while `part_done` runs.
+                    let plane = unsafe { self.plane(p) };
+                    for (v, s) in plane[x..y].iter_mut().zip(&self.plan.sums[x..y]) {
+                        *v /= s.max(1e-9);
+                    }
+                }
+                (self.ready)(x, y);
+            }
         }
-        if !progress(k + 1, offsets.len()) {
+    }
+}
+
+/// Run one or more networks over a track, each segment through all of them before the next
+/// (so with several specialists a stretch of the track is complete after one segment), in
+/// the order `sink.next` asks for, with results written to `sink.out` as they finish.
+pub fn separate_with(parts: &[Part], device: &Device, audio: &[f32], len: usize, overlap: f64, sink: &Sink, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<()> {
+    if len == 0 || audio.len() != 2 * len || parts.is_empty() {
+        candle_core::bail!("empty or malformed input")
+    }
+    if parts.iter().any(|p| p.source.is_some_and(|s| s >= 4)) {
+        candle_core::bail!("no such source")
+    }
+    // Three segments over one frame would make the order of additions matter.
+    let in_order;
+    let sink = if overlap > 0.5 {
+        in_order = Sink { out: sink.out, ready: sink.ready, next: None };
+        &in_order
+    } else {
+        sink
+    };
+    let plan = Plan::new(len, overlap);
+    #[cfg(target_os = "macos")]
+    {
+        let fast: Option<Vec<(&metal_fast::Fast, Option<usize>)>> = parts.iter().map(|p| p.graph.fast.as_ref().map(|f| (f, p.source))).collect();
+        if let Some(fast) = fast {
+            return separate_fast(&fast, device, audio, len, &plan, sink, progress);
+        }
+    }
+    let segment = TRAINING_FRAMES;
+    let planes: usize = parts.iter().map(|p| 2 * p.sources().len()).sum();
+    let mut asm = Assembly::new(&plan, sink.out, planes, len, parts.len(), sink.ready);
+    let n_seg = plan.spans.len();
+    let mut taken = vec![false; n_seg];
+    let mut count = 0;
+    while let Some(k) = pick(sink.next, &taken) {
+        taken[k] = true;
+        let (offset, end) = plan.spans[k];
+        let chunk_len = end - offset;
+        let crop = (segment - chunk_len) / 2;
+        let x = Tensor::from_vec(segment_at(audio, len, offset), (1, 2, segment), device)?;
+        let mut base = 0;
+        for part in parts {
+            let y = {
+                let _gpu = GPU.lock();
+                part.graph.forward(&x)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
+            };
+            let sources = part.sources();
+            for (n, &s) in sources.iter().enumerate() {
+                for ch in 0..2 {
+                    // SAFETY: this thread is the only user of the output.
+                    let dst = &mut unsafe { asm.plane(base + n * 2 + ch) }[offset..][..chunk_len];
+                    let src = &y[(s * 2 + ch) * segment + crop..][..chunk_len];
+                    for i in 0..chunk_len {
+                        dst[i] += plan.weight[i] * src[i];
+                    }
+                }
+            }
+            base += 2 * sources.len();
+            asm.part_done(k);
+        }
+        count += 1;
+        if !progress(count, n_seg) {
             candle_core::bail!("stopped")
         }
     }
-    for ch in out.chunks_mut(len) {
-        for (v, s) in ch.iter_mut().zip(&sums) {
-            *v /= s.max(1e-9);
-        }
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// Mean and (unbiased) standard deviation, accumulated in f64.
@@ -585,49 +809,74 @@ fn mean_std(x: &[f32]) -> (f32, f32) {
     (mean as f32, var.sqrt() as f32)
 }
 
-/// One segment ready for the GPU: normalised spectrogram and waveform with their statistics.
+/// One segment ready for the GPU (its normalised spectrogram and waveform are in an input
+/// slot) with the statistics they were normalised with.
 #[cfg(target_os = "macos")]
 struct Prepared {
-    offset: usize,
-    spec: Vec<f32>,
-    wave: Vec<f32>,
+    k: usize,
+    slot: usize,
     /// (mean, std) of the spectrogram and of the waveform.
     stats: [(f32, f32); 2],
 }
 
-/// The network's two outputs for one segment, still normalised.
+/// One network's two outputs for one segment, still normalised and still in GPU memory
+/// (finished: the GPU thread waited for them).
 #[cfg(target_os = "macos")]
 struct Raw {
-    offset: usize,
-    spec: Vec<f32>,
-    wave: Vec<f32>,
+    k: usize,
+    part: usize,
+    spec: Tensor,
+    wave: Tensor,
     stats: [(f32, f32); 2],
 }
 
 /// The Metal path: three stages run side by side so the GPU never waits for the CPU. A
-/// thread prepares segments (normalisation and the forward transform), this thread runs the
-/// network, and a third does the inverse transform and the overlap-add.
+/// thread prepares segments (normalisation and the forward transform) straight into GPU-
+/// visible input buffers, this thread runs the networks, and a third does the inverse
+/// transform and the overlap-add reading the results where the GPU left them.
 #[cfg(target_os = "macos")]
-fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: usize, opts: &Options, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<Vec<f32>> {
+fn separate_fast(parts: &[(&metal_fast::Fast, Option<usize>)], device: &Device, audio: &[f32], len: usize, plan: &Plan, sink: &Sink, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<()> {
     let segment = TRAINING_FRAMES;
     let freq = NFFT / 2;
     let frames = Stft::frames(segment);
     let plane = freq * frames;
-    let (offsets, weight) = plan(len, opts.overlap);
-    let sources: Vec<usize> = opts.source.map(|s| vec![s]).unwrap_or_else(|| (0..4).collect());
-    let n_src = sources.len();
+    let n_seg = plan.spans.len();
+    let srcs: Vec<usize> = parts.iter().map(|p| if p.1.is_some() { 1 } else { 4 }).collect();
+    let bases: Vec<usize> = srcs.iter().scan(0, |acc, n| {
+        let b = *acc;
+        *acc += 2 * n;
+        Some(b)
+    }).collect();
+    let planes: usize = srcs.iter().map(|n| 2 * n).sum();
     let stft = Stft::new();
     let envelope = stft.envelope(frames);
-    let mut out = vec![0f32; n_src * 2 * len];
-    let (stft, envelope, weight, offsets) = (&stft, &envelope, &weight, &offsets);
+    // Three input slots: one being filled, one waiting, one on the GPU.
+    const SLOTS: usize = 3;
+    let slots = metal_fast::Slots::new(device, SLOTS, 4 * plane, 2 * segment)?;
+    let mut asm = Assembly::new(plan, sink.out, planes, len, parts.len(), sink.ready);
+    let (stft, envelope, slots, bases) = (&stft, &envelope, &slots, &bases);
+    let next = sink.next;
 
-    let result = std::thread::scope(|scope| -> Result<()> {
-        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(2);
-        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(2);
+    std::thread::scope(|scope| -> Result<()> {
+        let (tx_free, rx_free) = std::sync::mpsc::sync_channel::<usize>(SLOTS);
+        for i in 0..SLOTS {
+            let _ = tx_free.send(i);
+        }
+        // One prepared segment waiting is enough to keep the GPU busy, and a short queue
+        // lets a new playhead position take effect sooner.
+        let (tx_in, rx_in) = std::sync::mpsc::sync_channel::<Prepared>(1);
+        // One segment's results waiting (each holds its network's whole output buffer).
+        let (tx_out, rx_out) = std::sync::mpsc::sync_channel::<Raw>(parts.len());
         scope.spawn(move || {
-            for &offset in offsets {
+            let mut taken = vec![false; n_seg];
+            while let Some(k) = pick(next, &taken) {
+                taken[k] = true;
+                let Ok(slot) = rx_free.recv() else { return };
+                let offset = plan.spans[k].0;
                 let input = segment_at(audio, len, offset);
-                let mut spec = vec![0f32; 4 * plane];
+                // SAFETY: the slot came from the free list, so neither the GPU nor another
+                // thread uses it until it is sent on.
+                let (spec, wave) = unsafe { slots.fill(slot) };
                 std::thread::scope(|s| {
                     for (ch, planes) in spec.chunks_mut(2 * plane).enumerate() {
                         let x = &input[ch * segment..(ch + 1) * segment];
@@ -637,85 +886,101 @@ fn separate_fast(fast: &metal_fast::Fast, device: &Device, audio: &[f32], len: u
                         });
                     }
                 });
-                let stats = [mean_std(&spec), mean_std(&input)];
-                let mut wave = input;
-                for (v, (mean, std)) in [(&mut spec, stats[0]), (&mut wave, stats[1])] {
+                let stats = [mean_std(spec), mean_std(&input)];
+                wave.copy_from_slice(&input);
+                for (v, (mean, std)) in [(&mut *spec, stats[0]), (&mut *wave, stats[1])] {
                     let scale = 1.0 / (std + 1e-5);
                     v.iter_mut().for_each(|x| *x = (*x - mean) * scale);
                 }
-                if tx_in.send(Prepared { offset, spec, wave, stats }).is_err() {
+                if tx_in.send(Prepared { k, slot, stats }).is_err() {
                     return;
                 }
             }
         });
-        let out = &mut out;
-        let post = scope.spawn(move || {
+        let asm = &mut asm;
+        let post = scope.spawn(move || -> Result<()> {
             for raw in rx_out {
-                let chunk_len = (len - raw.offset).min(segment);
+                let (offset, end) = plan.spans[raw.k];
+                let chunk_len = end - offset;
                 let crop = (segment - chunk_len) / 2;
-                let raw = &raw;
-                std::thread::scope(|s| {
-                    for (n, dst) in out.chunks_mut(len).enumerate() {
-                        s.spawn(move || {
-                            let (re, im) = raw.spec[n * 2 * plane..(n + 1) * 2 * plane].split_at(plane);
-                            let mut wave = vec![0f32; segment];
-                            stft.inverse(re, im, frames, raw.stats[0].1, raw.stats[0].0, envelope, &mut wave);
-                            let time = &raw.wave[n * segment..(n + 1) * segment];
-                            let (mean, std) = raw.stats[1];
-                            let dst = &mut dst[raw.offset..raw.offset + chunk_len];
-                            for i in 0..chunk_len {
-                                dst[i] += weight[i] * (wave[crop + i] + time[crop + i] * std + mean);
+                let base = bases[raw.part];
+                let n = srcs_of(&raw);
+                metal_fast::with_view(&raw.spec, |spec| {
+                    metal_fast::with_view(&raw.wave, |time_all| {
+                        let asm = &*asm;
+                        std::thread::scope(|s| {
+                            for q in 0..2 * n {
+                                // SAFETY: each plane goes to one thread; they are joined
+                                // before `part_done`.
+                                let dst = unsafe { asm.plane(base + q) };
+                                let (stats, weight) = (raw.stats, &plan.weight);
+                                s.spawn(move || {
+                                    let (re, im) = spec[q * 2 * plane..(q + 1) * 2 * plane].split_at(plane);
+                                    let mut wave = vec![0f32; segment];
+                                    stft.inverse(re, im, frames, stats[0].1, stats[0].0, envelope, &mut wave);
+                                    let time = &time_all[q * segment..(q + 1) * segment];
+                                    let (mean, std) = stats[1];
+                                    let dst = &mut dst[offset..offset + chunk_len];
+                                    for i in 0..chunk_len {
+                                        dst[i] += weight[i] * (wave[crop + i] + time[crop + i] * std + mean);
+                                    }
+                                });
                             }
                         });
-                    }
-                });
+                    })
+                })??;
+                asm.part_done(raw.k);
             }
+            Ok(())
         });
         let mut run = || -> Result<()> {
-            for (k, p) in rx_in.iter().enumerate() {
-                let (spec, wave) = {
+            for (count, p) in rx_in.iter().enumerate() {
+                let outs = {
                     let _gpu = GPU.lock();
-                    let x = Tensor::from_vec(p.spec, (4, freq, frames), device)?;
-                    let xt = Tensor::from_vec(p.wave, (2, 1, segment), device)?;
-                    let (mut y, mut yt) = fast.forward(&x, &xt)?;
-                    if let Some(s) = opts.source {
-                        y = y.narrow(0, s * 4, 4)?;
-                        yt = yt.narrow(0, s * 2, 2)?;
+                    let (x, xt) = slots.tensors(p.slot, (4, freq, frames), (2, 1, segment))?;
+                    let mut outs = Vec::with_capacity(parts.len());
+                    for (i, (fast, source)) in parts.iter().enumerate() {
+                        let (mut y, mut yt) = fast.forward(&x, &xt)?;
+                        if let Some(s) = source {
+                            y = y.narrow(0, s * 4, 4)?;
+                            yt = yt.narrow(0, s * 2, 2)?;
+                        }
+                        outs.push((i, y, yt));
                     }
-                    (metal_fast::read(&y)?, metal_fast::read(&yt)?)
+                    device.synchronize()?;
+                    metal_fast::mark(&xt, || "wait for the GPU".into());
+                    outs
                 };
-                if tx_out.send(Raw { offset: p.offset, spec, wave, stats: p.stats }).is_err() {
-                    candle_core::bail!("stem post-processing stopped")
+                // The GPU is done with the slot.
+                let _ = tx_free.send(p.slot);
+                for (part, spec, wave) in outs {
+                    if tx_out.send(Raw { k: p.k, part, spec, wave, stats: p.stats }).is_err() {
+                        candle_core::bail!("stem post-processing stopped")
+                    }
                 }
-                if !progress(k + 1, offsets.len()) {
+                if !progress(count + 1, n_seg) {
                     candle_core::bail!("stopped")
                 }
             }
             Ok(())
         };
         let r = run();
-        // Closing both channels lets the other two stages finish.
+        // Closing the channels lets the other two stages finish.
         drop(rx_in);
         drop(tx_out);
-        if post.join().is_err() {
-            candle_core::bail!("stem post-processing failed")
+        drop(tx_free);
+        match post.join() {
+            Ok(Ok(())) => r,
+            Ok(Err(e)) => r.and(Err(e)),
+            Err(_) => candle_core::bail!("stem post-processing failed"),
         }
-        r
-    });
-    result?;
-    let mut sums = vec![0f32; len];
-    for &offset in offsets {
-        let chunk_len = (len - offset).min(segment);
-        for i in 0..chunk_len {
-            sums[offset + i] += weight[i];
-        }
-    }
-    for ch in out.chunks_mut(len) {
-        for (v, s) in ch.iter_mut().zip(&sums) {
-            *v /= s.max(1e-9);
-        }
-    }
-    Ok(out)
+    })
+}
+
+/// Sources in one raw result (one or all four).
+#[cfg(target_os = "macos")]
+fn srcs_of(raw: &Raw) -> usize {
+    raw.wave.dim(0).unwrap_or(2) / 2
 }
 
 #[cfg(test)]
@@ -907,5 +1172,45 @@ mod tests {
         });
         assert!(stopped.is_err_and(|e| e.to_string().contains("stopped")) && calls == 1);
         release_scratch();
+    }
+}
+
+#[cfg(test)]
+mod load_bench {
+    use super::*;
+
+    /// Where loading a checkpoint goes: reading the .th, converting, uploading, preparing the
+    /// fused kernels' weights. PREPDECK_STEM_TH = path to a .th file.
+    #[test]
+    #[ignore]
+    fn load_breakdown() {
+        let Ok(path) = std::env::var("PREPDECK_STEM_TH") else { return };
+        let device = Device::new_metal(0).unwrap();
+        for pass in 0..2 {
+            let t = std::time::Instant::now();
+            let t_index = 0.0;
+            let cpu: HashMap<String, Tensor> = read_th(Path::new(&path)).unwrap().into_iter().collect();
+            let names: Vec<String> = cpu.keys().cloned().collect();
+            let t_read = t.elapsed().as_secs_f64();
+            if pass == 0 {
+                // Same tensors as Candle's own reader, bit for bit.
+                let pth = candle_core::pickle::PthTensors::new(&path, Some("state")).unwrap();
+                for n in &names {
+                    let a = pth.get(n).unwrap().unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    let b = cpu[n].to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()) && a.len() == b.len(), "{n} differs");
+                }
+                println!("LB all {} tensors identical to Candle's reader", names.len());
+            }
+            let dtypes: std::collections::BTreeSet<String> = cpu.values().map(|v| format!("{:?}", v.dtype())).collect();
+            let up: HashMap<String, Tensor> = cpu.iter().map(|(k, v)| (k.clone(), v.to_device(&device).unwrap().to_dtype(DType::F32).unwrap())).collect();
+            device.synchronize().unwrap();
+            let t_up = t.elapsed().as_secs_f64();
+            let g = Graph::from_weights(up, true).unwrap();
+            device.synchronize().unwrap();
+            let t_prep = t.elapsed().as_secs_f64();
+            drop(g);
+            println!("LB pass {pass}: index {:.3} s, read {:.3} s, upload+convert {:.3} s, prepare {:.3} s, total {:.3} s ({} tensors, {dtypes:?})", t_index, t_read - t_index, t_up - t_read, t_prep - t_up, t_prep, names.len());
+        }
     }
 }
