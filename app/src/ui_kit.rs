@@ -745,3 +745,88 @@ impl Bars {
         }
     }
 }
+
+/// Where the pointer says a fader should be this frame, or None when it is not being moved.
+/// Covers the press, the drag, the frame the button is released in (a fast drag's last move
+/// arrives together with the release) and a press and release that both arrive in one frame,
+/// which egui reports as neither a click nor a drag when the pointer moved in between.
+pub(crate) fn slider_pos(ui: &Ui, resp: &egui::Response, hit: Rect) -> Option<egui::Pos2> {
+    if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.is_pointer_button_down_on() || resp.clicked() || resp.drag_stopped()) {
+        ui.data_mut(|d| d.insert_temp(resp.id.with("slider_down"), resp.is_pointer_button_down_on()));
+        return Some(p);
+    }
+    // The button was held on the fader in the frame before: a release now ends that drag,
+    // wherever the pointer has got to (egui starts no drag when the move and the release
+    // arrive together).
+    let key = resp.id.with("slider_down");
+    let was_down = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+    ui.data_mut(|d| d.insert_temp(key, resp.is_pointer_button_down_on()));
+    let done = ui.input(|i| {
+        let (mut from, mut out) = (was_down.then_some(None), None);
+        for e in &i.events {
+            if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } = e {
+                if *pressed {
+                    from = hit.contains(*pos).then_some(Some(*pos));
+                } else if let Some(f) = from.take() {
+                    out = Some((f, *pos));
+                }
+            }
+        }
+        out
+    });
+    let (from, to) = done?;
+    // A press made in this same frame must not have gone through a menu or window lying
+    // over the fader.
+    from.map_or(true, |f| ui.ctx().layer_id_at(f).map_or(true, |l| l == resp.layer_id)).then_some(to)
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+    use egui::{pos2, vec2, Event, PointerButton, RawInput, Sense};
+
+    /// Run one frame with these pointer events over a 100 pt fader at x 100..200 and return
+    /// the value it would be set to.
+    fn frame(ctx: &egui::Context, events: Vec<Event>) -> Option<f32> {
+        let mut out = None;
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 100.0))), events, ..Default::default() };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let hit = Rect::from_min_max(pos2(94.0, 30.0), pos2(206.0, 54.0));
+                let resp = ui.interact(hit, ui.id().with("f"), Sense::click_and_drag());
+                out = slider_pos(ui, &resp, hit).map(|p| ((p.x - 100.0) / 100.0).clamp(0.0, 1.0));
+            });
+        });
+        out
+    }
+    fn button(x: f32, pressed: bool) -> Event {
+        Event::PointerButton { pos: pos2(x, 42.0), button: PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+    fn moved(x: f32) -> Event {
+        Event::PointerMoved(pos2(x, 42.0))
+    }
+
+    #[test]
+    fn a_fader_follows_slow_and_fast_gestures() {
+        let ctx = egui::Context::default();
+        frame(&ctx, vec![]);
+        // A slow drag: press, move and release in frames of their own.
+        frame(&ctx, vec![moved(150.0)]);
+        assert_eq!(frame(&ctx, vec![button(150.0, true)]), Some(0.5));
+        assert_eq!(frame(&ctx, vec![moved(180.0)]), Some(0.8));
+        assert_eq!(frame(&ctx, vec![button(180.0, false)]), Some(0.8));
+        assert_eq!(frame(&ctx, vec![]), None);
+        // A click whose press and release arrive together.
+        assert_eq!(frame(&ctx, vec![moved(125.0), button(125.0, true), button(125.0, false)]), Some(0.25));
+        frame(&ctx, vec![]);
+        // A drag whose last move arrives with the release.
+        assert_eq!(frame(&ctx, vec![moved(150.0), button(150.0, true)]), Some(0.5));
+        assert_eq!(frame(&ctx, vec![moved(110.0), button(110.0, false)]), Some(0.1));
+        frame(&ctx, vec![]);
+        // A whole drag in one frame.
+        assert_eq!(frame(&ctx, vec![moved(150.0), button(150.0, true), moved(190.0), button(190.0, false)]), Some(0.9));
+        frame(&ctx, vec![]);
+        // A press outside the fader does nothing, wherever it is released.
+        assert_eq!(frame(&ctx, vec![moved(300.0), button(300.0, true), moved(150.0), button(150.0, false)]), None);
+    }
+}

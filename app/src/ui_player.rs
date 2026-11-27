@@ -104,7 +104,6 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let main = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(full.max.x - 212.0, full.max.y));
     p.rect_filled(left, 0.0, BG2);
 
-    app.poll_stem_wave();
     let pos = app.pos();
     let playing = app.playing();
     let loaded = app.deck.track.is_some();

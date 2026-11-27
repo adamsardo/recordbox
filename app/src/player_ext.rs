@@ -1018,6 +1018,15 @@ impl App {
         s.stems.is_some() && !s.stem_on.iter().all(|x| *x) && !self.deck.x.stem_wave.as_ref().map(|w| w.0 == s.stem_on).unwrap_or(false)
     }
 
+    /// The stem waveform of every deck, each frame and in every mode. (It used to be polled
+    /// from the Export player's panel only, so a Performance deck whose part was muted waited
+    /// for a waveform that was never started and showed an empty lane.)
+    pub fn poll_stem_waves(&mut self) {
+        for n in 0..self.deck_count() {
+            self.with_deck(n, |app| app.poll_stem_wave());
+        }
+    }
+
     /// Keep the active deck's stem waveform in step with its part switches: worked out on a
     /// background thread from the audible stems whenever the set of parts changes.
     pub fn poll_stem_wave(&mut self) {

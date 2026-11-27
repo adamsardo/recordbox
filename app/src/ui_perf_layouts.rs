@@ -706,7 +706,8 @@ pub(crate) fn overview(app: &mut App, ui: &mut Ui, o: Pos2, w: f32, g: &DeckGeo,
     // Separation progress: rekordbox's thin blue line under the waveform.
     if let (Some((sid, pr)), Some(tid)) = (app.stem.separating, app.deck.track) {
         if sid == tid && pr > 0.0 {
-            p.rect_filled(Rect::from_min_max(pos2(x0, base + 1.5), pos2(x0 + width * pr.clamp(0.0, 1.0), base + 2.5)), 0.0, hex(0x077DE1));
+            // 2 pt tall, 3 pt under the waveform's baseline (measured on capture stems/25).
+            p.rect_filled(Rect::from_min_max(pos2(x0, base + 3.0), pos2(x0 + width * pr.clamp(0.0, 1.0), base + 5.0)), 0.0, hex(0x077DE1));
         }
     }
     // Vocal row: where the vocal is, brighter where it is stronger.

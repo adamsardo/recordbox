@@ -206,6 +206,7 @@ impl eframe::App for Gui {
         step!(app.poll_export());
         step!(app.poll_rekordbox_sync());
         step!(app.poll_stems());
+        step!(app.poll_stem_waves());
         step!(app.poll_phrases());
         step!(app.poll_vocal());
         step!(app.poll_key_job());
@@ -216,6 +217,13 @@ impl eframe::App for Gui {
         step!(menus::poll(app));
         step!(menus::sync(app));
         shortcuts(app, ctx);
+        // Preferences > View > Tooltips off: no hover text anywhere, including the ones drawn
+        // with egui's own `on_hover_text` (a delay that never runs out; infinity would panic
+        // in egui's repaint timer).
+        let tip_delay = if app.prefs.tooltips { 0.5 } else { 1.0e9 };
+        if ctx.style().interaction.tooltip_delay != tip_delay {
+            ctx.all_styles_mut(|s| s.interaction.tooltip_delay = tip_delay);
+        }
         // Full screen (View menu, keyboard): the window follows; the menu tick follows the window.
         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if std::mem::take(&mut app.dialogs.ext.toggle_fullscreen) {

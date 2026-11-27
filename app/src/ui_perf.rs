@@ -892,8 +892,8 @@ pub(crate) fn mixer(app: &mut App, ui: &mut Ui, r: Rect) {
         let (ft, fb) = (y0 + mg.fader.0, y0 + mg.fader.1);
         let fr = Rect::from_min_max(pos2(fx_ - 12.0, ft - 4.0), pos2(fx_ + 12.0, fb + 4.0));
         let fresp = ui.interact(fr, ui.id().with(("fader", n)), Sense::click_and_drag());
-        // (Also on `clicked`: a quick click's press and release can fall into one frame.)
-        if let Some(pp) = fresp.interact_pointer_pos().filter(|_| fresp.dragged() || fresp.is_pointer_button_down_on() || fresp.clicked()) {
+        // (`slider_pos` also covers a quick click or drag whose events fall into one frame.)
+        if let Some(pp) = crate::ui_kit::slider_pos(ui, &fresp, fr) {
             m.fader = ((fb - pp.y) / (fb - ft)).clamp(0.0, 1.0);
             changed = true;
         }
@@ -990,7 +990,7 @@ pub(crate) fn mixer4(app: &mut App, ui: &mut Ui, r: Rect) {
         let (ft, fb) = (y0 + mg.fader.0, y0 + mg.fader.1);
         let fr = Rect::from_min_max(pos2(cx - 12.0, ft - 4.0), pos2(cx + 12.0, fb + 4.0));
         let fresp = ui.interact(fr, ui.id().with(("fader4", n)), Sense::click_and_drag());
-        if let Some(pp) = fresp.interact_pointer_pos().filter(|_| fresp.dragged() || fresp.is_pointer_button_down_on() || fresp.clicked()) {
+        if let Some(pp) = crate::ui_kit::slider_pos(ui, &fresp, fr) {
             m.fader = ((fb - pp.y) / (fb - ft)).clamp(0.0, 1.0);
             changed = true;
         }
@@ -1132,7 +1132,7 @@ pub(crate) fn bottom_row(app: &mut App, ui: &mut Ui, r: Rect, cx: f32) {
     if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.any())) {
         xf = 0.5;
         changed = true;
-    } else if let Some(pp) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.is_pointer_button_down_on() || resp.clicked()) {
+    } else if let Some(pp) = crate::ui_kit::slider_pos(ui, &resp, rr) {
         xf = ((pp.x - fl) / (fr - fl)).clamp(0.0, 1.0);
         changed = true;
     }
