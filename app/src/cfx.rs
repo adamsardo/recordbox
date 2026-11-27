@@ -428,6 +428,10 @@ pub struct FcTables {
     /// Beat FX FILTER's cutoff tables (`LFOFilterCore::LPF_MAIN_FC`, `LPF_RESO_FC`,
     /// `HPF_MAIN_FC`, `HPF_RESO_FC`: 129 doubles each, one after another), when found.
     pub lfo: Option<Box<[[f64; 129]; 4]>>,
+    /// Multi-mode REVERB's comb gains (`ReverbEffectCombFilterGainTable::TABLE`: ten tables of
+    /// 100 floats, one per percent step; tables 0 .. 4 the five combs' left lines, 5 .. 9 their
+    /// right lines), when found.
+    pub verb: Option<Box<[[f32; 100]; 10]>>,
 }
 
 static FC_TABLES: std::sync::OnceLock<Option<FcTables>> = std::sync::OnceLock::new();
@@ -517,7 +521,7 @@ fn read_fc_tables() -> Option<FcTables> {
             let lpf: [f32; 124] = std::array::from_fn(|i| fl(at + 992 + 4 * i));
             let ok = hpf[0] == 61.0 && (hpf[123] - 8951.0).abs() < 1.0 && lpf[0] == 12000.0 && (lpf[123] - 93.0).abs() < 1.0 && hpf.windows(2).all(|w| w[0] < w[1]) && lpf.windows(2).all(|w| w[0] > w[1]);
             if ok {
-                return Some(FcTables { lpf, hpf, lfo: find_lfo_tables(&data) });
+                return Some(FcTables { lpf, hpf, lfo: find_lfo_tables(&data), verb: find_verb_tables(&data) });
             }
         }
         at += 4;
@@ -541,6 +545,28 @@ fn find_lfo_tables(data: &[u8]) -> Option<Box<[[f64; 129]; 4]>> {
             }
         }
         at += 8;
+    }
+    None
+}
+
+/// REVERB's comb-gain tables in the same section: each entry is 10^(-3 x delay / decay time),
+/// so every table rises from about 0.87 .. 0.93 toward 1 and keeps within 0.01 of
+/// `fx_verb::dyn_params`' fitted gains (which pick the place).
+fn find_verb_tables(data: &[u8]) -> Option<Box<[[f32; 100]; 10]>> {
+    let fl = |at: usize| f32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    let fit = |k: usize, p: i32| crate::fx_verb::fitted_gain(if k < 5 { 2 * k } else { 2 * (k - 5) + 1 }, p);
+    let first = fit(0, 1);
+    let mut at = 0;
+    while at + 4000 <= data.len() {
+        let v = fl(at);
+        if (v - first).abs() < 0.01 {
+            let t: [[f32; 100]; 10] = std::array::from_fn(|k| std::array::from_fn(|i| fl(at + 400 * k + 4 * i)));
+            let ok = (0..10).all(|k| t[k].windows(2).all(|w| w[0] <= w[1]) && (0..100).all(|i| t[k][i] < 1.0 && (t[k][i] - fit(k, i as i32 + 1)).abs() < 0.01));
+            if ok {
+                return Some(Box::new(t));
+            }
+        }
+        at += 4;
     }
     None
 }

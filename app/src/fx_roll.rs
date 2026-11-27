@@ -320,6 +320,10 @@ pub struct RollFx {
     /// `isValidRollSound`: the roll's sound is there (the mix law applies).
     pub valid: bool,
     start_pending: Option<f32>,
+    /// Single mode's SWING: the core's parameter 1 (ms, -2000 .. 2000), where a turn starts
+    /// in the roll's sound; `swing_ok` is `RollCore`'s 372 (the sound there is in).
+    pub swing_ms: f32,
+    swing_ok: bool,
     /// The channel history's place for this block.
     h_end: i64,
     h_block: i64,
@@ -333,7 +337,7 @@ fn frames_of(ms: f32, rate: f32) -> i32 {
 impl RollFx {
     pub fn new(kind: RollKind, rate: f32) -> RollFx {
         let len = (((rate as f64 * 0.001) as f32) * 4000.0) as i32;
-        RollFx { kind, rate, len, r_ms: 10.0, w: Writer::default(), rd: Reader::new(rate), play: false, play_off: 0, slip_left: 0, valid: false, start_pending: None, h_end: 0, h_block: 0 }
+        RollFx { kind, rate, len, r_ms: 10.0, w: Writer::default(), rd: Reader::new(rate), play: false, play_off: 0, slip_left: 0, valid: false, start_pending: None, swing_ms: 0.0, swing_ok: true, h_end: 0, h_block: 0 }
     }
 
     /// Frames the roll buffer needs at `rate` (interleaved stereo: twice this).
@@ -358,24 +362,44 @@ impl RollFx {
         self.h_block = block;
     }
 
-    /// `RollCore::startEffect` 0x102a2c35c / `ReverseRollCore::startEffect` 0x102a2ae68.
+    /// `RollCore::startEffect` 0x102a2c35c / `ReverseRollCore::startEffect` 0x102a2ae68. SWING
+    /// (`v21` frames) moves where the roll starts: earlier in the sound (the writer then also
+    /// fills backward / forward from there) or later; the reader starts there. (rekordbox's
+    /// ring ignores a write or read place outside the buffer, which a negative ROLL / positive
+    /// REV ROLL swing gives, and keeps its last one; here the place wraps round the buffer.)
     fn start_effect(&mut self, off_ms: f32) {
         let off = (self.rate * (off_ms as f64 * 0.001) as f32) as i32;
         let n = self.len;
+        let v21 = frames_of(self.swing_ms, self.rate);
+        let w = |d: i32| d.rem_euclid(n.max(1));
         match self.kind {
             RollKind::Rev => {
-                let src = self.h_end - self.h_block - 1 + off as i64;
-                let dst = n - 1;
-                self.w.start(Info { on: true, src, dst }, Info { on: false, ..Info::default() }, off.max(0));
-                self.rd.reset(n - 1, frames_of(self.r_ms, self.rate), false);
+                let mut src = self.h_end - self.h_block - 1 + off as i64;
+                let mut dst = n - 1;
+                let mut f = Info { on: false, ..Info::default() };
+                if v21 < 0 {
+                    src += v21 as i64;
+                    dst += v21;
+                    f = Info { on: true, src: src + 1, dst: w(dst + 1) };
+                }
+                self.w.start(Info { on: true, src, dst: w(dst) }, f, off.max(0));
+                self.rd.reset(w(n - 1 + v21), frames_of(self.r_ms, self.rate), false);
             }
             _ => {
-                let src = self.h_end - self.h_block + off as i64;
-                self.w.start(Info { on: false, ..Info::default() }, Info { on: true, src, dst: 0 }, off.max(0));
-                self.rd.reset(0, frames_of(self.r_ms, self.rate), true);
+                let mut src = self.h_end - self.h_block + off as i64;
+                let mut dst = 0;
+                let mut b = Info { on: false, ..Info::default() };
+                if v21 < 0 {
+                    src += v21 as i64;
+                    dst = v21;
+                    b = Info { on: true, src: src - 1, dst: w(dst - 1) };
+                }
+                self.w.start(b, Info { on: true, src, dst: w(dst) }, off.max(0));
+                self.rd.reset(w(v21), frames_of(self.r_ms, self.rate), true);
             }
         }
-        self.valid = true;
+        self.swing_ok = self.swing_ms < 0.0 || self.swing_ms.abs() < 1.1920929e-7;
+        self.valid = self.swing_ok;
         self.play = false;
     }
 
@@ -391,8 +415,12 @@ impl RollFx {
                 if self.play {
                     let fwd = self.kind == RollKind::Roll;
                     let rf = frames_of(self.r_ms, self.rate);
-                    let mut v7 = if fwd { 0 } else { len - 1 };
+                    // (`processEffectInternal`: the turn starts at the SWING place once it is
+                    // written, else where the reader started.)
+                    let v21 = frames_of(self.swing_ms, self.rate);
+                    let mut v7 = if fwd { v21 } else { len - 1 + v21 }.rem_euclid(len.max(1));
                     if self.w.is_written(v7) {
+                        self.swing_ok = true;
                         self.valid = true;
                     } else {
                         v7 = self.rd.start;
@@ -537,6 +565,35 @@ mod tests {
         assert!((l[4959 + 100] - 10100.0 * 100.0 / 159.0).abs() < 2.0, "{}", l[5059]);
         assert_eq!(l[4959 + 200], 10200.0);
         assert_eq!(r[100], -10100.0);
+    }
+
+    #[test]
+    fn swing_moves_the_rolls_start() {
+        // `RollCore::startEffect`: SWING -100 ms starts the roll 4800 frames earlier in the
+        // sound (the backward writer fills the frames before it); +100 ms 4800 frames later,
+        // and the sound is not in until a restart finds that place written.
+        let rate = 48000.0;
+        let h = hist(48000 * 6);
+        let len = 48000 * 6;
+        let mut rb = vec![0.0f32; RollFx::buffer_frames(rate) * 2];
+        for (sw, first) in [(-100.0f32, 48000 * 5 - 4800), (100.0, 48000 * 5 + 4800)] {
+            let mut fx = RollFx::new(RollKind::Roll, rate);
+            fx.swing_ms = sw;
+            fx.r_ms = 500.0;
+            fx.turn_on(0.0);
+            let mut l = vec![0.0f32; 512];
+            let mut r = vec![0.0f32; 512];
+            fx.set_block(48000 * 5 + 512, 512);
+            let hh = Hist { buf: &h, len, end: 48000 * 5 + 512, block: 512 };
+            fx.process(&mut rb, &hh, &mut l, &mut r);
+            if sw < 0.0 {
+                // The first frame played is the sound at the start minus 100 ms.
+                assert!((l[0] - h[first * 2]).abs() < 1e-6 && fx.valid, "{} {}", l[0], h[first * 2]);
+            } else {
+                assert!(!fx.valid, "not in before the swing place is written");
+                let _ = first;
+            }
+        }
     }
 
     #[test]

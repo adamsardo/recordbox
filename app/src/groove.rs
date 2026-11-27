@@ -2129,7 +2129,8 @@ mod tests {
         e.release = Some((2, 1.0));
         let (out, cut) = step(&mut e, &mut pos, 44100);
         assert!(cut);
-        assert!((out[2000] - 0.5).abs() < 0.12, "the spinning drums: {}", out[2000]);
+        // (rekordbox weights the spun sound by its speed: at about 2.3 x, 0.5598 (0.98 + 0.02 v).)
+        assert!((out[2000] - 0.5 * 0.5598 * (0.98 + 0.02 * 2.27)).abs() < 0.05, "the spinning drums: {}", out[2000]);
         assert!(out[40000].abs() < 0.01, "stopped: {}", out[40000]);
         // The press itself does not step: the deck's own drums fade as the effect comes in.
         assert!((out[0] - 0.0).abs() < 0.01 && out[..300].windows(2).all(|w| (w[1] - w[0]).abs() < 0.02), "{:?}", &out[..8]);

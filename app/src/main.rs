@@ -26,6 +26,8 @@ mod export;
 mod fx;
 mod fx_core;
 mod fx_lfo;
+mod fx_verb;
+mod fx_spin;
 mod fx_roll;
 mod fx_sweep;
 mod fx_rev;

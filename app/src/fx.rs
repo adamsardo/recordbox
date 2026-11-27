@@ -536,6 +536,13 @@ pub fn half_value(k: f32) -> f32 {
     }
 }
 
+/// Single-mode ROLL family's SWING knob (`SingleBeatFxRollBase::updateAndSetParameter`): the
+/// zone -4 .. 4 (ninths of the travel).
+pub fn roll_swing_zone(k: f32) -> f32 {
+    let edges = [0.11111, 0.22222, 0.33333, 0.44444, 0.55556, 0.66667, 0.77778, 0.88889];
+    -4.0 + edges.iter().filter(|&&e| k >= e).count() as f32
+}
+
 /// Single-mode ROLL / SLIP ROLL / REV ROLL's first knob (`SingleBeatFxRollBase::
 /// updateAndSetParameter` 0x102a2fca0 into its two `Trans` units, square waves): (roll gate
 /// duty, its start, live-sound gate duty, its start) over one turn of the roll. Centre: the
@@ -1082,70 +1089,27 @@ struct EchoCfg {
     dm: bool,
 }
 
-/// The reverb's settings for a block.
-#[derive(Clone, Copy)]
-struct Rv {
-    gin: f32,
-    /// Output gain (multi REVERB 0.7081, the FX+ reverbs 0.71068).
-    out: f32,
-    d: [usize; 10],
-    g: [f32; 10],
-    ap: [usize; 4],
-    /// One-pole steps: the loop's low-pass, the input's low-pass and high-pass.
-    loop_k: f32,
-    in_lp: f32,
-    in_hp: f32,
-    /// `NewReverbCore`'s filters as rekordbox makes them (`IirLpf1stOrder` 14 kHz and
-    /// `IirHpf1stOrder` 80 Hz on the input, `IirLpf1stOrder` in each comb's loop: bilinear,
-    /// pre-warped; b0, b1, a1). `None`: the FX+ reverbs' `ReverbCore`, whose filters keep the
-    /// one-pole form above (not traced).
-    bil: Option<[[f32; 3]; 3]>,
-}
-
-impl Rv {
-    /// The FX+ reverbs' core (`ReverbUpCoreParamInfo` / `ReverbDownCoreParamInfo`): the same
-    /// combs at `size` (each at most 100 ms), decay `rt` seconds to -60 dB, input gain.
-    fn raw(size: f32, rt: f32, gin: f32, rate: f32) -> Rv {
-        let step = |fc: f32| 1.0 - (-TAU * fc / rate).exp();
-        let lp: f32 = if (rate - 48000.0).abs() < 1.0 { 20500.0 } else if (rate - 44100.0).abs() < 1.0 { 21500.0 } else { 20000.0 };
-        let mut v = Rv { gin, out: 0.71068, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(lp.min(0.45 * rate)), in_lp: step(14000.0), in_hp: step(80.0), bil: None };
-        for i in 0..10 {
-            let ms = (REVERB_COMB_MS[i] * size).clamp(0.0, 100.0);
-            v.d[i] = ((ms * 0.001 * rate) as usize).clamp(1, COMB_LEN - 1);
-            v.g[i] = 10f32.powf(-0.003 * ms / rt.max(0.01)).clamp(0.0, 1.0);
-        }
-        for i in 0..4 {
-            v.ap[i] = ((REVERB_AP_MS[i] * 0.001 * rate) as usize).clamp(1, AP_LEN - 1);
-        }
-        v
-    }
-
-    /// `p`: the percent value; `size` and `decay` scale the lines and the decay time (1 in
-    /// multi mode).
-    fn new(p: f32, size: f32, decay: f32, rate: f32) -> Rv {
-        let p = p.clamp(1.0, 100.0);
-        let s = (reverb_size(p) * size).clamp(0.2, 2.08);
-        let rt = reverb_rt60_ms(p) * decay;
-        let step = |fc: f32| 1.0 - (-TAU * fc / rate).exp();
-        // (The loop's cutoff by rate, `MultiBeatFxReverb::CoreParameterCalculator`.)
-        let loop_fc: f32 = match rate as u32 { 44100 => 18000.0, 48000 => 20500.0, 96000 => 30000.0, _ => 20000.0 };
-        let fc = |f: f32| f.min(rate * 0.5).max(5.0) as f64;
-        let bil = Some([crate::fx_core::iir_1st(fc(14000.0), rate as f64, false), crate::fx_core::iir_1st(fc(80.0), rate as f64, true), crate::fx_core::iir_1st(fc(loop_fc), rate as f64, false)]);
-        let mut v = Rv { gin: reverb_in_gain(p), out: 0.7081, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(loop_fc.min(0.45 * rate)), in_lp: step(14000.0), in_hp: step(80.0), bil };
-        for i in 0..10 {
-            let ms = REVERB_COMB_MS[i] * s;
-            v.d[i] = ((ms * 0.001 * rate) as usize).clamp(1, COMB_LEN - 1);
-            v.g[i] = 10f32.powf(-3.0 * ms / rt);
-        }
-        for i in 0..4 {
-            v.ap[i] = ((REVERB_AP_MS[i] * 0.001 * rate) as usize).clamp(1, AP_LEN - 1);
-        }
-        v
-    }
-}
-
 /// One effect's state for one channel.
 pub(crate) struct Slot {
+    // fx7b
+    /// REVERB / REVERB UP / REVERB DOWN: rekordbox's `ReverbCore` (`crate::fx_verb`).
+    verb: crate::fx_verb::VerbCore,
+    /// The ROLL family's beat (ms) at its turn-on (`SingleBeatFxRollBase` a1+1260).
+    roll_beat_ms: f32,
+    /// Beat FX VINYL BRAKE: rekordbox's `VinylBrakeCore` (`crate::fx_spin`), where its sound
+    /// starts in the history, its speeds for the call (and how far they are read), the release
+    /// path's low-pass memories and its cross-fade (`BeatFxVinylBrake` 752 / 768).
+    vbc: crate::fx_spin::VinylCore,
+    vb_start: usize,
+    vb_sp: [f32; 512],
+    vb_k: (usize, usize),
+    vlp: [[f32; 2]; 2],
+    vxf: crate::fx_lfo::Sf,
+    /// STRETCH: `StretchCore`'s `SlowPlaybackFilter` and read gain (3.3 ms), and the frames
+    /// since a restart while that gain shuts (-1: none pending).
+    stf: crate::fx_spin::SlowPlay,
+    stg: crate::fx_lfo::Sf,
+    st_cnt: f64,
     kind: Kind,
     /// Stereo delay line (interleaved) and its write position (frames).
     delay: Vec<f32>,
@@ -1358,12 +1322,38 @@ const LFO_PIECE: usize = 1024;
 
 impl Slot {
     pub(crate) fn new() -> Slot {
-        Slot { delay: vec![0.0; DELAY_LEN * 2], combs: vec![0.0; COMB_LEN * 10], aps: vec![0.0; AP_LEN * 4], ps: crate::fx_core::PitchShifter::new(48000.0), ej: crate::fx_core::EnigmaJet::new(), mob: crate::fx_core::Mobius::new(), aux: vec![0.0; AUX_LEN * 2], ..Slot::empty() }
+        Slot {
+            // fx7b
+            verb: crate::fx_verb::VerbCore::new(48000.0),
+            roll_beat_ms: 500.0,
+            vbc: crate::fx_spin::VinylCore::new(48000.0),
+            vb_start: 0,
+            vb_sp: [0.0; 512],
+            vb_k: (0, 0),
+            vlp: [[0.0; 2]; 2],
+            vxf: crate::fx_rev::new_gate(48000.0),
+            stf: crate::fx_spin::SlowPlay::new(48000.0),
+            stg: { let mut g = crate::fx_lfo::Sf::new(48000.0); g.set_time(3.3); g.reset(1.0); g },
+            st_cnt: -1.0,
+            delay: vec![0.0; DELAY_LEN * 2], combs: vec![0.0; COMB_LEN * 10], aps: vec![0.0; AP_LEN * 4], ps: crate::fx_core::PitchShifter::new(48000.0), ej: crate::fx_core::EnigmaJet::new(), mob: crate::fx_core::Mobius::new(), aux: vec![0.0; AUX_LEN * 2], ..Slot::empty() }
     }
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0,
+        Slot {
+            // fx7b
+            verb: crate::fx_verb::VerbCore::empty(),
+            roll_beat_ms: 500.0,
+            vbc: crate::fx_spin::VinylCore::new(48000.0),
+            vb_start: 0,
+            vb_sp: [0.0; 512],
+            vb_k: (0, 0),
+            vlp: [[0.0; 2]; 2],
+            vxf: crate::fx_rev::new_gate(48000.0),
+            stf: crate::fx_spin::SlowPlay::new(48000.0),
+            stg: { let mut g = crate::fx_lfo::Sf::new(48000.0); g.set_time(3.3); g.reset(1.0); g },
+            st_cnt: -1.0,
+            kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0,
             // fx7a
             ec: None,
             b3: crate::fx_echo::Bands3::new(),
@@ -1373,6 +1363,15 @@ impl Slot {
     }
 
     fn clear(&mut self) {
+        // fx7b
+        self.verb.selected();
+        self.vbc.state = 2;
+        self.vb_k = (0, 0);
+        self.vlp = [[0.0; 2]; 2];
+        self.vxf.reset(0.0);
+        self.stf.clear();
+        self.stg.reset(1.0);
+        self.st_cnt = -1.0;
         self.delay.iter_mut().for_each(|v| *v = 0.0);
         self.ps.reset();
         self.ej.reset();
@@ -1614,71 +1613,6 @@ impl Slot {
             self.push(il + el * e.fb, ir + er * e.fb);
         }
         (el, er)
-    }
-
-    /// rekordbox's reverb (`NewReverbCore`): the input through a 14 kHz low-pass and an 80 Hz
-    /// high-pass at the input gain, five combs in parallel whose left and right lines feed
-    /// each other through a low-pass, then two all-passes of gain 0.7 in series, at 0.7081.
-    #[inline]
-    fn reverb(&mut self, l: f32, r: f32, v: &Rv) -> (f32, f32) {
-        let mut x = [l, r];
-        if let Some([lp, hp, _]) = &v.bil {
-            // `NewReverbCore::processEffect`: the input low-pass, then the high-pass, then the
-            // input gain (`IirFilter::handleFilterCore1st`: y = b0 x + b1 x1 - a1 y1).
-            for c in 0..2 {
-                let z = &mut self.rv1[c];
-                let y = lp[0] * x[c] + lp[1] * z[0] - lp[2] * z[1];
-                z[0] = x[c];
-                z[1] = y;
-                let z = &mut self.rv1[2 + c];
-                let h = hp[0] * y + hp[1] * z[0] - hp[2] * z[1];
-                z[0] = y;
-                z[1] = h;
-                x[c] = h * v.gin;
-            }
-        } else {
-            for c in 0..2 {
-                self.rin[c] += (x[c] - self.rin[c]) * v.in_lp;
-                self.rin[2 + c] += (self.rin[c] - self.rin[2 + c]) * v.in_hp;
-                x[c] = (self.rin[c] - self.rin[2 + c]) * v.gin;
-            }
-        }
-        let w = self.comb_w;
-        let mut acc = [0.0f32; 2];
-        for k in 0..5 {
-            let (il, ir) = (2 * k, 2 * k + 1);
-            let fl = self.combs[il * COMB_LEN + (w + COMB_LEN - v.d[il]) % COMB_LEN] * v.g[il];
-            let fr = self.combs[ir * COMB_LEN + (w + COMB_LEN - v.d[ir]) % COMB_LEN] * v.g[ir];
-            acc[0] += fl;
-            acc[1] += fr;
-            if let Some([_, _, lo]) = &v.bil {
-                for (i, f) in [(il, fl), (ir, fr)] {
-                    let z = &mut self.rv1[4 + i];
-                    let y = lo[0] * f + lo[1] * z[0] - lo[2] * z[1];
-                    z[0] = f;
-                    z[1] = y;
-                    self.comb_lp[i] = y;
-                }
-            } else {
-                self.comb_lp[il] += (fl - self.comb_lp[il]) * v.loop_k;
-                self.comb_lp[ir] += (fr - self.comb_lp[ir]) * v.loop_k;
-            }
-            self.combs[il * COMB_LEN + w] = x[0] + self.comb_lp[ir];
-            self.combs[ir * COMB_LEN + w] = x[1] + self.comb_lp[il];
-        }
-        self.comb_w = (w + 1) % COMB_LEN;
-        let aw = self.ap_w;
-        for c in 0..2 {
-            for k in 0..2 {
-                let i = k * 2 + c;
-                let d = self.aps[i * AP_LEN + (aw + AP_LEN - v.ap[i]) % AP_LEN];
-                let y = d - 0.7 * acc[c];
-                self.aps[i * AP_LEN + aw] = acc[c] + 0.7 * y;
-                acc[c] = y;
-            }
-        }
-        self.ap_w = (aw + 1) % AP_LEN;
-        (acc[0] * v.out, acc[1] * v.out)
     }
 
     #[inline]
@@ -2015,6 +1949,9 @@ impl Slot {
             // (`MultiBeatFxRollBase::calculateMixRatio`: the curve once the roll has its sound;
             // before the quantizer starts it the effect is not in.)
             Roll | RevRoll | SlipRoll => mix = if self.roll.valid || p.on { roll_mix(level) } else { (1.0, 0.0) },
+            // (`SingleFxRobot::calculateMixRatio` 0x102a235c0: LEVEL/DEPTH brings the robot in
+            // over the lower half; multi mode `RobotCore`'s 0 / 1.)
+            Robot if !multi => mix = half_mix(level),
             Robot | Helix => mix = (0.0, 1.0),
             Pitch => mix = if level <= 0.0 || p.value == 0.0 && (multi || (k1 - 0.5).abs() <= 0.02) { (1.0, 0.0) } else { (0.0, 1.0) },
             Noise => {
@@ -2172,7 +2109,11 @@ impl Slot {
         // LOW CUT / HI CUT: the effect is not given those bands (LOW CUT ECHO never gets the
         // lows). The echoes simply do not repeat them; the others pass them through.
         let has_cuts = info_of(kind).labels[2] == "LOW CUT";
-        let (cut_lo, cut_hi) = (kind == LowCutEcho || has_cuts && !multi && b1, has_cuts && !multi && b2);
+        // VINYL BRAKE's BPF (`BeatFxVinylBrake::updateStateAndParameter` 0x102a552c4): while the
+        // brake runs, the low and high bands pass live (`EffectFrequencyModule` bands 2 and 0 at
+        // fx 0, thru 1) and only the middle band is braked.
+        let vb_bpf = kind == VinylBrake && !multi && b2 && self.vb_state != 0;
+        let (cut_lo, cut_hi) = (kind == LowCutEcho || has_cuts && !multi && b1 || vb_bpf, has_cuts && !multi && b2 || vb_bpf);
         let cuts = cut_lo || cut_hi;
         let (lo_c, hi_c) = (butter(CUT_LOW_HZ, r, false), butter(CUT_HIGH_HZ, r, true));
         let (lo_hp, hi_lp) = (butter(CUT_LOW_HZ, r, true), butter(CUT_HIGH_HZ, r, false));
@@ -2187,8 +2128,10 @@ impl Slot {
         let pct = if !multi && (k1 - 0.5).abs() > 0.02 { (k1 - 0.5) * 200.0 } else { p.value };
         let robot_ratio = pitch_ratio(pct.clamp(-100.0, 100.0));
         let pitch_r = pitch_ratio(if multi { pct * 2.0 * level } else { pct });
-        let (rob_a, rob_b, rob_mod) = robot_law(level);
-        let rob_mod = if multi { rob_mod } else { 0.8 * k2 };
+        // Single mode (`SingleFxRobot::updateParameter` 0x102a22e60): MODULATION sets the
+        // core's PITCH GAIN by the multi law and its FLANGER GAIN straight; FLANGER RESONANCE
+        // keeps its default 0.267 (`RobotCore::createParameter`).
+        let (rob_a, rob_b, rob_mod) = if multi { robot_law(level) } else { (robot_law(k2).0, k2, 0.267) };
         let speed = stretch_speed(level);
         let stages = if multi { (6, 6) } else { phaser_stages(k2) };
         let (helix_keep, helix_in) = helix_law(level);
@@ -2215,24 +2158,25 @@ impl Slot {
         // REVERB: the percent value sets size, decay and input gain; single mode's ROOM SIZE
         // is the percent for the size and DECAY sets the decay time and input gain
         // (`SingleBeatFxReverb::updateParameter` / `getDynamicParameter`).
-        let rv = match kind {
-            Reverb if multi => Rv::new(p.value, 1.0, 1.0, r),
-            Reverb => {
-                let room = reverb_room(k1) as f32;
-                let mut v = Rv::new(room, 1.0, reverb_decay_secs(reverb_room(k2) as f32) * 1000.0 / reverb_rt60_ms(room), r);
-                v.gin = reverb_decay_in_gain(k2);
-                v
+        {
+            use crate::fx_verb::VerbLaw;
+            let law = match kind {
+                Reverb if multi => Some((p.value as i32, VerbLaw::Multi)),
+                Reverb => Some((reverb_room(k1), VerbLaw::Single { decay: crate::fx_verb::single_decay_percent(k2), gin: reverb_decay_in_gain(k2) })),
+                ReverbUp => {
+                    let (_, _, _, size, decay_s, gin) = reverb_up_law(fxp_v as i32, fxr_t);
+                    Some((1, VerbLaw::Fixed { size, decay_s, gin }))
+                }
+                ReverbDown => {
+                    let (size, decay_s, gin, _) = reverb_down_law(fxp_v as i32, fxr_t);
+                    Some((1, VerbLaw::Fixed { size, decay_s, gin }))
+                }
+                _ => None,
+            };
+            if let Some((pct, law)) = law {
+                self.verb.begin(pct, law, kind != Reverb, starting, r, frames);
             }
-            ReverbUp => {
-                let (_, _, _, size, rt, gin) = reverb_up_law(fxp_v as i32, fxr_t);
-                Rv::raw(size, rt, gin, r)
-            }
-            ReverbDown => {
-                let (size, rt, gin, _) = reverb_down_law(fxp_v as i32, fxr_t);
-                Rv::raw(size, rt, gin, r)
-            }
-            _ => Rv::new(50.0, 1.0, 1.0, r),
-        };
+        }
         // TRANS / PAN: each side's gain from rekordbox's LFOs, worked out a piece at a time
         // (the quantizer splits a piece where the effect restarts).
         let lfo_kind = matches!(kind, Trans | Pan | Roll | RevRoll | SlipRoll);
@@ -2319,6 +2263,13 @@ impl Slot {
                     self.lfo_piece(kind, multi, level, (k1, k2), b, bpm, rate, cycle, p.on, &mut lgain[..len], &mut rgain[..len]);
                 } else {
                     let end = ring.w as i64 - frames as i64 + (n + len) as i64;
+                    // Single mode's SWING (`SingleBeatFxRollBase::updateAndSetParameter`
+                    // 0x102a2fca0): the knob in nine zones -4 .. 4, times the beat (ms) at the
+                    // turn-on, within +-2000 ms.
+                    if starting && n == 0 {
+                        self.roll_beat_ms = 60000.0 / bpm;
+                    }
+                    self.roll.swing_ms = if multi { 0.0 } else { (roll_swing_zone(k2) * self.roll_beat_ms).clamp(-2000.0, 2000.0) };
                     self.roll_piece(ring, end, b, bpm, rate, cycle, p.on, &mut lgain[..len], &mut rgain[..len], &mut rphase[..len]);
                 }
             }
@@ -2599,7 +2550,7 @@ impl Slot {
                     mixed(sl + ol2, sr + or2)
                 }
                 Reverb => {
-                    let (rl, rr) = self.reverb(il, ir, &rv);
+                    let (rl, rr) = self.verb.frame(il, ir);
                     mixed(rl, rr)
                 }
                 ReverbUp | ReverbDown => {
@@ -2611,7 +2562,7 @@ impl Slot {
                         ul = crate::fx_core::bq(&up_bp, &mut self.f1[0], il) * up_g;
                         ur = crate::fx_core::bq(&up_bp, &mut self.f1[1], ir) * up_g;
                     }
-                    let (mut rl, mut rr) = self.reverb(ul, ur, &rv);
+                    let (mut rl, mut rr) = self.verb.frame(ul, ur);
                     if let Some(c) = &fxr_f {
                         rl = crate::fx_core::bq(c, &mut self.f3[0], rl);
                         rr = crate::fx_core::bq(c, &mut self.f3[1], rr);
@@ -2811,23 +2762,43 @@ impl Slot {
                         self.lag = 0.0;
                         self.t = 0.0;
                         self.vb = [lv, 0.0, 0.0, 0.0, lv, 0.0];
+                        // (`VinylBrakeCore::startVinylBrake`: its sound from here.)
+                        self.vbc.set_decay((vinyl_brake_beats(lv) * beat_secs).clamp(0.010, 12.0) * 1000.0);
+                        self.vbc.start(r);
+                        self.vb_start = (ring.w + RING_LEN - frames + n) % RING_LEN;
+                        self.vb_k = (0, 0);
                     }
                     let mut out = (dl, dr);
                     let mut wet_g = 0.0;
                     if self.vb_state == 1 {
                         self.vb[0] = self.vb[0].max(lv);
-                        let decay = (vinyl_brake_beats(lv) * beat_secs).clamp(0.010, 12.0);
-                        self.speed = brake_step(self.speed, decay, r);
-                        self.lag += (1.0 - self.speed) as f64;
-                        let (wl, wr) = ring.at(base + n as f64 - self.lag);
-                        let a = (self.speed * 8.0).min(1.0);
-                        out = (wl * a, wr * a);
+                        // `VinylBrakeCore::processBlock`: the speeds a call at a time (this
+                        // buffer's rest, at most 512 frames), the sound read at them, weighted
+                        // and through `SlowPlaybackFilter`.
+                        if self.vb_k.0 >= self.vb_k.1 {
+                            let m = (frames - n).min(512);
+                            self.vbc.set_decay((vinyl_brake_beats(lv) * beat_secs).clamp(0.010, 12.0) * 1000.0);
+                            self.vbc.speeds(&mut self.vb_sp[..m]);
+                            self.vb_k = (0, m);
+                        }
+                        let v = self.vb_sp[self.vb_k.0];
+                        self.vb_k.0 += 1;
+                        self.speed = v;
+                        let h0 = self.vb_start;
+                        let (wl, wr) = self.vbc.frame(v, |k| {
+                            let i = (h0 + k) % RING_LEN;
+                            (ring.buf[i * 2], ring.buf[i * 2 + 1])
+                        });
+                        out = (wl, wr);
                         wet_g = 1.0;
                         self.t += 1.0;
                         if b1 && !multi && self.t >= vinyl_repeat_beats(k1) * beat_secs * r {
                             self.t = 0.0;
                             self.lag = 0.0;
                             self.speed = 1.0;
+                            self.vbc.start(r);
+                            self.vb_start = (ring.w + RING_LEN - frames + n + 1) % RING_LEN;
+                            self.vb_k = (0, 0);
                         }
                         if lv < self.vb[0] - 0.03125 && !(b1 && !multi) {
                             // Into the release state from here.
@@ -2858,15 +2829,24 @@ impl Slot {
                         // (`updateMixRatio`: the release state's gain for the speed.)
                         let g = if sp < 0.01 { 0.0 } else if sp < 0.05 { 12.5 * sp - 0.125 } else if sp < 0.125 { 0.5 } else if sp < 1.0 { 0.42857 + 0.57143 * sp } else { 1.0 };
                         self.vb[5] += (g - self.vb[5]) * (1.0 / (0.2 * r)).min(1.0);
-                        out = (pl * self.vb[5], pr * self.vb[5]);
+                        // (`updateStateAndParameter`: under half speed an `IirLpf1stOrder` at
+                        // 2500 + 46000 v^2 Hz is cross-faded in over 3.3333 ms; else 14 kHz, out.)
+                        let fc = if sp < 0.5 { sp * sp * 46000.0 + 2500.0 } else { 14000.0 };
+                        let c = crate::fx_core::iir_1st(fc.min(0.5 * r).max(5.0) as f64, r as f64, false);
+                        self.vxf.set_target(if sp < 0.5 { 1.0 } else { 0.0 });
+                        let x = self.vxf.take();
+                        let mut f = [pl, pr];
+                        for (ch, v) in f.iter_mut().enumerate() {
+                            let z = &mut self.vlp[ch];
+                            let y = c[0] * *v + c[1] * z[0] - c[2] * z[1];
+                            z[0] = *v;
+                            z[1] = y;
+                            *v = *v + (y - *v) * x;
+                        }
+                        out = (f[0] * self.vb[5], f[1] * self.vb[5]);
                         wet_g = 1.0;
                     }
-                    let (mut wl, mut wr) = out;
-                    if b2 && !multi {
-                        let gf = svf_g(1000.0, r);
-                        wl = svf(&mut self.f2[0], wl, gf, 1.4).1 * 1.4;
-                        wr = svf(&mut self.f2[1], wr, gf, 1.4).1 * 1.4;
-                    }
+                    let (wl, wr) = out;
                     let (el, er) = if vb_echo { self.echo(wl * target, wr * target, &e, r) } else { (0.0, 0.0) };
                     self.ga[0] += (wet_g - self.ga[0]).clamp(-gate_k, gate_k);
                     let w = self.ga[0] * g;
@@ -2880,17 +2860,35 @@ impl Slot {
                     // (`BeatFxStretch::updateAndSetParameter`: the turn is the beat value times
                     // LEVEL/DEPTH, at most 16 s; `StretchCore` starts again at the live sound
                     // when it ends.)
+                    // (`StretchCore::processEffectInternal` 0x102a47408: a restart takes the live
+                    // place, shuts the read gain over 3.3 ms, jumps there and opens it again;
+                    // the read sound goes through `SlowPlaybackFilter` at the speed, then the
+                    // pitch shifter.)
                     let total = ((secs * level).min(16.0) * r).max(1.0);
+                    self.stf.set_rate(r);
+                    self.stg.set_rate(r);
                     if self.t >= total {
                         self.t = 0.0;
-                        self.lag = 0.0;
+                        self.st_cnt = 0.0;
+                        self.stg.set_target(0.0);
+                    }
+                    if self.st_cnt >= 0.0 && !self.stg.on && self.stg.cur.abs() < 1.1920929e-7 {
+                        self.lag = self.st_cnt;
+                        self.st_cnt = -1.0;
+                        self.stg.set_target(1.0);
+                    }
+                    if self.st_cnt >= 0.0 {
+                        self.st_cnt += 1.0;
                     }
                     self.lag += (1.0 - speed) as f64;
-                    let (mut wl, mut wr) = ring.at(base + n as f64 - self.lag);
+                    let (wl, wr) = ring.at(base + n as f64 - self.lag);
+                    let sg = self.stg.take();
+                    let y = self.stf.frame([wl * sg, wr * sg], speed);
+                    let (mut wl, mut wr) = (y[0], y[1]);
                     if !b1 && speed < 0.999 {
                         (wl, wr) = self.shift(wl, wr, 1.0 / speed);
                     }
-                    let edge = (self.t.min(total - self.t) / (SMOOTH_SECS * r)).clamp(0.0, 1.0);
+                    let edge = 1.0;
                     self.t += 1.0;
                     // LOW / HI CUT and BPF (`SingleBeatFxStretch::updateParameter` 0x102a459c0,
                     // `BeatFxStretch::updateAndSetParameter` / `processEffectConcrete`): the
@@ -3049,6 +3047,10 @@ impl Ring {
 
 /// RELEASE FX state for one channel.
 struct Release {
+    // fx7b
+    /// BACK SPIN's core and VINYL BRAKE's (`crate::fx_spin`), the latter's speeds for the buffer.
+    spin: crate::fx_spin::BackSpin,
+    brake: crate::fx_spin::VinylCore,
     kind: u8,
     /// Frames since it was pressed, where in the history playback stands (frames from the
     /// press) and the brake's speed.
@@ -3069,7 +3071,7 @@ pub(crate) struct Channel {
 
 impl Channel {
     fn new() -> Channel {
-        Channel { slots: [Slot::new(), Slot::new(), Slot::new(), Slot::new()], ring: Ring::new(), release: Release { kind: 0, t: 0.0, pos: 0.0, speed: 1.0, start: 0, gate: 0.0, held: false } }
+        Channel { slots: [Slot::new(), Slot::new(), Slot::new(), Slot::new()], ring: Ring::new(), release: Release { spin: crate::fx_spin::BackSpin::new(48000.0), brake: crate::fx_spin::VinylCore::new(48000.0), kind: 0, t: 0.0, pos: 0.0, speed: 1.0, start: 0, gate: 0.0, held: false } }
     }
 
     /// A channel that only ever runs its first slot (PAD FX).
@@ -3078,7 +3080,7 @@ impl Channel {
     }
 
     fn new_without_slots() -> Channel {
-        Channel { slots: [Slot::empty(), Slot::empty(), Slot::empty(), Slot::empty()], ring: Ring::new(), release: Release { kind: 0, t: 0.0, pos: 0.0, speed: 1.0, start: 0, gate: 0.0, held: false } }
+        Channel { slots: [Slot::empty(), Slot::empty(), Slot::empty(), Slot::empty()], ring: Ring::new(), release: Release { spin: crate::fx_spin::BackSpin::new(48000.0), brake: crate::fx_spin::VinylCore::new(48000.0), kind: 0, t: 0.0, pos: 0.0, speed: 1.0, start: 0, gate: 0.0, held: false } }
     }
 
     fn process(&mut self, p: &UnitParams, ch: usize, buf: &mut [f32], rate: u32, beat: Option<f64>) {
@@ -3104,11 +3106,30 @@ impl Channel {
             if !self.release.held {
                 // (The history already has this buffer: the brake starts at its first frame.)
                 let start = (self.ring.w + RING_LEN - frames % RING_LEN) % RING_LEN;
-                self.release = Release { kind, t: 0.0, pos: 0.0, speed: 1.0, start, gate: self.release.gate, held: true };
+                self.release = Release { spin: self.release.spin, brake: self.release.brake, kind, t: 0.0, pos: 0.0, speed: 1.0, start, gate: self.release.gate, held: true };
+                if kind == 0 {
+                    // (`ReleaseFxVinylBrake`: DECAY TIME 10 ms .. 12 s, the brake from the press.)
+                    self.release.brake.set_decay((beats * beat_secs).clamp(0.010, 12.0) * 1000.0);
+                    self.release.brake.start(r);
+                }
+                if kind == 2 {
+                    let secs = (beats * beat_secs).clamp(0.010, 12.0);
+                    self.release.spin.start(r, secs * 1000.0, (2.0 * beat_secs).clamp(0.010, 4.0) * 1000.0, frames);
+                }
             }
             let secs = (beats * beat_secs).clamp(0.010, 12.0);
             let total = secs * r;
-            let two_beats = (2.0 * beat_secs).clamp(0.010, 4.0);
+            if self.release.kind == 2 {
+                self.release.spin.begin_call();
+            }
+            // VINYL BRAKE: the buffer's speeds (rekordbox works them out a call at a time).
+            let mut vb_speed = [0.0f32; 4096];
+            if self.release.kind == 0 {
+                self.release.brake.set_decay(secs * 1000.0);
+                for k in vb_speed[..frames.min(4096)].chunks_mut(4096) {
+                    self.release.brake.speeds(k);
+                }
+            }
             let gk = 1.0 / (SMOOTH_SECS * r);
             for n in 0..frames {
                 let rel = &mut self.release;
@@ -3130,24 +3151,26 @@ impl Channel {
                         }
                     }
                     2 => {
-                        // BACK SPIN: backwards over the last two beats at rekordbox's speed curve.
-                        let sp = back_spin_speed(rel.t / r, secs, two_beats);
-                        rel.pos -= sp as f64;
-                        let span = (two_beats * r) as f64;
-                        if rel.pos < -span {
-                            rel.pos += span;
-                        }
-                        let (l, rr) = self.ring.at(rel.start as f64 + rel.pos);
-                        let a = if rel.t < 4.0 { 1.0 } else { (sp * 4.0).min(1.0) };
-                        (l * a, rr * a)
+                        // BACK SPIN (`crate::fx_spin`): the sound before the press read
+                        // backwards at rekordbox's speed, weighted and filtered by the speed.
+                        let (h0, ring) = (rel.start as i64 - 1, &self.ring);
+                        rel.spin.frame(|k| {
+                            let i = (h0 - k as i64).rem_euclid(RING_LEN as i64) as usize;
+                            (ring.buf[i * 2], ring.buf[i * 2 + 1])
+                        })
                     }
                     _ => {
-                        // VINYL BRAKE: the sound goes on, ever slower, to a stop.
-                        rel.speed = brake_step(rel.speed, secs, r);
-                        rel.pos += rel.speed as f64;
-                        let (l, rr) = self.ring.at(rel.start as f64 + rel.pos);
-                        let a = (rel.speed * 8.0).min(1.0);
-                        (l * a, rr * a)
+                        // VINYL BRAKE (`ReleaseFxVinylBrake` on `crate::fx_spin::VinylCore`):
+                        // the sound from the press at a falling speed, weighted and filtered.
+                        if n > 0 && n % 4096 == 0 {
+                            let m = (frames - n).min(4096);
+                            rel.brake.speeds(&mut vb_speed[..m]);
+                        }
+                        let (h0, ring) = (rel.start, &self.ring);
+                        rel.brake.frame(vb_speed[n % 4096], |k| {
+                            let i = (h0 + k) % RING_LEN;
+                            (ring.buf[i * 2], ring.buf[i * 2 + 1])
+                        })
                     }
                 };
                 rel.t += 1.0;
@@ -4014,6 +4037,32 @@ mod tests {
     }
 
     #[test]
+    fn single_robot_modulation_sets_the_cores_gains() {
+        // `SingleFxRobot::updateParameter`: PITCH GAIN 1 - 0.01 v (v = MOD x 255, 0.75 from 25),
+        // FLANGER GAIN = MOD, resonance 0.267; LEVEL/DEPTH is the mix (`calculateMixRatio`).
+        let ring = Ring::new();
+        let tone: Vec<f32> = (0..4800).flat_map(|i| { let v = (i as f32 * 0.05).sin() * 0.5; [v, v] }).collect();
+        let run = |k2: f32, level: f32| {
+            let mut s = Slot::new();
+            let mut p = SlotParams { on: true, level, knob: [0.5, k2], ..SlotParams::new(Kind::Robot) };
+            p.value = 0.0;
+            let mut y = tone.clone();
+            for c in y.chunks_mut(512 * 2) {
+                s.process(&p, 120.0, c, 48000, &ring, None, false);
+            }
+            (y, s.ga)
+        };
+        let (_, ga) = run(0.0, 1.0);
+        assert!((ga[0] - 1.0).abs() < 1e-6 && ga[1].abs() < 1e-6, "{ga:?}");
+        let (_, ga) = run(1.0, 1.0);
+        assert!((ga[0] - 0.75).abs() < 1e-6 && (ga[1] - 1.0).abs() < 1e-6, "{ga:?}");
+        assert_eq!(half_mix(0.25), (0.5, 0.5));
+        // LEVEL at 0: the dry sound alone.
+        let (y, _) = run(1.0, 0.0);
+        assert!(y.iter().zip(&tone).skip(2000).all(|(a, b)| (a - b).abs() < 1e-3));
+    }
+
+    #[test]
     fn single_reverb_decay_law() {
         // rekordbox's polynomial at the ends and the centre, and the input gain.
         assert!((reverb_decay_secs(1.0) - 1.5318).abs() < 1e-3 && (reverb_decay_secs(50.0) - 8.7007).abs() < 2e-3 && (reverb_decay_secs(100.0) - 100.6).abs() < 0.1, "{} {} {}", reverb_decay_secs(1.0), reverb_decay_secs(50.0), reverb_decay_secs(100.0));
@@ -4021,9 +4070,9 @@ mod tests {
         assert!((reverb_decay_in_gain(1.0) - 0.1).abs() < 1e-6);
         // The comb gains come out as rekordbox writes them: 10^(-k x size / time), with k =
         // 0.066281 for the first left comb (3 x 22.0938 ms).
-        let v = Rv::new(50.0, 1.0, reverb_decay_secs(50.0) * 1000.0 / reverb_rt60_ms(50.0), 48000.0);
+        let (_, _, g) = crate::fx_verb::dyn_params(crate::fx_verb::VerbLaw::Single { decay: 50.0, gin: 0.2 }, 50);
         let want = 10f32.powf(-0.066281 * reverb_size(50.0) / reverb_decay_secs(50.0));
-        assert!((v.g[0] - want).abs() < 1e-4, "{} {}", v.g[0], want);
+        assert!((g[0] - want).abs() < 1e-4, "{} {}", g[0], want);
     }
 
     #[test]
@@ -4370,19 +4419,20 @@ mod tests {
     #[test]
     fn reverb_decays_at_its_traced_rate() {
         // REVERB at 25 %: a decay time of about 1.5 s, so half a second later the tail is
-        // about 20 dB down, and it has not died within the first second.
+        // about 20 dB down, and it has not died within the first second. (The burst comes
+        // after the core's 128.625 ms stand-by from its reset at the first turn-on.)
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params = unit(Kind::Reverb, 25.0, 1.0);
         let a = rack.units[0].params.assign;
         rack.units[0].prepare(&a);
-        let mut x: Vec<f32> = (0..48000 * 3).flat_map(|i| { let v = if i < 2400 { ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.5 } else { 0.0 }; [v, v] }).collect();
+        let mut x: Vec<f32> = (0..48000 * 3).flat_map(|i| { let v = if (7200..9600).contains(&i) { ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.5 } else { 0.0 }; [v, v] }).collect();
         for chunk in x.chunks_mut(512 * 2) {
             rack.process(0, chunk, 48000);
         }
         let db = |a: usize| 20.0 * rms(&x[a * 2..(a + 9600) * 2]).log10();
-        let fall = db(12000) - db(36000);
-        assert!(db(12000) > -60.0, "{}", db(12000));
+        let fall = db(19200) - db(43200);
+        assert!(db(19200) > -60.0, "{}", db(19200));
         assert!((fall - 20.0).abs() < 7.0, "fell {fall} dB in 0.5 s");
     }
 
@@ -4457,14 +4507,14 @@ mod tests {
 
     #[test]
     fn reverb_filters_are_rekordboxs_first_order_sections() {
-        // `NewReverbCore`: IirLpf1stOrder 14 kHz and IirHpf1stOrder 80 Hz on the input, an
-        // IirLpf1stOrder in each loop at 20.5 kHz (48 kHz) / 18 kHz (44.1 kHz).
-        let v = Rv::new(50.0, 1.0, 1.0, 48000.0);
-        let [lp, hp, lo] = v.bil.unwrap();
+        // `ReverbCore`: IirLpf1stOrder 14 kHz and IirHpf1stOrder 80 Hz on the input, an
+        // IirLpf1stOrder in each loop at 20.5 kHz (48 kHz) / 18 kHz (44.1 kHz; FX+ 21.5 kHz).
+        let [lp, hp, lo] = crate::fx_verb::static_filters(48000.0, false);
         assert_eq!(lp, crate::fx_core::iir_1st(14000.0, 48000.0, false));
         assert_eq!(hp, crate::fx_core::iir_1st(80.0, 48000.0, true));
         assert_eq!(lo, crate::fx_core::iir_1st(20500.0, 48000.0, false));
-        assert_eq!(Rv::new(50.0, 1.0, 1.0, 44100.0).bil.unwrap()[2], crate::fx_core::iir_1st(18000.0, 44100.0, false));
+        assert_eq!(crate::fx_verb::static_filters(44100.0, false)[2], crate::fx_core::iir_1st(18000.0, 44100.0, false));
+        assert_eq!(crate::fx_verb::static_filters(44100.0, true)[2], crate::fx_core::iir_1st(21500.0, 44100.0, false));
         // A first-order high-pass at 80 Hz: -3 dB there (bilinear, pre-warped).
         let w = std::f64::consts::TAU * 80.0 / 48000.0;
         let (re, im) = (w.cos(), -w.sin());
@@ -4617,12 +4667,15 @@ mod tests {
         let dry = x.clone();
         rack.process(0, &mut x, 48000);
         // After the 3.33 ms fade-in the output is the dry sound within a frame or two (4 beats
-        // at 120 BPM = 2 s: 300 frames in the playback is 0.5 frame behind).
+        // at 120 BPM = 2 s: 300 frames in the playback is 0.5 frame behind), weighted by
+        // rekordbox's speed curve (`VinylBrakeCore`: 0.42857 + 0.57143 v).
         for f in [200usize, 300, 600] {
-            assert!((x[f * 2] - dry[f * 2]).abs() < 3.0 / 100000.0, "frame {f}: {} vs {}", x[f * 2], dry[f * 2]);
+            let w = crate::fx_spin::brake_gain(1.0 - (f + 1) as f32 / 96000.0);
+            assert!((x[f * 2] / w - dry[f * 2]).abs() < 3.0 / 100000.0, "frame {f}: {} vs {}", x[f * 2] / w, dry[f * 2]);
         }
         // Later it is clearly behind the live sound (slower), never ahead, never the old history.
-        assert!(x[4700 * 2] < dry[4700 * 2] && x[4700 * 2] > dry[4000 * 2]);
+        let w = crate::fx_spin::brake_gain(1.0 - 4701.0 / 96000.0);
+        assert!(x[4700 * 2] / w < dry[4700 * 2] && x[4700 * 2] / w > dry[4000 * 2]);
     }
 
     // fx7a
