@@ -1360,6 +1360,13 @@ impl App {
                         app.view = View::Related;
                     }
                     "grid" => app.deck.ctrl_tab = 1,
+                    // EXPORT mode whatever mode was saved (the 1 Player layout: "exportmode1").
+                    "exportmode" => app.prefs.app_mode = 0,
+                    "exportmode1" => {
+                        app.prefs.app_mode = 0;
+                        app.prefs.browser_only = false;
+                        app.prefs.player_layout = 0;
+                    }
                     "hotcue" => app.deck.panel_tab = 1,
                     "info" => app.deck.panel_tab = 2,
                     "prefs" => {
