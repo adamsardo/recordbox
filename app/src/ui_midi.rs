@@ -138,7 +138,7 @@ pub fn header_button(app: &mut App, ui: &mut Ui, r: Rect) {
     let resp = ui.interact(r.expand2(vec2(2.0, 4.0)), ui.id().with("midi_button"), if enabled { Sense::click() } else { Sense::hover() });
     // Arial Bold, JUCE height 12. Disabled: #363636 as measured on the reference
     // (performance/01); enabled: the bar's white (not captured).
-    let col = if !enabled { gy(0x363636) } else if app.midi.win.open { BLUE.c() } else if resp.hovered() { WHITE.c() } else { gy(0xE6E6E6) };
+    let col = if !enabled { gy(0x363636) } else if app.midi.win.open { BLUE.c() } else { crate::ui_feel::hl(&resp, gy(0xE6E6E6), WHITE.c()) };
     ui.painter().text(r.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, "MIDI", caps(10.7), col);
     app.midi.win.at.insert("MIDI".into(), r.center());
     let base = "MIDI LEARN :\nThe buttons, knobs, and faders on MIDI controllers can be mapped to perform different functions.";

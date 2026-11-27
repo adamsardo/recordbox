@@ -954,7 +954,7 @@ pub(crate) fn tab_column(ui: &mut Ui, r: Rect, grid_on: bool) -> Option<bool> {
     for (i, (rr, name)) in [(top, "padIcon.svg"), (bot, "gridIcon.svg")].into_iter().enumerate() {
         let resp = ui.interact(rr, ui.id().with(("decktab", i)), Sense::click());
         let on = (i == 1) == grid_on;
-        let col = if on { WHITE.c() } else if resp.hovered() { gy(0x969696) } else { gy(0x646464) };
+        let col = if on { WHITE.c() } else { crate::ui_feel::hl(&resp, gy(0x646464), gy(0x969696)) };
         let ir = Rect::from_center_size(rr.center() + vec2(0.0, 0.5), vec2(12.0, 13.0));
         if !skin_at(&p, name, ir, col) {
             if i == 0 {
@@ -1008,8 +1008,8 @@ pub(crate) fn grid_panel(app: &mut App, ui: &mut Ui, area: Rect, n: u8, right: b
         if !skin_at(&p, name, r, tint) {
             p.rect_filled(r, 2.0, gy(0x191919));
         }
-        if resp.hovered() && on {
-            p.rect_filled(r, 2.0, Color32::from_white_alpha(25));
+        if let Some(c) = crate::ui_feel::hover_fill_if(&resp, on, Color32::from_white_alpha(25)) {
+            p.rect_filled(r, 2.0, c);
         }
         let held = on && resp.is_pointer_button_down_on() && {
             let now = ui.input(|i| i.time);
@@ -1029,7 +1029,7 @@ pub(crate) fn grid_panel(app: &mut App, ui: &mut Ui, area: Rect, n: u8, right: b
     // Column 1: Set (the 1.1 Bars), A-GAIN, PLAY/PAUSE.
     let tb = |ui: &mut Ui, p: &Painter, r: Rect, id: &str, t: &str, on: bool| -> egui::Response {
         let resp = ui.interact(r, ui.id().with(("gridt", n, id)), Sense::click());
-        p.rect_filled(r, 2.0, if resp.hovered() && on { lighten(gy(0x191919)) } else { gy(0x191919) });
+        p.rect_filled(r, 2.0, crate::ui_feel::hl_if(&resp, on, gy(0x191919), lighten(gy(0x191919))));
         p.text(r.center(), Align2::CENTER_CENTER, t, arial(14.0 * 0.87), if on { grey } else { gy(0x505050) });
         resp
     };
@@ -1355,7 +1355,7 @@ pub(crate) fn beat_count_text(app: &App, pos: f64) -> String {
 /// memory cues, phrases) along the right. The waveform is one mesh, as `ui_kit::Bars`.
 pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: f64) {
     let p = ui.painter_at(lane);
-    let span = span(app).unwrap_or(2.0);
+    let span = crate::ui_feel::zoom_span(ui, lane, span(app).unwrap_or(2.0));
     let pps = lane.height() as f64 / span;
     let cy = lane.center().y;
     // The beat marks' outer ends: 1 pt in from the left, 2.5 pt in from the right.
@@ -1669,7 +1669,7 @@ pub(crate) fn h_lane(app: &mut App, ui: &mut Ui, lane: Rect, n: u8) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(lane).id_salt(("perfwave", n)));
     child.set_clip_rect(lane.intersect(ui.clip_rect()));
     app.with_deck(n, |app| {
-        let pos = app.pos();
+        let pos = crate::ui_feel::shown_pos(app);
         // (Cmd / Ctrl + wheel changes `prefs.zoom` in there: taken as a Performance zoom step.)
         let z = app.prefs.zoom;
         crate::ui_player::draw_detail_at(app, &mut child, r, pos, 0.0, crate::ui_player::DetailMode::Full);
@@ -1805,7 +1805,7 @@ fn vertical(app: &mut App, ui: &mut Ui) {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(lane).id_salt(("perfvwave", *n)));
         child.set_clip_rect(lane.intersect(ui.clip_rect()));
         let label = app.with_deck(*n, |app| {
-            let pos = app.pos();
+            let pos = crate::ui_feel::shown_pos(app);
             draw_detail_vertical(app, &mut child, lane, pos);
             capture_pick(app, &mut child, lane, *n, true);
             beat_count_text(app, pos)
@@ -2025,8 +2025,8 @@ pub(crate) fn layout_selector(app: &mut App, ui: &mut Ui, bar: Rect) {
     let p = ui.painter().clone();
     let r = Rect::from_min_size(bar.min + vec2(130.0, 3.0), vec2(50.0, 22.0));
     let resp = ui.interact(r, ui.id().with("perflayout"), Sense::click());
-    if resp.hovered() {
-        p.rect_filled(r, 2.0, gy(0x1E1E1E));
+    if let Some(c) = crate::ui_feel::hover_fill(&resp, gy(0x1E1E1E)) {
+        p.rect_filled(r, 2.0, c);
     }
     let row = layout(app).row();
     let mark = |p: &Painter, row: usize, c: Pos2| {
@@ -2123,7 +2123,7 @@ pub(crate) fn top_right(app: &mut App, ui: &mut Ui, bar: Rect) {
         let r = Rect::from_center_size(pos2(rx - 482.0, ty + 16.0), vec2(30.0, 16.0));
         let resp = ui.interact(r, ui.id().with(("top", "PAD")), Sense::click());
         let on = app.pads.editor_open;
-        p.text(pos2(rx - 482.0, ty + 15.75), Align2::CENTER_CENTER, "PAD", arial_b(12.0), if on { WHITE.c() } else if resp.hovered() { gy(0x8C8C8C) } else { gy(0x343434) });
+        p.text(pos2(rx - 482.0, ty + 15.75), Align2::CENTER_CENTER, "PAD", arial_b(12.0), if on { WHITE.c() } else { crate::ui_feel::hl(&resp, gy(0x343434), gy(0x8C8C8C)) });
         if resp.on_hover_text("Open/Close the PAD EDITOR window.").clicked() {
             app.pads.editor_open = !on;
         }

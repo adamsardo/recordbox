@@ -161,7 +161,7 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let mut plus_clicked = false;
                 if last && !adding {
                     let presp = ui.interact(plus, ui.id().with(("mytag_plus", c.id)), Sense::click());
-                    crate::icons_src::add_disc11(ui.painter(), plus.center(), if presp.hovered() { WHITE.c() } else { gy(0x969696) });
+                    crate::icons_src::add_disc11(ui.painter(), plus.center(), crate::ui_feel::hl(&presp, gy(0x969696), WHITE.c()));
                     let presp = if app.prefs.tooltips { presp.on_hover_text("Create a new My Tag.") } else { presp };
                     plus_clicked = presp.clicked();
                     if plus_clicked {
@@ -338,7 +338,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
     let tile = Rect::from_min_size(pos2(l + 11.0, t + 4.0), vec2(18.0, 18.0));
     let tresp = ui.interact(Rect::from_min_max(tile.min, pos2(right - 62.0, tile.max.y)), ui.id().with(("relwin_tile", which)), Sense::click());
     if which == 0 {
-        p.rect_filled(tile, 2.0, if tresp.hovered() { gy(0x3A3A3A) } else { BTN.c() });
+        p.rect_filled(tile, 2.0, crate::ui_feel::hl(&tresp, BTN.c(), gy(0x3A3A3A)));
         crate::icons_src::related(&p, tile, WHITE.c(), BTN.c());
         let name = app.prefs.related_lists.get(app.prefs.related_sel).map(|x| x.name.clone()).unwrap_or_else(|| "Related Tracks".into());
         p.with_clip_rect(Rect::from_min_max(pos2(l, t), pos2(right - 62.0, t + 26.0))).text(pos2(l + 30.5, t + 13.0), Align2::LEFT_CENTER, name, rb(SUB_NAME_FONT), WHITE.c());
@@ -381,7 +381,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
         // (the skin's #969696 is not what shows: reference 12 peaks at 238). The header has
         // the same divider 60 pt from the right as Related Tracks.
         let st = Rect::from_center_size(tile.center(), vec2(16.0, 16.0));
-        p.rect_filled(st, 2.0, if tresp.hovered() { gy(0x3E3E3E) } else { gy(0x323232) });
+        p.rect_filled(st, 2.0, crate::ui_feel::hl(&tresp, gy(0x323232), gy(0x3E3E3E)));
         crate::icons_src::atom(&p, st.center(), 6.0, 2.2, 1.0, WHITE.c());
         p.rect_filled(Rect::from_min_max(pos2(right - 60.0, t), pos2(right - 59.0, t + 26.0)), 0.0, BG);
         let kind = app.prefs.bx.suggest_kind.min(3);
@@ -419,7 +419,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
         let br = Rect::from_min_size(pos2(l + x, t + 32.0), vec2(w, 16.0));
         let resp = ui.interact(br, ui.id().with(("relwin_src", which, k)), Sense::click());
         let on = src_now == k;
-        p.rect_stroke(br, 2.0, Stroke::new(1.0, if on { BLUE.c() } else if resp.hovered() { gy(0x8C8C8C) } else { OFF.c() }), egui::StrokeKind::Inside);
+        p.rect_stroke(br, 2.0, Stroke::new(1.0, if on { BLUE.c() } else { crate::ui_feel::hl(&resp, OFF.c(), gy(0x8C8C8C)) }), egui::StrokeKind::Inside);
         p.text(br.center() + vec2(0.0, 0.5), Align2::CENTER_CENTER, label, rb_bold(if k >= 2 { 9.75 } else { 9.0 }), if k >= 2 { BLUE.c() } else { WHITE.c() });
         let resp = if tips { resp.on_hover_text(tip) } else { resp };
         if resp.clicked() {
@@ -442,7 +442,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
     let target = if app.node(target).is_some() { target } else { 0 };
     let tname = app.node(target).map(|n| n.name.clone()).unwrap_or_else(|| "Collection".into());
     let tr = ui.interact(Rect::from_min_max(tt.min, pos2(l + 160.0, tt.max.y)), ui.id().with(("relwin_target", which)), Sense::click());
-    p.rect_filled(tt, 2.0, if tr.hovered() { gy(0x3A3A3A) } else { BTN.c() });
+    p.rect_filled(tt, 2.0, crate::ui_feel::hl(&tr, BTN.c(), gy(0x3A3A3A)));
     for y in [5.0, 8.5, 12.0] {
         p.rect_filled(Rect::from_min_max(tt.min + vec2(4.5, y - 1.0), tt.min + vec2(13.5, y + 1.0)), 0.0, gy(0xC9C9C9));
     }
@@ -451,7 +451,7 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
     dropdown(ui, &tr, if which == 0 { "relwin_target_menu" } else { "sugwin_target_menu" }, |ui| target_menu(app, ui, which));
     let info = if which == 0 { app.prefs.bx.related_info } else { app.prefs.bx.suggest_info }.min(4);
     let ir = ui.interact(Rect::from_min_max(pos2(l + 164.0, t + 58.0), pos2(l + 250.0, t + 76.0)), ui.id().with(("relwin_info", which)), Sense::click());
-    crate::icons_src::sub_sort(&p, pos2(l + 174.0, t + 67.0), if ir.hovered() { WHITE.c() } else { DIM.c() });
+    crate::icons_src::sub_sort(&p, pos2(l + 174.0, t + 67.0), crate::ui_feel::hl(&ir, DIM.c(), WHITE.c()));
     p.text(pos2(l + 185.0, t + 67.0), Align2::LEFT_CENTER, INFO_CHOICES[info as usize], rb(SUB_NAME_FONT), WHITE.c());
     dropdown(ui, &ir, if which == 0 { "relwin_info_menu" } else { "sugwin_info_menu" }, |ui| {
         for (i, n) in INFO_CHOICES.iter().enumerate() {
@@ -639,7 +639,7 @@ pub fn node_row_extras(app: &mut App, ui: &mut Ui, n: &PlaylistNode, rr: Rect, s
     if sel && !is_cue && n.kind != NodeKind::Smart {
         let c = pos2(rr.max.x - 10.5, rr.center().y);
         let resp = ui.interact(Rect::from_center_size(c, vec2(14.0, 14.0)), ui.id().with(("node_plus", n.id)), Sense::click());
-        crate::icons_src::plus_disc(ui.painter(), c, if resp.hovered() { WHITE.c() } else { gy(0xA0A0A0) }, ROW_SEL.c());
+        crate::icons_src::plus_disc(ui.painter(), c, crate::ui_feel::hl(&resp, gy(0xA0A0A0), WHITE.c()), ROW_SEL.c());
         let parent = if n.kind == NodeKind::Folder { n.id } else { n.parent };
         dropdown(ui, &resp, "node_plus_menu", |ui| {
             for (label, kind) in [("Create New Playlist", NodeKind::Playlist), ("Create New Intelligent Playlist", NodeKind::Smart), ("Create New Folder", NodeKind::Folder)] {
@@ -797,10 +797,10 @@ fn cv_row(ui: &mut Ui, text: &str, icon: TreeIcon, count: Option<usize>, folder:
     use crate::icons_src as src;
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 15.0), Sense::click());
     let p = ui.painter().with_clip_rect(rr.intersect(ui.clip_rect()));
-    let bg = if selected { ROW_SEL.c() } else if resp.hovered() { gy(0x262626) } else { BG2.c() };
+    let bg = if selected { ROW_SEL.c() } else { crate::ui_feel::hl(&resp, BG2.c(), gy(0x262626)) };
     // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
     let _sel_dark = crate::theme::dark_scope(selected);
-    if selected || resp.hovered() {
+    if selected || bg != BG2.c() {
         p.rect_filled(rr, 0.0, bg);
     }
     let col = if selected { WHITE } else { TREE_ICON };

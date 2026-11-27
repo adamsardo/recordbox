@@ -41,6 +41,7 @@ mod fx_sweep;
 mod fx_rev;
 mod fx_echo;
 mod fx_echo_plus;
+mod feel_selftest;
 mod mfx;
 mod mfx_att;
 mod icons;
@@ -76,6 +77,7 @@ mod sampler_lib;
 mod sequencer;
 mod ui_sampler;
 mod model;
+mod motion;
 mod manual;
 mod phrase;
 mod phrase_rb;
@@ -125,6 +127,7 @@ mod ui_browser_ext;
 mod ui_dialogs;
 mod ui_edit;
 mod ui_edit_view;
+mod ui_feel;
 mod ui_kit;
 mod ui_library_ext;
 mod ui_midi;
@@ -180,6 +183,7 @@ impl eframe::App for Gui {
         }
         ui_groove::frame_hook(&mut self.app, raw);
         app_hooks::raw_input(&mut self.app, raw);
+        ui_feel::raw_input(&mut self.app, raw);
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         self.app.shot_perf_events(frame, raw);
@@ -244,6 +248,7 @@ impl eframe::App for Gui {
         prefs_bridge::frame_limit(&mut self.app, ctx);
         let bench_t0 = std::time::Instant::now();
         let app = &mut self.app;
+        ui_feel::begin_frame(app, ctx);
         // PREPDECK_BENCH: name any step that holds a frame up for more than 4 ms.
         macro_rules! step {
             ($e:expr) => {{
@@ -345,6 +350,7 @@ impl eframe::App for Gui {
         step!(cue_tools::windows(app, ctx));
         step!(ui_midi::window(app, ctx));
         step!(ui_rec::windows(app, ctx));
+        ui_feel::end_frame(app, ctx);
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -418,7 +424,9 @@ impl eframe::App for Gui {
                 std::process::exit(1);
             }
             app.screenshot = Some((path, frames + 1));
-            ctx.request_repaint();
+            if !feel_selftest::idle_probe() {
+                ctx.request_repaint();
+            }
         }
     }
 

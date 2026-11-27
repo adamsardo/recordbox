@@ -10,7 +10,7 @@ use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Response, Sense, Sha
 
 pub fn button(ui: &mut Ui, rect: Rect, id: &str, label: &str, fill: Color32, text: Color32, size: f32) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
-    let f = if r.is_pointer_button_down_on() { fill.gamma_multiply(0.7) } else if r.hovered() { lighten(fill) } else { fill };
+    let f = crate::ui_feel::face(&r, fill, lighten(fill), fill.gamma_multiply(0.7));
     ui.painter().rect_filled(rect, 3.0, f);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(size), text);
     r
@@ -32,10 +32,13 @@ pub(crate) fn tip(r: Response, app: &App, t: &str) -> Response {
 pub fn icon_button(ui: &mut Ui, rect: Rect, id: &str, fill: Option<Color32>, draw: impl FnOnce(&egui::Painter, Rect, Color32)) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
     if let Some(f) = fill {
-        let f = if r.is_pointer_button_down_on() { f.gamma_multiply(0.7) } else if r.hovered() { lighten(f) } else { f };
+        let f = crate::ui_feel::face(&r, f, lighten(f), f.gamma_multiply(0.7));
         ui.painter().rect_filled(rect, 2.0, f);
-    } else if r.hovered() {
-        ui.painter().rect_filled(rect, 2.0, gy(0x1A1A1A));
+    } else {
+        let h = if crate::motion::on() { crate::ui_feel::hover(&r) } else { r.hovered() as u8 as f32 };
+        if h > 0.0 {
+            ui.painter().rect_filled(rect, 2.0, crate::motion::fade(gy(0x1A1A1A), h));
+        }
     }
     draw(ui.painter(), rect, WHITE.c());
     r
@@ -73,19 +76,31 @@ pub(crate) fn sx(main: Rect, x: f32) -> f32 {
 /// layout): a ring 1.5 units thick around a face of radius 15 units. `lit`: full-colour ring;
 /// `loaded`: raised face, white label.
 pub(crate) fn cue_button_face(p: &egui::Painter, c: Pos2, dia: f32, lit: bool, loaded: bool, hovered: bool) {
+    cue_button_face_t(p, c, dia, lit, loaded, hovered as u8 as f32, 0.0)
+}
+
+/// `cue_button_face` with hover and press as amounts (`ui_feel::hover`, `ui_feel::press`).
+pub(crate) fn cue_button_face_t(p: &egui::Painter, c: Pos2, dia: f32, lit: bool, loaded: bool, hovered: f32, pressed: f32) {
     let k = dia / 36.0;
     // Unlit: the ring at 40 % over the #1E1E1E column.
     crate::icons_player::ring(p, c, 17.25 * k, 1.5 * k, if lit { CUE_ORANGE } else { hex(0x785C28) });
-    p.circle_filled(c, 15.0 * k, if hovered { gy(0x2E2E2E) } else { (if loaded { BTN } else { BG2 }).c() });
+    let face = crate::motion::mix((if loaded { BTN } else { BG2 }).c(), gy(0x2E2E2E), hovered);
+    p.circle_filled(c, 15.0 * k, crate::motion::mix(face, gy(0x161616), 0.6 * pressed));
     p.text(c - vec2(0.0, 0.25), Align2::CENTER_CENTER, "CUE", caps(9.0 * k), if loaded { WHITE.c() } else { gy(0x323232) });
 }
 
 /// The round PLAY button on the same grid: stopped, a 40 % green ring and a grey triangle;
 /// playing, the full ring, a raised face and white pause bars.
 pub(crate) fn play_button_face(p: &egui::Painter, c: Pos2, dia: f32, playing: bool, hovered: bool) {
+    play_button_face_t(p, c, dia, playing, hovered as u8 as f32, 0.0)
+}
+
+/// `play_button_face` with hover and press as amounts.
+pub(crate) fn play_button_face_t(p: &egui::Painter, c: Pos2, dia: f32, playing: bool, hovered: f32, pressed: f32) {
     let k = dia / 36.0;
     crate::icons_player::ring(p, c, 17.25 * k, 1.5 * k, if playing { PLAY_GREEN } else { hex(0x246822) });
-    p.circle_filled(c, 15.0 * k, if hovered { gy(0x2A2A2A) } else { (if playing { BTN } else { BG2 }).c() });
+    let face = crate::motion::mix((if playing { BTN } else { BG2 }).c(), gy(0x2A2A2A), hovered);
+    p.circle_filled(c, 15.0 * k, crate::motion::mix(face, gy(0x161616), 0.6 * pressed));
     if playing {
         crate::icons_player::pause_bars(p, c, k, WHITE.c());
     } else {
@@ -105,7 +120,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // (A 1 pt black line under the header, as across the rest of the window.)
     p.rect_filled(Rect::from_min_max(pos2(left.min.x, left.min.y + 1.0), left.max), 0.0, BG2);
 
-    let pos = app.pos();
+    let pos = crate::ui_feel::shown_pos(app);
     let playing = app.playing();
     let loaded = app.deck.track.is_some();
 
@@ -134,7 +149,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let bj_rect = Rect::from_min_size(pos2(lx + 12.0, ly + 98.0), vec2(56.0, 26.0));
     let bj_label = crate::player_ext::jump_label(bj, app.prefs.beat_jump_bars);
     let r = tip(ui.interact(bj_rect, ui.id().with("bjsize"), Sense::click()), app, "Select the beat/bar length jumping from the current position.");
-    p.rect_filled(bj_rect, 0.0, if r.hovered() { lighten(BTN.c()) } else { BTN.c() });
+    p.rect_filled(bj_rect, 0.0, crate::ui_feel::hl(&r, BTN.c(), lighten(BTN.c())));
     p.text(pos2(bj_rect.center().x, ly + 106.2), Align2::CENTER_CENTER, bj_label, bold(9.0), WHITE.c());
     crate::icons_player::chevron_down(&p, pos2(lx + 40.75, ly + 118.0), 1.0, WHITE.c());
     crate::ui_browser::dropdown(ui, &r, "bjpop", |ui: &mut Ui| {
@@ -145,7 +160,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let cue_rect = Rect::from_center_size(cue_c, vec2(42.0, 42.0));
     let cr = ui.interact(cue_rect, ui.id().with("cuebtn"), Sense::click_and_drag());
     let cue_lit = loaded && (!playing || app.deck.cue_preview);
-    cue_button_face(&p, cue_c, 40.0, cue_lit, loaded, cr.hovered());
+    crate::ui_feel::round_face(&p, cue_c, 40.0, cue_lit, loaded, &cr, true);
     if press_fired(ui, &cr) && !app.deck.cue_preview {
         app.cue_down();
     }
@@ -156,7 +171,7 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     // PLAY
     let play_c = pos2(lx + 40.0, ly + 214.0);
     let pr = ui.interact(Rect::from_center_size(play_c, vec2(42.0, 42.0)), ui.id().with("playbtn"), Sense::click());
-    play_button_face(&p, play_c, 40.0, playing, pr.hovered());
+    crate::ui_feel::round_face(&p, play_c, 40.0, playing, true, &pr, false);
     if tip(pr, app, "Play/Pause").clicked() {
         app.play_pause();
     }
@@ -514,6 +529,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         _ => Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 6.0)),
     });
     let span = crate::ui_perf_layouts::span(app).unwrap_or(ZOOMS[app.prefs.zoom.min(ZOOMS.len() - 1)]);
+    let span = crate::ui_feel::zoom_span(ui, r, span);
     let px_per_s = r.width() as f64 / span;
     let cx = r.center().x + cx_off;
     let t_of = |x: f32| pos + (x - cx) as f64 / px_per_s;
@@ -932,7 +948,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             let r = Rect::from_center_size(pos2(sx(main, 421.0 + slot as f32 * 33.0), y), vec2(28.0, 28.0));
             let cue = app.deck.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot).cloned();
             let resp = ui.interact(r, ui.id().with(("pad", slot)), Sense::click_and_drag());
-            p.rect_filled(r, 1.0, if resp.hovered() { gy(0x1A1A1A) } else { gy(0x0F0F0F) });
+            p.rect_filled(r, 1.0, crate::ui_feel::hl(&resp, gy(0x0F0F0F), gy(0x1A1A1A)));
             let tc = match &cue {
                 Some(c) => {
                     p.rect_filled(Rect::from_center_size(r.center() - vec2(0.5, 0.5), vec2(15.0, 15.0)), 0.0, hotcue_color(c.color));
@@ -961,7 +977,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                 let xr = Rect::from_center_size(pos2(r.max.x - 4.5, r.min.y + 4.5), vec2(10.0, 10.0));
                 let xresp = ui.interact(xr, ui.id().with(("padclr", slot)), Sense::click());
                 if ui.rect_contains_pointer(r.expand(2.0)) {
-                    p.rect_filled(xr, 2.0, if xresp.hovered() { gy(0x505050) } else { gy(0x323232) });
+                    p.rect_filled(xr, 2.0, crate::ui_feel::hl(&xresp, gy(0x323232), gy(0x505050)));
                     close_cross(&p, xr.center(), 5.0, WHITE.c());
                 }
                 if tip(xresp, app, &format!("Clear Hot Cue(Loop) {letter}")).clicked() {
@@ -1010,7 +1026,7 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             let dresp = tip(ui.interact(dr, ui.id().with("lsize"), Sense::click()), app, "Beat Loop");
             // rekordbox shows no arrow in the field: ours appears only under the pointer.
             if ui.rect_contains_pointer(field) {
-                crate::icons_player::chevron_down(&p, dr.center(), 0.9, if dresp.hovered() { WHITE.c() } else { DIM.c() });
+                crate::icons_player::chevron_down(&p, dr.center(), 0.9, crate::ui_feel::hl(&dresp, DIM.c(), WHITE.c()));
             }
             crate::ui_browser::dropdown(ui, &dresp, "lsizepop", |ui: &mut Ui| crate::ui_player2::loop_size_menu(app, ui));
             if tip(icon_button(ui, at(1046.0, 20.0), "ldouble", Some(BTN.c()), |p, r, c| crate::icons_player::chevron_right(p, r.center(), 1.25, c)), app, "Auto Beat Loop:\nMake Loop length longer.").clicked() {
@@ -1096,7 +1112,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         let r = at(474.0 + i as f32 * 50.0, 44.0).shrink2(vec2(0.0, 4.5));
         let resp = ui.interact(r, ui.id().with(("stem", i)), Sense::click());
         let lit = srcs.iter().all(|s| on[*s]);
-        p.rect_filled(r, 1.0, if resp.hovered() { gy(0x1E1E1E) } else { gy(0x0F0F0F) });
+        p.rect_filled(r, 1.0, crate::ui_feel::hl(&resp, gy(0x0F0F0F), gy(0x1E1E1E)));
         if lit {
             p.rect_stroke(r, 1.0, Stroke::new(1.0_f32, *col), egui::StrokeKind::Inside);
         }
@@ -1156,7 +1172,7 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
 /// MEMORY-style raised button with a bold caps label.
 pub(crate) fn bold_button(ui: &mut Ui, rect: Rect, id: &str, label: &str) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
-    ui.painter().rect_filled(rect, 2.0, if r.is_pointer_button_down_on() { BG2.c() } else if r.hovered() { lighten(BTN.c()) } else { BTN.c() });
+    ui.painter().rect_filled(rect, 2.0, crate::ui_feel::face(&r, BTN.c(), lighten(BTN.c()), BG2.c()));
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, caps(8.8), WHITE.c());
     r
 }
@@ -1172,10 +1188,11 @@ fn tab_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, active: bool) -> R
 /// Toggle buttons (AU / MA / Q, the panel tabs): blue when on, #1E1E1E with a 1 pt #646464 outline when off.
 pub(crate) fn seg_button(ui: &mut Ui, rect: Rect, id: &str, label: &str, on: bool) -> Response {
     let r = ui.interact(rect, ui.id().with(id), Sense::click());
-    let fill = if on { BLUE.c() } else if r.hovered() { gy(0x2A2A2A) } else { BG2.c() };
+    let lit = crate::ui_feel::state_amt(r.id, on);
+    let fill = crate::motion::mix(crate::ui_feel::hl(&r, BG2.c(), gy(0x2A2A2A)), BLUE.c(), lit);
     ui.painter().rect_filled(rect, 2.0, fill);
-    if !on {
-        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0_f32, OFF), egui::StrokeKind::Inside);
+    if lit < 1.0 {
+        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0_f32, crate::motion::fade(OFF.c(), 1.0 - lit)), egui::StrokeKind::Inside);
     }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, caps(8.8), WHITE.c());
     r
