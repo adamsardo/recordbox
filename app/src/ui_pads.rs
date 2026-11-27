@@ -455,7 +455,7 @@ fn hot_cue_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, pi
     }
     // A pad held while paused plays until it is let go (and SLIP comes back).
     let held = app.deck.hot_preview.is_some() || app.player.state.lock().slip_hold;
-    if held && !ui.input(|i| i.pointer.any_down()) {
+    if held && !ui.input(|i| i.pointer.any_down()) && !crate::keycmd::holding(n) {
         app.hot_cue_up();
     }
 }
@@ -659,7 +659,7 @@ fn key_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, keyboa
     }
     if keyboard {
         let held = app.deck.hot_preview.is_some() || app.player.state.lock().slip_hold;
-        if held && !ui.input(|i| i.pointer.any_down()) {
+        if held && !ui.input(|i| i.pointer.any_down()) && !crate::keycmd::holding(n) {
             app.pad_keyboard_up();
         }
     }

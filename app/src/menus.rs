@@ -918,11 +918,17 @@ pub fn handle(app: &mut App, id: &str) {
             });
         }
         "delete_playlist" => {
+            if crate::prefs_bridge::library_protected(app) {
+                return;
+            }
             if let Some(n) = current_node(app).cloned() {
                 app.dialogs.confirm_delete_node = Some((n.id, n.name.clone(), n.kind == NodeKind::Folder));
             }
         }
         "rename_playlist" => {
+            if crate::prefs_bridge::library_protected(app) {
+                return;
+            }
             if let Some(n) = current_node(app).cloned() {
                 app.side = SideMode::Playlists;
                 app.dialogs.rename = Some((n.id, n.name));

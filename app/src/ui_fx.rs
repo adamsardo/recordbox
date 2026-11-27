@@ -638,11 +638,19 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     // 24 pt CFX row at 53.)
     p.rect_filled(full, 0.0, egui::Color32::BLACK);
     let r = Rect::from_min_max(pos2(r.min.x, r.min.y + 1.0), pos2(r.max.x, r.min.y + 50.0));
-    let bottom = Rect::from_min_max(pos2(full.min.x, full.min.y + 53.0), pos2(full.max.x, full.min.y + 77.0));
-    if app.prefs.fx.mfx.enabled && app.px.fxx.mfx.show {
-        mfx_row(app, ui, bottom);
-    } else {
-        cfx_row(app, ui, bottom);
+    // (View > Layout > Effect Panel: BEAT FX, SOUND COLOR FX or both rows.)
+    let (beat_row, color_row) = app.prefs.rb.fx_rows();
+    let top = if beat_row { 53.0 } else { 0.0 };
+    let bottom = Rect::from_min_max(pos2(full.min.x, full.min.y + top), pos2(full.max.x, full.min.y + top + 24.0));
+    if color_row {
+        if app.prefs.fx.mfx.enabled && app.px.fxx.mfx.show {
+            mfx_row(app, ui, bottom);
+        } else {
+            cfx_row(app, ui, bottom);
+        }
+    }
+    if !beat_row {
+        return;
     }
     p.rect_filled(r, 0.0, hex(0x1E1E1E));
     let whole = Lay { x0: full.min.x, y0: full.min.y + 1.0, k: full.width() / 1280.0 };

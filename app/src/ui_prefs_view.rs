@@ -93,7 +93,7 @@ fn display_type(app: &mut App, ui: &mut Ui, mode: Mode) {
     if perf {
         item(ui, "ViewDeckInfo", 106.0, |it| {
             it.title("Deck track information display");
-            stored(it, "");
+            it.hint("The PERFORMANCE decks show no title, artist or artwork.");
             it.pill(52.0, 56.0, &mut app.prefs.rb.hide_deck_info, "Hide Title, Artist, and Artwork");
         });
     }
@@ -108,15 +108,19 @@ fn display_type(app: &mut App, ui: &mut Ui, mode: Mode) {
             p.key_alnum = true;
             dirty = true;
         }
-        stored(it, "");
+        it.hint("On: a key the library spelled its own way (\"Fm\", \"4A\") is shown so; off: every key in the format above.");
+        let was = p.rb.show_original_key;
         it.pill(52.0, 108.0, &mut p.rb.show_original_key, "Display key information on the database");
+        if was != p.rb.show_original_key {
+            dirty = true;
+        }
     });
     item(ui, "ViewWaveform", 286.0, |it| {
         it.title("Waveform");
         let p = &mut app.prefs;
         it.child(20.0, 56.0, |it| {
             it.sub(32.0, 0.0, "Waveform Drawing Rate");
-            stored(it, "recordbox draws at the display's rate.");
+            it.hint("High Speed: up to 120 frames a second; Medium and Low Speed: 40 (rekordbox's rates).");
             let mut sel = p.rb.draw_rate.min(2) as usize;
             if it.radios(64.0, 34.0, &mut sel, &["High Speed", "Medium Speed", "Low Speed"]) {
                 p.rb.draw_rate = sel as u8;
@@ -153,7 +157,7 @@ fn display_type(app: &mut App, ui: &mut Ui, mode: Mode) {
     if perf {
         item(ui, "ViewJogDisplay", 118.0, |it| {
             it.title("Switch JOG Display");
-            stored(it, "");
+            it.hint("What the platter's ring shows: the current cue and SLIP, or the countdown to the next hot cue.");
             let p = &mut app.prefs.rb;
             if it.radio(52.0, 56.0, p.jog_indicator == 1, "Current CUE / SLIP") {
                 p.jog_indicator = 1;
@@ -165,7 +169,7 @@ fn display_type(app: &mut App, ui: &mut Ui, mode: Mode) {
     }
     item(ui, "ViewTrafficLight", 98.0, |it| {
         it.title_tip("Traffic Light", "Tracks whose key suits the track on the master deck are marked in the track list. Choose how close the key has to be.");
-        stored(it, "");
+        it.hint("Which keys count as suiting the target deck's key.");
         let mut sel = (app.prefs.rb.traffic_light.clamp(1, 4) - 1) as usize;
         if it.choice(52.0, 56.0, 520.0, &mut sel, &["Same Key", "Related Key 1", "Related Key 2", "Related Key 3"]) {
             app.prefs.rb.traffic_light = sel as u8 + 1;
@@ -237,7 +241,7 @@ fn layout(app: &mut App, ui: &mut Ui, mode: Mode) {
             it.sep(y - 16.0);
             it.child(20.0, y, |it| {
                 it.sub(32.0, 0.0, "Deck");
-                stored(it, "recordbox does not show a sync rate next to BEAT SYNC yet.");
+                it.hint("The x1/2, x1, x2 button next to BEAT SYNC.");
                 it.check(64.0, 34.0, &mut p.rb.show_sync_rate, "Display SYNC RATE");
                 it.no_hint();
             });
@@ -270,7 +274,7 @@ fn layout(app: &mut App, ui: &mut Ui, mode: Mode) {
         });
         item(ui, "ViewZoomWaveform", 180.0, |it| {
             it.title("Enlarged Waveform");
-            stored(it, "The order of the decks' enlarged waveforms.");
+            it.hint("The order of the decks' enlarged waveforms in the 4-deck layouts (Auto: 1-2-3-4 horizontal, 3-1-2-4 vertical).");
             if it.radio(52.0, 56.0, !p.zoom_wave_custom, "Auto") {
                 p.zoom_wave_custom = false;
             }
@@ -292,7 +296,7 @@ fn layout(app: &mut App, ui: &mut Ui, mode: Mode) {
         });
         item(ui, "ViewPadMode", 150.0, |it| {
             it.title("PAD Mode");
-            stored(it, "How the pads are shown under the decks.");
+            it.hint("How the pads are shown under the decks.");
             if it.radio(52.0, 56.0, !p.pad_mode_custom, "Auto") {
                 p.pad_mode_custom = false;
             }
@@ -387,12 +391,12 @@ fn color(app: &mut App, ui: &mut Ui, mode: Mode) {
         });
         item(ui, "ViewSamplerColor", 118.0, |it| {
             it.title("SAMPLER color");
-            stored(it, "");
-            if it.radio(52.0, 56.0, p.sampler_color == 1, "Sync with Frequency") {
-                p.sampler_color = 1;
+            it.hint("Sync with Frequency: each pad in the colour of its sample's sound. Fixed: the colour chosen for the sample (`SamplerColorType` 0 / 1, `onLoadedClipChanged` 0x100b19f94).");
+            if it.radio(52.0, 56.0, p.sampler_color == 0, "Sync with Frequency") {
+                p.sampler_color = 0;
             }
-            if it.radio(52.0, 82.0, p.sampler_color == 2, "Fixed") {
-                p.sampler_color = 2;
+            if it.radio(52.0, 82.0, p.sampler_color != 0, "Fixed") {
+                p.sampler_color = 1;
             }
         });
     }

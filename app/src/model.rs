@@ -222,7 +222,9 @@ pub struct Track {
 impl Track {
     /// The key as shown: the imported spelling when there is one, else in the chosen notation.
     pub fn key_label(&self, alnum: bool) -> String {
-        if self.key_text.trim().is_empty() {
+        // (View > Display Type > "Display key information on the database": off, every key
+        // is shown in the chosen notation.)
+        if self.key_text.trim().is_empty() || !crate::prefs_bridge::SHOW_ORIGINAL_KEY.load(std::sync::atomic::Ordering::Relaxed) {
             key_name(self.key, alnum)
         } else {
             self.key_text.clone()

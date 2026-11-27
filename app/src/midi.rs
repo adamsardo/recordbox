@@ -1106,7 +1106,10 @@ impl Hub {
             s.loop_range = Some((start, e));
         }
         if !s.playing {
-            self.hot_preview[n].store(start.to_bits(), Relaxed);
+            // (Gate Cue: held, it plays and returns; off, it plays on.)
+            if crate::prefs_bridge::GATE_CUE.load(Relaxed) {
+                self.hot_preview[n].store(start.to_bits(), Relaxed);
+            }
             s.playing = true;
         }
         true
@@ -1811,7 +1814,7 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
                     if a.loop_active().is_some() {
                         a.loop_exit();
                     } else {
-                        let b = if f.act == Act::Loop4 { 4.0 } else { a.prefs.loop_beats };
+                        let b = if f.act == Act::Loop4 { 4.0 } else { crate::prefs_bridge::auto_beat_loop_beats(&a.prefs) };
                         a.auto_loop(b);
                     }
                 });
@@ -2473,6 +2476,7 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
         }
         Stub::AutoCue => {
             if press {
+                crate::prefs_bridge::toggle_auto_cue(app, deck);
                 note(app, format!("AutoCue deck {}", deck + 1));
             }
         }
@@ -2751,7 +2755,9 @@ mod tests {
             l.iter().any(|m| m == &[0x90, 0x0B, 0x00]) && l.iter().any(|m| m == &[0x90, 0x0B, 0x7F])
         });
         ctl_out.send(&[0x90, 0x0C, 0x00]).unwrap();
-        // Hot cue A held on the stopped deck: plays from 12 s; released: back there, stopped.
+        // Hot cue A held on the stopped deck with Gate Cue on (Preferences > Controller > Deck
+        // > HOT CUE): plays from 12 s; released: back there, stopped.
+        crate::prefs_bridge::GATE_CUE.store(true, std::sync::atomic::Ordering::Relaxed);
         ctl_out.send(&[0x97, 0x00, 0x7F]).unwrap();
         wait("hot cue A playing", || {
             let s = decks[0].lock();

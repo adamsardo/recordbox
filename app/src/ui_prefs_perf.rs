@@ -44,11 +44,11 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     let mut changed = false;
     let p = &mut app.prefs;
     changed |= lock_item(ui, "ControllerEjectLoadLock", "Eject/Load Lock", &mut p.deck_load_lock, "Lock: a deck that is playing refuses a new track.");
-    changed |= lock_item(ui, "ControllerNeedleLock", "Needle Lock", &mut p.rb.needle_lock, &format!("Lock: the full waveform does not move a deck that is playing. {STORED}"));
-    changed |= lock_item(ui, "ControllerMemoryCueCallLock", "Memory Cue Call Lock", &mut p.rb.memory_cue_call_lock, &format!("Lock: memory cues cannot be called while the deck plays. {STORED}"));
+    changed |= lock_item(ui, "ControllerNeedleLock", "Needle Lock", &mut p.rb.needle_lock, "Lock: the full waveform does not move a deck that is playing.");
+    changed |= lock_item(ui, "ControllerMemoryCueCallLock", "Memory Cue Call Lock", &mut p.rb.memory_cue_call_lock, "Lock: memory cues cannot be called while the deck plays (\"Memory Cue Call Lock. Not available during playback.\").");
     changed |= item(ui, "ControllerLoad", 118.0, |it| {
         it.title("Load");
-        stored(it, "");
+        it.hint("On: a track loaded in PERFORMANCE stands at its first memory cue or hot cue, whichever comes first.");
         it.check(52.0, 56.0, &mut p.rb.load_start_cue, "Playback starts at Memory/Hot Cue nearest to the beginning of the track");
         it.hint("Loading the track that is already on the other deck takes over its position, tempo and play state.");
         it.check(52.0, 82.0, &mut p.instant_doubles, "Instant Doubles");
@@ -57,7 +57,7 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     changed |= item(ui, "ControllerAutoCue", 190.0, |it| {
         it.title_tip("Auto Cue", "When Auto Cue is enabled, a cue point is set at the beginning of the track according to the Auto Cue Level. When a track is loaded, the track will pause at the beginning of the track.");
         it.sub(52.0, 56.0, "Auto Cue Level");
-        stored(it, "");
+        it.hint("A deck with Auto Cue on cues a track it loads to its first sound at this level or louder (a track with a memory cue goes to that instead).");
         let names = ["-36dB", "-42dB", "-48dB", "-54dB", "-60dB", "-66dB", "-72dB", "-78dB"];
         let mut sel = (p.rb.auto_cue_level.clamp(1, 8) - 1) as usize;
         if it.choice(88.0, 90.0, 520.0, &mut sel, &names) {
@@ -71,7 +71,7 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     });
     changed |= item(ui, "ControllerVinylSpeedAdjust", 258.0, |it| {
         it.title("Vinyl Speed Adjust");
-        stored(it, "How fast a deck stops and starts in vinyl mode.");
+        it.hint("How fast a deck stops and starts in vinyl mode.");
         it.sub(52.0, 56.0, "Touch/Brake");
         for (i, x) in [88.0, 270.0].into_iter().enumerate() {
             let mut t = p.rb.brake[i] as f32 / 255.0;
@@ -93,7 +93,7 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     changed |= item(ui, "ControllerJog", 216.0, |it| {
         it.title("JOG");
         it.sub(52.0, 56.0, "JOG Rotation Speed");
-        stored(it, "For a controller's jog wheels.");
+        it.hint("The platter's turning speed for scratching and the hot cue countdown. Below: CUE held while the jog is spun returns to the cue point when the jog is let go.");
         if it.radio(88.0, 90.0, p.rb.jog_speed == 1, "33rpm") {
             p.rb.jog_speed = 1;
         }
@@ -105,7 +105,7 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     });
     changed |= item(ui, "ControllerAutoPlay", 108.0, |it| {
         it.title("Continuous Playing");
-        stored(it, "");
+        it.hint("A deck whose track ends loads the next track of the list and plays it (not while Automix has the deck).");
         it.pill_h(52.0, 56.0, 38.0, &mut p.rb.auto_play, "Automatically load tracks in a list\nand have them play continuously one after another.");
         it.changed
     });
@@ -113,7 +113,7 @@ pub fn page_deck(app: &mut App, ui: &mut Ui) {
     changed |= hot_cue_item(ui, p);
     changed |= item(ui, "ControllerAutoBeatLoop", 98.0, |it| {
         it.title_tip("AUTO BEAT LOOP", "You can select the length of Auto Beat Loop. When you press the button (or rotary encoder) on the connected hardware, the Auto Beat Loop will start with the selected length.");
-        stored(it, "For a controller's loop button.");
+        it.hint("The length a controller's or a key's Auto Beat Loop starts with.");
         let names = ["Loop for specified beats", "1 Beat Loop", "2 Beat Loop", "4 Beat Loop", "8 Beat Loop", "16 Beat Loop", "32 Beat Loop"];
         let mut sel = (p.rb.auto_beat_loop.clamp(1, 7) - 1) as usize;
         if it.choice(52.0, 56.0, 556.0, &mut sel, &names) {
@@ -131,7 +131,7 @@ pub fn sync_type_item(ui: &mut Ui, p: &mut Prefs) -> bool {
     item(ui, "ControllerSyncType", 200.0, |it| {
         it.title("BEAT/BPM SYNC");
         it.sub(52.0, 56.0, "Sync Type");
-        stored(it, "recordbox's BEAT SYNC matches tempo and beat position.");
+        it.hint("BEAT SYNC matches tempo and beat position, BPM SYNC the tempo only.");
         if it.radio(88.0, 90.0, p.rb.beat_sync_type == 1, "BEAT SYNC") {
             p.rb.beat_sync_type = 1;
         }
@@ -147,7 +147,6 @@ pub fn sync_type_item(ui: &mut Ui, p: &mut Prefs) -> bool {
 pub fn hot_cue_item(ui: &mut Ui, p: &mut Prefs) -> bool {
     item(ui, "ControllerHotCue", 120.0, |it| {
         it.title_tip("HOT CUE", "For Hot Cues, the Smart Cue option and the Gate Cue option (during Pause) can be selected.\n\nSmart Cue:\nWhen you set a Hot Cue or start playback from a Hot Cue, that point is set as the new Cue point.\n\nGate Cue:\nPlayback starts from the Hot Cue position when the Hot Cue button is pressed.\nKeep pressing the Hot Cue button, the playback continues.\nWhen the Hot Cue button is released, the playback position will return to the Hot Cue position and the playback will pause.");
-        stored(it, "");
         it.pill(52.0, 56.0, &mut p.rb.smart_cue, "Overwrite the current Cue with a Hot Cue (Smart Cue)");
         it.pill(52.0, 84.0, &mut p.rb.gate_cue, "Gate playback during Pause (Gate Cue)");
         it.changed
@@ -203,7 +202,7 @@ pub fn page_mixer(app: &mut App, ui: &mut Ui) {
         }
         it.sep(148.0);
         it.sub(52.0, 164.0, "EQ Type");
-        it.hint(format!("recordbox's equalizer has the DJM-900NXS2 curves. {STORED}"));
+        it.hint("The equalizer's curves: DJM-900NXS or DJM-900NXS2.");
         if it.radio(88.0, 198.0, p.rb.eq_type == 0, "DJM-900NXS") {
             p.rb.eq_type = 0;
         }
@@ -358,7 +357,7 @@ pub fn page_others(app: &mut App, ui: &mut Ui) {
     let p = &mut app.prefs;
     changed |= item(ui, "ControllerQuantizeMode", 92.0, |it| {
         it.title_tip("Mode", "When this option is selected, HOT CUE and LOOP/SAMPLER(LOOP) point jumps before reaching the next beat.\nIf this option is not selected, the point jumps when it reaches the next beat.\nYou can select the beat length at [Type] > [QUANTIZE] > [HOT CUE] and [LOOP/SAMPLER(LOOP)].");
-        stored(it, "recordbox moves a quantized point to the nearest beat line at once.");
+        it.hint("On: a hot cue or loop pressed less than half a beat after a beat acts at once; off: it waits for the next beat unless the beat passed less than 1/32 beat ago.");
         it.pill(52.0, 56.0, &mut p.rb.quantize_jump_before, "Jump before reaching the next beat.");
         it.changed
     });
@@ -372,7 +371,7 @@ pub fn page_others(app: &mut App, ui: &mut Ui) {
         q_row(it, 20.0, 56.0, "SNAP", &mut snap, 2);
         it.sep(94.0);
         it.sub(52.0, 110.0, "QUANTIZE");
-        stored(it, "recordbox quantizes with the SNAP value.");
+        it.hint("Each type's switch and beat value: HOT CUE for hot cues called on a playing deck, REVERSE for the turn of REVERSE.");
         q_row(it, 52.0, 146.0, "HOT CUE", &mut p.rb.q_hot_cue, 2);
         q_row(it, 52.0, 178.0, "LOOP/SAMPLER(LOOP)", &mut p.rb.q_loop, 2);
         q_row(it, 52.0, 210.0, "REVERSE", &mut p.rb.q_reverse, 2);
@@ -393,7 +392,7 @@ pub fn page_others(app: &mut App, ui: &mut Ui) {
     if performance {
         changed |= item(ui, "ControllerQuantizeInOneGo", 118.0, |it| {
             it.title("Setting");
-            stored(it, "recordbox has one Q for the decks and one for the sampler.");
+            it.hint("All Decks: a deck's Q switches every deck and the sampler.");
             if it.radio(52.0, 56.0, !p.rb.quantize_in_one_go, "Each Deck / Sampler Deck") {
                 p.rb.quantize_in_one_go = false;
             }

@@ -1358,7 +1358,10 @@ impl App {
         let (Some((a, b)), Some(audio)) = (self.defined_loop(), self.deck.audio.clone()) else {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no loop is set"));
         };
-        write_wav16(path, audio.sr, 2, loop_samples(&audio.samples, audio.sr, a, b))
+        // (Advanced > Others > Export Loop As WAV > Sample Rate: 48 kHz or 44.1 kHz.)
+        let rate = if matches!(self.prefs.rb.loop_wav_rate, 44100 | 48000) { self.prefs.rb.loop_wav_rate } else { audio.sr };
+        let s = crate::prefs_bridge::resample_stereo(loop_samples(&audio.samples, audio.sr, a, b), audio.sr, rate);
+        write_wav16(path, rate, 2, &s)
     }
 
     // ------------------------------------------------------------------ loop buttons

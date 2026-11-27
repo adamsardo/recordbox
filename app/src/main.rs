@@ -31,6 +31,8 @@ mod importer;
 mod itunes;
 mod jobs;
 mod keycmd_data;
+mod keycmd;
+mod keytest_selftest;
 mod key;
 mod library_ext;
 mod menus;
@@ -127,6 +129,7 @@ impl eframe::App for Gui {
             }
         }
         ui_groove::frame_hook(&mut self.app, raw);
+        app_hooks::raw_input(&mut self.app, raw);
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         self.app.shot_perf_events(frame, raw);
@@ -137,6 +140,7 @@ impl eframe::App for Gui {
         crate::ui_perf_layouts::shot_layout_events(&mut self.app, frame, raw);
         self.app.shot_mix_events(frame, raw);
         self.app.shot_prefs_events(frame, raw);
+        self.app.shot_key_events(frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
@@ -185,6 +189,7 @@ impl eframe::App for Gui {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        prefs_bridge::frame_limit(&mut self.app, ctx);
         let bench_t0 = std::time::Instant::now();
         let app = &mut self.app;
         // PREPDECK_BENCH: name any step that holds a frame up for more than 4 ms.
@@ -201,6 +206,7 @@ impl eframe::App for Gui {
         step!(app.poll_analysis());
         step!(app.poll_load());
         step!(midi::poll(app));
+        step!(prefs_bridge::frame(app));
         step!(app.poll_decks());
         step!(automix::poll(app, ctx));
         step!(app.poll_export());
@@ -345,6 +351,7 @@ impl eframe::App for Gui {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        prefs_bridge::on_exit(&mut self.app);
         self.app.save_prefs();
         let _ = self.app.db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
@@ -360,6 +367,7 @@ fn recordbox_actions() -> Vec<&'static str> {
 }
 
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
+    keycmd::frame(app, ctx);
     if ui_edit::frame(app, ctx) { return; }
     // Previews never outlive what holds them: losing the window's focus ends them (key-up
     // events are not delivered then), and a hot-cue preview ends once neither a hot-cue key nor
@@ -378,7 +386,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     }
     if app.deck.hot_preview.is_some() {
         let hot_held = (1..=8).any(|n| app.prefs.key_for(&format!("hot{n}")).map(|k| ctx.input(|i| i.key_down(k))).unwrap_or(false));
-        if !hot_held && !ctx.input(|i| i.pointer.any_down()) {
+        if !hot_held && !ctx.input(|i| i.pointer.any_down()) && !keycmd::holding(app.px.active) {
             app.hot_cue_up();
         }
     }
@@ -408,7 +416,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
         return;
     }
     use egui::Key;
-    let shortcuts: std::collections::HashMap<&str, app::Shortcut> = recordbox_actions().iter().filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
+    let shortcuts: std::collections::HashMap<&str, app::Shortcut> = recordbox_actions().iter().filter(|a| keycmd::old_loop_runs(&app.prefs, a)).filter_map(|a| app.prefs.shortcut_for(a).map(|k| (*a, k))).collect();
     let key = |a: &str| shortcuts.get(a).map(|s| s.key);
     // A press of the action's key with exactly its modifiers (beat jumps also take Shift).
     // The sampler deck's keys work in PERFORMANCE mode only, and there they come before

@@ -228,7 +228,7 @@ pub(crate) fn player_height(app: &App) -> f32 {
 /// `getPlayerHeight` in every layout: 1 pt above the decks and a 3 pt gutter above the browser.
 pub(crate) fn height(app: &App) -> f32 {
     let l = layout(app);
-    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::ui_fx::FX_H } else { 0.0 };
+    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::prefs_bridge::fx_panel_height(app) } else { 0.0 };
     let smp = if app.prefs.perf_sampler && panel_enabled(app, 2) { crate::ui_sampler::SAMPLER_H } else { 0.0 };
     let _ = l;
     player_height(app) + 4.0 + fx + smp
@@ -1313,8 +1313,8 @@ pub(crate) fn panels(app: &mut App, ui: &mut Ui) -> Rect {
     ui.painter().rect_filled(full, 0.0, BG);
     let mut t = full.min.y;
     if app.prefs.perf_fx && panel_enabled(app, 0) {
-        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(full.min.x, t), vec2(full.width(), crate::ui_fx::FX_H - 1.0)));
-        t += crate::ui_fx::FX_H;
+        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(full.min.x, t), vec2(full.width(), crate::prefs_bridge::fx_panel_height(app) - 1.0)));
+        t += crate::prefs_bridge::fx_panel_height(app);
     }
     let sampler_h = if app.prefs.perf_sampler && panel_enabled(app, 2) { crate::ui_sampler::SAMPLER_H } else { 0.0 };
     app.sampler_poll();
@@ -1346,7 +1346,8 @@ fn vertical(app: &mut App, ui: &mut Ui) {
     // from 18 pt under its top (4 decks: the deck numbers' row) to 14 pt above its bottom (the
     // beat counts' row).
     let wa = fr.waves;
-    let order: &[u8] = if four { &[2, 0, 1, 3] } else { &[0, 1] };
+    let ord = crate::prefs_bridge::wave_order(app, true, fr.count);
+    let order: &[u8] = if four { &ord } else { &[0, 1] };
     let lane_w = wa.width() / fr.count as f32;
     let view_top = wa.min.y + if four { 18.0 } else { 0.0 };
     let view_bot = wa.max.y - 14.0;
@@ -1411,9 +1412,12 @@ fn simple(app: &mut App, ui: &mut Ui) {
 pub(crate) fn waves_h(app: &mut App, ui: &mut Ui, fr: &Frame) -> Vec<(u8, Rect)> {
     let ls = h_lanes(fr.waves, fr.count);
     let mut lanes = vec![];
-    for (n, lane) in ls.iter().enumerate() {
-        h_lane(app, ui, *lane, n as u8);
-        lanes.push((n as u8, *lane));
+    // (View > Layout > Enlarged Waveform: the decks' order, top to bottom.)
+    let order = crate::prefs_bridge::wave_order(app, false, fr.count);
+    for (i, lane) in ls.iter().enumerate() {
+        let n = order[i];
+        h_lane(app, ui, *lane, n);
+        lanes.push((n, *lane));
     }
     lane_numbers(app, ui, fr.waves, &ls);
     control_strip(app, ui, fr.waves, false);
@@ -1427,7 +1431,9 @@ pub(crate) fn lane_numbers(app: &App, ui: &Ui, wa: Rect, lanes: &[Rect]) {
         return;
     }
     let p = ui.painter();
-    for (n, lane) in lanes.iter().enumerate() {
+    let order = crate::prefs_bridge::wave_order(app, false, 4);
+    for (i, lane) in lanes.iter().enumerate() {
+        let n = order[i] as usize;
         let loaded = app.deck_of(n as u8).track.is_some();
         let col = if loaded { hex(0x969696) } else { hex(0x323232) };
         p.rect_filled(Rect::from_min_max(pos2(wa.min.x, lane.min.y), pos2(lane.min.x, lane.max.y)), 0.0, BG);
@@ -1880,7 +1886,7 @@ pub(crate) fn shot_layout_events(app: &mut App, frame: u32, raw: &mut egui::RawI
 /// The steps of the scripted run for the layout showing: (what, press at, release at).
 fn layout_steps(app: &App) -> Vec<(String, Pos2, Pos2)> {
     let l = layout(app);
-    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::ui_fx::FX_H } else { 0.0 };
+    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::prefs_bridge::fx_panel_height(app) } else { 0.0 };
     let area = Rect::from_min_size(pos2(0.0, 28.0 + fx), vec2(1512.0, player_height(app) + 4.0));
     let fr = frame(app, area);
     let mut v: Vec<(String, Pos2, Pos2)> = vec![];

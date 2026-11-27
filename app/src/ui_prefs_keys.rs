@@ -59,7 +59,7 @@ pub struct Row {
     pub cat: String,
     /// Index into `CMDS` and which unit (deck, channel, FX unit) of it this is.
     cmd: usize,
-    unit: u8,
+    pub unit: u8,
 }
 
 /// The order rekordbox's editor shows the categories in (`getCommandCategories` 0x10241532c).
@@ -76,8 +76,9 @@ pub fn commands(mode: Mode) -> Vec<Row> {
     for (ci, c) in CMDS.iter().enumerate() {
         let cat = CATS[c.cat as usize];
         if mode == Mode::Edit {
-            // (Edit mode replaces the list by its own three categories.)
-            if c.scope == 0 && matches!(cat, "Deck" | "Action pad" | "Tool area") {
+            // (Edit mode replaces the list by its own three categories, with the project
+            // commands of File and General's "Browser", which exist in EDIT only.)
+            if c.scope == 0 && (matches!(cat, "Deck" | "Action pad" | "Tool area") || matches!(c.id, 0x2013..=0x2017 | 0xcc1b)) {
                 v.push(Row { id: c.id, name: c.name.to_string(), cat: cat.to_string(), cmd: ci, unit: 0 });
             }
             continue;
@@ -148,6 +149,7 @@ pub fn action_of(id: u16, name: &str) -> Option<&'static str> {
     match id {
         0x3025..=0x302e => Some(["mem_call1", "mem_call2", "mem_call3", "mem_call4", "mem_call5", "mem_call6", "mem_call7", "mem_call8", "mem_call9", "mem_call10"][(id - 0x3025) as usize]),
         0x302f..=0x3038 => Some(["mem_delete1", "mem_delete2", "mem_delete3", "mem_delete4", "mem_delete5", "mem_delete6", "mem_delete7", "mem_delete8", "mem_delete9", "mem_delete10"][(id - 0x302f) as usize]),
+        0xd0f0..=0xd0f4 => Some(["rec_toggle", "rec_level_up", "rec_level_down", "rec_start", "rec_pause"][(id - 0xd0f0) as usize]),
         0x3003 => Some("vol_up"),
         0x3004 => Some("vol_down"),
         // The sampler's commands carry rekordbox's names in recordbox's action table.
@@ -245,10 +247,14 @@ pub fn mappings(prefs: &Prefs, mode: Mode) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = if mode == Mode::Edit { vec![(EDIT_PRESET.0.into(), EDIT_PRESET.1.into())] } else { PRESETS.iter().map(|p| (p.0.to_string(), p.1.to_string())).collect() };
     if mode != Mode::Edit {
         v.push((OWN.into(), OWN.into()));
-        for k in prefs.rb.key_mappings.keys() {
-            if k != OWN {
-                v.push((k.clone(), k.clone()));
-            }
+    }
+    // (User mappings are listed in the mode family they hold keys for: EDIT's rows are
+    // 0x2013..0x2017 and 0xccxx, nobody else's.)
+    let edit_row = |k: &String| u16::from_str_radix(k, 16).map(|id| matches!(id, 0x2013..=0x2017 | 0xcc00..=0xccff)).unwrap_or(false);
+    for (k, m) in &prefs.rb.key_mappings {
+        let is_edit = m.keys().any(edit_row) || m.get("family").map(|f| f == "edit").unwrap_or(false);
+        if k != OWN && is_edit == (mode == Mode::Edit) {
+            v.push((k.clone(), k.clone()));
         }
     }
     v
@@ -256,7 +262,7 @@ pub fn mappings(prefs: &Prefs, mode: Mode) -> Vec<(String, String)> {
 
 /// The key of a command under a mapping, in rekordbox's text form.
 pub fn key_of(prefs: &Prefs, mode: Mode, mapping: &str, row: &Row) -> String {
-    if mode == Mode::Edit {
+    if mode == Mode::Edit && is_preset(mapping, mode) {
         return CMDS[row.cmd].p1[0].to_string();
     }
     if is_preset(mapping, mode) {
@@ -277,6 +283,8 @@ pub fn key_of(prefs: &Prefs, mode: Mode, mapping: &str, row: &Row) -> String {
 /// they are left, and come back when "recordbox" is chosen again.
 pub fn select(prefs: &mut Prefs, mode: Mode, mapping: &str) {
     if mode == Mode::Edit {
+        // (EDIT's keys are read from the mapping by keycmd::edit_keys; nothing to copy.)
+        prefs.rb.key_mapping[family(mode)] = if mapping == EDIT_PRESET.0 { String::new() } else { mapping.to_string() };
         return;
     }
     let was = current(prefs, mode);
@@ -344,6 +352,9 @@ pub fn copy(prefs: &mut Prefs, mode: Mode, from: &str, name: &str) {
         if !k.is_empty() {
             m.insert(format!("{:x}", row.id), k);
         }
+    }
+    if mode == Mode::Edit {
+        m.insert("family".into(), "edit".into());
     }
     prefs.rb.key_mappings.insert(name.to_string(), m);
 }
@@ -447,7 +458,7 @@ pub fn page(app: &mut App, ui: &mut Ui, mode: Mode) {
                     pick = Some(id.clone());
                 }
             }
-            if mode != Mode::Edit && ui.selectable_label(false, "(Import)").clicked() {
+            if ui.selectable_label(false, "(Import)").clicked() {
                 act = Some("import");
             }
         });
@@ -459,7 +470,7 @@ pub fn page(app: &mut App, ui: &mut Ui, mode: Mode) {
         egui::popup_below_widget(it.ui, pid, &edit, egui::PopupCloseBehavior::CloseOnClick, |ui| {
             crate::ui_kit::apply_style(ui);
             ui.set_min_width(100.0);
-            if ui.add_enabled(mode != Mode::Edit, egui::Button::new("Copy")).clicked() {
+            if ui.add_enabled(true, egui::Button::new("Copy")).clicked() {
                 act = Some("copy");
             }
             if ui.add_enabled(!preset && cur != OWN, egui::Button::new("Rename")).clicked() {
@@ -468,7 +479,7 @@ pub fn page(app: &mut App, ui: &mut Ui, mode: Mode) {
             if ui.add_enabled(!preset && cur != OWN, egui::Button::new("Delete")).clicked() {
                 act = Some("delete");
             }
-            if ui.add_enabled(mode != Mode::Edit, egui::Button::new("Export")).clicked() {
+            if ui.add_enabled(true, egui::Button::new("Export")).clicked() {
                 act = Some("export");
             }
             if ui.add_enabled(!preset, egui::Button::new("Reset")).clicked() {
@@ -505,14 +516,22 @@ pub fn page(app: &mut App, ui: &mut Ui, mode: Mode) {
                 if !ui.is_rect_visible(r) {
                     continue;
                 }
-                let acts = row.unit == 0 && action_of(row.id, &row.name).is_some();
+                let acts = crate::keycmd::acts(row.id, mode);
                 crate::prefs_font::draw(ui, egui::Rect::from_min_max(egui::pos2(r.min.x + 40.0, r.min.y), egui::pos2(r.max.x - 190.0, r.max.y)), &row.name, 15.0, false, if acts { WHITE } else { DIM2 }, crate::ui_kit::Just::Left);
                 let key = if waiting == Some(row.id) { "Press a key…".to_string() } else { key_of(&app.prefs, mode, &cur, row) };
                 let br = egui::Rect::from_min_size(egui::pos2(r.max.x - 186.0, r.min.y + 2.0), egui::vec2(170.0, 20.0));
                 let resp = ui.interact(br, ui.id().with(("keybtn", row.id)), if preset { egui::Sense::hover() } else { egui::Sense::click() });
                 ui.painter().rect_filled(br, 3.0, if waiting == Some(row.id) { crate::ui_kit::PBLUE } else if resp.hovered() && !preset { hex(0x3C3C3C) } else { hex(0x323232) });
                 crate::prefs_font::draw(ui, br, &key, 14.0, false, if preset { DIM2 } else { WHITE }, crate::ui_kit::Just::Centre);
-                let hint = if preset { "A preset cannot be changed. Edit > Copy makes a mapping of your own from it." } else if acts { "Click, then press the new key (Esc cancels, Delete clears)." } else { "recordbox does not have this function yet: the key is kept with the mapping and does nothing." };
+                let why;
+                let hint = if preset {
+                    "A preset cannot be changed. Edit > Copy makes a mapping of your own from it."
+                } else if acts {
+                    "Click, then press the new key (Esc cancels, Delete clears)."
+                } else {
+                    why = format!("This key does nothing in recordbox: {} The key is kept with the mapping.", crate::keycmd::missing_reason_in(crate::keycmd::split_id(row.id).0, mode));
+                    why.as_str()
+                };
                 if resp.on_hover_text(hint).clicked() {
                     waiting = Some(row.id);
                 }
@@ -662,7 +681,7 @@ mod tests {
         }
         let x = cats(Mode::Export);
         assert!(x.iter().any(|c| c == "Player A") && x.iter().any(|c| c == "Player B") && !x.iter().any(|c| c == "Deck 3"));
-        assert_eq!(cats(Mode::Edit), ["Deck", "Action pad", "Tool area"]);
+        assert_eq!(cats(Mode::Edit), ["General", "File", "Deck", "Action pad", "Tool area"]);
         // No command id appears twice in a mode.
         for m in [Mode::Export, Mode::Performance, Mode::Edit] {
             let mut ids = std::collections::HashSet::new();

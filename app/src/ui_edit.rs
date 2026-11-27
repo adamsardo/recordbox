@@ -594,44 +594,15 @@ pub fn frame(app: &mut App, ctx: &egui::Context) -> bool {
     true
 }
 
-/// rekordbox's default keys for EDIT mode (spec 1.7). The command key with C, X and V
-/// reaches the app through the menu bar's Cut / Copy / Paste items (`menu_command`).
+/// EDIT mode's keys: those of the mapping chosen in Preferences > Keyboard (rekordbox's
+/// "Edit Mode (Preset)" unless a mapping of one's own is chosen; keycmd.rs). The command key
+/// with C, X and V also reaches the app through the menu bar's Cut / Copy / Paste items
+/// (`menu_command`).
 fn keys(app: &mut App, ctx: &egui::Context) {
-    use egui::Key;
-    let mut out = vec![];
+    let mut out = crate::keycmd::edit_keys(app, ctx);
     ctx.input(|i| {
         for e in &i.events {
             match e {
-                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
-                    let cmd = modifiers.command || modifiers.mac_cmd;
-                    let plain = !cmd && !modifiers.alt && !modifiers.ctrl;
-                    let c = match key {
-                        Key::Space if plain => Cmd::PlayPause,
-                        Key::C if plain => Cmd::Head,
-                        Key::L if plain => Cmd::Loop,
-                        Key::W if plain => Cmd::ZoomIn,
-                        Key::E if plain => Cmd::ZoomOut,
-                        Key::Slash if plain => Cmd::Select(SelectCmd::Half),
-                        Key::Escape if plain => Cmd::Select(SelectCmd::Cancel),
-                        Key::Backspace | Key::Delete if cmd => Cmd::Edit(EditCmd::Clear),
-                        Key::Backspace | Key::Delete if plain => Cmd::Edit(EditCmd::Delete),
-                        Key::D if cmd => Cmd::Edit(EditCmd::Clone),
-                        Key::C if cmd => Cmd::Edit(EditCmd::Copy),
-                        Key::X if cmd => Cmd::Edit(EditCmd::Cut),
-                        Key::V if cmd => Cmd::Edit(EditCmd::Insert),
-                        Key::P if cmd => Cmd::Edit(EditCmd::Paste),
-                        Key::Z if cmd && modifiers.shift => Cmd::Edit(EditCmd::Redo),
-                        Key::Z if cmd => Cmd::Edit(EditCmd::Undo),
-                        Key::Y if cmd => Cmd::Edit(EditCmd::Redo),
-                        Key::S if cmd && modifiers.shift => Cmd::SaveAs,
-                        Key::S if cmd => Cmd::Save,
-                        Key::R if cmd => Cmd::Render,
-                        _ => continue,
-                    };
-                    out.push(c);
-                }
-                // "*" has no key of its own on most layouts: it arrives as text.
-                egui::Event::Text(t) if t == "*" => out.push(Cmd::Select(SelectCmd::Double)),
                 egui::Event::Copy => out.push(Cmd::Edit(EditCmd::Copy)),
                 egui::Event::Cut => out.push(Cmd::Edit(EditCmd::Cut)),
                 egui::Event::Paste(_) => out.push(Cmd::Edit(EditCmd::Insert)),

@@ -177,26 +177,34 @@ pub struct PlayCredit {
     pub track: Option<i64>,
     pub secs: f64,
     pub done: bool,
+    /// Preferences > Advanced > Browse > Played time (seconds; 0 = `PLAY_CREDIT_SECS`). As in
+    /// rekordbox the time must be played in one go: a pause starts it again
+    /// (`UiPlayer::eventPlaySetStatus` 0x101ba6208 stops the timer, a new PLAY restarts it).
+    pub need: f64,
 }
 
 impl PlayCredit {
     /// A (new) load of `track`: its play time starts again.
     pub fn arm(&mut self, track: i64) {
-        *self = PlayCredit { track: Some(track), secs: 0.0, done: false };
+        *self = PlayCredit { track: Some(track), secs: 0.0, done: false, need: self.need };
     }
     /// One frame: returns the track once, when it reaches the play time that counts. Tracks
     /// shorter than a minute count after 90% of their length.
     pub fn tick(&mut self, loaded: Option<i64>, playing: bool, dt: f64, duration: f64) -> Option<i64> {
         if loaded != self.track {
-            *self = PlayCredit { track: loaded, secs: 0.0, done: false };
+            *self = PlayCredit { track: loaded, secs: 0.0, done: false, need: self.need };
         }
         let t = self.track?;
+        if !playing && self.need > 0.0 {
+            self.secs = 0.0;
+        }
         if self.done || !playing {
             return None;
         }
         // A stalled frame is not play time.
         self.secs += dt.clamp(0.0, 0.5);
-        let need = if duration > 0.0 { PLAY_CREDIT_SECS.min(duration * 0.9).max(1.0) } else { PLAY_CREDIT_SECS };
+        let base = if self.need > 0.0 { self.need } else { PLAY_CREDIT_SECS };
+        let need = if duration > 0.0 { base.min(duration * 0.9).max(1.0) } else { base };
         if self.secs >= need {
             self.done = true;
             Some(t)
@@ -538,6 +546,10 @@ impl App {
     /// Set one field of several tracks from text (the Information window's multi-track edit
     /// and the list's in-place editor). Every changed track is one Undo step.
     pub fn edit_field(&mut self, ids: &[i64], col: Col, text: &str) -> bool {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return false;
+        }
         let alnum = self.prefs.key_alnum;
         let mut ok = true;
         for id in ids {
@@ -605,6 +617,10 @@ impl App {
     /// "Renumber Track Order": the playlist's stored order becomes the order now displayed.
     /// Only when it is sorted by something other than # and nothing is filtered out.
     pub fn renumber_track_order(&mut self, pl: i64) -> bool {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return false;
+        }
         if self.view != View::Playlist(pl) || self.is_manual_playlist() != Some(pl) {
             return false;
         }
@@ -635,6 +651,10 @@ impl App {
     /// "Sort Items": the playlists and folders directly inside `parent` (0 = the Playlists root)
     /// in name order.
     pub fn sort_node_children(&mut self, parent: i64) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         let kids: Vec<(i64, String)> = self.nodes.iter().filter(|n| n.parent == parent).map(|n| (n.id, n.name.clone())).collect();
         for (i, id) in sorted_by_name(&kids).into_iter().enumerate() {
             let _ = self.db.set_node_seq(id, i as i64);
@@ -1042,7 +1062,9 @@ impl App {
         if self.ext.reloc_rx.is_some() {
             return self.toast_err("Already searching for missing files.");
         }
-        let folders: Vec<PathBuf> = self.prefs.relocate_folders.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect();
+        // (Preferences > Advanced > Database > Auto Relocate Search Folders: Music, Video,
+        // Desktop and, when ticked, the listed folders.)
+        let folders: Vec<PathBuf> = crate::prefs_rb::relocate_roots(&self.prefs).into_iter().filter(|p| p.is_dir()).collect();
         if folders.is_empty() {
             self.ext.missing_open = true;
             return self.toast_err("Add a folder to the Auto Relocate Search Folders first.");

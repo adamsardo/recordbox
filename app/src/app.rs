@@ -1135,6 +1135,8 @@ pub struct App {
     pub pads: crate::pads_ext::PadsState,
     /// Automix, MIX POINT LINK and the sampler lists (automix.rs, mpl.rs, sampler_lib.rs).
     pub mixx: crate::automix::MixExt,
+    /// Preferences rows that act over time (prefs_bridge.rs).
+    pub wiring: crate::prefs_bridge::WiringState,
     /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
     /// (B only in the 2 Players layout).
     pub load_target: u8,
@@ -1285,6 +1287,7 @@ impl App {
             rec: Default::default(),
             pads: Default::default(),
             mixx: Default::default(),
+            wiring: Default::default(),
             load_target: 0,
             deck: Deck::default(),
             pool,
@@ -1776,6 +1779,10 @@ impl App {
     /// Move a playlist/folder before or after `target`, or into `target` when it is a folder.
     /// Refuses to put a folder inside itself or one of its own subfolders.
     pub fn drop_node(&mut self, id: i64, target: i64, zone: i8) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         if id == target {
             return;
         }
@@ -2453,6 +2460,9 @@ impl App {
 
     // ------------------------------------------------------------------ import
     pub fn import_paths(&mut self, paths: Vec<std::path::PathBuf>, to_playlist: Option<i64>) {
+        if crate::prefs_bridge::import_protected(self) {
+            return;
+        }
         if paths.is_empty() {
             return;
         }
@@ -3336,7 +3346,7 @@ impl App {
             s.loop_range = None;
             s.metronome = None;
             s.search = 0.0;
-            let mut g = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
+            let mut g = if t.gain_db.is_finite() && crate::prefs_bridge::auto_gain_on(self) { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
             // rekordbox's optional peak cap (traced): when gain × peak reaches 1, the gain becomes
             // 0.9999998807907104 / peak.
             if self.prefs.auto_gain_peak_cap {
@@ -3369,6 +3379,7 @@ impl App {
         self.deck.bpm_text = format!("{:.2}", self.deck.grid.first_bpm());
         let first_mem = self.deck.cues.iter().filter(|c| c.kind == CueKind::Memory).map(|c| c.start).fold(f64::NAN, f64::min);
         self.deck.cue_point = if first_mem.is_nan() { self.deck.beats.first().map(|b| b.time).unwrap_or(0.0) } else { first_mem };
+        crate::prefs_bridge::on_load(self);
         self.deck.loading = Some(spawn_load(id, t.path.clone(), self.ctx.clone()));
         {
             let mut st = self.player.state.lock();
@@ -3400,6 +3411,7 @@ impl App {
                         self.toast_err("This file is incomplete: it ends before the length its header declares (cut short when copied or downloaded?).");
                     }
                     self.deck.duration = a.duration();
+                    crate::prefs_bridge::after_load(self, &a);
                     let cp = self.deck.cue_point;
                     let mut s = self.player.state.lock();
                     s.pos = cp * a.sr as f64;
@@ -3550,8 +3562,12 @@ impl App {
                 self.player.state.lock().loop_range = Some((c.start, e));
                 self.deck.last_loop = Some((c.start, e));
             }
+            crate::prefs_bridge::smart_cue(self, c.start);
             if !self.playing() {
-                self.deck.hot_preview = Some(c.start);
+                // Gate Cue: it plays while held; off, it plays on.
+                if crate::prefs_bridge::gate_cue(self) {
+                    self.deck.hot_preview = Some(c.start);
+                }
                 self.set_playing(true);
             }
         } else {
@@ -3561,6 +3577,7 @@ impl App {
                 None => (self.quantized(self.pos()), None, crate::pads::hot_cue_set_color(self.prefs.pads.hot_cue_color, slot, false)),
             };
             let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
+            crate::prefs_bridge::smart_cue(self, start);
             self.snapshot_cues();
             if let Ok(id) = self.db.save_cue(&c) {
                 c.id = id;
@@ -3767,6 +3784,9 @@ impl App {
         v
     }
     pub fn memory_jump(&mut self, dir: i32) {
+        if crate::prefs_bridge::memory_call_locked(self) {
+            return;
+        }
         let p = if self.playing() { self.pos() } else { self.deck.cue_point };
         let m = self.memory_cues();
         let target = if dir > 0 { m.iter().find(|c| c.start > p + 0.005) } else { m.iter().rev().find(|c| c.start < p - 0.005) };
@@ -3775,6 +3795,9 @@ impl App {
         }
     }
     pub fn call_memory(&mut self, c: &Cue) {
+        if crate::prefs_bridge::memory_call_locked(self) {
+            return;
+        }
         self.deck.cue_point = c.start;
         self.seek(c.start);
         if let Some(e) = c.end.filter(|e| *e > c.start) {
@@ -3838,13 +3861,13 @@ impl App {
         }
     }
     pub fn loop_in(&mut self) {
-        let q = self.quantized(self.pos());
+        let q = crate::prefs_bridge::loop_point(self, self.pos());
         self.deck.loop_in = Some(q);
     }
     pub fn loop_out(&mut self) {
         if let Some(a) = self.deck.loop_in {
             let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
-            let (a, b) = (crate::deck::on_frame(a, sr), crate::deck::on_frame(self.quantized(self.pos()), sr));
+            let (a, b) = (crate::deck::on_frame(a, sr), crate::deck::on_frame(crate::prefs_bridge::loop_point(self, self.pos()), sr));
             if b > a + crate::deck::MIN_LOOP_SECS {
                 self.player.state.lock().loop_range = Some((a, b));
                 self.deck.last_loop = Some((a, b));
@@ -4025,6 +4048,10 @@ impl App {
 
     // ------------------------------------------------------------------ playlists
     pub fn add_to_playlist(&mut self, pl: i64, ids: &[i64]) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         if self.node(pl).map(|n| n.kind != NodeKind::Playlist).unwrap_or(true) {
             return;
         }
@@ -4041,6 +4068,10 @@ impl App {
     }
     /// Add tracks to a playlist without asking about duplicates.
     pub fn add_to_playlist_force(&mut self, pl: i64, ids: &[i64]) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         let mut cur = self.db.playlist_tracks(pl).unwrap_or_default();
         cur.extend_from_slice(ids);
         let _ = self.db.set_playlist_tracks(pl, &cur);
@@ -4049,11 +4080,19 @@ impl App {
         self.toast(format!("Added {} track(s) to \"{name}\"", ids.len()));
     }
     pub fn remove_from_playlist(&mut self, pl: i64, ids: &HashSet<i64>) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         let cur: Vec<i64> = self.db.playlist_tracks(pl).unwrap_or_default().into_iter().filter(|t| !ids.contains(t)).collect();
         let _ = self.db.set_playlist_tracks(pl, &cur);
         self.reload_playlists();
     }
     pub fn move_in_playlist(&mut self, pl: i64, ids: &[i64], to: usize) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         let cur = self.db.playlist_tracks(pl).unwrap_or_default();
         let set: HashSet<i64> = ids.iter().copied().collect();
         let before = cur.iter().take(to).filter(|t| set.contains(t)).count();
@@ -4067,6 +4106,9 @@ impl App {
         self.reload_playlists();
     }
     pub fn create_node(&mut self, parent: i64, kind: NodeKind) -> i64 {
+        if crate::prefs_bridge::library_protected(self) {
+            return 0;
+        }
         if kind == NodeKind::Smart && self.nodes.iter().filter(|n| n.kind == NodeKind::Smart).count() >= 128 {
             self.toast_err("You can't create more than 128 intelligent lists.");
             return 0;
@@ -4091,6 +4133,10 @@ impl App {
     }
 
     pub fn remove_from_collection(&mut self, ids: &[i64]) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         // Remember removed files so a rekordbox sync does not add them back.
         let mut removed: HashSet<String> = self.db.setting("rb_removed_paths").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         for id in ids {
@@ -4159,6 +4205,10 @@ impl App {
     }
 
     pub fn set_tag(&mut self, ids: &[i64], tag: i64, on: bool) {
+        // (Advanced > Browse > Library Protection.)
+        if crate::prefs_bridge::library_protected(self) {
+            return;
+        }
         for id in ids {
             let _ = self.db.set_track_tag(*id, tag, on);
             let e = self.track_tags.entry(*id).or_default();

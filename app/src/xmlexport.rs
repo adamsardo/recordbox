@@ -340,7 +340,7 @@ pub fn track_children(t: &Track, extra: &crate::importer::XmlExtra, grid: Option
             // The per-beat records Recordbox writes to PQTZ, filtered as rekordbox does.
             let full = if t.raw_samples > 0 && t.sample_rate > 0 { t.raw_samples as f64 / t.sample_rate as f64 } else { t.duration };
             let recs: Vec<(u16, u16, u32)> = g.beats(full.max(t.duration)).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (b.time * 1000.0).round() as u32)).collect();
-            for i in tempo_select(&recs, BRIDGE_EXPORT_BEAT_GRID) {
+            for i in tempo_select(&recs, crate::prefs_bridge::xml_beatgrid_mode()) {
                 let (beat, bpm, ms) = recs[i];
                 x.push_str(&format!("      <TEMPO Inizio=\"{:.3}\" Bpm=\"{:.2}\" Metro=\"4/4\" Battito=\"{}\"/>\n", ms as f64 * 0.001, bpm as f64 * 0.01, beat));
             }

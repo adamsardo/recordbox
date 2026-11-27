@@ -168,7 +168,8 @@ pub struct RbPrefs {
     pub color_theme: u8,
     /// `HotCueColorType`: 1 CDJ, 2 COLD1, 3 COLD2, 4 COLORFUL. Stored (new hot cues are COLORFUL).
     pub hot_cue_color: u8,
-    /// `SamplerColorType`: 1 Sync with Frequency, 2 Fixed. Stored.
+    /// `SamplerColorType`: 0 Sync with Frequency, 1 Fixed (the default; traced in
+    /// `SamplerControlComp::onLoadedClipChanged` 0x100b19f94). Read by `sampler_color_code`.
     pub sampler_color: u8,
     /// `PadFxColor<FX NAME>`: pad colour ids chosen per effect. Stored.
     pub pad_fx_colors: std::collections::BTreeMap<String, u8>,
@@ -245,7 +246,8 @@ pub struct RbPrefs {
     /// `bridgeConvertiTunesGrouping`, `OverwriteSyncList`. Stored.
     pub itunes_grouping_to_label: bool,
     pub itunes_overwrite_sync: bool,
-    /// `bridgeExportBeatGrid`: 1 No, 2 BPM change points. Stored.
+    /// `bridgeExportBeatGrid`: 0 No, 1 BPM change points (the default; traced in
+    /// `DetailrbXmlExportBeatInfoComponent::buttonClicked` 0x10143f39c). Read by xmlexport.rs.
     pub xml_beatgrid: u8,
     /// Auto Relocate Search Folders: Music, Video, Desktop, Specified user folders
     /// (`AutoRelocateSelect*Folder`). `relocate_roots` gives the folders; Auto Relocate itself
@@ -261,9 +263,14 @@ pub struct RbPrefs {
     pub cache_track_list: bool,
     /// `ContextMenu` "Display the menu when long-pressing a track for 1 second.". Stored.
     pub long_press_menu: bool,
-    /// Tag List: 0 "Delete a track from Tag List when the track is loaded.", 1 "Delete all
-    /// tracks from Tag List when exiting rekordbox.". Stored.
-    pub tag_list_delete: u8,
+    /// Tag List: two independent check boxes, both off by default (`TaglistLoadOption`,
+    /// `TaglistDoNotSaveOption`; getters 0x1015d3fc0 / 0x1015d4138 return false for a missing
+    /// key, `DetailTagList::reset` 0x101c94268 clears both). Read by prefs_bridge.rs: a track
+    /// loaded from the Tag List leaves it (`LoadedContentsManager::removeFromTaglist`
+    /// 0x10139dfb8); the list is emptied on quitting (`DatabaseMediator::~DatabaseMediator`
+    /// 0x101e4a594 calls `cleanTaglist`).
+    pub tag_list_on_load: bool,
+    pub tag_list_on_exit: bool,
     /// `LibraryProtection` "Protect library edit.". Stored.
     pub library_protection: bool,
     /// `EnabledInlineEditWithDblClick` Library Edit "Double-click". Stored.
@@ -381,7 +388,8 @@ impl Default for RbPrefs {
             auto_export: false,
             cache_track_list: true,
             long_press_menu: true,
-            tag_list_delete: 1,
+            tag_list_on_load: false,
+            tag_list_on_exit: false,
             library_protection: false,
             inline_edit_dblclick: false,
             played_time: 60,
@@ -460,6 +468,8 @@ pub const SPEC: &[(&str, i64, fn(&RbPrefs) -> i64)] = &[
     ("autoReExport", 0, |p| p.auto_export as i64),
     ("CacheTrackList", 1, |p| p.cache_track_list as i64),
     ("ContextMenu", 1, |p| p.long_press_menu as i64),
+    ("TaglistLoadOption", 0, |p| p.tag_list_on_load as i64),
+    ("TaglistDoNotSaveOption", 0, |p| p.tag_list_on_exit as i64),
     ("EnabledInlineEditWithDblClick", 0, |p| p.inline_edit_dblclick as i64),
     ("playedTime", 60, |p| p.played_time as i64),
     ("DeckQuantize", 5, |p| p.deck_quantize as i64),

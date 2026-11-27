@@ -81,3 +81,56 @@ pub fn mpl_shown(app: &App) -> bool {
 pub fn toggle_mpl(app: &mut App) {
     app.mpl_toggle_panel();
 }
+
+/// PERFORMANCE: a click on a deck's title area (artwork, title and artist) loads the track
+/// selected in the list (rekordbox's tooltip there: "Load to the Deck:\n- Select a track and
+/// click here.\n- Drag & Drop a track here."). Called while deck `n` is the one in place.
+pub fn deck_title_click(app: &mut App, ui: &mut eframe::egui::Ui, r: eframe::egui::Rect, n: u8) {
+    let resp = ui.interact(r, ui.id().with(("deckload", n)), eframe::egui::Sense::click());
+    let resp = if app.prefs.tooltips { resp.on_hover_text("Load to the Deck:\n- Select a track and click here.\n- Drag & Drop a track here.") } else { resp };
+    if resp.clicked() {
+        load_selected_here(app);
+    }
+}
+
+/// The track selected in the list onto the deck in place.
+pub fn load_selected_here(app: &mut App) {
+    if app.list_dirty {
+        app.rebuild_list();
+    }
+    if let Some(id) = app.anchor_id.filter(|id| app.list.contains(id)) {
+        app.load_track_here(id);
+    }
+}
+
+/// Advanced > Browse > "Display the menu when long-pressing a track for 1 second." A track row
+/// held for a second without moving opens its menu, as a right-click would (the click is
+/// given to egui at the start of the next frame by `raw_input`).
+pub fn long_press_menu(app: &mut App, ui: &eframe::egui::Ui, resp: &eframe::egui::Response, _id: i64, _row: usize) {
+    if !app.prefs.rb.long_press_menu || !resp.is_pointer_button_down_on() || resp.dragged() {
+        return;
+    }
+    let (now, start, down, pos) = ui.input(|i| (i.time, i.pointer.press_start_time(), i.pointer.primary_down(), i.pointer.interact_pos()));
+    let (Some(start), true, Some(pos)) = (start, down, pos) else { return };
+    if app.wiring.long_press_done == Some(start) {
+        return;
+    }
+    if now - start >= 1.0 {
+        app.wiring.long_press_done = Some(start);
+        app.wiring.long_press = Some(pos);
+        ui.ctx().request_repaint();
+    } else {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Before a frame: input that features ask for (the long press's right-click).
+pub fn raw_input(app: &mut App, raw: &mut eframe::egui::RawInput) {
+    use eframe::egui::{Event, PointerButton};
+    if let Some(pos) = app.wiring.long_press.take() {
+        let m = raw.modifiers;
+        raw.events.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: m });
+        raw.events.push(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, modifiers: m });
+        raw.events.push(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: false, modifiers: m });
+    }
+}

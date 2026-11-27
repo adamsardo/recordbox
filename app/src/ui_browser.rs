@@ -1751,7 +1751,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
         app.search = s;
         app.list_dirty = true;
     }
-    if app.ext.sub_focus == in_sub && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+    if app.ext.sub_focus == in_sub && (ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) || ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::new("kc_search_focus"))).unwrap_or(false)) {
         te.request_focus();
     }
     // The tile above the right icon strip (skin brows_tagListPalette / playListPalette: 18 pt,
@@ -2056,7 +2056,9 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                             Col::Color => app.ext.color_pick = Some((id, pos2(cr.min.x, rr.max.y), now)),
                             // A click on a cell of the row already selected edits it in place
                             // (after the double-click time, so a double-click still loads).
-                            c if crate::library_ext::editable(c) && was_sole && !cmd && !shift => {
+                            // (Preferences > Advanced > Browse > Library Edit "Double-click":
+                            // then a double-click edits instead.)
+                            c if crate::library_ext::editable(c) && was_sole && !cmd && !shift && !app.prefs.rb.inline_edit_dblclick => {
                                 app.ext.edit_pending = Some((id, c, now));
                                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(360));
                             }
@@ -2081,7 +2083,14 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                         app.set_anchor(i);
                     }
                 }
-                if resp.double_clicked() {
+                let dbl_edit = resp.double_clicked() && app.prefs.rb.inline_edit_dblclick && hit.map(|h| crate::library_ext::editable(h.0)).unwrap_or(false);
+                if dbl_edit {
+                    // Library Edit "Double-click" (`ListViewer::cellClickedWithLeftButton`
+                    // 0x100408b50): the cell double-clicked is edited.
+                    if let Some((c, _, _)) = hit {
+                        app.ext.edit_pending = Some((id, c, ui.input(|inp| inp.time) - 1.0));
+                    }
+                } else if resp.double_clicked() {
                     app.ext.edit_pending = None;
                     // rekordbox loads on a double click in EXPORT mode only (traced:
                     // `ListViewer::loadTrackWhenRowDoubleClicked`); in PERFORMANCE a track goes
@@ -2116,6 +2125,9 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                     app.selected.insert(id);
                     app.set_anchor(i);
                 }
+                // "Display the menu when long-pressing a track for 1 second."
+                // (`CustomTableListBox::RowComp::mouseDown` 0x101a2a764 starts a 1000 ms timer.)
+                crate::app_hooks::long_press_menu(app, ui, &resp, id, i);
                 resp.context_menu(|ui| {
                     let sel: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
                     track_menu_items(app, ui, &sel);

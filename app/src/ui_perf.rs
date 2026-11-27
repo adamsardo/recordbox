@@ -43,8 +43,8 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     let (l, mut t) = (full.min.x, full.min.y);
     // The FX panel, when shown, sits above the waveforms.
     if app.prefs.perf_fx {
-        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), crate::ui_fx::FX_H - 1.0)));
-        t += crate::ui_fx::FX_H;
+        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), crate::prefs_bridge::fx_panel_height(app) - 1.0)));
+        t += crate::prefs_bridge::fx_panel_height(app);
     }
     // Two decks (2Deck Horizontal) or four (4Deck Horizontal: decks 1 and 3 on the left, 2 and
     // 4 on the right, the mixer's four strips between, in rekordbox's order 3, 1, 2, 4).
@@ -146,8 +146,11 @@ pub(crate) fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, 
     }
 
     p.text(r.min + g.num.to_vec2() + vec2(1.0, 0.0), Align2::CENTER_CENTER, format!("{}", n + 1), lay::arial_b(10.0), if is_active { WHITE } else { DIM });
-    crate::ui_player2::artwork(app, ui, g.art.translate(r.min.to_vec2()), &track);
+    // (View > "Hide Title, Artist, and Artwork": the empty artwork and no names.)
+    let hide = crate::prefs_bridge::hide_deck_info(app);
+    crate::ui_player2::artwork(app, ui, g.art.translate(r.min.to_vec2()), if hide { &None } else { &track });
     let (title, artist) = match &track {
+        Some(_) if hide => (String::new(), String::new()),
         Some(tr) => (tr.display_title(), tr.artist.clone()),
         None => ("Not Loaded.".to_string(), String::new()),
     };
@@ -156,11 +159,16 @@ pub(crate) fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, 
     app.px.sampler.deck_rects[(n as usize).min(3)] = r;
     let tx0 = g.text_x;
     let title_w = (w - 300.0 - tx0).max(60.0);
+    crate::app_hooks::deck_title_click(app, ui, g.art.translate(r.min.to_vec2()).union(at(tx0, 0.0, title_w, g.hdr_h)), n);
     if let Some(id) = app.deck.track {
         let hr = at(tx0, 4.0, title_w.min(240.0), g.title_y + 8.0);
-        let hresp = ui.interact(hr, ui.id().with("deckdrag"), Sense::drag());
+        let hresp = ui.interact(hr, ui.id().with("deckdrag"), Sense::click_and_drag());
         if hresp.drag_started() && app.drag.is_none() {
             app.drag = Some(vec![id]);
+        }
+        // (A click there loads the selected track, as on the rest of the title area.)
+        if hresp.clicked() {
+            crate::app_hooks::load_selected_here(app);
         }
     }
     let sub_font = if g.sub_bold { lay::arial_b(g.sub_f) } else { lay::arial(g.sub_f) };
@@ -495,7 +503,7 @@ pub(crate) fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
                 app.hot_cue_down(slot as i32);
             }
             let held = app.deck.hot_preview.is_some() || app.player.state.lock().slip_hold;
-            if held && !ui.input(|i| i.pointer.any_down()) && !app.midi.pad_held(n) {
+            if held && !ui.input(|i| i.pointer.any_down()) && !app.midi.pad_held(n) && !crate::keycmd::holding(n) {
                 app.hot_cue_up();
             }
             if let Some(c) = cue {

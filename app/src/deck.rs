@@ -525,7 +525,7 @@ impl App {
     /// runs on underneath and playback returns to it when reverse ends. With Q on and a
     /// grid the turn waits for the next REVERSE beat value.
     pub fn reverse_toggle(&mut self, slip: bool) {
-        if self.deck.audio.is_none() {
+        if self.deck.audio.is_none() || crate::prefs_bridge::reverse_quantized(self, slip) {
             return;
         }
         let on = !self.deck.x.dk.reverse;
@@ -574,7 +574,9 @@ impl App {
             self.sync_lost();
         }
         self.player.state.lock().dk.jog = self.deck.x.dk.jog;
-        if !on && self.deck.cue_preview {
+        // (Controller > Deck > JOG: "After turning on the cue button and spinning the jog, the
+        // track returns to the cue point and pause." Off, the deck plays on from the jog.)
+        if !on && self.deck.cue_preview && self.prefs.rb.jog_sampler_mode {
             self.cue_up();
         }
     }
@@ -719,8 +721,10 @@ impl App {
 
     /// Where an action of `kind` at `t` lands with Q on (`t` itself with Q off or no grid).
     pub fn quantize_action(&self, t: f64, kind: QType) -> f64 {
+        // (Preferences > Controller > Others: the type's QUANTIZE switch and mode.)
+        let Some(k) = crate::prefs_bridge::quantize_kind(self, kind) else { return t };
         if self.prefs.quantize && self.deck.beats.len() >= 2 {
-            quantize_point(&self.deck.beats, t, kind, self.quantize_unit(kind), self.deck.x.dk.reverse)
+            quantize_point(&self.deck.beats, t, k, self.quantize_unit(kind), self.deck.x.dk.reverse)
         } else {
             t
         }

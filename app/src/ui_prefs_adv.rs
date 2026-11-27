@@ -84,12 +84,12 @@ fn database(app: &mut App, ui: &mut Ui, mode: Mode) {
         let p = &mut app.prefs;
         it.child(20.0, 56.0, |it| {
             it.sub(32.0, 0.0, "Export BeatGrid information");
-            stored(it, "recordbox's xml export writes every tempo change of a grid.");
-            if it.radio(64.0, 34.0, p.rb.xml_beatgrid == 1, "No") {
-                p.rb.xml_beatgrid = 1;
+            it.hint("No: the exported tracks have no TEMPO entries. BPM change points: one where the tempo or the beat's place changes (`bridgeExportBeatGrid` 0 / 1, `DetailrbXmlExportBeatInfoComponent::buttonClicked` 0x10143f39c).");
+            if it.radio(64.0, 34.0, p.rb.xml_beatgrid == 0, "No") {
+                p.rb.xml_beatgrid = 0;
             }
-            if it.radio(64.0, 60.0, p.rb.xml_beatgrid == 2, "BPM change points") {
-                p.rb.xml_beatgrid = 2;
+            if it.radio(64.0, 60.0, p.rb.xml_beatgrid >= 1, "BPM change points") {
+                p.rb.xml_beatgrid = 1;
             }
             it.no_hint();
         });
@@ -123,7 +123,7 @@ fn database(app: &mut App, ui: &mut Ui, mode: Mode) {
     item(ui, "DetailAutoRelocate", 202.0, |it| {
         it.title("Auto Relocate Search Folders");
         let p = &mut app.prefs;
-        it.hint(format!("Track > Relocate > Auto Relocate searches the folders listed below. {STORED}"));
+        it.hint("Track > Relocate > Auto Relocate searches the ticked folders (and the listed ones with \"Specified user folders\").");
         it.check(52.0, 56.0, &mut p.rb.relocate_music, "Music");
         it.check(52.0, 82.0, &mut p.rb.relocate_video, "Video");
         it.check(52.0, 108.0, &mut p.rb.relocate_desktop, "Desktop");
@@ -168,7 +168,7 @@ fn database(app: &mut App, ui: &mut Ui, mode: Mode) {
     if export {
         item(ui, "DetailAutoExport", 92.0, |it| {
             it.title_tip("Auto Export", "When a device is connected, the playlists exported to it before are exported again with their changes.");
-            stored(it, "");
+            it.hint("rekordbox acts on this after an import, for files inside folders linked to devices (`DatabaseMediator::executeImport` 0x101a0dba4); recordbox has no such links. recordbox keeps this setting; nothing acts on it yet.");
             it.pill2(52.0, 56.0, &mut app.prefs.rb.auto_export, "Enable", "Disable");
         });
     }
@@ -225,32 +225,29 @@ fn browse(app: &mut App, ui: &mut Ui, mode: Mode) {
     let p = &mut app.prefs.rb;
     item(ui, "DetailDisplaySpeed", 92.0, |it| {
         it.title_tip("Display speed", "Playlists are kept ready so that they open quicker.");
-        it.hint(format!("recordbox always keeps its lists ready. {STORED}"));
+        it.hint("recordbox always keeps its lists ready, so this changes nothing (recordbox keeps the setting).");
         it.pill(52.0, 56.0, &mut p.cache_track_list, "Display playlists quicker.");
     });
     item(ui, "DetailContextMenu", 92.0, |it| {
         it.title("Drop-down menu");
-        stored(it, "recordbox opens the menu with a right click.");
+        it.hint("On: holding a track for a second opens its menu, as a right click does.");
         it.pill(52.0, 56.0, &mut p.long_press_menu, "Display the menu when long-pressing a track for 1 second.");
     });
     item(ui, "DetailTagList", 118.0, |it| {
         it.title("Tag List");
-        stored(it, "recordbox keeps the Tag List until you clear it.");
-        if it.radio(52.0, 56.0, p.tag_list_delete == 0, "Delete a track from Tag List when the track is loaded.") {
-            p.tag_list_delete = 0;
-        }
-        if it.radio(52.0, 82.0, p.tag_list_delete == 1, "Delete all tracks from Tag List when exiting rekordbox.") {
-            p.tag_list_delete = 1;
-        }
+        it.hint("A track loaded from the Tag List leaves it; all tracks leave it when recordbox quits. Both off by default.");
+        // (Two check boxes of their own, as rekordbox's `DetailTagList` has them.)
+        it.check(52.0, 56.0, &mut p.tag_list_on_load, "Delete a track from Tag List when the track is loaded.");
+        it.check(52.0, 82.0, &mut p.tag_list_on_exit, "Delete all tracks from Tag List when exiting rekordbox.");
     });
     item(ui, "DetailLibraryProtection", 92.0, |it| {
         it.title("Library Protection");
-        stored(it, "Protects track information from being edited by accident.");
+        it.hint("On: edits, deletions and imports are refused (\"Unable to edit or delete because Library Protection is enabled.\").");
         it.pill(52.0, 56.0, &mut p.library_protection, "Protect library edit.");
     });
     item(ui, "DetailQuickLibraryEdit", 92.0, |it| {
         it.title_tip("Library Edit", "With this on, a double click on a cell of the track list edits it.");
-        stored(it, "In recordbox a double click loads the track; cells are edited from the Information window.");
+        it.hint("On: a double click on a cell edits it (and a single click on the selected row no longer does).");
         it.pill(52.0, 56.0, &mut p.inline_edit_dblclick, "Double-click");
     });
     if mode == Mode::Performance {
@@ -259,7 +256,7 @@ fn browse(app: &mut App, ui: &mut Ui, mode: Mode) {
             it.text(52.0, 56.0, 580.0, 18.0, "The length of time before a track is added to Histories", 16.0, Just::Left);
             it.text(52.0, 72.0, 580.0, 18.0, "(Length of time before played tracks are displayed in color)", 16.0, Just::Left);
             it.text(52.0, 104.0, 100.0, 20.0, &format!("{} sec", p.played_time), 14.0, Just::Centre);
-            stored(it, "");
+            it.hint("A track goes to the day's history after it has played this long without a pause.");
             let mut v = p.played_time.clamp(1, 60) as u32 - 1;
             if it.steps(160.0, 104.0, 400.0, &mut v, 59) {
                 p.played_time = v as u8 + 1;
@@ -317,7 +314,7 @@ fn others(app: &mut App, ui: &mut Ui, mode: Mode) {
         item(ui, "DetailLoopWave", 152.0, |it| {
             it.title("Export Loop As WAV");
             it.sub(52.0, 56.0, "Sample Rate");
-            stored(it, "Loops are saved at the track's own sample rate.");
+            it.hint("The sample rate of loops saved with Export Loop As WAV.");
             let p = &mut app.prefs.rb;
             if it.radio(88.0, 90.0, p.loop_wav_rate == 48000, "48kHz") {
                 p.loop_wav_rate = 48000;
