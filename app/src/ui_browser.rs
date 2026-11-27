@@ -53,110 +53,59 @@ pub fn artwork_texture(app: &mut App, path: &str) -> Option<egui::TextureHandle>
 /// clock.
 fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
-    // Layout selector: 2Deck Horizontal is the layout that exists so far.
-    let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
-    let lay = ui.interact(lay_r, ui.id().with("perflayout"), Sense::click());
-    let lc = pos2(r.min.x + 145.0, r.min.y + 14.0);
-    p.rect_filled(Rect::from_center_size(lc - vec2(0.0, 3.0), vec2(18.0, 2.0)), 0.0, WHITE);
-    p.rect_filled(Rect::from_center_size(lc + vec2(0.0, 3.0), vec2(18.0, 2.0)), 0.0, WHITE);
-    crate::icons_player::chevron_down(&p, pos2(r.min.x + 170.75, r.min.y + 14.5), 1.0, WHITE);
-    dropdown(ui, &lay, "perflayoutpop", |ui| {
-        // rekordbox's order: 2Deck Horizontal, 2Deck Vertical, 4Deck Horizontal, 4Deck Vertical, Browse.
-        let four = app.prefs.perf_four;
-        if ui.selectable_label(!four, "2Deck Horizontal").clicked() {
-            app.prefs.perf_four = false;
-            app.poll_decks();
-            app.save_prefs();
-            ui.memory_mut(|m| m.close_popup());
-        }
-        ui.add_enabled(false, egui::SelectableLabel::new(false, "2Deck Vertical")).on_disabled_hover_text("Not built in recordbox yet.");
-        if ui.selectable_label(four, "4Deck Horizontal").clicked() {
-            app.prefs.perf_four = true;
-            app.poll_decks();
-            app.save_prefs();
-            ui.memory_mut(|m| m.close_popup());
-        }
-        for name in ["4Deck Vertical", "Browse"] {
-            ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
-        }
-    });
-    // Panel buttons. Only the mixer exists; the others are shown unlit with the reason.
-    for (i, (name, built)) in [("FX", true), ("Sampler", true), ("GROOVE CIRCUIT", true), ("Mixer", true), ("Rec", false)].iter().enumerate() {
+    // Layout selector: rekordbox's five layouts with their marks (ui_perf_layouts.rs).
+    crate::ui_perf_layouts::layout_selector(app, ui, r);
+    // Panel buttons, in the order rekordbox's `MainComponent::resized` places them: FX,
+    // GROOVE CIRCUIT (only while its function is enabled), Mix Point Link, Sampler, Mixer, Rec;
+    // each 20 pt, 17 pt after the one before. `kind`: 0 FX, 1 Mix Point Link, 2 Sampler,
+    // 3 Mixer, 4 Rec (the numbers `ui_perf_layouts::panel_tile` knows), 5 GROOVE CIRCUIT.
+    let mut tiles: Vec<(u8, &str, bool)> = vec![(0, "FX", true)];
+    if app.prefs.groove.enable {
+        tiles.push((5, "GROOVE CIRCUIT", true));
+    }
+    tiles.extend([(1, "Mix Point Link", crate::app_hooks::mpl_available()), (2, "Sampler", true), (3, "Mixer", true), (4, "Rec", true)]);
+    let mut last_right = r.min.x + 195.0;
+    for (i, (kind, name, built)) in tiles.iter().enumerate() {
         let tr = Rect::from_min_size(pos2(r.min.x + 195.0 + 37.0 * i as f32, r.min.y + 4.0), vec2(20.0, 20.0));
-        let resp = ui.interact(tr, ui.id().with(("panel", i)), Sense::click());
-        // The FX button shows and hides the FX panel; the mixer is always shown so far.
-        let lit = match i {
+        last_right = tr.max.x;
+        let resp = ui.interact(tr, ui.id().with(("panel", *kind)), Sense::click());
+        let lit = match kind {
             0 => app.prefs.perf_fx,
-            1 => app.prefs.perf_sampler,
-            2 => app.groove_visible(),
-            _ => *built,
+            1 => crate::app_hooks::mpl_shown(app),
+            2 => app.prefs.perf_sampler,
+            3 => crate::ui_perf_layouts::mixer_shown(app),
+            4 => app.prefs.rec.panel,
+            _ => app.groove_visible(),
         };
-        if i == 1 && resp.clicked() {
-            app.prefs.perf_sampler = !app.prefs.perf_sampler;
-            app.save_prefs();
-        }
-        if i == 2 && resp.clicked() {
-            crate::ui_groove::toggle_panel(app);
-        }
-        if i == 0 && resp.clicked() {
-            app.prefs.perf_fx = !app.prefs.perf_fx;
-            app.save_prefs();
+        if resp.clicked() {
+            match kind {
+                0 => {
+                    app.prefs.perf_fx = !app.prefs.perf_fx;
+                    app.save_prefs();
+                }
+                1 => crate::app_hooks::toggle_mpl(app),
+                2 => {
+                    app.prefs.perf_sampler = !app.prefs.perf_sampler;
+                    app.save_prefs();
+                }
+                3 => crate::ui_perf_layouts::toggle_mixer(app),
+                4 => app.rec_toggle_panel(),
+                _ => crate::ui_groove::toggle_panel(app),
+            }
         }
         p.rect_filled(tr, 2.0, if lit { BLUE } else { BTN });
-        let c = tr.center();
-        let col = if lit { WHITE } else if *built { hex(0xC8C8C8) } else { hex(0x8C8C8C) };
-        match i {
-            0 => {
-                p.text(c, Align2::CENTER_CENTER, "FX", caps(8.5), col);
-            }
-            1 => {
-                for (k, h) in [4.0, 9.0, 6.0, 11.0, 5.0].iter().enumerate() {
-                    p.rect_filled(Rect::from_center_size(pos2(c.x - 6.0 + 3.0 * k as f32, c.y), vec2(1.5, *h)), 0.0, col);
-                }
-            }
-            2 => crate::ui_groove::header_icon(app, ui, tr, lit),
-            3 => {
-                for (k, y) in [2.5, -3.0, 1.0].iter().enumerate() {
-                    let x = c.x - 5.0 + 5.0 * k as f32;
-                    p.rect_filled(Rect::from_center_size(pos2(x, c.y), vec2(1.5, 13.0)), 0.0, col);
-                    p.rect_filled(Rect::from_center_size(pos2(x, c.y + *y), vec2(4.5, 2.5)), 0.0, col);
-                }
-            }
-            _ => crate::icons_player::record(&p, c, col),
+        if *kind == 5 {
+            crate::ui_groove::header_icon(app, ui, tr, lit);
+        } else {
+            // rekordbox's own tile; dimmed where the layout has no such panel.
+            crate::ui_perf_layouts::panel_tile(app, ui, *kind as usize, tr, lit);
         }
         let _ = resp.on_hover_text(if *built { format!("Show/Hide {name} panel") } else { format!("{name} panel: not built in recordbox yet.") });
     }
-    let rx = r.max.x;
-    let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
-    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
-    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if gear.on_hover_text("Preferences").clicked() {
-        app.dialogs.prefs_open = true;
-    }
-    // Master level meter: two 3 pt bars (L over R), 80 pt wide.
-    for c in 0..2 {
-        let br = Rect::from_min_size(pos2(rx - 204.0, ty + 9.5 + 6.0 * c as f32), vec2(80.0, 3.0));
-        p.rect_filled(br, 0.0, hex(0x323232));
-        let db = app.px.master_db[c];
-        let f = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
-        if f > 0.0 {
-            p.rect_filled(Rect::from_min_size(br.min, vec2(br.width() * f, 3.0)), 0.0, if db >= -0.1 { hex(0xF00000) } else if db > -6.0 { hex(0xFF8C19) } else { hex(0x2DD728) });
-        }
-    }
-    // Master volume (the same slider as in EXPORT mode's top bar).
-    let vr = Rect::from_min_max(pos2(rx - 105.0, ty + 6.0), pos2(rx - 70.0, ty + 22.0));
-    let vresp = ui.interact(vr, ui.id().with("perfvol"), Sense::click_and_drag());
-    let mut vol = app.player.state.lock().volume;
-    if let Some(pp) = vresp.interact_pointer_pos().filter(|_| vresp.dragged() || vresp.is_pointer_button_down_on() || vresp.clicked()) {
-        vol = ((pp.x - vr.min.x) / vr.width()).clamp(0.0, 1.0);
-        app.player.state.lock().volume = vol;
-    }
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.max.x, ty + 15.5)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(vr.min.x, ty + 12.5), pos2(vr.min.x + vr.width() * vol, ty + 15.5)), 0.0, BLUE);
-    let _ = vresp.on_hover_text("Master Volume");
+    // LINK, then the right-hand side: PAD, MIDI, information, Preferences, master volume,
+    // level meter, audio dropout meter, clock (ui_perf_layouts.rs).
+    crate::ui_perf_layouts::link_button(ui, r, last_right);
+    crate::ui_perf_layouts::top_right(app, ui, r);
 }
 
 /// right-hand items measured from the right edge of a 1512 pt window).
@@ -170,24 +119,32 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     // 9.5–17), pull-down chevrons (8 × 4, 1 pt) centred at 115.75 and 170.75, y 14.5.
     let ip = crate::icons_player::chevron_down;
     let perf = app.performance();
-    p.text(pos2(r.min.x + 16.0, r.min.y + 14.0), Align2::LEFT_CENTER, if perf { "PERFORMANCE" } else { "EXPORT" }, caps(10.3), WHITE);
+    p.text(pos2(r.min.x + 16.0, r.min.y + 14.0), Align2::LEFT_CENTER, if perf { "PERFORMANCE" } else if crate::ui_edit::is_edit(app) { "EDIT" } else { "EXPORT" }, caps(10.3), WHITE);
     let mode_r = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y), pos2(r.min.x + 124.0, r.max.y));
     ip(&p, pos2(r.min.x + 115.75, r.min.y + 14.5), 1.0, WHITE);
     // The mode list: EXPORT and PERFORMANCE (rekordbox also has LIGHTING and EDIT).
     let mode = ui.interact(mode_r, ui.id().with("mode"), Sense::click());
     dropdown(ui, &mode, "modepop", |ui| {
         for (i, name) in ["EXPORT", "PERFORMANCE"].iter().enumerate() {
-            if ui.selectable_label(perf == (i == 1), *name).clicked() {
+            if ui.selectable_label(app.prefs.app_mode == i as u8, *name).clicked() {
                 app.set_app_mode(i as u8);
                 ui.memory_mut(|m| m.close_popup());
             }
         }
-        for name in ["LIGHTING", "EDIT"] {
+        for name in ["LIGHTING"] {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
+        }
+        if ui.selectable_label(crate::ui_edit::is_edit(app), "EDIT").clicked() {
+            app.set_app_mode(crate::ui_edit::MODE_EDIT);
+            ui.memory_mut(|m| m.close_popup());
         }
     });
     if perf {
         performance_header(app, ui, r);
+        return;
+    }
+    if crate::ui_edit::is_edit(app) {
+        crate::ui_edit_view::header(app, ui, r);
         return;
     }
     // Layout selector: an 18 × 9 frame at x 136–154, y 9.5–18.5.
@@ -216,10 +173,14 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     let rec_r = Rect::from_min_size(pos2(r.min.x + 310.0, r.min.y + 4.0), vec2(20.0, 20.0));
     let rec = ui.interact(rec_r, ui.id().with("autoan"), Sense::click());
     p.rect_filled(rec_r, 2.0, if rec.hovered() { hex(0x323232) } else { BTN });
-    crate::icons_player::record(&p, rec_r.center(), if app.prefs.auto_analysis { WHITE } else { OFF });
-    if tipf(rec, if app.prefs.auto_analysis { "Auto Analysis On (click to turn off)" } else { "Auto Analysis Off (click to turn on)" }).clicked() {
-        app.prefs.auto_analysis = !app.prefs.auto_analysis;
-        app.save_prefs();
+    // (rekordbox's circle mark here is the recording panel's button; Auto Analysis has its
+    // switch in Preferences > Analysis.)
+    if app.prefs.rec.panel_export {
+        p.rect_filled(rec_r, 2.0, BLUE);
+    }
+    crate::icons_player::record(&p, rec_r.center(), WHITE);
+    if tipf(rec, "Show/Hide Rec panel").clicked() {
+        app.rec_toggle_panel();
     }
     // Right side, measured from the right edge (1512 pt window): gear 14 pt centred at −261,
     // sync mark 18 pt centred at −223, level meter −204..−124, volume −102..−70, clock ends −21.5.
@@ -655,6 +616,7 @@ pub(crate) fn list_for_view(app: &mut App, lui: &mut Ui) {
     match app.view.clone() {
         View::Device { root, node } => device_list(app, lui, &root, node, None),
         View::DeviceHistory { root, id } => device_list(app, lui, &root, None, Some(id)),
+        View::Explorer(dir) if crate::ui_rec::owns(app, &dir) => crate::ui_rec::list(app, lui, &dir),
         View::Explorer(dir) => explorer_list(app, lui, &dir),
         View::Source { kind, node } => crate::ui_library_ext::source_list(app, lui, kind, &node),
         _ => track_list(app, lui),
@@ -690,7 +652,7 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
         (src::explorer, Tile::Side(SideMode::Explorer), "Explorer"),
         (src::device, Tile::Side(SideMode::Devices), "Devices"),
         (src::history, Tile::Side(SideMode::History), "Histories"),
-        (src::recording, Tile::Off, "Recordings (not available in this app)"),
+        (src::recording, Tile::Side(SideMode::Recordings), "Recordings"),
     ];
     // The highlight is bright while the tree side was clicked last (reference 04) and muted
     // while the track list was, or nothing yet (references 01 and 02).
@@ -753,6 +715,7 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
                         }
                         SideMode::Itunes => app.set_view(View::Source { kind: crate::library_ext::SRC_ITUNES, node: String::new() }),
                         SideMode::RekordboxXml => app.set_view(View::Source { kind: crate::library_ext::SRC_RBXML, node: String::new() }),
+                        SideMode::Recordings => app.set_view(View::Explorer(crate::ui_rec::rec_dir(&app.prefs.rec).to_string_lossy().to_string())),
                         SideMode::Playlists | SideMode::Suggest => {}
                     }
                 }
@@ -1040,6 +1003,7 @@ pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>)
         SideMode::Itunes => crate::ui_library_ext::source_tree(app, ui, crate::library_ext::SRC_ITUNES),
         SideMode::RekordboxXml => crate::ui_library_ext::source_tree(app, ui, crate::library_ext::SRC_RBXML),
         SideMode::Explorer => explorer_tree(app, ui),
+        SideMode::Recordings => crate::ui_rec::tree(app, ui),
     }
 }
 

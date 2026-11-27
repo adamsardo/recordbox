@@ -16,6 +16,8 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher", "backup"] }
 symphonia = { version = "0.5.5", features = ["all"] }
 lofty = "0.22"
 cpal = "0.15"
+# MIDI controllers (CoreMIDI).
+midir = "0.10"
 rustfft = "6.4"
 rfd = "0.15"
 quick-xml = "0.41"

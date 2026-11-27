@@ -417,6 +417,7 @@ impl App {
 
     /// EXPORT (0) or PERFORMANCE (1).
     pub fn set_app_mode(&mut self, mode: u8) {
+        if crate::ui_edit::intercept_mode(self, mode) { return; }
         self.prefs.app_mode = mode.min(1);
         self.poll_decks();
         self.save_prefs();
@@ -447,10 +448,9 @@ impl App {
     /// (225 pt, 21 pt more with the stem part buttons) and the mixer's bottom row (43 pt).
     /// rekordbox 7.2.19: 368 + 43 (+ 21).
     pub fn performance_height(&self) -> f32 {
-        // 4Deck Horizontal: 576 + 43, and the per-deck rows count twice (two rows of decks).
-        let rows = if self.prefs.perf_four { 2.0 } else { 1.0 };
-        let base = if self.prefs.perf_four { 576.0 } else { 368.0 };
-        base + 43.0 + self.groove_extra_height() + if self.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 } + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + rows * (if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 })
+        // (Every Performance layout's height: ui_perf_layouts.rs.) The GROOVE CIRCUIT rows
+        // come on top (ui_groove.rs).
+        crate::ui_perf_layouts::height(self) + crate::ui_perf_layouts::groove_row(self) * if self.deck_count() == 4 { 2.0 } else { 1.0 }
     }
 
     /// How many decks exist in the layout showing: 4 (Performance, 4Deck), 2 or 1.
@@ -771,6 +771,7 @@ impl App {
         // The deck engine's own rules on top: sync rate and range, vinyl ramps, crossfader
         // curve and assign, Headroom, EQ type.
         self.push_deck_engine(infos.map(|i| i.1), master_bpm);
+        crate::midi::after_push(self);
     }
 
     // ------------------------------------------------------------------ tempo, sync and key
@@ -1282,7 +1283,7 @@ impl App {
             let _ = self.db.delete_cue(id);
             self.deck.cues.retain(|c| c.id != id);
         }
-        let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color: hotcue_default_color(slot, end.is_some()), comment: String::new(), active_loop: false };
+        let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color: crate::pads::hot_cue_set_color(self.prefs.pads.hot_cue_color, slot, end.is_some()), comment: String::new(), active_loop: false };
         if let Ok(id) = self.db.save_cue(&c) {
             c.id = id;
             self.deck.cues.push(c);
@@ -1638,7 +1639,7 @@ fn shot_flags() -> Vec<String> {
 
 impl App {
     /// Wait for the active deck's audio (screenshot runs only).
-    fn shot_wait_load(&mut self) {
+    pub(crate) fn shot_wait_load(&mut self) {
         if let Some(rx) = self.deck.loading.take() {
             if let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(20)) {
                 let (tx2, rx2) = crossbeam_channel::bounded(1);

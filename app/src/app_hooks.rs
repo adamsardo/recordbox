@@ -63,3 +63,14 @@ pub fn playlist_to_sampler_bank(app: &mut App, playlist: i64) {
         app.sampler_load(slot, id);
     }
 }
+
+/// MIX POINT LINK: its top bar tile and strip.
+pub fn mpl_available() -> bool {
+    false
+}
+
+pub fn mpl_shown(_app: &App) -> bool {
+    false
+}
+
+pub fn toggle_mpl(_app: &mut App) {}

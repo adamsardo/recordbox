@@ -218,6 +218,8 @@ pub struct Prefs {
     pub perf_fx: bool,
     /// Performance: 4Deck Horizontal instead of 2Deck Horizontal.
     pub perf_four: bool,
+    /// The rest of the Performance layout (vertical, Browse, zoom ...): ui_perf_layouts.rs.
+    pub perf_lay: crate::ui_perf_layouts::LayoutPrefs,
     /// Performance: the sampler panel is shown.
     pub perf_sampler: bool,
     /// The sampler deck: its slots and settings.
@@ -229,11 +231,19 @@ pub struct Prefs {
     pub deck: crate::deck::DeckPrefs,
     /// Groove Circuit: Preferences > Extensions > STEMS, its rows (groove.rs).
     pub groove: crate::groove::GroovePrefs,
+    /// Controller settings (midi.rs).
+    pub midi: crate::midi::MidiPrefs,
+    /// Recording: the panel and Preferences > Controller > Recordings (ui_rec.rs).
+    pub rec: crate::ui_rec::RecPrefs,
+    /// The pad modes' settings (layout, BEAT JUMP pages, hot cue colour set, slicer, USER pads).
+    pub pads: crate::pads::PadsPrefs,
     /// The FX panel's choices (rekordbox's FxUnitSettings): modes, effects, beat values,
     /// single-mode snapshots, RELEASE FX and the CFX row.
     pub fx: crate::ui_fx::FxSaved,
     /// 0 = EXPORT, 1 = PERFORMANCE (the header's mode list).
     pub app_mode: u8,
+    /// EDIT mode's settings (ui_edit.rs); `app_mode` 2 is EDIT.
+    pub edit: crate::ui_edit::EditPrefs,
     /// Preferences > Controller > Mixer: HIGH / MID / LOW as an isolator (else an equalizer),
     /// and the channel fader curve (0 Exponential, 1 Linear, 2 Logarithmic).
     pub eq_isolator: bool,
@@ -732,12 +742,17 @@ impl Default for Prefs {
             perf_fx: false,
             fx: Default::default(),
             perf_four: false,
+            perf_lay: Default::default(),
             perf_sampler: false,
             sampler: Default::default(),
             traffic: Default::default(),
             deck: Default::default(),
             groove: Default::default(),
+            midi: Default::default(),
+            rec: Default::default(),
+            pads: Default::default(),
             app_mode: 0,
+            edit: Default::default(),
             eq_isolator: false,
             ch_fader_curve: 1,
             stems_auto_separate: true,
@@ -909,6 +924,8 @@ pub enum SideMode {
     Explorer,
     Itunes,
     RekordboxXml,
+    /// The Recordings folder (ui_rec.rs).
+    Recordings,
 }
 
 pub struct Deck {
@@ -1102,6 +1119,10 @@ pub struct App {
     pub traffic_now: Vec<i32>,
     /// Groove Circuit's state while the app runs (groove.rs).
     pub gc: crate::groove::GrooveUi,
+    /// The recorder: the recording in progress and the steps after it (ui_rec.rs).
+    pub rec: crate::ui_rec::RecUi,
+    /// The pad modes' state per deck (`pads_ext.rs`).
+    pub pads: crate::pads_ext::PadsState,
     /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
     /// (B only in the 2 Players layout).
     pub load_target: u8,
@@ -1162,6 +1183,10 @@ pub struct App {
     pub edit_cmds: Vec<u8>,
     /// Library management state kept by `library_ext` (histories, Tag List, filter, preview…).
     pub ext: crate::library_ext::LibExt,
+    /// MIDI controllers and the MIDI setting window (midi.rs).
+    pub midi: crate::midi::MidiState,
+    /// EDIT mode: the open project and the editor's state (ui_edit.rs).
+    pub edit: crate::ui_edit::EditState,
 }
 
 impl App {
@@ -1245,6 +1270,8 @@ impl App {
             cue_tools: Default::default(),
             traffic_now: Vec::new(),
             gc: Default::default(),
+            rec: Default::default(),
+            pads: Default::default(),
             load_target: 0,
             deck: Deck::default(),
             pool,
@@ -1276,8 +1303,11 @@ impl App {
             menu: None,
             edit_cmds: vec![],
             ext: Default::default(),
+            midi: Default::default(),
+            edit: Default::default(),
         };
         app.menu = crate::menus::build();
+        crate::ui_edit::attach_menu(&mut app);
         crate::menus::wake_on_menu(&app.ctx);
         app.reload_all();
         app.reload_library_ext();
@@ -1578,10 +1608,14 @@ impl App {
                         app.prefs.perf_fx = true;
                     }
                     // Performance with BEAT JUMP pads on deck 1 and BEAT LOOP pads on deck 2.
+                    // The recording panel (ui_rec.rs).
+                    "perfrec" | "exportrec" => crate::ui_rec::shot_view(&mut app, &v),
                     "perfpads" => {
                         app.prefs.app_mode = 1;
                         app.px.pad_mode = [2, 3, 0, 0];
                     }
+                    v if crate::ui_edit::shot_view(&mut app, v) => {}
+                    v if crate::ui_perf_layouts::shot_view(&mut app, v) => {}
                     other => crate::library_ext::shot_view(&mut app, other),
                 }
             }
@@ -3262,6 +3296,7 @@ impl App {
 
     /// Load a track into the load-target deck (`load_target`; deck A outside 2 Players).
     pub fn load_track(&mut self, id: i64) {
+        if crate::ui_edit::intercept_load(self, id) { return; }
         self.load_track_to(self.load_target, id);
     }
 
@@ -3507,8 +3542,8 @@ impl App {
         } else {
             let lr = self.player.state.lock().loop_range;
             let (start, end, color) = match lr {
-                Some((a, b)) => (a, Some(b), hotcue_default_color(slot, true)),
-                None => (self.quantized(self.pos()), None, hotcue_default_color(slot, false)),
+                Some((a, b)) => (a, Some(b), crate::pads::hot_cue_set_color(self.prefs.pads.hot_cue_color, slot, true)),
+                None => (self.quantized(self.pos()), None, crate::pads::hot_cue_set_color(self.prefs.pads.hot_cue_color, slot, false)),
             };
             let mut c = Cue { id: 0, track_id: tid, kind: CueKind::Hot, slot, start, end, color, comment: String::new(), active_loop: false };
             self.snapshot_cues();

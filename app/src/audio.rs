@@ -294,6 +294,8 @@ pub struct PlayState {
     pub sync_bend: f64,
     /// The deck engine's own state (`deck.rs`): reverse, jog, vinyl ramps, sync rate, routes.
     pub dk: crate::deck::Engine,
+    /// The pad modes' engines (slicer, active censor): `pad_audio.rs`.
+    pub pads: crate::pad_audio::DeckPads,
     click_phase: usize,
     next_click: usize,
     search_count: usize,
@@ -341,6 +343,7 @@ impl Default for PlayState {
             sync_follow: false,
             sync_bend: 0.0,
             dk: Default::default(),
+            pads: Default::default(),
             click_phase: usize::MAX,
             next_click: 0,
             search_count: 0,
@@ -1108,6 +1111,8 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
         }
         crate::sampler::FOLLOW_PHASE.store(phase.to_bits(), Relaxed);
     }
+    // (Recording: master volume and mute come off the decks here and go on after the REC tap.)
+    let rec_lift = crate::recorder::lift_master(&mut guards);
     // With Beat FX in use each deck is rendered on its own, sent through the FX units
     // assigned to it (after its faders, as in rekordbox), then mixed; the master's effects
     // take the mix. Otherwise the decks go straight into the output.
@@ -1149,9 +1154,12 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
         }
     }
     drop(rack);
+    crate::recorder::restore_master(&mut guards, rec_lift);
     drop(guards);
+    crate::edit_audio::mix(out, channels, rate);
     // The master section (Performance mixer): peak limiter, then the master level meter.
     use std::sync::atomic::Ordering::Relaxed;
+    crate::recorder::tap(out, channels, rate, rec_lift);
     if let Some(mut lim) = MASTER_LIMITER.try_lock() {
         lim.process(out, channels, rate, LIMITER_ON.load(Relaxed));
     }
@@ -1465,6 +1473,8 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
                     d.snd = (d.snd + (s.search - 1.0) * grain as f64 * step).clamp(0.0, last);
                 }
             } else {
+                // SLICER: its roll, return and loop-mode jumps (pad_audio.rs).
+                s.pads.position(&mut d.snd, step * d.vel);
                 // A quantized jump waiting for its place (sample exact, like a loop's wrap).
                 if let Some((exit, enter)) = s.dk.warp {
                     if (d.vel > 0.0 && d.snd >= exit) || (d.vel < 0.0 && d.snd <= exit) {
@@ -1587,6 +1597,8 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
                 cue[fi * 2 + 1] += r * cue_gain;
             }
         }
+        // ACT. CENSR: the effect inside a censored region (pad_audio.rs).
+        s.pads.sound(p, &mut l, &mut r, rate);
         d.ch_fader += (s.ch_fader - d.ch_fader) * fader_k;
         let xf = if route_on {
             d.xfade.next() * d.assign.next()

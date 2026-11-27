@@ -541,6 +541,7 @@ pub fn sync(app: &App) {
             if let Some(menu) = &app.menu {
                 fill(menu, h, mode);
             }
+            crate::ui_edit::refill_menu(app, mode == 2);
             h.mode = mode;
         }
         let ps = sig(&app.nodes.iter().map(|n| (n.id, n.parent, n.name.clone(), n.kind == NodeKind::Folder, n.kind == NodeKind::Smart)).collect::<Vec<_>>());
@@ -612,6 +613,7 @@ pub fn sync(app: &App) {
 const AUDIO_EXT: [&str; 9] = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac", "alac", "mp4"];
 
 pub fn handle(app: &mut App, id: &str) {
+    if crate::ui_edit::menu_command(app, id) { return; }
     let sel = selected(app);
     // Items of the filled-in submenus: "addpl:<playlist>", "exptrk:<device>", "exppl:<device>".
     if let Some((kind, n)) = id.split_once(':') {

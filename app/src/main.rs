@@ -15,6 +15,11 @@ mod deck;
 mod demo;
 mod dupes;
 mod device_ext;
+mod edit_audio;
+mod edit_model;
+mod edit_project;
+mod edit_render;
+mod edit_selftest;
 mod export;
 mod fx;
 mod icons;
@@ -26,9 +31,16 @@ mod jobs;
 mod key;
 mod library_ext;
 mod menus;
+mod midi;
+mod midi_csv;
+mod midi_map;
 mod mixer;
 mod groove;
 mod ui_groove;
+mod pad_audio;
+mod pads;
+mod pads_ext;
+mod pads_selftest;
 mod perf_selftest;
 mod sampler;
 mod sampler_ext;
@@ -42,6 +54,7 @@ mod preview;
 mod player_ext;
 mod prefs_ext;
 mod rbimport;
+mod recorder;
 mod stems;
 mod smart;
 mod split;
@@ -50,12 +63,18 @@ mod traffic;
 mod ui_browser;
 mod ui_browser_ext;
 mod ui_dialogs;
+mod ui_edit;
+mod ui_edit_view;
 mod ui_kit;
 mod ui_library_ext;
+mod ui_midi;
 mod ui_player;
 mod ui_prefs;
+mod ui_rec;
 mod ui_fx;
+mod ui_pads;
 mod ui_perf;
+mod ui_perf_layouts;
 mod ui_player2;
 mod xmlexport;
 
@@ -91,6 +110,11 @@ impl eframe::App for Gui {
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         self.app.shot_perf_events(frame, raw);
+        self.app.shot_midi_events(frame, raw);
+        self.app.shot_rec_events(frame, raw);
+        self.app.shot_edit_events(frame, raw);
+        self.app.shot_pads_events(frame, raw);
+        crate::ui_perf_layouts::shot_layout_events(&mut self.app, frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
@@ -154,6 +178,7 @@ impl eframe::App for Gui {
         step!(app.poll_import());
         step!(app.poll_analysis());
         step!(app.poll_load());
+        step!(midi::poll(app));
         step!(app.poll_decks());
         step!(app.poll_export());
         step!(app.poll_rekordbox_sync());
@@ -163,6 +188,7 @@ impl eframe::App for Gui {
         step!(app.poll_key_job());
         step!(app.poll_audio_device());
         step!(app.poll_relocate());
+        step!(app.poll_rec());
         step!(backup::poll(app));
         step!(menus::poll(app));
         step!(menus::sync(app));
@@ -180,6 +206,11 @@ impl eframe::App for Gui {
         egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
+        // EXPORT mode's recording panel, a strip under the top bar.
+        if !app.performance() && app.prefs.rec.panel_export {
+            egui::TopBottomPanel::top("recstrip").exact_height(ui_rec::EXPORT_H).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG2)).show(ctx, |ui| ui_rec::export_strip(app, ui));
+        }
+        if ui_edit::is_edit(app) { step!(ui_edit_view::top_panel(app, ctx)); } else
         if !app.prefs.browser_only || app.performance() {
             // The header is 28 pt and 1 Player / 2 Players 256 pt tall with no rule between them
             // (measured on rekordbox: the player ends 284 pt below the window top); the Simple
@@ -196,6 +227,7 @@ impl eframe::App for Gui {
         // Split Screen: the browser is in a window of its own (split.rs).
         let split = split::frame(app, ctx);
         egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+            if ui_edit_view::hides_browser(app) { return; }
             if !split {
                 step!(ui_browser::browser(app, ui));
             }
@@ -203,6 +235,8 @@ impl eframe::App for Gui {
         step!(ui_dialogs::dialogs(app, ctx));
         step!(dupes::windows(app, ctx));
         step!(cue_tools::windows(app, ctx));
+        step!(ui_midi::window(app, ctx));
+        step!(ui_rec::windows(app, ctx));
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -291,6 +325,7 @@ fn recordbox_actions() -> Vec<&'static str> {
 }
 
 fn shortcuts(app: &mut App, ctx: &egui::Context) {
+    if ui_edit::frame(app, ctx) { return; }
     // Previews never outlive what holds them: losing the window's focus ends them (key-up
     // events are not delivered then), and a hot-cue preview ends once neither a hot-cue key nor
     // a mouse button is held.

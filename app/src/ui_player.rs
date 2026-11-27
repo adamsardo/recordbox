@@ -504,7 +504,7 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
         DetailMode::HalfDown => Rect::from_min_max(r.min - vec2(0.0, 0.5), r.max + vec2(0.0, 27.0)),
         _ => Rect::from_min_max(r.min - vec2(0.0, 20.0), r.max + vec2(0.0, 6.0)),
     });
-    let span = ZOOMS[app.prefs.zoom.min(ZOOMS.len() - 1)];
+    let span = crate::ui_perf_layouts::span(app).unwrap_or(ZOOMS[app.prefs.zoom.min(ZOOMS.len() - 1)]);
     let px_per_s = r.width() as f64 / span;
     let cx = r.center().x + cx_off;
     let t_of = |x: f32| pos + (x - cx) as f64 / px_per_s;

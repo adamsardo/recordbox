@@ -46,7 +46,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
         6 => &["STEMS"],
-        7 => &["Deck", "Mixer", "Effect", "Sampler", "Others"],
+        7 => &["Deck", "Mixer", "Effect", "Sampler", "Recordings", "Others"],
         _ => &["Database", "Browse", "Others"],
     }
 }
@@ -60,7 +60,7 @@ const SETTINGS: [(u8, usize, &str); 113] = [
     (7, 3, "Auto Panel Mode"),
     (7, 3, "Sequence Load"),
     (7, 3, "Velocity Curve"),
-    (7, 4, "SEQUENCER"),
+    (7, 5, "SEQUENCER"),
     (0, 0, "Language"),
     (0, 0, "Show Tooltips"),
     (0, 0, "Font Size"),
@@ -181,6 +181,7 @@ pub fn search_settings(q: &str) -> Vec<(u8, usize, String)> {
             v.push((3, tab, label.to_string()));
         }
     }
+    v.extend(crate::ui_rec::SETTINGS.iter().filter(|s| s.to_lowercase().contains(&q)).map(|s| (7u8, tabs_of(7).iter().position(|t| *t == "Recordings").unwrap_or(0), s.to_string())));
     v
 }
 
@@ -437,9 +438,11 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 5 => page_audio(app, ui, sub_tab),
                 6 => page_stems(app, ui),
                 7 if sub_tab == 0 => page_deck(app, ui),
+                7 if sub_tab == 1 && crate::ui_midi::prefs_rows_shown(app) => { page_mixer(app, ui); crate::ui_midi::prefs_rows(app, ui) }
                 7 if sub_tab == 1 => page_mixer(app, ui),
                 7 if sub_tab == 2 => page_effect(app, ui),
                 7 if sub_tab == 3 => page_sampler(app, ui),
+                7 if tabs.get(sub_tab) == Some(&"Recordings") => crate::ui_rec::prefs_page(app, ui),
                 7 => page_controller_others(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }
@@ -619,17 +622,7 @@ fn page_view(app: &mut App, ui: &mut Ui, tab: usize) {
                 }
             });
             card(ui, "HOT CUE color", |ui| {
-                // Recordbox gives new hot cues rekordbox's COLORFUL colours; the other three
-                // colour sets are listed as rekordbox lists them, and cannot be chosen.
-                let why = "recordbox colours hot cues as rekordbox's COLORFUL setting does; it has no other colour set yet.";
-                kit::combo_row(ui, 22.0, |ui| {
-                    kit::combo("hotcue_color", 520.0, "COLORFUL", 14.0).show_ui(ui, |ui| {
-                        for n in ["CDJ", "COLD1", "COLD2"] {
-                            ui.add_enabled(false, egui::SelectableLabel::new(false, n)).on_disabled_hover_text(why);
-                        }
-                        let _ = ui.selectable_label(true, "COLORFUL");
-                    });
-                });
+                crate::ui_pads::prefs_hot_cue_color(app, ui);
             });
         }
         _ => {
@@ -741,6 +734,7 @@ fn page_layout(app: &mut App, ui: &mut Ui) {
             kit::checkbox_off(ui, "Vocal (Enlarged Waveform)", "recordbox shows vocal positions above the full waveform only, so far.");
         }
         kit::checkbox(ui, &mut app.prefs.show_vocal, "Vocal (Full Waveform)");
+        crate::ui_pads::prefs_pad_mode(app, ui);
     });
 }
 

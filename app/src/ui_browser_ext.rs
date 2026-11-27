@@ -965,7 +965,7 @@ pub fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect, drop: &mut Vec<(Rect, i6
         (src::itunes, Some(SideMode::Itunes), "iTunes"),
         (src::device, Some(SideMode::Devices), "Devices"),
         (src::history, Some(SideMode::History), "Histories"),
-        (src::recording, None, "Recordings (not available in this app)"),
+        (src::recording, Some(SideMode::Recordings), "Recordings"),
     ];
     for (i, (draw, mode, name)) in tiles.iter().enumerate() {
         let rr = Rect::from_center_size(pos2(r.min.x + 14.5, r.min.y + 12.0 + i as f32 * 20.0), vec2(18.0, 18.0));
@@ -992,6 +992,7 @@ pub fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect, drop: &mut Vec<(Rect, i6
                     }
                     SideMode::History => app.set_view(View::History(0)),
                     SideMode::Itunes => app.set_view(View::Source { kind: crate::library_ext::SRC_ITUNES, node: String::new() }),
+                    SideMode::Recordings => app.set_view(View::Explorer(crate::ui_rec::rec_dir(&app.prefs.rec).to_string_lossy().to_string())),
                     _ => {}
                 }
             }

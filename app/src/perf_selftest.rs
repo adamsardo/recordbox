@@ -51,7 +51,7 @@ impl App {
             // Quick clicks: press and release in the same frame (found by hand: sliders missed them).
             ("quick click on channel fader 2, half way", pos2(782.0, my + 194.5), pos2(782.0, my + 194.5)),
             ("quick click on the crossfader, a quarter in", pos2(733.5, by + 21.5), pos2(733.5, by + 21.5)),
-            ("quick click on master volume, half way", pos2(1512.0 - 87.5, 14.0), pos2(1512.0 - 87.5, 14.0)),
+            ("quick click on master volume, half way", pos2(1512.0 - 223.25, 13.75), pos2(1512.0 - 223.25, 13.75)),
             // The deck engine (`deck.rs`): the platter dragged a quarter turn (a scratch), then
             // its rules called as a controller would, on the playing deck 1.
             ("platter drag scratch held", o + egui::vec2(105.0 + 49.0, 65.0), o + egui::vec2(105.0, 65.0 + 49.0)),

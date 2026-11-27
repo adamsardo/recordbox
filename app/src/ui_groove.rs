@@ -665,6 +665,16 @@ pub fn wave_column(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) -> bool {
     if app.gc.page != 2 {
         return false;
     }
+    capture_buttons(app, ui, o, waves_h);
+    true
+}
+
+/// The DRUM CAPTURE page of the waveforms' control strip (its third page): one capture button
+/// per deck and the length button. `o`: the strip's top left; `waves_h`: its height.
+pub fn capture_buttons(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) {
+    let p = ui.painter().clone();
+    let h = waves_h.floor() as i32;
+    let at = |x: i32, y: i32, w: i32, hh: i32| Rect::from_min_size(pos2(o.x + x as f32, o.y + y as f32), vec2(w as f32, hh as f32));
     // One DRUM CAPTURE button per deck, in the middle of the deck's lane.
     let count = app.deck_count() as i32;
     let lane = h / count.max(1);
@@ -695,7 +705,6 @@ pub fn wave_column(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) -> bool {
     if tip(resp, app, "Change the DRUM CAPTURE length to 4, 8, 16, or 32 beats.").clicked() {
         app.groove_capture_length_next();
     }
-    true
 }
 
 /// Preferences > Extensions > STEMS: "Enable the GROOVE CIRCUIT Function", DRUM SWAP, DRUM
