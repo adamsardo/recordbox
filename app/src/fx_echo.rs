@@ -545,6 +545,168 @@ impl Bands3 {
         }
         (fx, th)
     }
+
+    /// The LOW CUT / HI CUT buttons as every Beat FX with them sets the module
+    /// (`setThru`: LOW CUT takes band 2 out of what the effect gets, HI CUT band 0; a band taken
+    /// out goes to the "thru" sum instead). For another effect: keep a `Bands3`, `setup(rate)`
+    /// once made (or at a new rate), `set_cuts` every buffer, and per frame
+    /// `let (fx, thru) = b.next([l, r])`: run the effect on `fx` and add `thru` to its output
+    /// (the wet side), as `crate::fx::Slot` does for single DELAY / REV DELAY / MT DELAY.
+    pub fn set_cuts(&mut self, low_cut: bool, hi_cut: bool) {
+        self.set_gains([if hi_cut { 0.0 } else { 1.0 }, 1.0, if low_cut { 0.0 } else { 1.0 }]);
+    }
+}
+
+/// Single DELAY / REV DELAY's first knob (`SingleBeatFxDelayBase`): the delay's output goes
+/// through `BfxPan` (a `BeatFxPan` made on two `SquareWave`s with its LFOs smoothed over 30 ms,
+/// sides starting at turn positions 0 and 0.5) on the share of `SmoothFloat` 1272, and passes
+/// unpanned on the share of `SmoothFloat` 1320 (3.3333 ms each; the centre zone of the knob is
+/// all unpanned). The pan restarts when its period or side changes (`updateAndSetParameter`
+/// 0x1029ccc24) and when the delay is switched on (`onCalledTurnOn` 0x1029cd240); the beat
+/// quantizer does not restart it (`playHead` 0x1029cd28c reaches only the delay).
+#[derive(Clone, Copy, Debug)]
+pub struct DelayPan {
+    pub trans: crate::fx_lfo::TransFx,
+    rate: f32,
+    /// `BeatFxPan` +600 restart asked, +601 flip, +602 a new beat time, +604 its period (ms).
+    restart: bool,
+    flip: bool,
+    set_bt: bool,
+    bt_ms: f32,
+    /// `BfxPan` +668 (the period it was given, made at 10 ms), +680 the side's level, +688 the
+    /// side it starts on (left half of the knob: the left).
+    period: f32,
+    amp: f32,
+    flag: bool,
+    pan: Sf,
+    thru: Sf,
+}
+
+impl DelayPan {
+    pub fn new(rate: f32) -> DelayPan {
+        let mut d = DelayPan { trans: crate::fx_lfo::TransFx::new(rate, crate::fx_lfo::Wave::SQUARE), rate, restart: false, flip: false, set_bt: false, bt_ms: 100.0, period: 10.0, amp: 0.0, flag: true, pan: Sf::new(rate), thru: Sf::new(rate) };
+        d.setup(rate);
+        d
+    }
+
+    pub fn rate(&self) -> f32 {
+        self.rate
+    }
+
+    /// Made at `rate` (the constructors' state).
+    pub fn setup(&mut self, rate: f32) {
+        let mut t = crate::fx_lfo::TransFx::new(rate, crate::fx_lfo::Wave::SQUARE);
+        for l in t.lfo.iter_mut() {
+            l.set_smoothing_time(30.0);
+        }
+        t.par = crate::fx_lfo::TransPar { dry: 0.0, wet: 1.0, duty: [0.5; 2], min5: false, amp: [0.0; 2], head: [0.0; 2], free: [false; 2], free_ms: [0.0; 2] };
+        self.trans = t;
+        self.rate = rate;
+        self.restart = false;
+        self.flip = false;
+        self.set_bt = false;
+        self.bt_ms = 100.0;
+        self.period = 10.0;
+        self.amp = 0.0;
+        self.flag = true;
+        for s in [&mut self.pan, &mut self.thru] {
+            *s = Sf::new(rate);
+            s.set_time(3.3333);
+        }
+    }
+
+    /// The pan part of `updateAndSetParameter` for the knob `k` at `bpm` (`60000 / BPM` times the
+    /// zone's step; the left half starts on the left).
+    pub fn set(&mut self, k: f32, bpm: f32) {
+        let beat = 60000.0 / bpm;
+        let (step, left) = if k < 0.090909 {
+            (0.0625, true)
+        } else if k < 0.18182 {
+            (0.125, true)
+        } else if k < 0.27273 {
+            (0.25, true)
+        } else if k < 0.36364 {
+            (0.5, true)
+        } else if k < 0.45455 {
+            (1.0, true)
+        } else if k < 0.54545 {
+            self.pan.set_target(0.0);
+            self.thru.set_target(1.0);
+            return;
+        } else if k < 0.63636 {
+            (1.0, false)
+        } else if k < 0.72727 {
+            (0.5, false)
+        } else if k < 0.81818 {
+            (0.25, false)
+        } else if k < 0.90909 {
+            (0.125, false)
+        } else {
+            (0.0625, false)
+        };
+        let ms = if step == 1.0 { beat } else { beat * step };
+        self.pan.set_target(1.0);
+        self.thru.set_target(0.0);
+        if (ms - self.period).abs() >= EPS || left != self.flag {
+            let c = crate::fx::through_value(k);
+            self.amp = 1.0 - (c - 1.4125 * c);
+            self.flag = left;
+            // `BfxPan::setEffectBeatTimeWithPlayHead(ms)`, then `turnOn`.
+            self.period = ms;
+            if !self.restart {
+                self.restart = true;
+                self.flip = !self.flip;
+            }
+            self.set_bt = true;
+            self.bt_ms = ms + ms;
+            self.turn_on();
+        }
+    }
+
+    /// `BeatFxPan::onCalledTurnOn` 0x102a4e9e4 (the delay's turn-on passes it on).
+    pub fn turn_on(&mut self) {
+        self.restart = true;
+        self.flip = true;
+    }
+
+    /// `onCalledMakeSelected` 0x1029cd1d8: the shares where they are going, the LFOs reset.
+    pub fn make_selected(&mut self) {
+        let t = self.pan.target;
+        self.pan.reset(t);
+        let t = self.thru.target;
+        self.thru.reset(t);
+        self.trans.par.amp = [self.amp; 2];
+        self.trans.par.head = [0.5, 0.0];
+        self.trans.make_selected();
+    }
+
+    /// `BeatFxPan::processEffectConcrete` 0x102a4e768: each side's gain for the next frames
+    /// (heads 0 and 0.5, swapped by the side; a new period or a restart from the heads).
+    pub fn gains(&mut self, gl: &mut [f32], gr: &mut [f32]) {
+        use crate::fx_lfo::BeatSync;
+        self.trans.par.amp = [self.amp; 2];
+        if self.restart {
+            let (base, other) = (0.0f32, 0.5f32);
+            let one = self.flip != self.flag;
+            self.trans.par.head = if one { [other, base] } else { [base, other] };
+            if self.set_bt {
+                self.trans.set_beat_time(self.bt_ms, 0.0);
+            } else {
+                self.trans.play_head();
+            }
+            self.restart = false;
+            self.set_bt = false;
+        }
+        self.trans.gains(gl, gr);
+    }
+
+    /// One frame of the delay's output with this frame's pan gains.
+    #[inline]
+    pub fn next(&mut self, l: f32, r: f32, gl: f32, gr: f32) -> (f32, f32) {
+        let t = self.thru.take();
+        let p = self.pan.take();
+        ((l * p) * gl + l * t, (r * p) * gr + r * t)
+    }
 }
 
 #[cfg(test)]
@@ -674,5 +836,39 @@ mod tests {
         let zero_at = after.iter().position(|v| v.abs() < 1e-6).unwrap();
         assert_eq!(zero_at, 157, "158-frame fade (the last step lands on 0)");
         assert!((after[1000] - 3.0).abs() < 1e-5 && after.iter().all(|&v| v <= 3.0 + 1e-5));
+    }
+
+    /// DELAY's first knob at 0.2 (the 1/4-beat zone, left half): at 120 BPM the pan's turn is
+    /// 2 x 125 ms; the left side starts on at 1 + 0.4125 x 0.5887, the right off, and they swap
+    /// half a turn later (`SingleBeatFxDelayBase::updateAndSetParameter`, `BeatFxPan`). In the
+    /// centre zone the delay passes unpanned.
+    #[test]
+    fn delay_pan_swaps_sides_on_square_waves() {
+        let mut d = DelayPan::new(48000.0);
+        d.set(0.2, 120.0);
+        d.make_selected();
+        d.turn_on();
+        let amp = 1.0 + 0.4125 * crate::fx::through_value(0.2);
+        let mut out = vec![(0.0f32, 0.0f32); 24000];
+        for c in 0..(24000 / 480) {
+            d.set(0.2, 120.0);
+            let (mut gl, mut gr) = ([0.0f32; 480], [0.0f32; 480]);
+            d.gains(&mut gl, &mut gr);
+            for k in 0..480 {
+                out[c * 480 + k] = d.next(1.0, 1.0, gl[k], gr[k]);
+            }
+        }
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(near(out[3000].0, amp) && near(out[3000].1, 0.0), "{:?}", out[3000]);
+        assert!(near(out[9000].0, 0.0) && near(out[9000].1, amp), "{:?}", out[9000]);
+        assert!(near(out[15000].0, amp) && near(out[15000].1, 0.0), "{:?}", out[15000]);
+        // (The edges are smoothed over 30 ms ending on the jump.)
+        assert!(out[5800].0 < amp && out[5800].0 > 0.0, "{:?}", out[5800]);
+        let mut d = DelayPan::new(48000.0);
+        d.set(0.5, 120.0);
+        d.make_selected();
+        let (mut gl, mut gr) = ([0.0f32; 64], [0.0f32; 64]);
+        d.gains(&mut gl, &mut gr);
+        assert_eq!(d.next(0.3, -0.2, gl[10], gr[10]), (0.3, -0.2));
     }
 }

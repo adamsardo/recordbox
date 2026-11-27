@@ -32,6 +32,7 @@ mod fx_roll;
 mod fx_sweep;
 mod fx_rev;
 mod fx_echo;
+mod fx_echo_plus;
 mod mfx;
 mod icons;
 mod icons_player;
@@ -365,6 +366,7 @@ impl eframe::App for Gui {
                     eprintln!("bench: stems ready {}, separating {:?}, stem error {:?}", app.player.state.lock().stems.is_some(), app.stem.separating, app.stem.error);
                     eprintln!("bench: mixer meters deck 1 {:.1} dB, master {:.1} dB, limiter on {}", app.px.mix[0].shown_db[0], app.px.master_db[0], audio::LIMITER_ON.load(Relaxed));
                     eprintln!("bench: audio callback found a deck held {} times, gave a buffer up {} times", audio::AUDIO_CONTENDED.load(Relaxed), audio::AUDIO_DROPPED.load(Relaxed));
+                    eprintln!("bench: buffers given up by lock: sampler {}, a deck {}, effects rack {}", audio::AUDIO_DROPPED_AT[0].load(Relaxed), audio::AUDIO_DROPPED_AT[1].load(Relaxed), audio::AUDIO_DROPPED_AT[2].load(Relaxed));
                 }
             }
         }

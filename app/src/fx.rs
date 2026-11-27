@@ -294,9 +294,10 @@ pub fn echo_mix(level: f32) -> (f32, f32) {
     if level < 0.75 { (1.0, 1.3333 * level) } else { (4.0 - 4.0 * level, 1.0) }
 }
 
-/// MT DELAY's LEVEL/DEPTH law (`GroupMultiTapDelay::calculateMixRatio`): (dry, wet).
+/// MT DELAY's LEVEL/DEPTH law (`GroupMultiTapDelay::calculateMixRatio` 0x102a081c4, re-read
+/// from its disassembly: the dry side above the centre is one fused `L x -0.6 + 1.3`): (dry, wet).
 pub fn mt_mix(level: f32) -> (f32, f32) {
-    if level < 0.5 { (1.0, 1.4 * level) } else { (1.3 - 0.6 * level, 0.7) }
+    if level < 0.5 { (1.0, level * 1.4) } else { (level.mul_add(-0.6, 1.3), 0.7) }
 }
 
 /// TRANS and PAN (`MultiBeatFxTrans` / `MultiBeatFxPan::updateParameter`): the effect takes
@@ -700,14 +701,6 @@ pub fn vinyl_brake_beats(l: f32) -> f32 {
 pub fn echo_fb(k: f32, turning_off: bool) -> f32 {
     let half = half_value(k);
     if k < 0.48627 { (half * 0.7).clamp(0.0, 1.0) } else if k <= 0.51373 { 0.7 } else { (half * if turning_off { 0.3 } else { 0.293 } + 0.7).clamp(0.0, 1.0) }
-}
-
-/// DELAY's first knob in eleven zones (`SingleBeatFxDelayBase::updateAndSetParameter`): the
-/// pan LFO's period in beats, none in the centre zone.
-pub fn delay_pan_beats(k: f32) -> Option<f32> {
-    const T: [f32; 11] = [0.0625, 0.125, 0.25, 0.5, 1.0, 0.0, 1.0, 0.5, 0.25, 0.125, 0.0625];
-    let i = ((k.clamp(0.0, 1.0) * 11.0) as usize).min(10);
-    if i == 5 { None } else { Some(T[i]) }
 }
 
 /// TRANS's DUTY knob in single mode (`SingleBeatFxTrans::updateParameter`): the open share,
@@ -1246,6 +1239,11 @@ pub(crate) struct Slot {
     pe: Option<Box<crate::fx_echo::PitchEchoCore>>,
     /// MT DELAY's core (`MultiTapDelayCore`), made by the interface (`ensure_rev`).
     mt: Option<Box<crate::fx_echo::MtCore>>,
+    /// fx8a: BPF / HPF / LPF / CRUSH ECHO's body (`crate::fx_echo_plus`, with `Rmx4thEcho`'s
+    /// cores), made by the interface (`ensure_rev`) for the slot's mode.
+    fxp: Option<Box<crate::fx_echo_plus::FxPlusEcho>>,
+    /// fx8a: single DELAY / REV DELAY's pan (`SingleBeatFxDelayBase::BfxPan` and its shares).
+    dpan: crate::fx_echo::DelayPan,
 }
 
 /// The beat quantizer's calls for the echo family over one buffer: the stretches between
@@ -1320,6 +1318,30 @@ impl crate::fx_lfo::BeatSync for EchoSync {
 /// Frames of TRANS / PAN gain worked out at a time (on the stack).
 const LFO_PIECE: usize = 1024;
 
+/// Effect cores made by the interface outside the rack's lock (`Rack::rev_needs`,
+/// `NewCores::make`, `Rack::rev_install`).
+#[derive(Default)]
+pub struct NewCores {
+    rv: Option<Box<crate::fx_rev::RevFx>>,
+    ec: Option<Box<crate::fx_echo::EchoCore>>,
+    pe: Option<Box<crate::fx_echo::PitchEchoCore>>,
+    mt: Option<Box<crate::fx_echo::MtCore>>,
+    fxp: Option<Box<crate::fx_echo_plus::FxPlusEcho>>,
+}
+
+impl NewCores {
+    /// The cores of `bits` (`Slot::rev_needs`). This is where the memory is taken.
+    pub fn make(bits: u8, single: bool) -> NewCores {
+        NewCores {
+            rv: (bits & 1 != 0).then(crate::fx_rev::RevFx::new),
+            ec: (bits & 2 != 0).then(crate::fx_echo::EchoCore::new),
+            pe: (bits & 4 != 0).then(crate::fx_echo::PitchEchoCore::new),
+            mt: (bits & 8 != 0).then(crate::fx_echo::MtCore::new),
+            fxp: (bits & 16 != 0).then(|| crate::fx_echo_plus::FxPlusEcho::new(single)),
+        }
+    }
+}
+
 impl Slot {
     pub(crate) fn new() -> Slot {
         Slot {
@@ -1359,6 +1381,8 @@ impl Slot {
             b3: crate::fx_echo::Bands3::new(),
             pe: None,
             mt: None,
+            fxp: None,
+            dpan: crate::fx_echo::DelayPan::new(48000.0),
         }
     }
 
@@ -1491,6 +1515,74 @@ impl Slot {
         if k == Kind::MtDelay && self.mt.is_none() && !self.delay.is_empty() {
             self.mt = Some(crate::fx_echo::MtCore::new());
         }
+        if matches!(k, Kind::BpfEcho | Kind::HpfEcho | Kind::LpfEcho | Kind::CrushEcho) && self.fxp.as_ref().is_none_or(|f| f.single() != single) && !self.delay.is_empty() {
+            self.fxp = Some(crate::fx_echo_plus::FxPlusEcho::new(single));
+        }
+    }
+
+    /// The cores `ensure_rev` would make for this kind and mode, as bits (1 reverse, 2 echo,
+    /// 4 pitch echo, 8 multi tap, 16 FX+). Cheap: for the interface to ask under the rack's
+    /// lock, so that the cores themselves (up to 25 MB) can be made without holding it: the
+    /// audio thread waits only a quarter of a millisecond for that lock.
+    pub(crate) fn rev_needs(&self, k: Kind, single: bool) -> u8 {
+        if self.delay.is_empty() {
+            return 0;
+        }
+        let want_rv = match k {
+            Kind::RevDelay => true,
+            Kind::Echo | Kind::LowCutEcho | Kind::PingPong | Kind::PitchEcho => single,
+            _ => false,
+        };
+        let mut m = 0u8;
+        if want_rv && self.rv.is_none() {
+            m |= 1;
+        }
+        if matches!(k, Kind::Delay | Kind::Echo | Kind::LowCutEcho | Kind::PingPong) && self.ec.is_none() {
+            m |= 2;
+        }
+        if matches!(k, Kind::PitchEcho | Kind::UpEcho | Kind::DownEcho) && self.pe.is_none() {
+            m |= 4;
+        }
+        if k == Kind::MtDelay && self.mt.is_none() {
+            m |= 8;
+        }
+        if matches!(k, Kind::BpfEcho | Kind::HpfEcho | Kind::LpfEcho | Kind::CrushEcho) && self.fxp.as_ref().is_none_or(|f| f.single() != single) {
+            m |= 16;
+        }
+        m
+    }
+
+    /// Put cores made outside the lock in place. What they replace (or what turned out not
+    /// to be needed any more) is handed back, to be dropped outside the lock too.
+    pub(crate) fn rev_install(&mut self, k: Kind, single: bool, mut c: NewCores) -> NewCores {
+        let m = self.rev_needs(k, single);
+        if m & 1 != 0 && c.rv.is_some() {
+            std::mem::swap(&mut self.rv, &mut c.rv);
+        }
+        if m & 2 != 0 && c.ec.is_some() {
+            std::mem::swap(&mut self.ec, &mut c.ec);
+        }
+        if m & 4 != 0 && c.pe.is_some() {
+            std::mem::swap(&mut self.pe, &mut c.pe);
+        }
+        if m & 8 != 0 && c.mt.is_some() {
+            std::mem::swap(&mut self.mt, &mut c.mt);
+        }
+        if m & 16 != 0 && c.fxp.as_ref().is_some_and(|f| f.single() == single) {
+            std::mem::swap(&mut self.fxp, &mut c.fxp);
+        }
+        c
+    }
+
+    /// fx8a: make the echo cores MERGE FX's slots can need (its patterns run DELAY and LOW CUT
+    /// ECHO in multi mode, LOW CUT ECHO and PITCH ECHO in single mode: `EchoCore`,
+    /// `PitchEchoCore` and the reverse core, about 8 MB). For the interface thread, once, where the
+    /// MERGE FX engine is made (`mfx::UnitEng::new`); until then those slots run the older
+    /// interleaved line.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_merge_cores(&mut self) {
+        self.ensure_rev(Kind::LowCutEcho, true);
+        self.ensure_rev(Kind::PitchEcho, true);
     }
 
     /// Read the delay line `frames` back (fractional), channel `c`.
@@ -1729,9 +1821,9 @@ impl Slot {
             self.t = 0.0;
             self.speed = 1.0;
         }
-        // DELAY / REV DELAY's first knob in single mode: the pan LFO's beats (none in the
-        // centre zone).
-        let delay_pan = if multi || !matches!(kind, Delay | RevDelay) { None } else { delay_pan_beats(k1) };
+        // DELAY / REV DELAY's first knob in single mode: the pan on the delay's output
+        // (fx8a: `crate::fx_echo::DelayPan`).
+        let use_dpan = !multi && matches!(kind, Delay | RevDelay);
         // SPIRAL UP / DOWN's laws (main knob, beat).
         let rmx = rmx_spiral_law(level, kind == SpiralDown, p.on, (beat_secs * 1000.0).clamp(10.0, 3990.0));
         // The beat quantizer's calls for this buffer (`FxQuantizeManager::processQuantizeEffect`)
@@ -2031,6 +2123,38 @@ impl Slot {
         }
         let made = !self.fresh;
         self.fresh = true;
+        // fx8a: single DELAY / REV DELAY's pan: made with the effect, its knob read every buffer,
+        // restarted when the delay is switched on.
+        if use_dpan {
+            if made || (self.dpan.rate() - r).abs() > 0.5 {
+                self.dpan.setup(r);
+                self.dpan.set(k1, bpm);
+                self.dpan.make_selected();
+            } else {
+                self.dpan.set(k1, bpm);
+            }
+            if starting {
+                self.dpan.turn_on();
+            }
+        }
+        let mut dpg = ([0.0f32; 64], [0.0f32; 64]);
+        // fx8a: the FX+ echoes on their rekordbox body (`crate::fx_echo_plus`): one call a
+        // buffer; multi mode is made without the LFO and with the half-beat echo alone.
+        let use_fxp = matches!(kind, BpfEcho | HpfEcho | LpfEcho | CrushEcho) && self.fxp.as_ref().is_some_and(|f| f.single() == !multi);
+        if use_fxp {
+            let pk = match kind { BpfEcho => crate::fx_echo_plus::PlusKind::Bpf, HpfEcho => crate::fx_echo_plus::PlusKind::Hpf, LpfEcho => crate::fx_echo_plus::PlusKind::Lpf, _ => crate::fx_echo_plus::PlusKind::Crush };
+            let par = crate::fx_echo_plus::PlusPar { on: p.on, main: level, echo: if multi { 0.5 } else { k1 }, modu: if multi { 0.0 } else { k2 }, rev: b1 && !multi, freeze: b2 && !multi, beat_ms: beat_secs * 1000.0 };
+            if let Some(c) = self.fxp.as_deref_mut() {
+                if made || c.kind() != pk || (c.rate() - r).abs() > 0.5 {
+                    c.setup(pk, r);
+                    c.make_selected(&par);
+                }
+                if starting {
+                    c.turn_on();
+                }
+                c.call(frames, &par);
+            }
+        }
         // fx7a: the forward core (`crate::fx_echo::EchoCore`) and each side's time for it:
         // ECHO / LOW CUT ECHO 1 .. 4000 ms (`SingleBeatFxEcho::updateAndSetParameter`,
         // `SingleLowCutFxEcho::updateParameter`), PING PONG's right side 0.75 x the time held
@@ -2256,6 +2380,10 @@ impl Slot {
             _ => false,
         };
         for n in 0..frames {
+            if use_dpan && n % 64 == 0 {
+                let len = (frames - n).min(64);
+                self.dpan.gains(&mut dpg.0[..len], &mut dpg.1[..len]);
+            }
             if lfo_kind && n % LFO_PIECE == 0 {
                 let len = (frames - n).min(LFO_PIECE);
                 let b = beat.map(|b| b + n as f64 * bpm as f64 / (60.0 * r as f64));
@@ -2468,23 +2596,12 @@ impl Slot {
                         self.ifl[1].process(&mut fr, la, 51, rate);
                         (el, er) = (fr[0], fr[1]);
                     }
-                    if let Some(pb) = delay_pan {
-                        // DELAY's first knob (`SingleBeatFxDelayBase::BfxPan`, a `BeatFxPan` on
-                        // two square waves): the repeats sit on one side, then the other (a full
-                        // turn per its beat value); the side in use at 1 + 0.4125 x the
-                        // knob's distance from the centre (+3 dB at the ends), the edges
-                        // smoothed over 30 ms. The left half of the knob starts on the left.
-                        self.lfo2 = (self.lfo2 + 1.0 / (pb * beat_secs * r)).fract();
-                        let first = self.lfo2 < 0.5;
-                        let left_on = if k1 < 0.5 { first } else { !first };
-                        let amp = 1.0 + 0.4125 * through_value(k1);
-                        let sk = 1.0 / (0.030 * r);
-                        let (tl_, tr_) = if left_on { (amp, 0.0) } else { (0.0, amp) };
-                        self.ga[0] += (tl_ - self.ga[0]).clamp(-sk * amp, sk * amp);
-                        self.ga[1] += (tr_ - self.ga[1]).clamp(-sk * amp, sk * amp);
-                        let m = (el + er) * 0.5;
-                        el = m * self.ga[0];
-                        er = m * self.ga[1];
+                    if use_dpan {
+                        // DELAY's first knob (`SingleBeatFxDelayBase::processEffectConcrete`
+                        // 0x1029cd094): each side times its square-wave gain (0 .. 1 + 0.4125 x
+                        // the knob's distance from the centre) on the pan share, plus the
+                        // unpanned share.
+                        (el, er) = self.dpan.next(el, er, dpg.0[n % 64], dpg.1[n % 64]);
                     }
                     mixed(el, er)
                 }
@@ -2917,6 +3034,11 @@ impl Slot {
                     }
                     (dl * (1.0 - g) + (wl * edge + thru[0]) * g, dr * (1.0 - g) + (wr * edge + thru[1]) * g)
                 }
+                BpfEcho | HpfEcho | LpfEcho | CrushEcho if use_fxp => {
+                    // (EffectBase mix of these: dry 0, wet 1; the on/off gate fades between.)
+                    let (wl, wr) = match self.fxp.as_deref_mut() { Some(c) => c.next(dl, dr), None => (dl, dr) };
+                    (dl * (1.0 - g) + wl * g, dr * (1.0 - g) + wr * g)
+                }
                 BpfEcho | HpfEcho | LpfEcho | CrushEcho => {
                     // rekordbox's FX+ echoes: the main knob (read in 8-bit steps) moves a
                     // filter (or the crusher and its high-pass) and the share of the filtered
@@ -3292,6 +3414,52 @@ impl Rack {
     /// run one: REV DELAY, and in single mode ECHO, LOW CUT ECHO, PING PONG and PITCH ECHO (their
     /// REV button); a PAD FX unit set to REV DELAY. Called by the interface once the units'
     /// params are in, never by the audio thread.
+    /// The slots that lack a core for the effect they are set to (see `Slot::rev_needs`):
+    /// where (unit, channel, slot; unit `usize::MAX` = the PAD FX unit of deck `channel`),
+    /// the kind, the mode and the bits.
+    pub fn rev_needs(&self) -> Vec<(usize, usize, usize, Kind, bool, u8)> {
+        let mut out = Vec::new();
+        for (ui, u) in self.units.iter().enumerate() {
+            let p = u.params;
+            for (ci, ch) in u.channels.iter().enumerate() {
+                let Some(ch) = ch.as_ref() else { continue };
+                for (i, s) in ch.slots.iter().enumerate() {
+                    let k = if i < 3 { p.slots[i].kind } else { p.one.kind };
+                    let m = s.rev_needs(k, i == 3);
+                    if m != 0 {
+                        out.push((ui, ci, i, k, i == 3, m));
+                    }
+                }
+            }
+        }
+        for (pi, (pc, set)) in self.pads.iter().zip(self.pad_set.iter()).enumerate() {
+            if let (Some(pc), Some(b)) = (pc.as_deref(), set.beat) {
+                let m = pc.ch.slots[0].rev_needs(b.kind, false);
+                if m != 0 {
+                    out.push((usize::MAX, pi, 0, b.kind, false, m));
+                }
+            }
+        }
+        out
+    }
+
+    /// Install cores made outside the lock; returns what is to be dropped outside it.
+    pub fn rev_install(&mut self, made: Vec<((usize, usize, usize, Kind, bool, u8), NewCores)>) -> Vec<NewCores> {
+        let mut old = Vec::with_capacity(made.len());
+        for ((ui, ci, si, k, single, _), c) in made {
+            let slot = if ui == usize::MAX {
+                self.pads.get_mut(ci).and_then(|p| p.as_deref_mut()).map(|p| &mut p.ch.slots[0])
+            } else {
+                self.units.get_mut(ui).and_then(|u| u.channels.get_mut(ci)).and_then(|c| c.as_mut()).and_then(|c| c.slots.get_mut(si))
+            };
+            old.push(match slot {
+                Some(s) => s.rev_install(k, single, c),
+                None => c,
+            });
+        }
+        old
+    }
+
     pub fn prepare_rev(&mut self) {
         for u in self.units.iter_mut() {
             let p = u.params;
@@ -4185,7 +4353,7 @@ mod tests {
             run(&label, &|p| p.slots[0] = SlotParams { on: true, level: 0.7, ..SlotParams::new(info.kind) });
         }
         // Single mode with REV held: both cores run (`BeatFxEcho`).
-        for kind in [Kind::Echo, Kind::PingPong, Kind::LowCutEcho, Kind::PitchEcho] {
+        for kind in [Kind::Echo, Kind::PingPong, Kind::LowCutEcho, Kind::PitchEcho, Kind::BpfEcho, Kind::HpfEcho, Kind::LpfEcho, Kind::CrushEcho] {
             let label = format!("{} REV (single)", info_of(kind).name);
             run(&label, &|p| {
                 p.single = true;
@@ -4315,7 +4483,6 @@ mod tests {
         assert_eq!((vinyl_repeat_beats(0.0), vinyl_repeat_beats(0.5), vinyl_repeat_beats(1.0)), (0.0625, 0.5, 4.0));
         assert_eq!((vinyl_echo_beats(0.5), vinyl_echo_beats(1.0)), (None, Some(2.0)));
         assert_eq!((vinyl_brake_beats(0.1), vinyl_brake_beats(1.0)), (4.0, 0.125));
-        assert_eq!((delay_pan_beats(0.0), delay_pan_beats(0.5), delay_pan_beats(1.0)), (Some(0.0625), None, Some(0.0625)));
         // Single-mode knobs.
         let pr = |k: f32| { let p = crate::fx_lfo::PanPar::single(1.0, k, 0.5, 250.0); (p.free, p.free_ms) };
         assert_eq!((pr(0.0), pr(0.5), pr(1.0)), (([true, false], [62.5, 0.0]), ([false, false], [0.0, 0.0]), ([false, true], [0.0, 62.5])));
@@ -4721,5 +4888,30 @@ mod tests {
         let r = (15000..40000).find(|&t| y[t * 2 + 1].abs() > 1e-3).unwrap();
         assert!((23000..23010).contains(&l), "left repeat at {l}");
         assert!((29000..29010).contains(&r), "right repeat at {r}");
+    }
+
+    // fx8a
+    #[test]
+    fn merge_slots_get_every_echo_core_they_can_run() {
+        let mut s = Slot::new();
+        s.ensure_merge_cores();
+        assert!(s.ec.is_some() && s.pe.is_some() && s.rv.is_some());
+    }
+
+    #[test]
+    fn single_fx_plus_echo_runs_its_rekordbox_body() {
+        // HPF ECHO at LEVEL 0.5 (step 127): `FxPlusHpfEcho` keeps g^3 = 0.13259 of the input dry
+        // and its filtered sound and echoes carry no DC, so a steady 1.0 settles at g^3.
+        let mut y = vec![1.0f32; 2 * 96000];
+        run_single(Kind::HpfEcho, 0.5, [0.5, 0.0], &mut y);
+        let g = 1.0159f32 - 0.0039841 * 127.0;
+        assert!((y[2 * 95000] - g * g * g).abs() < 1e-3, "{}", y[2 * 95000]);
+        // BPF ECHO with ECHO MIX at 0.25 (the quarter-beat core alone): the first repeat of a burst
+        // comes a quarter beat (6000 frames at 120 BPM) after it.
+        let mut y: Vec<f32> = (0..48000).flat_map(|t| { let v = if (5000..5480).contains(&t) { (t as f32 * 0.3).sin() } else { 0.0 }; [v, v] }).collect();
+        run_single(Kind::BpfEcho, 0.6, [0.25, 0.0], &mut y);
+        let quiet = (5480 + 2000..11000).map(|t| y[t * 2].abs()).fold(0.0f32, f32::max);
+        let loud = (11000..11480).map(|t| y[t * 2].abs()).fold(0.0f32, f32::max);
+        assert!(loud > 0.05 && quiet < loud * 0.05, "repeat {loud} vs between {quiet}");
     }
 }

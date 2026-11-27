@@ -372,7 +372,16 @@ pub fn sync(app: &mut App) {
     }
     // With RELEASE FX > Unit Number 1 the one RELEASE FX is the master's (FX1's panel).
     let master_release = app.prefs.fx.effect.release_units == 1;
-    let stop = {
+    // (The rack's delay lines are made before its lock is taken: the audio thread waits only a
+    // quarter of a millisecond for that lock, and gives its buffer up after that.)
+    if fx::RACK.lock().is_none() {
+        let made = Box::new(fx::Rack::new());
+        let mut g = fx::RACK.lock();
+        if g.is_none() {
+            *g = Some(made);
+        }
+    }
+    let (stop, needs) = {
         let mut g = fx::RACK.lock();
         let rack = g.get_or_insert_with(|| Box::new(fx::Rack::new()));
         rack.enabled = on;
@@ -400,13 +409,16 @@ pub fn sync(app: &mut App) {
             rack.pad_quantize[d] = quantize[d];
         }
         rack.pad_set = pad_sets;
-        rack.prepare_rev();
-        if merge || rack.merge.is_some() {
-            crate::mfx::sync(app, rack, &bpm)
-        } else {
-            Vec::new()
-        }
+        // (Which slots lack a core for their effect; the cores are made below, unlocked.)
+        let needs = rack.rev_needs();
+        let stop = if merge || rack.merge.is_some() { crate::mfx::sync(app, rack, &bpm) } else { Vec::new() };
+        (stop, needs)
     };
+    if !needs.is_empty() {
+        let made: Vec<_> = needs.into_iter().map(|n| (n, fx::NewCores::make(n.5, n.4))).collect();
+        let replaced = fx::RACK.lock().as_mut().map(|rack| rack.rev_install(made));
+        drop(replaced);
+    }
     // MERGE FX has dropped: "Stop playing the operating deck after MERGE FX finishes".
     for d in stop {
         if (d as u8) < app.deck_count() {

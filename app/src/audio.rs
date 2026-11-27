@@ -826,7 +826,7 @@ fn mix_sampler(out: &mut [f32], cue: &mut [f32], channels: usize, rate: u32, rac
     if channels != 2 {
         return;
     }
-    if let Some(mut g) = lock_for_audio(&crate::sampler::SAMPLER) {
+    if let Some(mut g) = lock_for_audio(&crate::sampler::SAMPLER, 0) {
         if let Some(e) = g.as_deref_mut() {
             let fx = rack.filter(|r| r.sampler_in_use());
             e.direct = fx.is_none();
@@ -1045,7 +1045,10 @@ pub static AUDIO_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// a single `try_lock` loses now and then, and losing means a whole buffer of silence: an
 /// audible click. Waiting out such a hold costs far less than a buffer, so the callback spins
 /// for it, and gives up only after a quarter of a millisecond (something is then really wrong).
-fn lock_for_audio<T>(m: &Mutex<T>) -> Option<parking_lot::MutexGuard<'_, T>> {
+/// (PREPDECK_BENCH: buffers given up, by lock: 0 the sampler, 1 a deck, 2 the effects rack.)
+pub static AUDIO_DROPPED_AT: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn lock_for_audio<T>(m: &Mutex<T>, site: usize) -> Option<parking_lot::MutexGuard<'_, T>> {
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(g) = m.try_lock() {
         return Some(g);
@@ -1061,6 +1064,7 @@ fn lock_for_audio<T>(m: &Mutex<T>) -> Option<parking_lot::MutexGuard<'_, T>> {
         }
         if t.elapsed() > std::time::Duration::from_micros(250) {
             AUDIO_DROPPED.fetch_add(1, Relaxed);
+            AUDIO_DROPPED_AT[site.min(2)].fetch_add(1, Relaxed);
             return None;
         }
     }
@@ -1126,7 +1130,7 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     // read here where all positions belong to the same instant.
     let mut guards: [Option<parking_lot::MutexGuard<'_, PlayState>>; 4] = [None, None, None, None];
     for (g, st) in guards.iter_mut().zip(states.iter()) {
-        *g = lock_for_audio(st);
+        *g = lock_for_audio(st, 1);
     }
     // MIX POINT LINK: a linked deck starts here, on the block its start position falls in.
     crate::mpl::pre_render(&mut guards);
@@ -1178,7 +1182,7 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     // assigned to it (after its faders, as in rekordbox), then mixed; the master's effects
     // take the mix. Otherwise the decks go straight into the output.
     // (Waited for like the decks' state: the interface holds it only to copy the settings.)
-    let mut rack = lock_for_audio(&crate::fx::RACK);
+    let mut rack = lock_for_audio(&crate::fx::RACK, 2);
     match rack.as_deref_mut().and_then(|r| r.as_deref_mut()).filter(|r| r.active() && channels == 2) {
         Some(rack) => {
             rack.beat = [None; crate::fx::CHANNELS];
