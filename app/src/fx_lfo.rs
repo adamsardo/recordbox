@@ -84,6 +84,10 @@ impl Sf {
 
     /// `onSamplingRateChanged` 0x10297ae08.
     pub fn set_rate(&mut self, rate: f32) {
+        // (Only a change of rate re-times the line: rekordbox calls this when the rate changes.)
+        if rate == self.rate {
+            return;
+        }
         self.rate = rate;
         let n = (frames_of(self.ms, rate) as i32).max(1);
         if self.on {

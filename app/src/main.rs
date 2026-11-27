@@ -27,6 +27,7 @@ mod fx;
 mod fx_core;
 mod fx_lfo;
 mod fx_roll;
+mod fx_sweep;
 mod fx_rev;
 mod mfx;
 mod icons;

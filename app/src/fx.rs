@@ -745,6 +745,17 @@ pub fn flanger_gain(k: f32, neg: bool) -> f32 {
     }
 }
 
+/// PHASER's version of that level (`SingleBeatFxPhaser::updateParameter` 0x102a0d14c): with the
+/// button, 1 - 1.0875 r under 0.1, 0.89125 up to 0.5, then 1.1515 - 0.52059 r.
+pub fn phaser_gain(k: f32, neg: bool) -> f32 {
+    if neg {
+        let r = recommend_value(k);
+        if r < 0.1 { 1.0 - 1.0875 * r } else if r < 0.5 { 0.89125 } else { 1.1515 - 0.52059 * r }
+    } else {
+        flanger_gain(k, false)
+    }
+}
+
 /// Single REVERB's ROOM SIZE (`SingleBeatFxReverb::updateParameter`): the percent value, 1 .. 50
 /// across the left half, 50 in the centre, 50 .. 100 across the right.
 pub fn reverb_room(k: f32) -> i32 {
@@ -1252,6 +1263,13 @@ pub(crate) struct Slot {
     tq: crate::fx_lfo::Quant,
     trans: crate::fx_lfo::TransFx,
     pan: crate::fx_lfo::PanFx,
+    /// FILTER (`BeatFxFilter` on four LFOs) and PHASER (`BeatFxPhaser` on two), with their
+    /// gates and cores (`crate::fx_sweep`).
+    bf: crate::fx_sweep::BeatFilter,
+    bp: crate::fx_sweep::BeatPhaser,
+    /// The echoes' time as the beat quantizer last gave it (`setEffectBeatTimeWithPlayHead`,
+    /// ms; 0 = not yet).
+    qms: f32,
 }
 
 /// The beat quantizer's calls for the echo family over one buffer: the stretches between
@@ -1333,7 +1351,7 @@ impl Slot {
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0) }
+        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0 }
     }
 
     fn clear(&mut self) {
@@ -1387,6 +1405,7 @@ impl Slot {
         self.ifl[0].reset(0, 0);
         self.ifl[1].reset(0, 0);
         self.fl = FL_INIT;
+        self.qms = 0.0;
         // (A new effect is made selected: its LFOs start over.)
         self.tq = crate::fx_lfo::Quant::new();
         self.tq.slip = self.kind == Kind::SlipRoll;
@@ -1709,6 +1728,10 @@ impl Slot {
             self.mob.prepare(r);
             self.trans.set_rate(r);
             self.pan.trans.set_rate(r);
+            if matches!(self.kind, Kind::Filter | Kind::Phaser) {
+                // (FILTER / PHASER are made again at the new rate.)
+                self.fresh = false;
+            }
         }
         let bpm = bpm.clamp(20.0, 1000.0);
         let beat_secs = 60.0 / bpm;
@@ -1750,6 +1773,28 @@ impl Slot {
         let delay_pan = if multi || !matches!(kind, Delay | RevDelay) { None } else { delay_pan_beats(k1) };
         // SPIRAL UP / DOWN's laws (main knob, beat).
         let rmx = rmx_spiral_law(level, kind == SpiralDown, p.on, (beat_secs * 1000.0).clamp(10.0, 3990.0));
+        // The beat quantizer's calls for this buffer (`FxQuantizeManager::processQuantizeEffect`)
+        // for the effects that take them here: the echoes, FLANGER, FILTER, PHASER.
+        let echo_fam = matches!(kind, Delay | RevDelay | Echo | LowCutEcho | PingPong | UpEcho | DownEcho | PitchEcho);
+        let mut sync = EchoSync::new(kind == RevDelay);
+        if echo_fam || matches!(kind, Flanger | Filter | Phaser) {
+            let mut q = self.tq;
+            q.process(&mut sync, beat, bpm, rate, frames, if down { -beats } else { beats }, p.on, |s, at, len| s.seg(at, len));
+            self.tq = q;
+        }
+        // The echoes run at the time the quantizer gives them (`setEffectBeatTimeWithPlayHead`:
+        // whole frames of the beat value at the tempo of that restart), taken at each restart:
+        // a new beat value or tempo reaches them at the next one. Here the time at the buffer's
+        // start; a later restart in the buffer re-times them at its frame.
+        if echo_fam && sync.n > 0 && sync.at[0] == 0 && sync.beat_ms[0] > 0.0 {
+            self.qms = sync.beat_ms[0];
+        }
+        let q_secs = if echo_fam && self.qms > 0.0 { self.qms * 0.001 } else { secs };
+        if echo_fam {
+            if let Some(i) = (0..sync.n).rev().find(|&i| sync.beat_ms[i] > 0.0) {
+                self.qms = sync.beat_ms[i];
+            }
+        }
         // Time the delay line runs at (rekordbox: 1 ms .. 4 s; SPIRAL 10 ms .. 3.99 s).
         let echo_secs = match kind {
             VinylBrake => vinyl_echo_beats(if multi { 0.5 } else { k2 }).unwrap_or(1.0) * beat_secs,
@@ -1759,7 +1804,7 @@ impl Slot {
             SpiralUp | SpiralDown => rmx.1 * 0.001,
             Helix => if multi { secs } else { helix_time(k1, secs * 1000.0) * 0.001 },
             Spiral => secs.clamp(0.010, 3.99),
-            _ => secs,
+            _ => q_secs,
         };
         let want_time = (echo_secs.min(4.0) * r).min((DELAY_LEN - 2) as f32).min(if matches!(kind, SpiralUp | SpiralDown) { (AUX_LEN - 4) as f32 } else { f32::MAX });
         // SPIRAL's read point moves as rekordbox's `SpiralBuffer` moves it (a new beat value
@@ -1921,7 +1966,7 @@ impl Slot {
             Flanger | Phaser => {
                 mix = quarter_mix(if multi { level } else { recommend_value(level) });
                 if !multi {
-                    let g = flanger_gain(k1, b1);
+                    let g = if kind == Phaser { phaser_gain(k1, b1) } else { flanger_gain(k1, b1) };
                     mix = (mix.0 * g, mix.1 * g);
                 }
             }
@@ -1998,18 +2043,14 @@ impl Slot {
         // at least 10 ms), its feedback, which sides run themselves (status not on; single REV
         // DELAY: also the side with the longer time), and the restarts the beat quantizer
         // gives this buffer.
-        let rv_ms = if kind == RevDelay { [t_ms * e.ml, t_ms * e.mr] } else { [(t_ms * e.ml).max(10.0), (t_ms * e.mr).max(10.0)] };
+        let rv_times = |ms: f32| { let t = ms.clamp(1.0, 4000.0); if kind == RevDelay { [t * e.ml, t * e.mr] } else { [(t * e.ml).max(10.0), (t * e.mr).max(10.0)] } };
+        let rv_ms = rv_times(t_ms);
         let rv_fb = if kind == RevDelay { [0.0; 2] } else { [e.fb; 2] };
         let rs = !p.on;
         let rv_self = if kind == RevDelay && !multi { [rs || lr_zone >= 5, rs || lr_zone <= 3] } else { [rs; 2] };
         let rv_shift = e.ratio - 1.0;
-        let mut sync = EchoSync::new(kind == RevDelay);
-        if revc.is_some() || kind == Flanger {
-            let mut q = self.tq;
-            q.process(&mut sync, beat, bpm, rate, frames, if down { -beats } else { beats }, p.on, |s, at, len| s.seg(at, len));
-            self.tq = q;
-        }
         let mut si = 0usize;
+        let mut dsi = 0usize;
         let (dry, wet) = mix;
         // LOW CUT / HI CUT: the effect is not given those bands (LOW CUT ECHO never gets the
         // lows). The echoes simply do not repeat them; the others pass them through.
@@ -2122,8 +2163,20 @@ impl Slot {
         let ph_fb = if multi { mod_fb(level) } else { flanger_fb(k1, b1) };
         // Beat FX FILTER: resonance gain, the LFO's reach and the type.
         let reso = if multi { filter_reso(level) } else { filter_single_reso(k1) };
-        // (LFO AMP: 1 - the distance from the centre on the left, the whole travel on the right.)
-        let (flt_span, flt_hp, flt_inv) = if multi { (1.0, false, false) } else { (if k2 < 0.48627 { 1.0 - through_value(k2) } else { 1.0 }, b1, b2) };
+        // FILTER / PHASER (`crate::fx_sweep`): made (the constructor and `onCalledMakeSelected`)
+        // when the effect is new; FILTER's parameters depend on its main LFO's period, so they
+        // are worked out again for each stretch.
+        let flt_par = |bf: &crate::fx_sweep::BeatFilter| if multi { crate::fx_sweep::FilterPar::multi(reso) } else { crate::fx_sweep::FilterPar::single(reso, k2, bpm, bf.lfo[0].period_ms, b1, b2) };
+        let ph_par = crate::fx_sweep::PhaserPar::new(ph_fb, stages, !multi && b2);
+        if made && kind == Filter {
+            self.bf = crate::fx_sweep::BeatFilter::new(r);
+            let fp = flt_par(&self.bf);
+            self.bf.make_selected(&fp);
+        }
+        if made && kind == Phaser {
+            self.bp = crate::fx_sweep::BeatPhaser::new(r);
+            self.bp.make_selected(&ph_par);
+        }
         // The FX+ echoes: the main knob in 8-bit steps, ECHO MIX and MOD.
         let (fxp_echo, fxp_mod) = if multi { (0.5, 0.0) } else { (k1, k2) };
         let fxp_depth = if fxp_mod < 0.015625 { 0.0 } else if fxp_mod >= 0.15625 { 50.0 } else { 1.3943 * fxp_mod * 255.0 - 5.5556 };
@@ -2216,6 +2269,19 @@ impl Slot {
             if spiral_kind {
                 self.time = self.spiral.next();
             } else if dm_kind {
+                // (A restart later in the buffer with a new time: `DelayModule::setDelayTime`.)
+                while dsi < sync.n && sync.at[dsi] as usize <= n {
+                    let ms = sync.beat_ms[dsi];
+                    if ms > 0.0 && sync.at[dsi] > 0 {
+                        let wi = (ms.clamp(1.0, 4000.0) * 0.001 * r).trunc().clamp(1.0, (DELAY_LEN - 2) as f32);
+                        let cmp = if self.dpend > 0.0 { self.dpend } else { self.time };
+                        if (wi - cmp).abs() >= 0.5 {
+                            self.dpend = wi;
+                            self.dg.iter_mut().for_each(|g| g.set(0.0));
+                        }
+                    }
+                    dsi += 1;
+                }
                 self.gv = [self.dg[0].next(), self.dg[1].next()];
                 if self.dpend > 0.0 {
                     if self.dg.iter().all(|g| g.settled() && g.cur <= 0.0) {
@@ -2244,7 +2310,6 @@ impl Slot {
                     self.odd = !self.odd;
                 }
             }
-            let tri = 1.0 - (2.0 * self.lfo - 1.0).abs(); // 0..1..0
             let m = level * g;
             let (il, ir) = (dl * target, dr * target);
             // The dry sound (whole for the echoes) and the wet sound, mixed by the effect's
@@ -2270,6 +2335,7 @@ impl Slot {
                             } else if sync.play[si] {
                                 f.play_head();
                             }
+                            let rv_ms = if sync.beat_ms[si] > 0.0 { rv_times(sync.beat_ms[si]) } else { rv_ms };
                             f.begin_call(sync.len[si] as usize, frames, rv_ms, rv_fb, rv_self, rv_shift);
                             si += 1;
                         }
@@ -2395,52 +2461,25 @@ impl Slot {
                     mixed(dl * lgain[i], dr * rgain[i])
                 }
                 Filter => {
-                    // rekordbox's LFO filter: three first-order sections at the swept cutoff,
-                    // and a resonance path (three more, band-limiting the result) fed back
-                    // and added at the resonance gain. A triangle LFO turns once per beat
-                    // value. TONE: the high-pass; PHASE: the LFO turned over.
-                    let t = (if flt_inv { 1.0 - tri } else { tri }) * flt_span;
-                    if self.lfb_made != (rate, flt_hp) {
-                        self.lfb_made = (rate, flt_hp);
-                        self.lfb = lfo_filter_tables(flt_hp, rate);
+                    // `BeatFxFilter::processEffectConcrete` 0x1029cf584 (`crate::fx_sweep`): the
+                    // quantizer's calls before this stretch, the parameters, a restart shutting
+                    // the output gate; each side's place in the sweep is its main LFO (a triangle
+                    // over the beat value, 0 .. 1) plus its second one (single mode's LFO AMP),
+                    // through `LFOFilterCore`'s 129-step tables: three first-order sections and a
+                    // resonance path of three more. TONE (high-pass) and PHASE (the LFOs turned
+                    // over) wait for the gate to shut, like the jump to the head.
+                    while si < sync.n && sync.at[si] as usize == n {
+                        self.bf.calls(sync.until_ms[si], sync.beat_ms[si], sync.play[si] || sync.on[si]);
+                        let fp = flt_par(&self.bf);
+                        self.bf.update(&fp);
+                        self.bf.begin();
+                        si += 1;
                     }
-                    // `LFOFilterCore::processEffect` 0x1029d6688: the LFO's place in 129 steps,
-                    // each section's b0 read between two steps (clamped to 0 .. 1); first-order
-                    // sections derive b1 and a1 from it (low-pass b1 = b0, a1 = 2 b0 - 1; high-pass
-                    // b1 = -b0, a1 = 1 - 2 b0).
-                    let pos = (t * 128.0).clamp(0.0, 128.0);
-                    let i0 = pos.trunc() as usize;
-                    let i1 = if i0 >= 128 { 128 } else { i0 + 1 };
-                    let fr = pos - pos.trunc();
-                    let b0 = |tab: &[f32; 129]| (tab[i0] + (tab[i1] - tab[i0]) * fr).clamp(0.0, 1.0);
-                    let (mb, rb) = (b0(&self.lfb[0]), b0(&self.lfb[1]));
-                    let lpc = |b: f32| [b, b, 2.0 * b - 1.0];
-                    let hpc = |b: f32| [b, -b, 1.0 - 2.0 * b];
-                    let (main, res) = if flt_hp { (hpc(mb), lpc(rb)) } else { (lpc(mb), hpc(rb)) };
-                    // The resonance path's level in the output: 0.8 for the high-pass, 0.4 for
-                    // the low-pass at 44.1 / 48 kHz (0.8 at 96 kHz, none at other rates).
-                    let a7 = if flt_hp { 0.8 } else { match rate { 44100 | 48000 => 0.4, 96000 => 0.8, _ => 0.0 } };
-                    let rg = reso * if t < 0.1 { 0.0001 } else if t < 0.2 { (1.0 - 0.9999 * (2.0 - 10.0 * t).powi(3)).clamp(0.0001, 1.0) } else { 1.0 };
-                    let mut o = [0.0f32; 2];
-                    for (c, x) in [dl, dr].into_iter().enumerate() {
-                        let z = &mut self.lf[c];
-                        let mut y = x + rg * z[12];
-                        for k in 0..3 {
-                            let out = main[0] * y + main[1] * z[k * 2] - main[2] * z[k * 2 + 1];
-                            z[k * 2] = y;
-                            z[k * 2 + 1] = out;
-                            y = out;
-                        }
-                        let mut q = y;
-                        for k in 3..6 {
-                            let out = res[0] * q + res[1] * z[k * 2] - res[2] * z[k * 2 + 1];
-                            z[k * 2] = q;
-                            z[k * 2 + 1] = out;
-                            q = out;
-                        }
-                        z[12] = q;
-                        o[c] = y + rg * a7 * q;
+                    if self.lfb_made != (rate, self.bf.hp) {
+                        self.lfb_made = (rate, self.bf.hp);
+                        self.lfb = lfo_filter_tables(self.bf.hp, rate);
                     }
+                    let o = self.bf.frame([dl, dr], &self.lfb, rate);
                     mixed(o[0], o[1])
                 }
                 Flanger => {
@@ -2494,29 +2533,19 @@ impl Slot {
                     mixed(o[0], o[1])
                 }
                 Phaser => {
-                    // First-order all-pass stages (six in multi mode), their centre swept by
-                    // a triangle LFO: 300 Hz .. 8.06 kHz in multi mode (rekordbox's bottom and
-                    // peak), 100 Hz .. 15 kHz in single mode (its limits).
-                    let t = if !multi && b2 { 1.0 - tri } else { tri };
-                    // (`PhaserCore::processEffect`: the pre-warped cutoff moves from the
-                    // bottom to the peak with the cube of the LFO.)
-                    let (fb_, fp_) = if multi { (299.96f32, 8058.92f32) } else { (100.0, 15000.0) };
-                    let warp = |f: f32| (PI * (f / r).min(0.49)).tan();
-                    let tn = warp(fb_) + t * t * t * (warp(fp_) - warp(fb_));
-                    let a = (tn - 1.0) / (tn + 1.0);
-                    let mut o = [0.0f32; 2];
-                    for (c, x) in [dl, dr].into_iter().enumerate() {
-                        let mut y = x + self.fb[c] * ph_fb;
-                        for k in 0..if c == 0 { stages.0 } else { stages.1 } {
-                            let z = self.ap[c][k];
-                            let out = a * y + z;
-                            self.ap[c][k] = y - a * out;
-                            y = out;
-                        }
-                        let y = sat(y);
-                        self.fb[c] = y;
-                        o[c] = y;
+                    // `BeatFxPhaser::processEffectConcrete` 0x102a0c9d8 (`crate::fx_sweep`): as
+                    // FILTER, with one triangle a side (the heads half way: a restart starts at
+                    // the sweep's top) and a new stage count also waiting for the gate.
+                    // `PhaserCore::processEffect`: 299.96 Hz .. 8058.92 Hz pre-warped, moved with
+                    // the cube of the LFO; first-order all-pass stages; the output fed back
+                    // through a one-pole, eased off at the bottom of the sweep.
+                    while si < sync.n && sync.at[si] as usize == n {
+                        self.bp.calls(sync.until_ms[si], sync.beat_ms[si], sync.play[si] || sync.on[si]);
+                        self.bp.update(&ph_par);
+                        self.bp.begin(sync.len[si] as usize);
+                        si += 1;
                     }
+                    let o = self.bp.frame([dl, dr]);
                     mixed(o[0], o[1])
                 }
                 Roll | RevRoll | SlipRoll => {
@@ -4206,6 +4235,31 @@ mod tests {
         let shut = rms(&x[11700 * 2..12300 * 2]);
         assert!(open > 0.25, "{open}");
         assert!(20.0 * (shut / open).log10() < -45.0, "{}", 20.0 * (shut / open).log10());
+    }
+
+    #[test]
+    fn echo_takes_its_time_from_the_quantizer_restarts() {
+        // `SingleBeatFxEcho::setEffectBeatTimeWithPlayHead` stores the quantizer's time: ECHO
+        // at 1 beat started on beat 8 at 120 BPM runs 24000 frames; a tempo change to 125 BPM
+        // half a beat later leaves it there until the restart on beat 9, which gives
+        // round(60 x 48000 / 125) = 23040 frames.
+        let mut s = Slot::new();
+        let ring = Ring::new();
+        let p = SlotParams { on: true, level: 0.5, value: 1.0, ..SlotParams::new(Kind::Echo) };
+        let mut beat = 8.0f64;
+        let mut bpm = 120.0f32;
+        let mut seen = Vec::new();
+        for i in 0..100 {
+            if i == 25 {
+                bpm = 125.0;
+            }
+            let mut x = vec![0.0f32; 480 * 2];
+            s.process(&p, bpm, &mut x, 48000, &ring, Some(beat), true);
+            seen.push((beat, s.time, s.dpend));
+            beat += 480.0 * bpm as f64 / (60.0 * 48000.0);
+        }
+        assert!(seen.iter().filter(|v| v.0 < 8.99).all(|v| v.1 == 24000.0), "{:?}", &seen[..5]);
+        assert!(seen.iter().filter(|v| v.0 > 9.05).all(|v| v.1 == 23040.0 || v.2 == 23040.0), "{:?}", seen.iter().find(|v| v.0 > 9.05));
     }
 
     #[test]
