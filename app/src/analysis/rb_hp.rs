@@ -7,7 +7,14 @@
 //! 2. `madmom::analyze` (0x10230a820) runs madmom's downbeat network (`net`) on a 60 s window from
 //!    that offset (the whole track when the tempo may change), decodes it with a bar-pointer DBN
 //!    (`dbn`) and turns the beat times into a beat list (`madmom::get_beat_list`, `get_bpm`);
-//! 3. `Analyzer::analyzeFocus` merges that list with the legacy analysis into the final grid.
+//! 3. `Analyzer::analyzeFocus` merges that list with the legacy analysis into the final grid
+//!    (`focus`, its bar-phase vote in `vote`), and `convertToMicrosec` stores every beat
+//!    (`grid_from_list`).
+//!
+//! The legacy analysis is `legacy` (BeatAnalyzer_2_0 as far as it matters here). Not ported: the
+//! tempo-change path (Dynamic, and Auto when 2_0 judges the tempo varied) and rekordbox's
+//! resampling for rates other than 44.1 / 48 kHz; those keep the standard grid and say why
+//! (`take_notes`).
 
 #[path = "rb_hp_net.rs"]
 pub mod net;
@@ -18,6 +25,10 @@ pub mod uba;
 
 #[path = "rb_hp_focus.rs"]
 pub mod focus;
+#[path = "rb_hp_vote.rs"]
+pub mod vote;
+#[path = "rb_hp_legacy.rs"]
+pub mod legacy;
 
 use crate::model::BeatGrid;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,9 +40,10 @@ pub const MODE_AUTO: u8 = 2;
 pub const MODE_NORMAL: u8 = 3;
 pub const MODE_DYNAMIC: u8 = 4;
 
-/// The legacy analysis rekordbox runs first (`BeatAnalyzer_2_0`): its BPM and beat positions.
-/// recordbox supplies its own estimate (see `legacy_from_grid`); rekordbox only uses the BPM for
-/// its octave and integer-snap rules and the beats to pick the 60 s window.
+/// The legacy analysis rekordbox runs first (`BeatAnalyzer_2_0`): its BPM and beat positions
+/// (`legacy::analyze`; `legacy_from_grid` makes a stand-in from the standard grid when that
+/// gives nothing, or with PREPDECK_HP_LEGACY=standard). rekordbox uses the BPM for its octave
+/// and integer-snap rules and the beats to pick the 60 s window.
 #[derive(Clone, Debug)]
 pub struct Legacy {
     /// BPM as the legacy library stores it (float, the same value x100 rounded is `BA_GetBpm`).
@@ -312,20 +324,36 @@ pub struct HpOutcome {
     pub window: (usize, usize),
 }
 
+/// Why the high precision analysis gave no result (the caller then keeps the standard one).
+pub const NOT_44_48: &str = "the audio is not at 44.1 or 48 kHz (rekordbox's resampling for other rates is not built)";
+pub const NO_MODELS: &str = "rekordbox's beat models were not found";
+pub const NO_TEMPO_CHANGE: &str = "the tempo-change analysis (Dynamic) of high precision is not built yet";
+pub const NO_GRID: &str = "the standard analysis found no beats to start from";
+pub const NO_NET_BEATS: &str = "the network found no beats";
+
 /// rekordbox's high precision analysis of decoded audio. `legacy` is the standard analysis'
-/// tempo and first beat (recordbox's own, standing in for `BeatAnalyzer_2_0`). Returns None
-/// when the models are not installed or the audio is not 44.1 / 48 kHz.
-pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) -> Option<HpOutcome> {
+/// tempo and first beat, used only when `legacy::analyze` gives nothing. The error says
+/// why there is no result.
+pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) -> Result<HpOutcome, &'static str> {
     let sr = dec.sr;
     if sr != 44100 && sr != 48000 {
-        return None;
+        return Err(NOT_44_48);
     }
     if !available() {
-        return None;
+        return Err(NO_MODELS);
     }
     let total = dec.frames();
-    let (std_bpm, std_t0, std_beat) = legacy;
-    let legacy = legacy_from_grid(legacy.0, legacy.1, sr, total)?;
+    // the legacy analysis (BeatAnalyzer_2_0, `legacy.rs`); PREPDECK_HP_LEGACY=standard uses
+    // recordbox's standard grid in its place (as before)
+    let leg2 = if std::env::var("PREPDECK_HP_LEGACY").as_deref() == Ok("standard") { None } else { legacy::analyze(&dec.samples, sr, mode == MODE_DYNAMIC) };
+    let (legacy, bpm100) = match leg2 {
+        Some(l) => (Legacy { bpm: l.bpm, beats: l.beats.iter().map(|b| b.pos).collect() }, l.bpm100()),
+        None => {
+            let l = legacy_from_grid(legacy.0, legacy.1, sr, total).ok_or(NO_GRID)?;
+            let b = (l.bpm as f64 * 100.0).round() as i32;
+            (l, b)
+        }
+    };
     let pcm16 = uba::to_i16(&dec.samples);
     let env = Uba::new(sr as i32, &pcm16);
     let offset = get_offset_calc(&env, sr as i32, &legacy);
@@ -333,54 +361,127 @@ pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) ->
     if hendou {
         // The tempo-change path (model7 over the whole track in chunks, the gap filling after
         // it and analyzeFocus' second half) is not ported: the caller keeps its own grid.
-        return None;
+        return Err(NO_TEMPO_CHANGE);
     }
     let (start, len) = madmom_window(total as i64, sr as i64, offset as i64, hendou);
-    let (list, mbpm, _) = madmom_stage(&dec.samples, sr, start as usize, len as usize, hendou)?;
-    let bpm100 = (legacy.bpm as f64 * 100.0).round() as i32;
+    let (list, mbpm, _) = madmom_stage(&dec.samples, sr, start as usize, len as usize, hendou).ok_or(NO_MODELS)?;
     let ml: Vec<(i32, i32, i32)> = list.iter().map(|b| (b.pos as i32, b.num_bar, b.bpm)).collect();
     let input = focus::FocusInput { sr: sr as i32, total: total as i32, offset, hendou, legacy_bpm100: bpm100, legacy_count: legacy.beats.len() as i32, madmom: &ml, madmom_bpm: mbpm as i32 };
     // a reading past the end of a list in a branch not yet seen must not take the analysis down
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| focus::analyze_focus(&env, &input))).ok().flatten()?;
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| focus::analyze_focus(&env, &input))).unwrap_or(Err(focus::OUT_OF_RANGE))?;
     if out.beats.is_empty() {
-        return None;
+        return Err(NO_NET_BEATS);
     }
-    let mut beats = out.beats;
-    // The bar-phase pass that follows UnitBeatAdjust in analyzeFocus (0x10116c050; decompiled
-    // lines 2250-5222 of the constant path: band integrals at every beat, intro / outro onsets,
-    // ranking and a vote over beat numbers) is not ported. The bar phase is taken from
-    // recordbox's own estimate instead: the number of its beat nearest to the first beat.
-    // PREPDECK_HP_BARPHASE=focus keeps the numbering the port has before that pass.
-    if std::env::var("PREPDECK_HP_BARPHASE").as_deref() != Ok("focus") && std_bpm > 0.0 {
-        let t = beats[0].0 as f64 / sr as f64;
-        let k = ((t - std_t0) / (60.0 / std_bpm)).round() as i64;
-        let n0 = (k + std_beat as i64 - 1).rem_euclid(4);
-        for (i, b) in beats.iter_mut().enumerate() {
-            b.1 = ((n0 + i as i64) % 4 + 1) as i32;
+    let beats = out.beats;
+    let bpm = out.bpm100 as f64 / 100.0;
+    let grid = grid_from_list(&beats, sr);
+    Ok(HpOutcome { bpm, grid, beats, offset, window: (start as usize, len as usize) })
+}
+
+/// Microseconds of a beat position as `AnalyzeJobBeatDetector::convertToMicrosec` (0x102328b20)
+/// computes them: `1000000 * pos / sr` in integers; the analysis file keeps `us / 1000` (PQTZ).
+pub fn beat_us(pos: i32, sr: u32) -> i64 {
+    1_000_000i64 * pos as i64 / sr as i64
+}
+
+/// The grid for rekordbox's beat list (position, beat number, tempo x 100 per beat): rekordbox
+/// stores every beat, recordbox a grid. An anchor at the first beat and wherever the running
+/// grid would give a beat another whole millisecond (or the listed tempo changes), so every
+/// beat the export writes (`BeatGrid::beats`, ms = round(t * 1e6) / 1000) has rekordbox's
+/// millisecond, beat number and tempo. Anchors sit on the beats' own microseconds.
+pub fn grid_from_list(beats: &[(i32, i32, i32)], sr: u32) -> BeatGrid {
+    let mut anchors: Vec<crate::model::GridAnchor> = vec![];
+    let ms_of = |t: f64| ((t.max(0.0) * 1e6).round() as i64) / 1000;
+    // `pt`: where `BeatGrid::beats` puts this beat (it adds the period beat by beat)
+    let (mut pt, mut a_bpm100, mut pn) = (0f64, 0i32, 0i32);
+    for (j, &(pos, num, bpm100)) in beats.iter().enumerate() {
+        let us = beat_us(pos, sr);
+        let t = us as f64 / 1e6;
+        let num = num.clamp(1, 4);
+        if j > 0 {
+            pt += 60.0 / (a_bpm100 as f64 / 100.0).max(1.0);
+            pn = pn % 4 + 1;
+        }
+        let fits = j > 0 && bpm100 == a_bpm100 && bpm100 > 0 && num == pn && ms_of(pt) == us / 1000;
+        if !fits {
+            let bpm = if bpm100 > 0 { bpm100 as f64 / 100.0 } else { anchors.last().map(|a| a.bpm).unwrap_or(120.0) };
+            anchors.push(crate::model::GridAnchor { time: t, bpm, beat: num as u8 });
+            (pt, a_bpm100, pn) = (t, if bpm100 > 0 { bpm100 } else { (bpm * 100.0).round() as i32 }, num);
         }
     }
-    let first = beats[0];
-    let bpm = out.bpm100 as f64 / 100.0;
-    let t0 = first.0 as f64 / sr as f64;
-    let grid = BeatGrid::constant(t0, bpm, first.1.clamp(1, 4) as u8);
-    Some(HpOutcome { bpm, grid, beats, offset, window: (start as usize, len as usize) })
+    BeatGrid { anchors }
 }
 
 /// The analysis mode the next analyses use: 0 = high precision off, 2 / 3 / 4 = Auto / Normal /
 /// Dynamic. Set from the preferences (`App::analysis_settings`); `PREPDECK_HP_MODE` overrides it.
 static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Preferences -> mode: high precision on gives Normal (3) or Dynamic (4) as the Analysis Mode
-/// says; rekordbox's Auto (2) is used for Normal, as its default.
-pub fn set_mode(high_precision: bool, analysis_mode: u8) {
+/// rekordbox's setting `trackHiPrecisionBeatAnalysisMode` (the Analysis Mode while high precision
+/// is on; `AnalysisTrackAnalysisModeComponent2`, 0x100505568): 0 Normal, 1 Dynamic, 2 Auto. Its
+/// getter defaults to 2. Kept apart from the Analysis Mode used with high precision off, as
+/// rekordbox does (`trackAnalysisMode`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct HpPrefs {
+    pub mode: u8,
+}
+
+impl Default for HpPrefs {
+    fn default() -> Self {
+        HpPrefs { mode: 2 }
+    }
+}
+
+/// The combo box items (`ItemData2` table built in `_GLOBAL__sub_I_AnalysisTrackAnalysisModeComponent2.cpp`
+/// 0x100507148): name, setting value, item id. "Auto " (with its space, as the key in the
+/// locale files) is only listed while high precision is on.
+pub const MODE_ITEMS: [(&str, u8, i32); 3] = [("Normal", 0, 1), ("Dynamic", 1, 2), ("Auto", 2, 3)];
+
+/// The tooltip of "Track Analysis Mode" (built in `lookAndFeelChanged` 0x100505e04).
+pub const MODE_TOOLTIP: &str = "When selecting auto while using high precision BeatGrid analysis, \nautomatically switches to an optimal analysis mode based on the track.\nFor tracks with a constant tempo : Normal\nFor tracks that change tempo : Dynamic";
+
+/// Preferences -> mode (`CBeatAnalyzeThread::analyze` field +14544): high precision off 0, on
+/// 3 / 4 / 2 for its Analysis Mode Normal / Dynamic / Auto.
+pub fn set_mode(high_precision: bool, hp_mode: u8) {
     let m = if !high_precision {
         0
-    } else if analysis_mode == 1 {
-        MODE_DYNAMIC
     } else {
-        MODE_AUTO
+        match hp_mode {
+            0 => MODE_NORMAL,
+            1 => MODE_DYNAMIC,
+            _ => MODE_AUTO,
+        }
     };
     MODE.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reasons the high precision analysis fell back to the standard one since the last
+/// [`take_notes`], with a count each.
+fn notes() -> &'static Mutex<std::collections::BTreeMap<&'static str, usize>> {
+    static N: OnceLock<Mutex<std::collections::BTreeMap<&'static str, usize>>> = OnceLock::new();
+    N.get_or_init(|| Mutex::new(Default::default()))
+}
+
+fn note(why: &'static str) {
+    eprintln!("high precision BeatGrid: {why}; standard analysis used");
+    if let Ok(mut n) = notes().lock() {
+        *n.entry(why).or_insert(0) += 1;
+    }
+}
+
+/// One line per reason for the status line / a toast, e.g. "High precision BeatGrid analysis
+/// was not used for 2 tracks: ...; their standard grid was kept." Empties the list.
+pub fn take_notes() -> Vec<String> {
+    let Ok(mut n) = notes().lock() else { return vec![] };
+    let out = n
+        .iter()
+        .map(|(why, k)| {
+            let what = if *k == 1 { "1 track".to_string() } else { format!("{k} tracks") };
+            format!("High precision BeatGrid analysis was not used for {what}: {why}. The standard beat grid was kept.")
+        })
+        .collect();
+    n.clear();
+    out
 }
 
 pub fn current_mode() -> u8 {
@@ -407,15 +508,18 @@ pub fn dispatch(dec: &crate::audio::Decoded, s: &super::AnalysisSettings, bpm: f
     if mode == 0 || !s.do_grid {
         return (bpm, grid);
     }
-    let Some((first, beat)) = grid.as_ref().and_then(|g| g.anchors.first()).map(|a| (a.time, a.beat)) else { return (bpm, grid) };
+    let Some((first, beat)) = grid.as_ref().and_then(|g| g.anchors.first()).map(|a| (a.time, a.beat)) else {
+        note(NO_GRID);
+        return (bpm, grid);
+    };
     if !available() {
-        eprintln!("high precision BeatGrid: rekordbox's beat models were not found in {}; standard analysis used", net::models_dir().display());
+        note(NO_MODELS);
         return (bpm, grid);
     }
     // "Analyze Track (Dynamic)" / the Dynamic analysis mode ask for the tempo-change path
     let mode = if s.dynamic { MODE_DYNAMIC } else { mode };
     match analyze(dec, mode, (bpm, first, beat)) {
-        Some(o) => {
+        Ok(o) => {
             let mut g = o.grid;
             let mut b = o.bpm;
             // convertToMicrosec: halve or double into the BPM range (constant tempo only)
@@ -430,8 +534,8 @@ pub fn dispatch(dec: &crate::audio::Decoded, s: &super::AnalysisSettings, bpm: f
             }
             (b, Some(g))
         }
-        None => {
-            eprintln!("high precision BeatGrid: not available for this track (mode {mode}); standard analysis used");
+        Err(why) => {
+            note(why);
             (bpm, grid)
         }
     }
@@ -604,14 +708,29 @@ mod stage_tests {
             }
             let Ok(dec) = crate::audio::decode_file(&d.path) else { continue };
             let env = super::uba::Uba::new(dec.sr as i32, &super::uba::to_i16(&dec.samples));
-            let Some((list, mbpm, _)) = super::madmom_stage(&dec.samples, dec.sr, d.win.0, d.win.1, false) else { continue };
-            let ml: Vec<(i32, i32, i32)> = list.iter().map(|b| (b.pos as i32, b.num_bar, b.bpm)).collect();
+            // PREPDECK_HP_USEJ=1: the dump's network beat list (J lines, e.g. one the oracle was
+            // given with RB_MLFILE) instead of running the network
+            let (ml, mbpm): (Vec<(i32, i32, i32)>, f64) = if std::env::var("PREPDECK_HP_USEJ").is_ok() {
+                (d.j.iter().map(|b| (b.0 as i32, b.1, b.2)).collect(), d.j_bpm)
+            } else {
+                let Some((list, mbpm, _)) = super::madmom_stage(&dec.samples, dec.sr, d.win.0, d.win.1, false) else { continue };
+                (list.iter().map(|b| (b.pos as i32, b.num_bar, b.bpm)).collect(), mbpm)
+            };
             let inp = super::focus::FocusInput { sr: dec.sr as i32, total: dec.frames() as i32, offset: d.offset as i32, hendou: false, legacy_bpm100: d.legacy_bpm, legacy_count: d.beat_num, madmom: &ml, madmom_bpm: mbpm as i32 };
-            let Some(out) = super::focus::analyze_focus(&env, &inp) else {
-                eprintln!("  #{k} focus returned nothing");
-                continue;
+            let out = match super::focus::analyze_focus(&env, &inp) {
+                Ok(o) => o,
+                Err(why) => {
+                    eprintln!("  #{k} focus returned nothing: {why}");
+                    continue;
+                }
             };
             n += 1;
+            if let Ok(dir) = std::env::var("PREPDECK_HP_DUMPFOCUS") {
+                // the lists around UnitBeatAdjust in the probe format (pos:interval:number)
+                let fmt = |v: &[super::uba::BeatInfo]| v.iter().map(|b| format!("{}:{}:{}", b.pos, b.interval, b.num)).collect::<Vec<_>>().join(" ");
+                let text = format!("B n={} {}\nA n={} {}\nV {:?}\n", out.before_uba.len(), fmt(&out.before_uba), out.after_uba.len(), fmt(&out.after_uba), out.vote);
+                std::fs::write(format!("{dir}/{k}.focus"), text).unwrap();
+            }
             let mut line = format!("  #{k}");
             for (c, name) in names.iter().enumerate() {
                 let want: Vec<String> = std::fs::read_to_string(format!("{prop}/{k}/csv/{name}")).unwrap_or_default().split("\r\n").filter(|l| !l.is_empty()).map(|l| l.trim_end_matches('\r').to_string()).collect();
@@ -692,6 +811,20 @@ mod stage_tests {
 
 #[cfg(test)]
 mod reference_benchmark {
+    #[repr(C)]
+    struct Rusage([i64; 18]);
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    /// User + system CPU seconds of the whole process (`getrusage(RUSAGE_SELF)`; timeval is
+    /// 16 bytes on macOS: seconds, then microseconds in the low 32 bits).
+    fn process_cpu() -> f64 {
+        let mut r = Rusage([0; 18]);
+        unsafe { getrusage(0, &mut r) };
+        let us = |i: usize| (r.0[i + 1] & 0xffff_ffff) as f64 * 1e-6 + r.0[i] as f64;
+        us(0) + us(2)
+    }
+
     /// End to end against rekordbox's stored high precision grids, exact in rekordbox's own units:
     /// BPM x100, first beat in whole ms (`convertToMicrosec`), beat number of the first beat.
     /// PREPDECK_GT = oracle/rbgrids.tsv; PREPDECK_HP_MODE = 2 | 3 (default 2).
@@ -710,30 +843,74 @@ mod reference_benchmark {
                 (v.len() == 3).then(|| (p.to_string(), (v[0], v[1], v[2])))
             })
             .collect();
+        // PREPDECK_ANLZ_PAIRS (audio path \t rekordbox ANLZ base): also compare every beat the
+        // export would write (PQTZ: beat number, tempo x 100, ms) with rekordbox's stored list.
+        let pairs: std::collections::HashMap<String, String> = std::env::var("PREPDECK_ANLZ_PAIRS")
+            .ok()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| t.lines().filter_map(|l| l.split_once('\t')).map(|(a, b)| (a.to_string(), b.to_string())).collect())
+            .unwrap_or_default();
+        let pqtz_of = |grid: &crate::model::BeatGrid, dur: f64| -> Vec<(u16, u16, u32)> {
+            grid.beats(dur).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (((b.time.max(0.0) * 1e6).round() as u64) / 1000) as u32)).collect()
+        };
+        let beat_stats = std::sync::Mutex::new((0usize, 0usize, 0usize, 0usize, 0usize, 0usize));
+        let wall = std::sync::Mutex::new(Vec::<f64>::new());
         let results = std::sync::Mutex::new(vec![]);
         let threads: usize = std::env::var("PREPDECK_HP_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         let chunks: Vec<_> = rows.chunks(rows.len().div_ceil(threads).max(1)).collect();
         std::thread::scope(|s| {
             for ch in chunks {
                 let results = &results;
+                let (pairs, beat_stats, pqtz_of, wall) = (&pairs, &beat_stats, &pqtz_of, &wall);
                 s.spawn(move || {
                     for (p, (rb, rbpm, rms)) in ch {
                         let Ok(dec) = crate::audio::decode_file(p) else { continue };
-                        let mono = dec.mono();
-                        let t0 = std::time::Instant::now();
-                        let (bpm, grid) = super::super::tempo_and_grid(&mono, dec.sr as f64, 70.0, 180.0);
-                        let t_std = t0.elapsed().as_secs_f64();
-                        let Some(g) = grid else { continue };
-                        let t1 = std::time::Instant::now();
+                        // the standard analysis (rekordbox's BeatAnalyzer_1_0, Normal) and then the high
+                        // precision one; process CPU seconds (all threads), one track at a time with
+                        // PREPDECK_HP_THREADS=1
+                        let c0 = process_cpu();
+                        let std_res = super::super::rb_beat1::tempo_and_grid(&dec.samples, dec.sr, false, 70.0, 180.0);
+                        let t_std = process_cpu() - c0;
+                        let Some((bpm, Some(g))) = std_res else { continue };
+                        let c1 = process_cpu();
+                        let w1 = std::time::Instant::now();
                         let out = super::analyze(&dec, mode, (bpm, g.anchors[0].time, g.anchors[0].beat));
-                        let t_hp = t1.elapsed().as_secs_f64();
-                        let row = match out {
+                        let t_hp = process_cpu() - c1;
+                        wall.lock().unwrap().push(w1.elapsed().as_secs_f64());
+                        if let (Some(o), Some(base)) = (out.as_ref().ok(), pairs.get(p)) {
+                            let secs = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.DAT")));
+                            let want = secs.get("PQTZ").map(|s| crate::export::anlz::pqtz_entries(s)).unwrap_or_default();
+                            if !want.is_empty() {
+                                let dur = dec.duration();
+                                let mine = pqtz_of(&o.grid, dur);
+                                let (p0, n0, _) = o.beats[0];
+                                let plain = crate::model::BeatGrid::constant(p0 as f64 / dec.sr as f64, o.bpm, n0.clamp(1, 4) as u8);
+                                let old = pqtz_of(&plain, dur);
+                                let diff = |v: &[(u16, u16, u32)]| v.iter().zip(&want).filter(|(a, b)| a != b).count() + v.len().abs_diff(want.len());
+                                let (d_new, d_old) = (diff(&mine), diff(&old));
+                                let mut s = beat_stats.lock().unwrap();
+                                s.0 += 1;
+                                s.1 += want.len();
+                                s.2 += (d_new == 0) as usize;
+                                s.3 += d_new;
+                                s.4 += (d_old == 0) as usize;
+                                s.5 += d_old;
+                                if d_new != 0 {
+                                    let first = mine.iter().zip(&want).position(|(a, b)| a != b);
+                                    eprintln!("  beats: {d_new} of {} differ (mine {} beats), first {:?} :: {}", want.len(), mine.len(), first.map(|i| (i, mine[i], want[i])), p.rsplit('/').next().unwrap_or(""));
+                                }
+                            }
+                        }
+                        let row = match out.as_ref().ok() {
                             Some(o) => {
                                 let (pos, num, _) = o.beats[0];
                                 let ms = (1_000_000i64 * pos as i64 / dec.sr as i64) / 1000;
                                 (p.clone(), *rb, *rbpm, *rms, Some(((o.bpm * 100.0).round() as i64, ms, num as i64)), t_std, t_hp)
                             }
-                            None => (p.clone(), *rb, *rbpm, *rms, None, t_std, t_hp),
+                            None => {
+                                eprintln!("  no high precision result ({}) :: {}", out.as_ref().err().copied().unwrap_or(""), p.rsplit('/').next().unwrap_or(""));
+                                (p.clone(), *rb, *rbpm, *rms, None, t_std, t_hp)
+                            }
                         };
                         results.lock().unwrap().push(row);
                     }
@@ -752,7 +929,6 @@ mod reference_benchmark {
             match got {
                 None => {
                     none += 1;
-                    eprintln!("  no high precision result :: {name}");
                 }
                 Some((b, ms, num)) => {
                     let (a, m, u) = (b == rbpm, ms == rms, num == rb);
@@ -767,6 +943,122 @@ mod reference_benchmark {
             }
         }
         eprintln!("high precision mode {mode}: tracks {n}, no result {none}, bpm identical {bpm_ok}, first beat ms identical {ms_ok}, beat number identical {num_ok}, all three {all_ok}");
-        eprintln!("time per track: standard {:.2} s, high precision extra {:.2} s ({:+.0} %)", ts / n.max(1) as f64, th / n.max(1) as f64, 100.0 * th / ts.max(1e-9));
+        eprintln!("CPU time per track (process, all threads): standard {:.2} s, high precision extra {:.2} s ({:+.0} %)", ts / n.max(1) as f64, th / n.max(1) as f64, 100.0 * th / ts.max(1e-9));
+        let w = wall.into_inner().unwrap();
+        eprintln!("wall time of the high precision part per track: mean {:.2} s", w.iter().sum::<f64>() / w.len().max(1) as f64);
+        let s = beat_stats.into_inner().unwrap();
+        if s.0 > 0 {
+            eprintln!("every stored beat (PQTZ): tracks {}, beats {}; grid from the list: tracks identical {}, beats differing {}; first beat + k * 60 / BPM: tracks identical {}, beats differing {}", s.0, s.1, s.2, s.3, s.4, s.5);
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_dump {
+    /// Writes the UnitBeatAdjust envelopes of PREPDECK_AUDIO (one file) to PREPDECK_HP_ENVOUT in the
+    /// layout of the oracle's RB_DUMPENV (count, cap, then the three i16 buffers +112, +120, +128).
+    #[test]
+    #[ignore]
+    fn dump_envelopes() {
+        let (Ok(p), Ok(out)) = (std::env::var("PREPDECK_AUDIO"), std::env::var("PREPDECK_HP_ENVOUT")) else { return };
+        let dec = crate::audio::decode_file(&p).unwrap();
+        let env = super::uba::Uba::new(dec.sr as i32, &super::uba::to_i16(&dec.samples));
+        let mut b = vec![];
+        b.extend_from_slice(&(env.high.len() as i32).to_le_bytes());
+        b.extend_from_slice(&env.cap.to_le_bytes());
+        for buf in [&env.high, &env.low, &env.all] {
+            for v in buf.iter() {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        std::fs::write(out, b).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    /// The legacy stage (`legacy.rs` + getOffsetCalc) against the oracle's L lines: BA_GetBpm,
+    /// BA_GetBeatNum, BA_GetOffsetCalc and every listed beat (position, number).
+    /// PREPDECK_HP_ORACLE = rbhp dumps (RB_ALL=1), PREPDECK_HP_ONLY = track numbers.
+    #[test]
+    #[ignore]
+    fn legacy_against_oracle() {
+        let Ok(dir) = std::env::var("PREPDECK_HP_ORACLE") else { return };
+        let only: Vec<usize> = std::env::var("PREPDECK_HP_ONLY").map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+        let (mut n, mut bpm_ok, mut cnt_ok, mut off_ok, mut list_ok) = (0, 0, 0, 0, 0);
+        let mut ents: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        ents.sort_by_key(|e| e.file_name());
+        for e in ents {
+            let Some(k) = e.file_name().to_str().and_then(|f| f.strip_suffix(".txt")).and_then(|f| f.parse::<usize>().ok()) else { continue };
+            if !only.is_empty() && !only.contains(&k) {
+                continue;
+            }
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            let mut path = String::new();
+            let (mut lb, mut lc, mut lo, mut hendou) = (0i32, 0usize, 0i64, false);
+            let mut list: Vec<(i32, i32)> = vec![];
+            for l in text.lines() {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                if l.starts_with("P ") {
+                    path = l[2..].to_string();
+                } else if w.len() > 6 && w[0] == "L" && w[1] == "bpm" {
+                    lb = w[2].parse().unwrap();
+                    lc = w[4].parse().unwrap();
+                    lo = w[6].parse().unwrap();
+                    hendou = w.iter().position(|x| *x == "hendou").map(|i| w[i + 1] == "1").unwrap_or(false);
+                } else if w.len() == 4 && w[0] == "L" {
+                    list.push((w[1].parse().unwrap(), w[2].parse().unwrap()));
+                }
+            }
+            let Ok(dec) = crate::audio::decode_file(&path) else { continue };
+            let Some(l2) = super::legacy::analyze(&dec.samples, dec.sr, false) else {
+                eprintln!("  #{k} no legacy result");
+                continue;
+            };
+            let env = super::uba::Uba::new(dec.sr as i32, &super::uba::to_i16(&dec.samples));
+            let leg = super::Legacy { bpm: l2.bpm, beats: l2.beats.iter().map(|b| b.pos).collect() };
+            let off = super::get_offset_calc(&env, dec.sr as i32, &leg) as i64;
+            let mine: Vec<(i32, i32)> = l2.beats.iter().map(|b| (b.pos, b.stat)).collect();
+            n += 1;
+            let (a, b, c, d) = (l2.bpm100() == lb, mine.len() == lc, off == lo, mine == list);
+            bpm_ok += a as usize;
+            cnt_ok += b as usize;
+            off_ok += c as usize;
+            list_ok += d as usize;
+            if !(a && b && c && d) {
+                let first = mine.iter().zip(&list).position(|(x, y)| x != y);
+                eprintln!("  #{k} bpm {} vs {lb}, beats {} vs {lc}, offset {off} vs {lo}, first list diff {:?}, oracle hendou {hendou} :: {}", l2.bpm100(), mine.len(), first.map(|i| (i, mine[i], list[i])), path.rsplit('/').next().unwrap_or(""));
+            }
+        }
+        eprintln!("legacy stage: tracks {n}; BA_GetBpm identical {bpm_ok}, beat count {cnt_ok}, offset {off_ok}, beat list {list_ok}");
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    #[test]
+    fn grid_from_list_writes_every_listed_millisecond() {
+        // 129.97 BPM at 44.1 kHz, positions rounded to whole samples as rekordbox's list
+        let sr = 44100u32;
+        let per = sr as f64 * 60.0 / 129.97;
+        let beats: Vec<(i32, i32, i32)> = (0..700).map(|k| ((4321.6 + k as f64 * per + 0.5) as i32, (k % 4 + 1) as i32, 12997)).collect();
+        let g = super::grid_from_list(&beats, sr);
+        let dur = (beats.last().unwrap().0 as f64 + per) / sr as f64;
+        let got: Vec<(u8, u32)> = g.beats(dur).iter().map(|b| (b.beat, (((b.time * 1e6).round() as u64) / 1000) as u32)).collect();
+        let want: Vec<(u8, u32)> = beats.iter().map(|b| (b.1 as u8, (super::beat_us(b.0, sr) / 1000) as u32)).collect();
+        assert_eq!(&got[..want.len()], &want[..]);
+        assert!(g.anchors.len() < 60, "{} anchors", g.anchors.len());
+        assert!(g.anchors.iter().all(|a| (a.bpm - 129.97).abs() < 1e-9));
+    }
+
+    #[test]
+    fn reader16_clamps_like_rekordbox() {
+        use super::uba::reader16;
+        assert_eq!(reader16(1.0), 32767);
+        assert_eq!(reader16(-1.0), -32768);
+        assert_eq!(reader16(-1.5), -32768);
+        assert_eq!(reader16(f32::NAN), -32768);
+        assert_eq!(reader16(0.5), 16384);
+        assert_eq!(reader16(-0.99999), -32767);
     }
 }

@@ -177,9 +177,10 @@ pub fn analysis_rate(sr: u32) -> u32 {
 }
 
 /// Interleaved stereo from `from` Hz to `to` Hz: windowed sinc (Blackman, 16 zero crossings,
-/// cut-off at 0.95 of the lower Nyquist frequency). rekordbox's own resampler
-/// (`rbxfrm::PcmReaderTemplate`) is not traced, so beats of such files are close to, not
-/// identical with, rekordbox's.
+/// cut-off at 0.95 of the lower Nyquist frequency). Only a fallback now: `analyze_decoded` hands
+/// this analyser audio already converted by the port of rekordbox's own converter
+/// (`rb_reader::rb_src`); this runs for rates that converter refuses (not multiples of 50 Hz)
+/// or with PREPDECK_RBSRC=own.
 fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
     let frames = x.len() / 2;
     let ratio = to as f64 / from as f64;
@@ -232,8 +233,10 @@ pub fn tempo_and_grid(samples: &[f32], sr: u32, dynamic: bool, bpm_min: f64, bpm
         let x = resample(samples, sr, to);
         return tempo_and_grid(&x, to, dynamic, bpm_min, bpm_max);
     }
-    let st = pipeline(samples, 32768.0, true, sr, dynamic, false);
     let duration = samples.len() as f64 / 2.0 / sr as f64;
+    // The analysis reads the track's length minus one frame (`analysis::analysed_frames`).
+    let samples = &samples[..2 * crate::analysis::analysed_frames(samples.len() / 2)];
+    let st = pipeline(samples, 32768.0, true, sr, dynamic, false);
     Some(grid_from(&st, sr, dynamic, duration, bpm_min, bpm_max))
 }
 

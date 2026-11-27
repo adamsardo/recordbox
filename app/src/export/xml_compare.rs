@@ -84,7 +84,12 @@ fn export_matches_collection_xml() {
                 for t in tags {
                     if let Some(x) = theirs.get(t) {
                         total += 1;
-                        if mine.get(t) == Some(x) {
+                        // The device copy of PVDI is scrambled, as rekordbox exports it.
+                        let mut x = x.clone();
+                        if t == "PVDI" {
+                            super::anlz::scramble_pvdi(&mut x);
+                        }
+                        if mine.get(t) == Some(&x) {
                             same += 1;
                         }
                     }

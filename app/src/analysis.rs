@@ -22,6 +22,8 @@ pub struct AnalysisSettings {
 
 pub mod dynamic;
 pub mod mp3_timebase;
+pub mod rbcheck;
+pub mod rb_reader;
 pub mod rb_hp;
 pub mod rb_beat1;
 
@@ -76,10 +78,27 @@ pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> 
     Ok(r)
 }
 
-pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
+pub fn analyze_decoded(orig: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
+    // Files at rates other than 44.1 / 48 kHz are analysed after rekordbox's own converter, as
+    // rekordbox's reader delivers them (analysis/rb_reader.rs).
+    let conv = rb_reader::for_analysis(orig);
+    let dec = conv.as_ref().unwrap_or(orig);
     let mono = dec.mono();
     let sr = dec.sr as f64;
     let wave = waveform(&mono, sr);
+    let (bpm, grid) = tempo_and_grid_for(dec, &mono, s);
+    let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
+    let (lufs, peak) = loudness_and_peak(dec);
+    // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
+    let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
+    let vocal = if s.vocal { crate::vocal_rb::analyse(dec) } else { None };
+    AnalysisResult { duration: orig.duration(), raw_samples: orig.raw_frames as u64, sample_rate: orig.sr, bpm, grid, key, wave, gain_db, peak, vocal }
+}
+
+/// Tempo and grid exactly as `analyze_decoded` makes them (standard analysis, then the high
+/// precision pass when it is on). `mono` = `dec.mono()`.
+pub fn tempo_and_grid_for(dec: &Decoded, mono: &[f32], s: &AnalysisSettings) -> (f64, Option<BeatGrid>) {
+    let sr = dec.sr as f64;
     let (bpm, grid) = match (s.do_grid, s.dynamic) {
         (false, _) => (0.0, None),
         (true, dynamic) => {
@@ -88,18 +107,12 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
             let rb = if own_beat_engine() { None } else { rb_beat1::tempo_and_grid(&dec.samples, dec.sr, dynamic, s.bpm_min, s.bpm_max) };
             match rb {
                 Some(r) => r,
-                None if dynamic => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
-                None => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
+                None if dynamic => dynamic::tempo_and_grid_dynamic(mono, sr, s.bpm_min, s.bpm_max),
+                None => tempo_and_grid(mono, sr, s.bpm_min, s.bpm_max),
             }
         }
     };
-    let (bpm, grid) = rb_hp::dispatch(dec, s, bpm, grid);
-    let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
-    let (lufs, peak) = loudness_and_peak(dec);
-    // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
-    let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
-    let vocal = if s.vocal { crate::vocal_rb::analyse(dec) } else { None };
-    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak, vocal }
+    rb_hp::dispatch(dec, s, bpm, grid)
 }
 
 // ------------------------------------------------------------------------------------------
@@ -781,6 +794,13 @@ pub fn loudness(dec: &Decoded) -> f64 {
     loudness_and_peak(dec).0
 }
 
+/// The frames rekordbox's analysis reads of a track `frames` long: `CBeatAnalyzeThread::analyze`
+/// (0x1001528c4) takes the reader's length minus one as the total for every analyser (beat,
+/// key, vocal, loudness, phrase), so the last frame is never read.
+pub fn analysed_frames(frames: usize) -> usize {
+    frames.saturating_sub(1)
+}
+
 /// Loudness as [`loudness`] plus the linear sample peak of the same measured (16-bit
 /// truncated, block-sampled) samples, as rekordbox measures both together.
 pub fn loudness_and_peak(dec: &Decoded) -> (f64, f32) {
@@ -791,6 +811,9 @@ pub fn loudness_and_peak(dec: &Decoded) -> (f64, f32) {
     }
     let e = frames - 1;
     let d = e / rate;
+    // rekordbox's analysis reads one frame less than the reader's length (`analyze`: total =
+    // length - 1), so the last frame is never measured.
+    let frames = analysed_frames(frames);
     let f = (d / 30 + 1).min(16);
     let block = 2 * rate;
     let q = |x: f32| ((x * 32768.0).clamp(-32768.0, 32767.0).trunc()) / 32768.0;
@@ -809,26 +832,64 @@ pub fn loudness_and_peak(dec: &Decoded) -> (f64, f32) {
     (r128_integrated(&fed, dec.sr as f64), peak)
 }
 
-/// EBU R128 integrated loudness of interleaved stereo (libebur128's non-histogram mode).
+/// libebur128's K-weighting filter at `sr`: (b, a) of the 4th-order filter, computed with the
+/// same constants and operation order as `_ebur128_init` (pre-filter shelf: π·f0, 1/Q, Vb/Q, Vh;
+/// high-pass: π·f0, 1/Q).
+pub fn ebur128_filter(sr: f64) -> ([f64; 5], [f64; 5]) {
+    let c = f64::from_bits;
+    let k = (c(0x40b4a4141dbaf1ba) / sr).tan();
+    let kq = k * c(0x3ff6a00eda24c22c);
+    let k2 = k * k;
+    let a0 = 1.0 / (kq + 1.0 + k2);
+    let vbk = k * c(0x3ffc7a95abe25caf);
+    let vh = c(0x3ff95b9b16bf11c6);
+    let pb0 = (vbk + vh + k2) * a0;
+    let pb1 = (k2 + k2 + c(0xc0095b9b16bf11c6)) * a0;
+    let pb2 = (vh - vbk + k2) * a0;
+    let pa1 = (k2 + k2 - 2.0) * a0;
+    let pa2 = (1.0 - kq + k2) * a0;
+    let k = (c(0x405df39763fa798b) / sr).tan();
+    let k2 = k * k;
+    let kq = k * c(0x3ffffaa533e0bf11);
+    let d = kq + 1.0 + k2;
+    let ra1 = (k2 + k2 - 2.0) / d;
+    let ra2 = (1.0 - kq + k2) / d;
+    let b = [pb0, pb1 - (pb0 + pb0), (pb2 + pb0) - (pb1 + pb1), pb1 - (pb2 + pb2), pb2];
+    let a = [1.0, ra1 + pa1, ra1.mul_add(pa1, ra2 + pa2), ra2.mul_add(pa1, ra1 * pa2), ra2 * pa2];
+    (b, a)
+}
+
+/// EBU R128 integrated loudness of interleaved stereo, as the libebur128 rekordbox links
+/// computes it (`_ebur128_init` 0x101ec0204, `_ebur128_filter_float` 0x101ec0e90, gating in
+/// `_ebur128_calc_gating_block` / `_ebur128_gated_loudness`; non-histogram mode): the K-weighting
+/// is libebur128's single 4th-order filter (its shelf and high-pass designed at the sample rate
+/// with the constants below, taken from the binary, and multiplied out; the high-pass numerator
+/// is 1, -2, 1 unnormalised, as in BS.1770), run in double precision in direct form II.
 pub fn r128_integrated(samples: &[f32], sr: f64) -> f64 {
-    let mut ch: Vec<(Biquad, Biquad)> = (0..2)
-        .map(|_| (Biquad::new("hs", 1681.97, 0.7072, sr, 4.0), Biquad::new("hp", 38.13, 0.5003, sr, 0.0)))
-        .collect();
-    let step = ((sr as usize) + 5) / 10;
-    let window = 4 * step;
+    let (b, a) = ebur128_filter(sr);
+    let mut st = [[0f64; 5]; 2];
+    let mut run = |c: usize, x: f64| -> f64 {
+        let v = &mut st[c];
+        let v0 = x - (a[1] * v[1] + a[2] * v[2] + a[3] * v[3] + a[4] * v[4]);
+        let y = b[0] * v0 + b[1] * v[1] + b[2] * v[2] + b[3] * v[3] + b[4] * v[4];
+        v[4] = v[3];
+        v[3] = v[2];
+        v[2] = v[1];
+        v[1] = v0;
+        y
+    };
     let frames = samples.len() / 2;
     let mut pre = vec![0f64; frames + 1];
     for i in 0..frames {
         let mut s = 0.0;
         for c in 0..2 {
-            let x = samples[i * 2 + c] as f64;
-            let f = &mut ch[c];
-            let y0 = f.0.run(x);
-            let y = f.1.run(y0);
+            let y = run(c, samples[i * 2 + c] as f64);
             s += y * y;
         }
         pre[i + 1] = pre[i] + s;
     }
+    let step = ((sr as usize) + 5) / 10;
+    let window = 4 * step;
     let mut blocks = vec![];
     let mut s = 0;
     while s + window <= frames {

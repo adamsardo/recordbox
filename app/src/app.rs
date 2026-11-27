@@ -366,6 +366,8 @@ pub struct Prefs {
     pub show_phrase_bar: bool,
     /// Analysis Mode: 0 = Normal (one tempo), 1 = Dynamic (the grid follows tempo changes).
     pub analysis_mode: u8,
+    /// Analysis Mode while high precision is on (rekordbox keeps it apart; default Auto).
+    pub hp: crate::analysis::rb_hp::HpPrefs,
     /// A key already written in the file's tag (for example by Mixed In Key) is kept when the
     /// track is first analysed; Analyze Key still replaces it.
     pub keep_tag_key: bool,
@@ -631,11 +633,13 @@ mod pvdi_tests {
         let v = super::parse_pvdi(&s).unwrap();
         assert!((v.0 - 1024.0 / 22050.0).abs() < 1e-9);
         assert_eq!(v.1, vec![0, 2, 4, 1]);
-        // Scrambled (negative discriminator) and truncated sections are refused.
-        let mut neg = s.clone();
-        neg[12] = 0xff;
-        assert!(super::parse_pvdi(&neg).is_none());
+        // Scrambled sections (as on a device) read back the same; truncated ones are refused.
+        let mut scr = s.clone();
+        crate::export::anlz::scramble_pvdi(&mut scr);
+        assert!(scr[12] & 0x80 != 0 && scr[24..] != s[24..]);
+        assert_eq!(super::parse_pvdi(&scr).unwrap().1, vec![0, 2, 4, 1]);
         assert!(super::parse_pvdi(&s[..26]).is_none());
+        assert!(super::parse_pvdi(&scr[..26]).is_none());
     }
 
     #[test]
@@ -818,6 +822,7 @@ impl Default for Prefs {
             // As rekordbox: "Phrase (Full Waveform)" is not ticked until the user ticks it.
             show_phrase_bar: false,
             analysis_mode: 0,
+            hp: Default::default(),
             keep_tag_key: true,
             palette_enabled: true,
             playlist_search_filter: true,
@@ -1737,11 +1742,11 @@ impl App {
 
     /// Tracks queued with "Analyze Track (Normal)" / "(Dynamic)" override the preference once.
     pub fn analysis_dynamic(&self) -> bool {
-        self.prefs.analysis_mode == 1
+        if self.prefs.high_precision_grid { self.prefs.hp.mode == 1 } else { self.prefs.analysis_mode == 1 }
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        crate::analysis::rb_hp::set_mode(self.prefs.high_precision_grid, self.prefs.analysis_mode);
+        crate::analysis::rb_hp::set_mode(self.prefs.high_precision_grid, self.prefs.hp.mode);
         AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic(), vocal: self.prefs.vocal_analysis }
     }
 
@@ -3208,6 +3213,9 @@ impl App {
         if self.pool.pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             self.analysis_total = 0;
             self.analysis_done = 0;
+            for n in crate::analysis::rb_hp::take_notes() {
+                self.toast(n);
+            }
         }
     }
 
@@ -4977,13 +4985,22 @@ pub fn grid_jump(beats: &[Beat], p: f64, n: f64) -> Option<f64> {
 
 /// A PVDI section: header 24 bytes (u16 discriminator at 12, hop at 14, sample rate at 16,
 /// stride at 18, count at 20), then count × stride bytes. Scrambled sections (negative
-/// discriminator) are not readable yet.
+/// discriminator, as on a device) are unscrambled first, as rekordbox's reader does.
 pub fn parse_pvdi(s: &[u8]) -> Option<std::sync::Arc<(f64, Vec<u8>)>> {
+    let plain;
+    let s = if s.get(12).map(|b| *b & 0x80 != 0).unwrap_or(false) {
+        let mut v = s.to_vec();
+        crate::export::anlz::unscramble_pvdi(&mut v);
+        if v.get(12).map(|b| *b & 0x80 != 0).unwrap_or(true) {
+            return None;
+        }
+        plain = v;
+        &plain[..]
+    } else {
+        s
+    };
     let u16at = |o: usize| -> Option<u16> { Some(u16::from_be_bytes(s.get(o..o + 2)?.try_into().ok()?)) };
     let hlen = u32::from_be_bytes(s.get(4..8)?.try_into().ok()?) as usize;
-    if (u16at(12)? as i16) < 0 {
-        return None;
-    }
     let (hop, sr, stride) = (u16at(14)? as f64, u16at(16)? as f64, u16at(18)?.max(1) as usize);
     let n = u32::from_be_bytes(s.get(20..24)?.try_into().ok()?) as usize;
     if hop <= 0.0 || sr <= 0.0 {

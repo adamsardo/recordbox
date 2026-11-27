@@ -330,22 +330,59 @@ pub fn trace_key(left: Vec<f32>, right: Option<Vec<f32>>, sr: u32, bpm: f64, gri
             .beats(duration)
             .iter()
             .filter(|b| b.time >= 0.0)
-            .map(|b| key_rb::GridBeat { num: b.beat as u16, ms: (b.time * 1000.0).round() as u32 })
+            .map(|b| key_rb::GridBeat { num: b.beat as u16, ms: crate::export::anlz::ms(b.time) })
             .collect(),
         _ => vec![],
     };
     let bpm = if bpm > 0.0 { bpm } else { grid.map(|g| g.first_bpm()).unwrap_or(0.0) };
+    trace_key_beats(left, right, sr, bpm, &beats)
+}
+
+/// `trace_key` with the beat list given as rekordbox stores it (beat number, whole ms).
+pub fn trace_key_beats(left: Vec<f32>, right: Option<Vec<f32>>, sr: u32, bpm: f64, beats: &[key_rb::GridBeat]) -> key_rb::Trace {
+    let frames = left.len();
+    let peak = left.iter().chain(right.iter().flatten()).fold(0f32, |m, v| m.max(v.abs()));
+    if frames == 0 || sr == 0 || !(peak > 1e-5) {
+        return key_rb::Trace { key: -1, ..Default::default() };
+    }
     let (left, base) = to_base_rate(left, sr);
     let right = right.map(|r| to_base_rate(r, sr).0);
-    key_rb::analyze(&left, right.as_deref(), base, bpm as f32, &beats)
+    key_rb::analyze(&left, right.as_deref(), base, bpm as f32, beats)
+}
+
+/// Key (Camelot-ordered index, or -1) of interleaved stereo audio with a beat list in
+/// rekordbox's form; the samples go through rekordbox's 16-bit reader first, as in
+/// `detect_key_stereo`.
+pub fn detect_key_beats(samples: &[f32], sr: u32, bpm: f64, beats: &[key_rb::GridBeat]) -> i32 {
+    // PREPDECK_KEY_INPUT=float: the decoder's floats and every frame, as this port had them
+    // before (for comparisons).
+    let (rd, samples): (fn(f32) -> f32, &[f32]) = if std::env::var("PREPDECK_KEY_INPUT").map(|v| v == "float").unwrap_or(false) {
+        (|x| x, samples)
+    } else {
+        // The track's length minus one frame, as rekordbox's analysis reads it.
+        (crate::analysis::rb_beat1::reader_sample, &samples[..2 * crate::analysis::analysed_frames(samples.len() / 2)])
+    };
+    let left: Vec<f32> = samples.chunks_exact(2).map(|c| rd(c[0])).collect();
+    let right: Vec<f32> = samples.chunks_exact(2).map(|c| rd(c[1])).collect();
+    from_traced(trace_key_beats(left, Some(right), sr, bpm, beats).key)
 }
 
 /// Key of interleaved stereo audio with its analysed tempo and beat grid (estimated here when
 /// none is given)
 /// (Camelot-ordered index, see model::key_from_pitch, or -1).
 pub fn detect_key_stereo(samples: &[f32], sr: u32, bpm: f64, grid: Option<&BeatGrid>) -> i32 {
-    let left: Vec<f32> = samples.chunks_exact(2).map(|c| c[0]).collect();
-    let right: Vec<f32> = samples.chunks_exact(2).map(|c| c[1]).collect();
+    // What rekordbox's reader hands the key analysis (`CBeatAnalyzeThread::getStreamAt`): the
+    // 16-bit values (× 32768, clamped, truncated), as floats of that size.
+    // PREPDECK_KEY_INPUT=float: the decoder's floats and every frame, as this port had them
+    // before (for comparisons).
+    let (rd, samples): (fn(f32) -> f32, &[f32]) = if std::env::var("PREPDECK_KEY_INPUT").map(|v| v == "float").unwrap_or(false) {
+        (|x| x, samples)
+    } else {
+        // The track's length minus one frame, as rekordbox's analysis reads it.
+        (crate::analysis::rb_beat1::reader_sample, &samples[..2 * crate::analysis::analysed_frames(samples.len() / 2)])
+    };
+    let left: Vec<f32> = samples.chunks_exact(2).map(|c| rd(c[0])).collect();
+    let right: Vec<f32> = samples.chunks_exact(2).map(|c| rd(c[1])).collect();
     let mono = || -> Vec<f32> { samples.chunks_exact(2).map(|c| 0.5 * (c[0] + c[1])).collect() };
     // Without a grid (grid analysis switched off) one is estimated just for the segment vote.
     let estimated = match grid {
@@ -531,24 +568,32 @@ mod bench {
     /// Runs the native research harness (directory in PREPDECK_RBKEY, see the trace notes) on
     /// the same decoded audio and beat grid; returns the Camelot-ordered key or -2.
     fn oracle_key(dir: &str, slice: &str, d: &crate::audio::Decoded, bpm: f64, grid: Option<&BeatGrid>, tag: usize) -> i32 {
+        let beats: Vec<key_rb::GridBeat> = grid
+            .map(|g| g.beats(d.duration()).iter().filter(|b| b.time >= 0.0).map(|b| key_rb::GridBeat { num: b.beat as u16, ms: crate::export::anlz::ms(b.time) }).collect())
+            .unwrap_or_default();
+        oracle_key_beats(dir, slice, d, bpm, &beats, tag)
+    }
+
+    /// The reference routine on rekordbox's reader values of `d` (16-bit, as floats of that size,
+    /// the same input `detect_key_beats` uses) with the decimator fed 2·sr blocks.
+    fn oracle_key_beats(dir: &str, slice: &str, d: &crate::audio::Decoded, bpm: f64, beats: &[key_rb::GridBeat], tag: usize) -> i32 {
         let tmp = std::env::temp_dir().join(format!("prepdeck-keyoracle-{}-{tag}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let pcm = tmp.join("pcm.f32");
-        let beats = tmp.join("beats.txt");
-        let bytes: Vec<u8> = d.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let beats_f = tmp.join("beats.txt");
+        let n = 2 * crate::analysis::analysed_frames(d.samples.len() / 2);
+        let bytes: Vec<u8> = d.samples[..n].iter().flat_map(|v| crate::analysis::rb_beat1::reader_sample(*v).to_le_bytes()).collect();
         let mut text = format!("{}\n", bpm as f32);
-        if let Some(g) = grid {
-            for b in g.beats(d.duration()) {
-                if b.time >= 0.0 {
-                    text.push_str(&format!("{} {}\n", b.beat, (b.time * 1000.0).round() as u32));
-                }
-            }
+        for b in beats {
+            text.push_str(&format!("{} {}\n", b.num, b.ms));
         }
+        let beats = beats_f;
         let mut key = -2;
         if std::fs::write(&pcm, bytes).is_ok() && std::fs::write(&beats, text).is_ok() {
             let out = std::process::Command::new(format!("{dir}/rbkey"))
                 .current_dir(dir)
-                .args([slice, "fixups.txt", pcm.to_str().unwrap(), &d.sr.to_string(), beats.to_str().unwrap(), "2"])
+                .env("RB_CHUNK", std::env::var("PREPDECK_RBKEY_CHUNK").unwrap_or_else(|_| (2 * d.sr).to_string()))
+                .args([slice, "fixups.txt", pcm.to_str().unwrap(), &d.sr.to_string(), beats.to_str().unwrap(), &std::env::var("PREPDECK_RBKEY_VER").unwrap_or_else(|_| "2".into())])
                 .output();
             if let Ok(o) = out {
                 let s = String::from_utf8_lossy(&o.stdout);
@@ -591,7 +636,9 @@ mod bench {
                     let Some((path, key, conf)) = rows.get(i) else { break };
                     let Ok(d) = crate::audio::decode_file(path) else { continue };
                     let mono = d.mono();
-                    let (bpm, grid) = crate::analysis::tempo_and_grid(&mono, d.sr as f64, 70.0, 180.0);
+                    // The grid the app's analysis makes (rekordbox's beat analyser, or the own
+                    // estimator with PREPDECK_BEAT=own; high precision with PREPDECK_HP_MODE).
+                    let (bpm, grid) = crate::analysis::tempo_and_grid_for(&d, &mono, &crate::analysis::AnalysisSettings::default());
                     let t0 = std::time::Instant::now();
                     let traced = detect_key_stereo(&d.samples, d.sr, bpm, grid.as_ref());
                     let secs = t0.elapsed().as_secs_f64();
@@ -637,6 +684,84 @@ mod bench {
             if r.traced != r.key {
                 eprintln!("  ref {:>4} traced {:>4} legacy {:>4} ({}) :: {}", name(r.key), name(r.traced), name(r.legacy), relation(r.key, r.traced), r.path.rsplit('/').next().unwrap());
             }
+        }
+    }
+
+    /// rekordbox's stored beat list (PQTZ of `<base>.DAT`): beat numbers, whole ms and the first
+    /// beat's tempo.
+    fn stored_beats(base: &str) -> Option<(Vec<key_rb::GridBeat>, f64)> {
+        let dat = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.DAT")));
+        let q = dat.get("PQTZ")?;
+        let n = u32::from_be_bytes(q.get(20..24)?.try_into().ok()?) as usize;
+        let mut v = vec![];
+        let mut bpm = 0.0;
+        for k in 0..n {
+            let o = 24 + k * 8;
+            let e = q.get(o..o + 8)?;
+            if k == 0 {
+                bpm = u16::from_be_bytes([e[2], e[3]]) as f64 / 100.0;
+            }
+            v.push(key_rb::GridBeat { num: u16::from_be_bytes([e[0], e[1]]), ms: u32::from_be_bytes([e[4], e[5], e[6], e[7]]) });
+        }
+        Some((v, bpm))
+    }
+
+    /// The key detector against the keys rekordbox stored for the user's library (snapshot of its
+    /// database; analysis files read only): on rekordbox's own stored grid (PQTZ), and on the grid
+    /// this application makes (PREPDECK_BEAT / PREPDECK_HP_MODE apply). With PREPDECK_RBKEY +
+    /// PREPDECK_RBSLICE the original routine runs on the same input and stored grid too.
+    /// PREPDECK_RBCHECK_FILTER = path part. Run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn key_vs_rekordbox() {
+        let rows: Vec<(String, String, i32)> = crate::analysis::rbcheck::tests::library().into_iter().filter(|r| r.2 >= 0).collect();
+        let oracle = std::env::var("PREPDECK_RBKEY").ok().zip(std::env::var("PREPDECK_RBSLICE").ok());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let res = std::sync::Mutex::new(vec![]);
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((path, base, key)) = rows.get(i) else { break };
+                    let Some((mut beats, bpm)) = stored_beats(base) else { continue };
+                    // Experiment: the whole-track decision only (no grid given to the detector).
+                    if std::env::var("PREPDECK_KEY_NOGRID").is_ok() {
+                        beats.clear();
+                    }
+                    let Ok(d) = crate::audio::decode_file(path) else { continue };
+                    let on_rb = detect_key_beats(&d.samples, d.sr, bpm, &beats);
+                    let mono = d.mono();
+                    let (obpm, grid) = crate::analysis::tempo_and_grid_for(&d, &mono, &crate::analysis::AnalysisSettings::default());
+                    let on_own = detect_key_stereo(&d.samples, d.sr, obpm, grid.as_ref());
+                    let orc = match &oracle {
+                        Some((dir, slice)) => oracle_key_beats(dir, slice, &d, bpm, &beats, i),
+                        None => -2,
+                    };
+                    res.lock().unwrap().push((path.clone(), *key, on_rb, on_own, orc));
+                });
+            }
+        });
+        let mut r = res.into_inner().unwrap();
+        r.sort();
+        let name = crate::model::key_alnum;
+        let (mut a, mut b, mut o, mut po, mut no) = (Tally::default(), Tally::default(), Tally::default(), 0, 0);
+        for (p, k, x, y, z) in &r {
+            a.add(*k, *x);
+            b.add(*k, *y);
+            if *z >= -1 {
+                no += 1;
+                o.add(*k, *z);
+                po += (z == x) as usize;
+            }
+            if x != k || y != k {
+                eprintln!("  rekordbox {:>4} | on rekordbox's grid {:>4} ({}) | on own grid {:>4} ({}){} :: {}", name(*k), name(*x), relation(*k, *x), name(*y), relation(*k, *y), if *z >= -1 { format!(" | original routine {}", name(*z)) } else { String::new() }, p.rsplit('/').next().unwrap());
+            }
+        }
+        eprintln!("KEY tracks {}", r.len());
+        eprintln!("KEY on rekordbox's stored grid: {}", a.line());
+        eprintln!("KEY on this application's grid: {}", b.line());
+        if no > 0 {
+            eprintln!("KEY original routine on the stored grid: {}; port == original {po}/{no}", o.line());
         }
     }
 }

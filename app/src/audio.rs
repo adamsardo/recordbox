@@ -119,6 +119,32 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     if let Some(n) = track.codec_params.n_frames {
         out.reserve((n as usize).min(60 * 60 * 48000) * 2);
     }
+    // MP3: decoded as rekordbox decodes it, with the mpg123 library it ships, when that is
+    // installed and decodes the whole file cleanly (analysis/rb_reader.rs).
+    if track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_MP3 && crate::analysis::rb_reader::use_rb_mp3() {
+        if let Some((pcm, rate)) = crate::vocal_rb_mp3::decode_clean(path) {
+            let frames = pcm.len() / 2;
+            let declared_secs = declared_frames.map(|n| match time_base {
+                Some(tb) => {
+                    let t = tb.calc_time(n);
+                    t.seconds as f64 + t.frac
+                }
+                None => n as f64 / rate.max(1) as f64,
+            });
+            let truncated = declared_secs.map(|d| frames as f64 / rate.max(1) as f64 + 1.0 < d).unwrap_or(false);
+            if frames > 0 {
+                return Ok(Decoded { sr: rate, samples: pcm.iter().map(|v| *v as f32 / 32768.0).collect(), raw_frames: frames, damaged: 0, truncated });
+            }
+        }
+    }
+    // AAC in MP4: decoded by AudioToolbox as rekordbox does (analysis/rb_reader.rs).
+    #[cfg(target_os = "macos")]
+    if track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_AAC && crate::analysis::rb_reader::use_rb_aac(path) {
+        if let Some((pcm, rate)) = crate::analysis::rb_reader::apple_aac::decode(path) {
+            let frames = pcm.len() / 2;
+            return Ok(Decoded { sr: rate, samples: pcm.iter().map(|v| *v as f32 / 32768.0).collect(), raw_frames: frames, damaged: 0, truncated: false });
+        }
+    }
     let mut sbuf: Option<SampleBuffer<f32>> = None;
     let mut damaged = 0usize;
     loop {
@@ -195,6 +221,21 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
                 }
                 out.push(l);
                 out.push(r);
+            }
+        }
+    }
+    // FLAC: rekordbox (libFLAC) decodes every frame up to STREAMINFO's total; symphonia's
+    // demuxer can drop a short last frame (analysis/rb_reader.rs).
+    if track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_FLAC {
+        if let Some(total) = declared_frames {
+            // STREAMINFO (the codec's extra data): u16 minimum and maximum block size first.
+            let fixed = track.codec_params.extra_data.as_ref().filter(|e| e.len() >= 4).map(|e| u16::from_be_bytes([e[2], e[3]]) as u32);
+            if let Some((tail, ch)) = crate::analysis::rb_reader::flac_tail(path, decoder.as_mut(), track_id, (out.len() / 2) as u64, total, fixed) {
+                match ch {
+                    1 => tail.iter().for_each(|v| out.extend_from_slice(&[*v, *v])),
+                    2 => out.extend_from_slice(&tail),
+                    _ => {}
+                }
             }
         }
     }

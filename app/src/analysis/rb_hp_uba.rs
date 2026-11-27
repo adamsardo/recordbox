@@ -435,6 +435,13 @@ fn lane_sum(v: &[f64]) -> f64 {
     s
 }
 
+/// `PREPDECK_HP_UBATRACE`: print the arguments of `getPeakBpm` and `reflectBeatData` in the
+/// oracle's probe format (for comparison with `RB_PROBE` runs).
+fn trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("PREPDECK_HP_UBATRACE").is_ok())
+}
+
 /// State of the BPM / position refinement (`UnitBeatAdjust` fields +24, +32, +40, +48..+80, +88).
 pub struct UbaRefine<'a> {
     pub env: &'a Uba,
@@ -586,6 +593,9 @@ impl<'a> UbaRefine<'a> {
     /// `getPeakBpm(bpm, steps, start, beats, &bpm_out, &peak_out, &idx_out, &more)` (0x10113c028).
     #[allow(clippy::too_many_arguments)]
     fn get_peak_bpm(&mut self, bpm0: f64, a2: i32, start: i32, beats: i32, out_bpm: &mut f64, out_peak: &mut f64, out_idx: &mut i32, more: &mut bool) {
+        if trace() {
+            eprintln!("P 10113c028 {bpm0:.17} {a2} {start} {beats}");
+        }
         if start < 0 || bpm0 <= 0.0 || !(1..=51).contains(&a2) || beats < 1 || self.env.cap <= start {
             return;
         }
@@ -644,6 +654,9 @@ impl<'a> UbaRefine<'a> {
             if let Some(d) = self.create_beat_data(b, start) {
                 self.beat_data.insert(k, d);
             }
+        }
+        if trace() {
+            eprintln!("P 10113c294 n={} {}", n, peaks.iter().map(|v| format!("{v:.17e}")).collect::<Vec<_>>().join(" "));
         }
         let (idx, pk, prom, _w) = findpeaks_x(n, &peaks);
         let mut found = 0usize;
@@ -843,6 +856,9 @@ impl<'a> UbaRefine<'a> {
     /// `reflectBeatData(bpm_val, bpm, list, idx)` (0x10113c670): the chosen candidate's beats
     /// become the list.
     fn reflect_beat_data(&mut self, bpm: &mut f32, list: &mut Vec<BeatInfo>, idx: i32, a5: f64) {
+        if trace() {
+            eprintln!("P 10113b78c {a5:.17} {idx} {:.9}", *bpm);
+        }
         if !(a5 > 0.0) || idx < 0 || idx >= self.pushed || !(*bpm > 0.0) {
             return;
         }
@@ -1451,7 +1467,22 @@ impl<'a> UbaRefine<'a> {
 /// The samples `Analyzer::setSample` gives the envelope units: float scaled to 16-bit range,
 /// truncated to an integer and narrowed without saturation.
 pub fn to_i16(samples: &[f32]) -> Vec<i16> {
-    samples.iter().map(|&v| ((v * 32768.0) as i32) as i16).collect()
+    samples.iter().map(|&x| reader16(x)).collect()
+}
+
+/// A decoded sample as rekordbox's PCM reader hands it to the beat library
+/// (`PcmReaderTemplate<Float2>::getStreamAt(int, short*, short*, int)` 0x102853e3c): x 32768,
+/// above 32767 -> 32767, below -32768 or NaN -> -32768, truncated toward zero.
+pub fn reader16(x: f32) -> i16 {
+    let v = x * 32768.0;
+    let v = if v > 32767.0 {
+        32767.0
+    } else if !(v >= -32768.0) {
+        -32768.0
+    } else {
+        v
+    };
+    v as i32 as i16
 }
 
 #[cfg(test)]

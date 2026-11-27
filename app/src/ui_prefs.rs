@@ -985,14 +985,22 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
             app.toast(why);
         }
         separator(ui);
-        kit::sub_help(ui, "Track Analysis Mode", Some("Normal: optimized for tracks which have a constant BPM.\nDynamic: for tracks whose tempo changes, the beat grid follows the tempo."));
+        kit::sub_help(ui, "Track Analysis Mode", Some(crate::analysis::rb_hp::MODE_TOOLTIP));
         kit::labeled(ui, "Analysis Mode", |ui| {
-            let modes = [("Normal", "Optimized for tracks which have a constant BPM"), ("Dynamic", "For tracks whose tempo changes: the beat grid follows the tempo")];
-            let cur = (app.prefs.analysis_mode as usize).min(1);
-            kit::combo("amode", 400.0, modes[cur].0, 14.0).show_ui(ui, |ui| {
-                for (i, (n, tip)) in modes.iter().enumerate() {
-                    if ui.selectable_label(cur == i, *n).on_hover_text(*tip).clicked() {
-                        app.prefs.analysis_mode = i as u8;
+            // rekordbox lists Auto (and keeps a separate setting, default Auto) only while high
+            // precision is on (AnalysisTrackAnalysisModeComponent2::lookAndFeelChanged).
+            let hp = HIGH_PRECISION_WIRED && app.prefs.high_precision_grid;
+            let items: Vec<(&str, u8)> = crate::analysis::rb_hp::MODE_ITEMS.iter().filter(|m| hp || m.2 != 3).map(|m| (m.0, m.1)).collect();
+            let cur = if hp { app.prefs.hp.mode } else { app.prefs.analysis_mode.min(1) };
+            let name = items.iter().find(|m| m.1 == cur).map(|m| m.0).unwrap_or("");
+            kit::combo("amode", 400.0, name, 14.0).show_ui(ui, |ui| {
+                for (n, v) in &items {
+                    if ui.selectable_label(cur == *v, *n).clicked() {
+                        if hp {
+                            app.prefs.hp.mode = *v;
+                        } else {
+                            app.prefs.analysis_mode = *v;
+                        }
                     }
                 }
             });

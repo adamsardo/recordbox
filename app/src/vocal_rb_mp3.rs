@@ -97,6 +97,28 @@ pub fn decode(path: &str) -> Option<(Vec<i16>, u32)> {
     if !available() {
         return None;
     }
+    decode_with(path).map(|(p, r, _)| (p, r))
+}
+
+/// Whether rekordbox's library can decode MP3s here (it is installed and loads).
+pub fn library_loads() -> bool {
+    api().is_some()
+}
+
+/// As `decode`, for the general decoder (`audio::decode_file`): only when the whole file decoded
+/// without an error, or the one error is a last frame cut off by the end of the file (which
+/// takes its length of silence, as in rekordbox). Other damaged files are left to the decoder
+/// that keeps going past bad frames. Independent of PREPDECK_VOCAL_MP3.
+pub fn decode_clean(path: &str) -> Option<(Vec<i16>, u32)> {
+    match decode_with(path)? {
+        (p, r, true) => Some((p, r)),
+        (p, r, false) if std::fs::read(path).ok().and_then(|d| truncated_last_frame(&d)).is_some() => Some((p, r)),
+        _ => None,
+    }
+}
+
+/// (16-bit interleaved stereo, sample rate, whether mpg123 reached the end without an error).
+fn decode_with(path: &str) -> Option<(Vec<i16>, u32, bool)> {
     let a = api()?;
     let cpath = CString::new(path).ok()?;
     unsafe {
@@ -124,6 +146,7 @@ pub fn decode(path: &str) -> Option<(Vec<i16>, u32)> {
             return None;
         }
         let (mut rate, mut ch, mut enc): (c_long, c_int, c_int) = (0, 0, 0);
+        let mut clean = true;
         let mut pcm: Vec<i16> = Vec::new();
         let mut buf = vec![0u8; 1 << 16];
         loop {
@@ -155,6 +178,7 @@ pub fn decode(path: &str) -> Option<(Vec<i16>, u32)> {
                 if pcm.is_empty() {
                     return None;
                 }
+                clean = false;
                 break;
             }
         }
@@ -171,7 +195,7 @@ pub fn decode(path: &str) -> Option<(Vec<i16>, u32)> {
         if let Some(spf) = std::fs::read(path).ok().and_then(|d| truncated_last_frame(&d)) {
             pcm.extend(std::iter::repeat(0i16).take(2 * spf));
         }
-        Some((pcm, rate as u32))
+        Some((pcm, rate as u32, clean))
     }
 }
 

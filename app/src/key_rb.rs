@@ -164,13 +164,19 @@ fn lowpass_decimate(block: &[f32], out: &mut [f32]) {
     }
 }
 
-/// The analyser's input signal: 0.99·L + 0.01·R, low-passed and decimated by 8 in one-second
-/// blocks. Returns `total/8` samples (the tail the blocks do not reach stays zero).
+/// The analyser's input signal: 0.99·L + 0.01·R, low-passed and decimated by 8 block by block,
+/// the filter starting afresh in each block. The blocks are what `CBeatAnalyzeThread::analyze`
+/// reads per `getStreamAt` call: 2·sr frames (traced: the read size is `sr << 1` at 0x1001539dc,
+/// the sample buffers hold 2·sr floats). Returns `total/8` samples, or 3,600,000 when that is
+/// more than 0xA4CB80 (as the original sizes its buffer); the tail the blocks do not reach stays
+/// zero.
 pub fn decimate(left: &[f32], right: Option<&[f32]>, sr: u32) -> Vec<f32> {
     let total = left.len();
-    let ndec = (total / 8).min(0xA4CB80);
+    let ndec = if total / 8 > 0xA4CB80 { 3_600_000 } else { total / 8 };
     let mut dec = vec![0f32; ndec];
-    let block = (sr as usize).max(8);
+    // PREPDECK_KEY_BLOCK=1: one-second blocks, as this port had them before (for comparisons).
+    let secs = if std::env::var("PREPDECK_KEY_BLOCK").map(|v| v == "1").unwrap_or(false) { 1 } else { 2 };
+    let block = (secs * sr as usize).max(8);
     let (wl, wr) = if total < 30 * sr as usize { (0.999f32, 0.00099999f32) } else { (0.99f32, 0.01f32) };
     let mut mono = vec![0f32; block];
     let (mut pos, mut done) = (0usize, 0usize);

@@ -731,7 +731,9 @@ pub fn to_s16(x: f32, round: bool) -> f32 {
 /// Features of a decoded track (interleaved stereo at `sr`), fed in 2-second blocks as
 /// rekordbox does. None for tracks rekordbox would not analyse (≤ 0.418 s or > 2 h).
 pub fn features(samples: &[f32], sr: u32, round: bool) -> Option<(usize, Vec<f64>)> {
-    let frames = samples.len() / 2;
+    // rekordbox's analysis reads one frame less than the track has (`analysis::analysed_frames`).
+    let frames = crate::analysis::analysed_frames(samples.len() / 2);
+    let samples = &samples[..2 * frames];
     let dur = frames as f64 / sr as f64;
     if !(dur > 0.417959184 && dur <= 7200.0) {
         return None;
@@ -761,6 +763,9 @@ pub fn analyse(dec: &crate::audio::Decoded) -> Option<Vec<u8>> {
         return None;
     }
     let model = crate::vocal_rb_net::installed()?;
+    // Other rates than 44.1 / 48 kHz go through rekordbox's converter first, as in its reader.
+    let conv = crate::analysis::rb_reader::for_analysis(dec);
+    let dec = conv.as_ref().unwrap_or(dec);
     let (_, feat) = features(&dec.samples, dec.sr, ROUND_S16)?;
     Some(levels(&model.run(&feat)?))
 }
@@ -889,6 +894,7 @@ pub fn features_s16(pcm: &[i16], sr: u32) -> Option<(usize, Vec<f64>)> {
 /// The same, with the time spent per stage (filter + resampler, frames + FFT, mel,
 /// fluctogram, end: seconds).
 pub fn features_s16_timed(pcm: &[i16], sr: u32) -> Option<((usize, Vec<f64>), [f64; 5])> {
+    let pcm = &pcm[..2 * crate::analysis::analysed_frames(pcm.len() / 2)];
     let dur = (pcm.len() / 2) as f64 / sr as f64;
     if !(dur > 0.417959184 && dur <= 7200.0) {
         return None;

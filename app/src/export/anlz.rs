@@ -325,7 +325,9 @@ fn pwvc() -> Vec<u8> {
 
 /// Whole milliseconds of a time, with the time first rounded to the microsecond (so 1.9 s is
 /// 1900, not 1899) and the rest cut off; [`micros`] is the part cut.
-fn ms(t: f64) -> u32 {
+/// Whole milliseconds of a beat time as rekordbox stores them (cut, from microseconds; the
+/// key detector gets its beats the same way).
+pub(crate) fn ms(t: f64) -> u32 {
     ((t.max(0.0) * 1e6).round() as u64 / 1000).min(u32::MAX as u64) as u32
 }
 
@@ -491,6 +493,53 @@ pub fn pvdi(levels: &[u8]) -> Vec<u8> {
     }
     h.extend_from_slice(&(levels.len() as u32).to_be_bytes());
     section(b"PVDI", &h, levels)
+}
+
+/// rekordbox's USB scrambling of the vocal levels (`analyzer::ConvUSB_ScrambleVocalDetect`,
+/// 0x1007b3b3c in 7.2.19): the bytes are XORed with "Kanzen-niRikaishita", each key byte
+/// first turned into (byte + '0') ^ 0x80, starting at key position (('0' + ('\n' << 8)) % 19)
+/// = 5. The '0' and '\n' are the first two characters of `snprintf("%d\n", 0)` in the original,
+/// so the stream is the same for every track. Applying it twice gives the input back.
+pub fn scramble_vocal(data: &mut [u8]) {
+    const KEY: &[u8; 19] = b"Kanzen-niRikaishita";
+    let start = (b'0' as usize + ((b'\n' as usize) << 8)) % KEY.len();
+    for (j, b) in data.iter_mut().enumerate() {
+        *b ^= KEY[(start + j) % KEY.len()].wrapping_add(b'0') ^ 0x80;
+    }
+}
+
+/// The PVDI section as rekordbox exports it to a device (`ExportAnalysisExtend2`): when the
+/// version word (u16 at 12) has its top bit clear, the levels (count × stride bytes after the
+/// header) are scrambled and the bit is set. Already scrambled sections are left as they are.
+pub fn scramble_pvdi(s: &mut [u8]) {
+    let Some(v) = s.get(12..14).map(|b| u16::from_be_bytes([b[0], b[1]])) else { return };
+    if v & 0x8000 != 0 || s.get(..4) != Some(b"PVDI") {
+        return;
+    }
+    let Some((h, n)) = pvdi_body(s) else { return };
+    scramble_vocal(&mut s[h..h + n]);
+    s[12..14].copy_from_slice(&(v | 0x8000).to_be_bytes());
+}
+
+/// The reverse, as rekordbox's reader does it (`CMusicAnalyzeFile::read_pmai_ex2_vocal_detect`):
+/// a section with a negative version word gets its levels unscrambled and the word set to 0.
+pub fn unscramble_pvdi(s: &mut [u8]) {
+    let Some(v) = s.get(12..14).map(|b| i16::from_be_bytes([b[0], b[1]])) else { return };
+    if v >= 0 {
+        return;
+    }
+    let Some((h, n)) = pvdi_body(s) else { return };
+    scramble_vocal(&mut s[h..h + n]);
+    s[12..14].copy_from_slice(&0u16.to_be_bytes());
+}
+
+/// Header length and body length (count × stride) of a PVDI section, when the section holds them.
+fn pvdi_body(s: &[u8]) -> Option<(usize, usize)> {
+    let h = u32::from_be_bytes(s.get(4..8)?.try_into().ok()?) as usize;
+    let stride = u16::from_be_bytes(s.get(18..20)?.try_into().ok()?) as usize;
+    let count = u32::from_be_bytes(s.get(20..24)?.try_into().ok()?) as usize;
+    let n = count.checked_mul(stride)?;
+    (h >= 24 && h.checked_add(n)? <= s.len()).then_some((h, n))
 }
 
 /// Section tags Recordbox writes itself (or deliberately drops when the grid changed).
@@ -722,7 +771,9 @@ pub fn build_with(usb_path: &str, beats: &[Beat], wave: &Waveform, cues: &[Cue],
         ext.push(s);
     }
     let mut ex2 = vec![ppth(usb_path), or("PWV7", &|| pwv7(&frames)), or("PWV6", &|| pwv6(wave)), or("PWVC", &pwvc)];
-    if let Some(s) = take("PVDI").or_else(|| ov.and_then(|o| o.pvdi.clone())) {
+    // Vocal levels: scrambled on the device as rekordbox does (`ExportAnalysisExtend2`).
+    if let Some(mut s) = take("PVDI").or_else(|| ov.and_then(|o| o.pvdi.clone())) {
+        scramble_pvdi(&mut s);
         ex2.push(s);
     }
     let mut dat = dat;
@@ -759,6 +810,33 @@ pub fn anlz_folder(usb_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The vocal scrambling equals rekordbox's own `ConvUSB_ScrambleVocalDetect` (its output on
+    /// a run of zeros, taken from the original with the oracle harness `rbscr.c`, which
+    /// calls the unmodified routine in the 7.2.19 slice), round-trips, and the exported section reads back through `parse_pvdi`.
+    #[test]
+    fn vocal_scrambling_matches_rekordbox() {
+        let stream: [u8; 19] = [0x1e, 0xdd, 0x1e, 0x19, 0x02, 0x19, 0x1b, 0x11, 0x19, 0x23, 0x18, 0x19, 0x24, 0x11, 0xfb, 0x11, 0x1e, 0x2a, 0x15];
+        let mut z = vec![0u8; 40];
+        scramble_vocal(&mut z);
+        assert_eq!(&z[..19], &stream);
+        assert_eq!(&z[19..38], &stream);
+        assert_eq!(&z[38..], &stream[..2]);
+        let levels = vec![0u8, 1, 2, 3, 4, 4, 0, 0, 2, 1, 0, 3, 3, 3, 4, 0, 0, 0, 1, 2, 4, 4];
+        let plain = pvdi(&levels);
+        let mut s = plain.clone();
+        scramble_pvdi(&mut s);
+        assert_eq!(u16::from_be_bytes([s[12], s[13]]), 0x8000);
+        assert_eq!(&s[..12], &plain[..12]);
+        assert_eq!(&s[14..24], &plain[14..24]);
+        assert_ne!(&s[24..], &plain[24..]);
+        let again = s.clone();
+        scramble_pvdi(&mut s);
+        assert_eq!(s, again, "an already scrambled section stays as it is");
+        assert_eq!(crate::app::parse_pvdi(&s).unwrap().1, levels);
+        unscramble_pvdi(&mut s);
+        assert_eq!(s, plain);
+    }
+
     /// Unknown sections already on the drive survive a rewrite; audio sections are reused.
     #[test]
     fn rewrite_keeps_device_sections() {
