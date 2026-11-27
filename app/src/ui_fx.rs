@@ -381,6 +381,19 @@ pub fn sync(app: &mut App) {
             *g = Some(made);
         }
     }
+    // The same for everything else the sync below would make at a first use (a unit's channel
+    // when a deck is assigned, the master's RELEASE FX, a deck's PAD FX unit, the MERGE FX
+    // engine): asked under the lock, made without it, put in under it.
+    {
+        let assigns: Vec<[bool; fx::CHANNELS]> = app.px.fx.iter().map(|u| u.params.assign).collect();
+        let want = fx::RACK.lock().as_ref().map(|r| r.missing_parts(&assigns, master_release && on, &pad_wanted, merge));
+        if let Some(want) = want.filter(|w| !w.is_empty()) {
+            let parts = fx::RackParts::make(&want);
+            if let Some(r) = fx::RACK.lock().as_mut() {
+                r.install_parts(parts);
+            }
+        }
+    }
     let (stop, needs) = {
         let mut g = fx::RACK.lock();
         let rack = g.get_or_insert_with(|| Box::new(fx::Rack::new()));

@@ -1318,6 +1318,39 @@ impl crate::fx_lfo::BeatSync for EchoSync {
 /// Frames of TRANS / PAN gain worked out at a time (on the stack).
 const LFO_PIECE: usize = 1024;
 
+/// See `Rack::missing_parts`.
+pub struct RackWant {
+    chans: Vec<(usize, usize)>,
+    master_rel: bool,
+    pads: [bool; 4],
+    merge: bool,
+}
+
+impl RackWant {
+    pub fn is_empty(&self) -> bool {
+        self.chans.is_empty() && !self.master_rel && !self.merge && !self.pads.iter().any(|p| *p)
+    }
+}
+
+/// The parts of a `RackWant`, made without the rack's lock.
+pub struct RackParts {
+    chans: Vec<((usize, usize), Box<Channel>)>,
+    master_rel: Option<Box<Channel>>,
+    pads: [Option<Box<PadChan>>; 4],
+    merge: Option<Box<crate::mfx::Engine>>,
+}
+
+impl RackParts {
+    pub fn make(w: &RackWant) -> RackParts {
+        RackParts {
+            chans: w.chans.iter().map(|a| (*a, Box::new(Channel::new()))).collect(),
+            master_rel: w.master_rel.then(|| Box::new(Channel::new_without_slots())),
+            pads: std::array::from_fn(|d| w.pads[d].then(|| Box::new(PadChan { ch: Channel::one_slot(), cfx: crate::cfx::Cfx::new(), last: SlotParams::new(Kind::Delay), color: (0, 0.5), idle: u32::MAX }))),
+            merge: w.merge.then(|| Box::new(crate::mfx::Engine::new())),
+        }
+    }
+}
+
 /// Effect cores made by the interface outside the rack's lock (`Rack::rev_needs`,
 /// `NewCores::make`, `Rack::rev_install`).
 #[derive(Default)]
@@ -3458,6 +3491,53 @@ impl Rack {
             });
         }
         old
+    }
+
+    /// What the `prepare*` calls of the interface's sync would have to make: unit channels
+    /// (unit, channel), the master's RELEASE FX state, PAD FX units and the MERGE FX engine.
+    /// Asked under the lock; `RackParts::make` takes the memory without it (a channel is
+    /// about 12 MB, the engine more) and `install_parts` puts the parts in. The `prepare*`
+    /// calls after that find everything in place.
+    pub fn missing_parts(&self, assigns: &[[bool; CHANNELS]], master_release: bool, pads: &[bool; 4], merge: bool) -> RackWant {
+        let mut w = RackWant { chans: Vec::new(), master_rel: master_release && self.master_rel.is_none(), pads: [false; 4], merge: merge && self.merge.is_none() };
+        for (ui, (u, a)) in self.units.iter().zip(assigns).enumerate() {
+            for (ci, (c, on)) in u.channels.iter().zip(a).enumerate() {
+                if *on && c.is_none() {
+                    w.chans.push((ui, ci));
+                }
+            }
+        }
+        for d in 0..4 {
+            w.pads[d] = pads[d] && self.pads[d].is_none();
+        }
+        w
+    }
+
+    pub fn install_parts(&mut self, p: RackParts) {
+        for ((ui, ci), c) in p.chans {
+            if let Some(slot) = self.units.get_mut(ui).and_then(|u| u.channels.get_mut(ci)) {
+                if slot.is_none() {
+                    *slot = Some(c);
+                }
+            }
+        }
+        if self.master_rel.is_none() {
+            if let Some(c) = p.master_rel {
+                self.master_rel = Some(c);
+            }
+        }
+        for (d, pc) in p.pads.into_iter().enumerate() {
+            if self.pads[d].is_none() {
+                if let Some(pc) = pc {
+                    self.pads[d] = Some(pc);
+                }
+            }
+        }
+        if self.merge.is_none() {
+            if let Some(m) = p.merge {
+                self.merge = Some(m);
+            }
+        }
     }
 
     pub fn prepare_rev(&mut self) {
