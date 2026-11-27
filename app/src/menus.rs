@@ -432,6 +432,12 @@ pub fn owns_shortcut(app: &App, action: &str) -> bool {
     app.menu.is_some() && crate::prefs_ext::MENU_ACTIONS.iter().any(|(a, _)| *a == action) && app.prefs.shortcut_for(action).map(|s| crate::prefs_ext::accelerator(&s).is_some()).unwrap_or(false)
 }
 
+/// The list shows collection tracks gathered by something other than a playlist (a history,
+/// the Tag List, related tracks ...), which "Copy to Playlists category" can turn into one.
+fn copyable_list(app: &App) -> bool {
+    matches!(app.view, View::History(_) | View::TagList | View::Related | View::Matching | View::Suggest(_) | View::Category { .. }) && !app.list.is_empty()
+}
+
 /// (enabled, ticked) of every command for the app's present state.
 pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
     let sel = selected(app);
@@ -442,39 +448,65 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
     let busy = app.dialogs.ext.backup_job.is_some();
     let layout = app.player_layout();
     let locked = has_sel && sel.iter().all(|id| app.track(*id).map(|t| t.grid_locked).unwrap_or(false));
+    let unlocked = has_sel && sel.iter().all(|id| app.track(*id).map(|t| !t.grid_locked).unwrap_or(false));
     let any_missing = app.tracks.iter().any(|t| t.missing);
+    let panel = crate::ui_browser_ext::right_panel(app);
+    let perf = app.performance();
+    let device_sel = matches!(app.view, View::Device { .. }) && !app.device_ui.sel.is_empty();
     let mut m = HashMap::new();
     for (id, _, _) in COMMANDS {
         let v = match id {
             "backup" | "restore" => (!busy, false),
             "relocate_missing" | "auto_relocate" => (any_missing, false),
+            "dupes" => (app.tracks.len() > 1 && !app.dupes.open && app.dupes.prompt == 0, false),
+            // Not in recordbox: backups of device libraries made by rekordbox, a rekordbox 5
+            // library to bring over, and AlphaTheta's download servers.
+            "device_backup_mgmt" | "import_v5" | "pack_sample_dl" | "pack_gc_dl" => (false, false),
+            "pack_sample_import" | "pack_gc_import" => (perf && crate::app_hooks::pack_import_available(id), false),
             "export_xml" => (!app.tracks.is_empty(), false),
             "export_playlists_info" => (app.nodes.iter().any(|n| n.kind != NodeKind::Folder), false),
             "sync_rekordbox" => (app.rb_job.is_none(), false),
             "undo" => (!app.undo.is_empty(), false),
             "redo" => (!app.redo.is_empty(), false),
             "fullscreen" => (true, app.dialogs.ext.fullscreen),
+            // The Light appearance does not exist in recordbox (Preferences > View says why).
+            "appearance_dark" => (true, true),
+            "appearance_light" => (false, false),
             "layout_player" => (true, layout == 0),
             "layout_2players" => (true, layout == 1),
             "layout_dual" => (true, layout == 2),
             "layout_simple" => (true, layout == 3),
             "layout_browser" => (true, layout == 4),
-            "mytag_window" => (true, app.prefs.show_mytag),
+            "perf_2h" | "perf_2v" | "perf_4h" | "perf_4v" | "perf_browse" => {
+                let k = ["perf_2h", "perf_2v", "perf_4h", "perf_4v", "perf_browse"].iter().position(|x| *x == id).unwrap_or(0) as u8;
+                (perf && crate::app_hooks::perf_layout_available(k), perf && crate::app_hooks::perf_layout(app) == k)
+            }
+            "pad_platter" => (perf && crate::app_hooks::pad_platter_available(app), false),
+            "split_screen" => (true, app.split.open),
+            "mytag_window" => (true, panel == 1),
+            "related_subpanel" => (true, panel == 2),
+            "suggest_subpanel" => (true, panel == 3),
+            "info_window" => (true, panel == 4),
+            "sub_browser" => (true, panel == 5),
+            "sub_browser_h" => (true, app.prefs.bx.sub_horizontal),
+            "automix" => (perf && crate::app_hooks::automix_available(), perf && crate::app_hooks::automix_shown(app)),
             "related_window" => (true, app.view == View::Related),
-            "info_window" => (layout != 3, layout != 3 && app.deck.panel_tab == 2),
-            "sub_browser" => (true, app.prefs.sub_browser),
             "filter" => (true, app.filter_open),
             "wave_blue" => (true, app.prefs.wave_color == 0),
             "wave_rgb" => (true, app.prefs.wave_color == 1),
             "wave_3band" => (true, app.prefs.wave_color == 2),
+            "import_to_collection" => (device_sel, false),
             "analyze" | "analyze_missing" | "analyze_key" | "export_tracks" | "reload_tags" | "remove_collection" => (has_sel, false),
             "analysis_lock" => (has_sel, locked),
+            "lock_on" => (has_sel && !locked, false),
+            "lock_off" => (has_sel && !unlocked, false),
             "auto_on" => (true, app.prefs.auto_analysis),
             "auto_off" => (true, !app.prefs.auto_analysis),
             "stop_analysis" => (app.analysis_total > app.analysis_done, false),
             "relocate" | "show_finder" | "property" | "load" => (one, false),
             "delete_playlist" | "rename_playlist" => (node.is_some(), false),
-            "export_playlist" | "save_playlist_info" => (node.map(|n| n.kind != NodeKind::Folder).unwrap_or(false), false),
+            "export_playlist" | "save_playlist_info" | "save_info_txt" | "save_info_m3u8" => (node.map(|n| n.kind != NodeKind::Folder).unwrap_or(false), false),
+            "copy_to_playlists" => (copyable_list(app), false),
             "sort_items" => (!app.nodes.is_empty(), false),
             "renumber" => (manual, false),
             _ => (true, false),
@@ -482,6 +514,14 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
         m.insert(id, v);
     }
     m
+}
+
+/// Whether a submenu can be opened in the app's present state.
+fn sub_state(app: &App) -> [(&'static str, bool); 4] {
+    let has_sel = app.list.iter().any(|t| app.selected.contains(t));
+    let node = current_node(app).map(|n| n.kind != NodeKind::Folder).unwrap_or(false);
+    let playlists = app.nodes.iter().any(|n| n.kind == NodeKind::Playlist);
+    [("analysis_lock", has_sel), ("add_to_playlist", has_sel && playlists), ("export_track", has_sel && !app.devices.is_empty()), ("export_playlist", node && !app.devices.is_empty())]
 }
 
 /// Bring the menu bar in line with the app: enabled, ticks and accelerators. Cheap when
@@ -495,6 +535,40 @@ pub fn sync(app: &App) {
     HANDLES.with(|h| {
         let mut h = h.borrow_mut();
         let h = &mut *h;
+        // The menus of the mode (rekordbox rebuilds its menu bar when the mode changes).
+        let mode = menu_mode(app);
+        if h.mode != mode {
+            if let Some(menu) = &app.menu {
+                fill(menu, h, mode);
+            }
+            h.mode = mode;
+        }
+        let ps = sig(&app.nodes.iter().map(|n| (n.id, n.parent, n.name.clone(), n.kind == NodeKind::Folder, n.kind == NodeKind::Smart)).collect::<Vec<_>>());
+        if h.playlists_sig != ps {
+            fill_playlists(h, app);
+            h.playlists_sig = ps;
+        }
+        let ds = sig(&app.devices.iter().map(|d| (d.root.clone(), d.name.clone())).collect::<Vec<_>>());
+        if h.devices_sig != ds {
+            fill_devices(h, app);
+            h.devices_sig = ds;
+        }
+        for (key, en) in sub_state(app) {
+            if h.subs_shown.get(key) != Some(&en) {
+                if let Some(s) = h.subs.get(key) {
+                    s.set_enabled(en);
+                }
+                h.subs_shown.insert(key, en);
+            }
+        }
+        // "Remove from Collection" in the collection, "Remove from Playlist" in a playlist.
+        let label = if app.is_manual_playlist().is_some() { "Remove from Playlist" } else { "Remove from Collection" };
+        if h.remove_label != label {
+            if let Some(Entry::Plain(i)) = h.items.get("remove_collection") {
+                i.set_text(label);
+            }
+            h.remove_label = label;
+        }
         for (id, (en, on)) in &want {
             if h.shown.get(id) == Some(&(*en, *on)) {
                 continue;
@@ -539,7 +613,96 @@ const AUDIO_EXT: [&str; 9] = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "flac",
 
 pub fn handle(app: &mut App, id: &str) {
     let sel = selected(app);
+    // Items of the filled-in submenus: "addpl:<playlist>", "exptrk:<device>", "exppl:<device>".
+    if let Some((kind, n)) = id.split_once(':') {
+        let Ok(n) = n.parse::<i64>() else { return };
+        match kind {
+            "addpl" => {
+                if !sel.is_empty() {
+                    app.add_to_playlist(n, &sel);
+                }
+            }
+            "exptrk" | "exppl" => {
+                let Some(root) = app.devices.get(n as usize).map(|d| d.root.clone()) else { return };
+                if kind == "exptrk" {
+                    crate::ui_browser::open_export(app, vec![], sel);
+                } else if let Some(node) = current_node(app).cloned() {
+                    crate::ui_browser::open_export(app, vec![node.id], vec![]);
+                } else {
+                    return;
+                }
+                app.dialogs.export_root = Some(root);
+            }
+            _ => {}
+        }
+        return;
+    }
     match id {
+        "dupes" => app.dupes_search(),
+        "pack_sample_import" | "pack_gc_import" => crate::app_hooks::pack_import(app, id),
+        "perf_2h" | "perf_2v" | "perf_4h" | "perf_4v" | "perf_browse" => {
+            let k = ["perf_2h", "perf_2v", "perf_4h", "perf_4v", "perf_browse"].iter().position(|x| *x == id).unwrap_or(0) as u8;
+            crate::app_hooks::set_perf_layout(app, k);
+        }
+        "pad_platter" => crate::app_hooks::toggle_pad_platter(app),
+        "split_screen" => app.split_toggle(),
+        "automix" => crate::app_hooks::toggle_automix(app),
+        "related_subpanel" | "suggest_subpanel" => {
+            let k = if id == "related_subpanel" { 2 } else { 3 };
+            let now = crate::ui_browser_ext::right_panel(app);
+            crate::ui_browser_ext::set_right_panel(app, if now == k { 0 } else { k });
+        }
+        "sub_browser_h" => {
+            let on = !app.prefs.bx.sub_horizontal;
+            if on {
+                crate::ui_browser_ext::set_right_panel(app, 0);
+            }
+            app.prefs.bx.sub_horizontal = on;
+            app.save_prefs();
+        }
+        "import_to_collection" => {
+            if let View::Device { root, .. } = app.view.clone() {
+                let ids: Vec<u32> = app.device_ui.sel.iter().copied().collect();
+                if !ids.is_empty() {
+                    app.import_from_device(&root, &ids, vec![]);
+                }
+            }
+        }
+        "lock_on" | "lock_off" => {
+            for t in &sel {
+                if let Some(tr) = app.track_mut(*t) {
+                    tr.grid_locked = id == "lock_on";
+                }
+                app.save_track(*t);
+            }
+        }
+        "save_info_txt" | "save_info_m3u8" => {
+            if let Some(n) = current_node(app).cloned() {
+                let (ext, kind) = if id == "save_info_txt" { ("txt", "Text") } else { ("m3u8", "M3U8 playlist") };
+                if let Some(f) = rfd::FileDialog::new().set_title("Save Playlist Info").set_file_name(format!("{}.{ext}", n.name)).add_filter(kind, &[ext]).save_file() {
+                    app.export_playlist_file(n.id, &f);
+                }
+            }
+        }
+        "copy_to_playlists" => {
+            if copyable_list(app) {
+                if app.list_dirty {
+                    app.rebuild_list();
+                }
+                let ids = app.list.clone();
+                let name = crate::ui_browser::view_title(app);
+                let name = name.split(" (").next().unwrap_or("Playlist").trim().to_string();
+                match app.db.create_node(0, if name.is_empty() { "Playlist" } else { &name }, NodeKind::Playlist, None) {
+                    Ok(pl) => {
+                        let _ = app.db.set_playlist_tracks(pl, &ids);
+                        app.reload_playlists();
+                        app.side = SideMode::Playlists;
+                        app.set_view(View::Playlist(pl));
+                    }
+                    Err(e) => app.toast_err(format!("The playlist could not be created: {e}")),
+                }
+            }
+        }
         "about" | "h_about" => app.dialogs.about = true,
         "edit_cut" | "edit_copy" | "edit_paste" | "edit_select_all" => {
             app.edit_cmds.push(match id {
@@ -656,9 +819,14 @@ pub fn handle(app: &mut App, id: &str) {
         "layout_dual" => app.set_player_layout(2),
         "layout_simple" => app.set_player_layout(3),
         "layout_browser" => app.set_player_layout(4),
-        "mytag_window" => {
-            app.prefs.show_mytag = !app.prefs.show_mytag;
-            app.save_prefs();
+        "mytag_window" | "info_window" | "sub_browser" => {
+            let k = match id {
+                "mytag_window" => 1,
+                "info_window" => 4,
+                _ => 5,
+            };
+            let now = crate::ui_browser_ext::right_panel(app);
+            crate::ui_browser_ext::set_right_panel(app, if now == k { 0 } else { k });
         }
         "related_window" => {
             if app.view == View::Related {
@@ -668,13 +836,6 @@ pub fn handle(app: &mut App, id: &str) {
                 app.side = SideMode::Related;
                 app.set_view(View::Related);
             }
-        }
-        "info_window" => {
-            app.deck.panel_tab = if app.deck.panel_tab == 2 { 0 } else { 2 };
-        }
-        "sub_browser" => {
-            app.prefs.sub_browser = !app.prefs.sub_browser;
-            app.save_prefs();
         }
         "filter" => {
             app.filter_open = !app.filter_open;
@@ -689,8 +850,15 @@ pub fn handle(app: &mut App, id: &str) {
             app.save_prefs();
         }
         "load" => {
+            // rekordbox (`ListViewer::returnKeyPressed`): player A, or player B with Shift held
+            // in the layouts that have two players.
             if let Some(t) = sel.first() {
-                app.load_track(*t);
+                let shift = app.ctx.input(|i| i.modifiers.shift);
+                if !app.performance() && app.two_players() && shift {
+                    app.load_track_to(1, *t);
+                } else {
+                    app.load_track(*t);
+                }
             }
         }
         "analyze" => app.reanalyze(&sel),
@@ -725,7 +893,10 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "remove_collection" => {
-            if !sel.is_empty() {
+            if let Some(pl) = app.is_manual_playlist().filter(|_| !sel.is_empty()) {
+                let s: std::collections::HashSet<i64> = sel.iter().copied().collect();
+                app.remove_from_playlist(pl, &s);
+            } else if !sel.is_empty() {
                 app.dialogs.confirm_remove = Some(sel);
             }
         }
@@ -805,6 +976,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_mode_lays_out_known_commands_and_submenus() {
+        let cmds: std::collections::HashSet<&str> = COMMANDS.iter().map(|c| c.0).collect();
+        let subs: std::collections::HashSet<&str> = SUBMENUS.iter().map(|s| s.0).chain(["help"]).collect();
+        for mode in 0..3u8 {
+            let lay = layout(mode);
+            let filled: std::collections::HashSet<&str> = lay.iter().map(|l| l.0).collect();
+            for (key, items) in &lay {
+                assert!(subs.contains(key), "{key}");
+                let mut seen = std::collections::HashSet::new();
+                for i in items {
+                    match i {
+                        C(id) => {
+                            assert!(cmds.contains(id), "{key}: {id}");
+                            assert!(seen.insert(*id), "{key}: {id} twice");
+                        }
+                        Sub(k) => assert!(subs.contains(k), "{key}: submenu {k}"),
+                        Sep => {}
+                    }
+                }
+                assert!(!matches!(items.first(), Some(Sep)) && !matches!(items.last(), Some(Sep)), "{key} starts or ends with a separator");
+            }
+            for top in top_level(mode) {
+                assert!(filled.contains(top), "{top} has no layout");
+            }
+        }
+        // rekordbox's menu bar: Track and Playlist are not in EDIT mode; Performance adds its
+        // layouts, Split Screen, Automix and the sample packs.
+        assert_eq!(top_level(2), ["file", "edit", "view", "help"]);
+        let has = |mode: u8, menu: &str, id: &str| layout(mode).iter().any(|(k, items)| *k == menu && items.iter().any(|i| matches!(i, C(x) if *x == id)));
+        assert!(has(0, "view", "layout_dual") && !has(1, "view", "layout_dual"));
+        assert!(has(1, "view", "perf_4v") && has(1, "view", "split_screen") && has(1, "view", "automix") && !has(0, "view", "automix"));
+        assert!(has(0, "file", "dupes") && has(1, "file", "dupes"));
+    }
+
+    #[test]
     fn commands_are_unique_and_keyboard_actions_reach_them() {
         let mut ids = std::collections::HashSet::new();
         for (id, label, _) in COMMANDS {
@@ -821,7 +1027,7 @@ mod tests {
             }
         }
         // The menu's own fixed accelerators do not collide with default keyboard shortcuts.
-        for fixed in ["Cmd+N", "Cmd+E", "Cmd+I"] {
+        for fixed in ["Cmd+N", "Cmd+E", "Cmd+I", "Cmd+R"] {
             assert!(!crate::prefs_ext::ACTIONS.iter().any(|a| a.2 == fixed), "{fixed}");
         }
     }

@@ -1689,7 +1689,7 @@ pub fn col_width(app: &App, c: Col) -> f32 {
     app.prefs.widths.get(&c.key()).copied().unwrap_or(c.width())
 }
 
-fn view_title(app: &App) -> String {
+pub fn view_title(app: &App) -> String {
     match &app.view {
         View::Collection => "Collection".into(),
         View::Playlist(id) => app.node(*id).map(|n| n.name.clone()).unwrap_or_default(),
@@ -1741,38 +1741,36 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
     }
     let two = app.two_players();
     if !in_sub {
-        // PLAYER A (load target): a 16 pt high #282828 box 80 pt wide, its last 16 pt a
-        // separate chevron part.
+        // Traffic Light (traffic.rs): a 16 pt high #282828 box 80 pt wide. Its first 63.5 pt
+        // switch the feature on and off and name the target; the last 16 pt are a separate
+        // pull-down part that picks the target.
         let pa = Rect::from_min_max(pos2(gx, bar.min.y + 5.0), pos2(gx + 80.0, bar.min.y + 21.0));
-        p.rect_filled(Rect::from_min_max(pa.min, pos2(pa.max.x - 16.5, pa.max.y)), egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, BTN);
-        p.rect_filled(Rect::from_min_max(pos2(pa.max.x - 16.0, pa.min.y), pa.max), egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, BTN);
-        p.text(pos2(pa.min.x + 7.0, pa.center().y), Align2::LEFT_CENTER, if app.performance() { format!("DECK {}", app.px.active + 1) } else if two && app.load_target == 1 { "PLAYER B".to_string() } else { "PLAYER A".to_string() }, rb_bold(9.75), WHITE);
+        let on = app.prefs.traffic.on;
+        let target = app.traffic_target();
+        let (label, tip_target) = crate::traffic::target_label(target);
+        let left = Rect::from_min_max(pa.min, pos2(pa.max.x - 16.5, pa.max.y));
+        let right = Rect::from_min_max(pos2(pa.max.x - 16.0, pa.min.y), pa.max);
+        p.rect_filled(left, egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, if on { BLUE } else { BTN });
+        p.rect_filled(right, egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, BTN);
+        p.text(pos2(pa.min.x + 7.0, pa.center().y), Align2::LEFT_CENTER, label, rb_bold(9.75), WHITE);
         {
             let c = pos2(pa.max.x - 8.0, pa.center().y + 0.5);
             p.add(egui::Shape::line(vec![c + vec2(-3.6, -1.8), c + vec2(0.0, 1.8), c + vec2(3.6, -1.8)], Stroke::new(1.0, WHITE)));
         }
-        let par = ui.interact(pa.intersect(bar), ui.id().with("playera"), Sense::click());
-        let par = if app.prefs.tooltips { par.on_hover_text("Player that double-click or Return loads tracks into.") } else { par };
+        let tl = ui.interact(left.intersect(bar), ui.id().with("traffic_on"), Sense::click());
+        let tl = if app.prefs.tooltips { tl.on_hover_text(format!("{tip_target}\n{}", crate::traffic::TIP_ENABLE)) } else { tl };
+        if tl.clicked() {
+            app.prefs.traffic.on = !on;
+            app.save_prefs();
+        }
+        let par = ui.interact(right.intersect(bar), ui.id().with("playera"), Sense::click());
+        let par = if app.prefs.tooltips { par.on_hover_text(crate::traffic::TIP_TARGET) } else { par };
         dropdown(ui, &par, "playera_menu", |ui| {
-            // Performance: the decks of the layout; the one chosen becomes the active deck.
-            if app.performance() {
-                for n in 0..app.deck_count() {
-                    if ui.selectable_label(app.px.active == n, format!("DECK {}", n + 1)).clicked() {
-                        app.activate_deck(n);
-                        ui.memory_mut(|m| m.close_popup());
-                    }
+            for t in app.traffic_targets() {
+                if ui.selectable_label(t == target, crate::traffic::target_label(t).0).clicked() {
+                    app.set_traffic_target(t);
+                    ui.memory_mut(|m| m.close_popup());
                 }
-                return;
-            }
-            // Load target: deck B exists in the 2 Players layout.
-            if ui.selectable_label(app.load_target == 0 || !two, "PLAYER A").clicked() {
-                app.load_target = 0;
-            }
-            if ui.add_enabled(two, egui::SelectableLabel::new(two && app.load_target == 1, "PLAYER B")).clicked() {
-                app.load_target = 1;
-            }
-            if !two {
-                ui.label(RichText::new("PLAYER B is available in the 2 Players layout.").size(11.0).color(DIM));
             }
         });
     }
@@ -2042,6 +2040,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
             app.scroll_to_selected = false;
         }
         let mut drop_line: Option<usize> = None;
+        app.traffic_now = if app.ext.in_sub { Vec::new() } else { app.traffic_matches() };
         let vout = sa.show_rows(ui, rh, n, |ui, range| {
             for i in range {
                 let id = app.list[i];
@@ -2172,7 +2171,10 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                 }
                 if resp.double_clicked() {
                     app.ext.edit_pending = None;
-                    if !matches!(hit.map(|h| h.0), Some(Col::Preview | Col::Rating | Col::Color)) {
+                    // rekordbox loads on a double click in EXPORT mode only (traced:
+                    // `ListViewer::loadTrackWhenRowDoubleClicked`); in PERFORMANCE a track goes
+                    // to a deck by dragging, the right-click menu or a Load key.
+                    if !app.performance() && !matches!(hit.map(|h| h.0), Some(Col::Preview | Col::Rating | Col::Color)) {
                         app.preview_stop();
                         app.load_track(id);
                     }
@@ -2539,7 +2541,16 @@ fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize)
             }
         }
         Col::Time => txt(if t.duration > 0.0 { fmt_time(t.duration, false) } else { String::new() }),
-        Col::Key => txt(t.key_label(app.prefs.key_alnum)),
+        Col::Key => {
+            // Traffic Light: a matching key stands black on a green cell that leaves 1 pt of
+            // the row above and below it.
+            if !app.ext.in_sub && !app.traffic_now.is_empty() && app.traffic_now.contains(&t.key) {
+                ui.painter().with_clip_rect(r).rect_filled(Rect::from_min_max(pos2(r.min.x, r.min.y + 1.0), pos2(r.max.x - 1.0, r.max.y - 1.0)), 0.0, Color32::from_rgb(0x00, 0xFF, 0x00));
+                p.text(text_pos(false), Align2::LEFT_CENTER, t.key_label(app.prefs.key_alnum), font.clone(), Color32::BLACK);
+            } else {
+                txt(t.key_label(app.prefs.key_alnum))
+            }
+        }
         Col::DateAdded => txt(t.date_added.get(..10).unwrap_or(&t.date_added).to_string()),
         Col::Color => {
             if t.color > 0 {

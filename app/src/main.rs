@@ -3,6 +3,7 @@
 use eframe::egui;
 mod analysis;
 mod app;
+mod app_hooks;
 mod audio;
 mod backup;
 mod brand;
@@ -10,6 +11,7 @@ mod cfx;
 mod browser_ext;
 mod db;
 mod demo;
+mod dupes;
 mod device_ext;
 mod export;
 mod fx;
@@ -38,7 +40,9 @@ mod prefs_ext;
 mod rbimport;
 mod stems;
 mod smart;
+mod split;
 mod theme;
+mod traffic;
 mod ui_browser;
 mod ui_browser_ext;
 mod ui_dialogs;
@@ -184,10 +188,15 @@ impl eframe::App for Gui {
                 _ => step!(ui_player::player_panel(app, ui)),
             });
         }
+        // Split Screen: the browser is in a window of its own (split.rs).
+        let split = split::frame(app, ctx);
         egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
-            step!(ui_browser::browser(app, ui));
+            if !split {
+                step!(ui_browser::browser(app, ui));
+            }
         });
         step!(ui_dialogs::dialogs(app, ctx));
+        step!(dupes::windows(app, ctx));
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));

@@ -222,6 +222,8 @@ pub struct Prefs {
     pub perf_sampler: bool,
     /// The sampler deck: its slots and settings.
     pub sampler: crate::ui_sampler::SamplerPrefs,
+    /// Traffic Light (traffic.rs): on / off, target per mode, range.
+    pub traffic: crate::traffic::TrafficPrefs,
     /// The FX panel's choices (rekordbox's FxUnitSettings): modes, effects, beat values,
     /// single-mode snapshots, RELEASE FX and the CFX row.
     pub fx: crate::ui_fx::FxSaved,
@@ -727,6 +729,7 @@ impl Default for Prefs {
             perf_four: false,
             perf_sampler: false,
             sampler: Default::default(),
+            traffic: Default::default(),
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -1084,6 +1087,11 @@ pub struct App {
     pub deck: Deck,
     /// Second deck, active deck number and other player state (player_ext.rs).
     pub px: crate::player_ext::PlayerExt,
+    /// Duplicated File Manager (dupes.rs), Split Screen (split.rs) and the keys Traffic Light
+    /// lights up this frame (traffic.rs).
+    pub dupes: crate::dupes::Dupes,
+    pub split: crate::split::Split,
+    pub traffic_now: Vec<i32>,
     /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
     /// (B only in the 2 Players layout).
     pub load_target: u8,
@@ -1222,6 +1230,9 @@ impl App {
             filter_tags_all: false,
             player: Player::with_device(audio_device.as_deref()),
             px: Default::default(),
+            dupes: Default::default(),
+            split: Default::default(),
+            traffic_now: Vec::new(),
             load_target: 0,
             deck: Deck::default(),
             pool,
@@ -1366,6 +1377,16 @@ impl App {
                         app.prefs.app_mode = 0;
                         app.prefs.browser_only = false;
                         app.prefs.player_layout = 0;
+                    }
+                    "dupes" | "dupesmerge" => crate::dupes::shot_setup(&mut app, v.as_str()),
+                    // Traffic Light on, for the target PREPDECK_SHOT_TRAFFIC names (default: the
+                    // mode's default target).
+                    "traffic" => {
+                        app.prefs.traffic.on = true;
+                        if let Some(t) = std::env::var("PREPDECK_SHOT_TRAFFIC").ok().and_then(|v| v.parse::<u8>().ok()) {
+                            app.prefs.traffic.target_export = t;
+                            app.prefs.traffic.target_perf = t;
+                        }
                     }
                     "hotcue" => app.deck.panel_tab = 1,
                     "info" => app.deck.panel_tab = 2,
