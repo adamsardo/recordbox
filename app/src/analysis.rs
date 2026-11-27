@@ -23,6 +23,7 @@ pub struct AnalysisSettings {
 pub mod dynamic;
 pub mod mp3_timebase;
 pub mod rb_hp;
+pub mod rb_beat1;
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
@@ -60,6 +61,12 @@ pub struct AnalysisResult {
     pub vocal: Option<Vec<u8>>,
 }
 
+/// `PREPDECK_BEAT=own`: use recordbox's own tempo/grid estimator instead of the port of
+/// rekordbox's beat library.
+pub fn own_beat_engine() -> bool {
+    std::env::var("PREPDECK_BEAT").map(|v| v == "own").unwrap_or(false)
+}
+
 pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> {
     let dec = decode_file(path)?;
     let mut r = analyze_decoded(&dec, &AnalysisSettings { vocal: false, ..s.clone() });
@@ -75,8 +82,16 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let wave = waveform(&mono, sr);
     let (bpm, grid) = match (s.do_grid, s.dynamic) {
         (false, _) => (0.0, None),
-        (true, false) => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
-        (true, true) => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
+        (true, dynamic) => {
+            // rekordbox's own analyser (ported, `rb_beat1`); recordbox's estimator with
+            // PREPDECK_BEAT=own.
+            let rb = if own_beat_engine() { None } else { rb_beat1::tempo_and_grid(&dec.samples, dec.sr, dynamic, s.bpm_min, s.bpm_max) };
+            match rb {
+                Some(r) => r,
+                None if dynamic => dynamic::tempo_and_grid_dynamic(&mono, sr, s.bpm_min, s.bpm_max),
+                None => tempo_and_grid(&mono, sr, s.bpm_min, s.bpm_max),
+            }
+        }
     };
     let (bpm, grid) = rb_hp::dispatch(dec, s, bpm, grid);
     let key = if s.do_key { crate::key::detect_key_stereo(&dec.samples, dec.sr, bpm, grid.as_ref()) } else { -1 };
