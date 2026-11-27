@@ -102,7 +102,8 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let left = Rect::from_min_size(full.min, vec2(80.0, full.height()));
     let right = Rect::from_min_max(pos2(full.max.x - 202.0, full.min.y), full.max);
     let main = Rect::from_min_max(pos2(left.max.x, full.min.y), pos2(full.max.x - 212.0, full.max.y));
-    p.rect_filled(left, 0.0, BG2);
+    // (A 1 pt black line under the header, as across the rest of the window.)
+    p.rect_filled(Rect::from_min_max(pos2(left.min.x, left.min.y + 1.0), left.max), 0.0, BG2);
 
     let pos = app.pos();
     let playing = app.playing();
@@ -194,15 +195,15 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
         // The title starts at x 156.5 (rekordbox puts a streaming service's mark before it,
         // which moves it to 179; local files have none).
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(sx(main, 156.5), my), pos2(x_artist - 8.0, my + 21.0)));
-        clip.text(pos2(sx(main, 156.5), my + HDR_TITLE_Y), Align2::LEFT_CENTER, t.display_title(), bold(15.5), WHITE);
+        clip.text(pos2(sx(main, 156.5), my + HDR_TITLE_Y), Align2::LEFT_CENTER, t.display_title(), caps(16.2), WHITE);
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(x_artist, my), pos2(x_time - 8.0, my + 21.0)));
-        clip.text(pos2(x_artist + 16.5, my + HDR_TEXT_Y), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.25), DIM);
+        clip.text(pos2(x_artist + 16.5, my + HDR_TEXT_Y), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.25), HDR_GREY);
     }
     for x in [x_artist, x_time, x_key, x_bpm] {
         div(x);
     }
     let remain = (dur - pos).max(0.0);
-    let dim_t = if loaded { DIM } else { OFF };
+    let dim_t = if loaded { HDR_GREY } else { OFF };
     let bright_t = if loaded { WHITE } else { OFF };
     let (big, small) = split_time(if loaded { remain } else { 0.0 });
     let (c1, c2) = if app.prefs.time_remain { (bright_t, dim_t) } else { (dim_t, bright_t) };
@@ -284,7 +285,9 @@ pub(crate) fn fit_rect(bx: Rect, size: egui::Vec2) -> Rect {
 }
 
 /// Vertical centres of the header row's texts (from the player's top edge).
-const HDR_TITLE_Y: f32 = 10.8;
+const HDR_TITLE_Y: f32 = 11.8;
+/// The players' grey text (artist, elapsed time): #878787 in references 01, 05, 06 and 07.
+pub(crate) const HDR_GREY: Color32 = hex(0x878787);
 const HDR_TEXT_Y: f32 = 11.2;
 const HDR_TIME_Y: f32 = 9.9;
 
@@ -1208,8 +1211,8 @@ pub(crate) struct PanelGeom {
 /// 1 Player: MEMORY 10 × 21 pt on a 22 pt pitch, HOT CUE 8 × 26 pt on a 27 pt pitch, tabs at y 230.
 pub(crate) const PANEL_1P: PanelGeom = PanelGeom { mem_pitch: 22.0, hot_pitch: 27.0, list_bottom: 225.0, tabs_y: 230.0 };
 /// 2 Players / Dual Player (one panel per deck, 186 pt tall): MEMORY 10 × 14 pt on a 15 pt
-/// pitch, the eight hot cues in the same height, tabs at y 162.
-pub(crate) const PANEL_2P: PanelGeom = PanelGeom { mem_pitch: 15.0, hot_pitch: 18.75, list_bottom: 155.0, tabs_y: 162.0 };
+/// pitch, the eight hot cues in the same height, tabs at y 161 (reference 05: 189 and 377 pt).
+pub(crate) const PANEL_2P: PanelGeom = PanelGeom { mem_pitch: 15.0, hot_pitch: 18.75, list_bottom: 155.0, tabs_y: 161.0 };
 
 pub(crate) fn side_panel(app: &mut App, ui: &mut Ui, r: Rect, g: &PanelGeom) {
     let p = ui.painter().clone();

@@ -1788,7 +1788,7 @@ fn date_dmy(s: &str) -> String {
     if parts.len() == 3 { format!("{}/{}/{}", parts[2], parts[1], parts[0]) } else { d.to_string() }
 }
 
-pub const INFO_LABEL: Color32 = hex(0x828282);
+pub const INFO_LABEL: Color32 = hex(0x878787);
 
 /// Information window at the right of the browser (reference 13), 445 pt wide on #1E1E1E:
 /// Summary / Info / Artwork tabs 21 pt high from 8.5 pt down (the chosen one blue with dark
@@ -1853,6 +1853,8 @@ pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
         let font = rb(INFO_ROW_FONT);
         let widest = rows.iter().map(|(_, v)| ui.painter().layout_no_wrap(v.clone(), font.clone(), WHITE).size().x).fold(0.0, f32::max);
         let content_w = (171.0 + widest + 8.0).max(body.width());
+        // The horizontal scroll bar's black track: 12 pt along the body's foot (reference 13).
+        bui.painter().rect_filled(Rect::from_min_max(pos2(body.min.x, body.max.y - 12.0), body.max), 0.0, Color32::BLACK);
         egui::ScrollArea::horizontal().id_salt("info_summary_h").auto_shrink([false, false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(&mut bui, |ui| {
             let (cr, _) = ui.allocate_exact_size(vec2(content_w, ui.available_height()), Sense::hover());
             let p = ui.painter().clone();
@@ -1885,8 +1887,9 @@ pub fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let y = t + 168.0 + 24.0 * i as f32;
                 p.rect_filled(Rect::from_min_max(pos2(l + 9.5, y), pos2(line_right, y + 1.0)), 0.0, hex(0x313131));
                 p.rect_filled(Rect::from_min_max(pos2(vx - 4.5, y + 3.5), pos2(vx - 3.5, y + 21.5)), 0.0, hex(0x313131));
-                p.text(pos2(l + 9.5, y + 12.5), Align2::LEFT_CENTER, *label, rb(INFO_LABEL_FONT), INFO_LABEL);
-                p.text(pos2(vx, y + 12.5), Align2::LEFT_CENTER, value, font.clone(), WHITE);
+                // (Text 1.5 pt under the row's middle: reference 13.)
+                p.text(pos2(l + 9.5, y + 14.0), Align2::LEFT_CENTER, *label, rb(INFO_LABEL_FONT), INFO_LABEL);
+                p.text(pos2(vx, y + 14.0), Align2::LEFT_CENTER, value, font.clone(), WHITE);
             }
             let y = t + 168.0 + 24.0 * rows.len() as f32;
             p.rect_filled(Rect::from_min_max(pos2(l + 9.5, y), pos2(line_right, y + 1.0)), 0.0, hex(0x313131));
@@ -2151,10 +2154,11 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
     let ids: HashSet<i64> = missing.iter().map(|t| t.id).collect();
     app.ext.missing_sel.retain(|t| ids.contains(t));
     let busy = app.ext.reloc_rx.is_some() || app.relocate_rx.is_some();
-    kit::dialog(ctx, "Missing File Manager").open(&mut open).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).frame(egui::Frame::window(&ctx.style()).fill(BG2).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
+    // (The window is #191919 in reference 16, not the browser's #1E1E1E.)
+    kit::dialog(ctx, "Missing File Manager").open(&mut open).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).frame(egui::Frame::window(&ctx.style()).fill(hex(0x191919)).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(602.0, 528.0), Sense::hover());
         let p = ui.painter().clone();
-        p.rect_filled(r, 0.0, BG2);
+        p.rect_filled(r, 0.0, hex(0x191919));
         let table = Rect::from_min_max(pos2(r.min.x + 4.0, r.min.y + 4.5), pos2(r.max.x - 4.0, r.min.y + 453.5));
         p.rect_filled(table, 0.0, BG);
         let font = rb(MFM_FONT);
@@ -2171,7 +2175,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             let cols: [(&str, f32); 4] = [("Track Title", 120.0), ("artist", 120.0), ("album", 120.0), ("location", content_w - 360.0)];
             let (hr, _) = ui.allocate_exact_size(vec2(content_w, 27.0), Sense::hover());
-            ui.painter().rect_filled(hr, 0.0, hex(0x1A1A1A));
+            ui.painter().rect_filled(hr, 0.0, hex(0x191919));
             let mut x = hr.min.x;
             for (i, (label, cw)) in cols.iter().enumerate() {
                 if i > 0 {
@@ -2234,7 +2238,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
         bg.context_menu(|ui| search_folders_menu(app, ui));
         // Count, and what is going on.
         let n = missing.len();
-        p.text(pos2(r.max.x - 15.5, r.min.y + 473.0), Align2::RIGHT_CENTER, format!("{n} Track{}", if n == 1 { "" } else { "s" }), font.clone(), hex(0xDCDCDC));
+        p.text(pos2(r.max.x - 15.5, r.min.y + 473.0), Align2::RIGHT_CENTER, format!("{n} Track{}", if n == 1 { "" } else { "s" }), font.clone(), hex(0xC8C8C8));
         if busy {
             p.text(pos2(r.min.x + 15.0, r.min.y + 473.0), Align2::LEFT_CENTER, "Searching…", font.clone(), DIM);
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
@@ -2242,8 +2246,10 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
         let picked: Vec<i64> = missing.iter().map(|t| t.id).filter(|t| app.ext.missing_sel.contains(t)).collect();
         let all: Vec<i64> = missing.iter().map(|t| t.id).collect();
         let target = if picked.is_empty() { all } else { picked.clone() };
-        for (k, (label, x)) in [("Auto Relocate", 15.0), ("Relocate", 138.5), ("Delete", 262.5), ("OK", 474.5)].into_iter().enumerate() {
-            let br = Rect::from_min_size(pos2(r.min.x + x, r.min.y + 489.0), vec2(108.5, 28.0));
+        // Buttons (reference 16): 110 x 30 pt from x 14 / 138 / 262 / 474, y 488, a 0.5 pt black
+        // outline and a fill from #474747 at the top to #3D3D3D at the foot.
+        for (k, (label, x)) in [("Auto Relocate", 14.0), ("Relocate", 138.0), ("Delete", 262.0), ("OK", 474.0)].into_iter().enumerate() {
+            let br = Rect::from_min_size(pos2(r.min.x + x, r.min.y + 488.0), vec2(110.0, 30.0));
             let enabled = match k {
                 0 => !target.is_empty() && !busy,
                 1 => picked.len() == 1,
@@ -2251,8 +2257,9 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
                 _ => true,
             };
             let resp = ui.interact(br, ui.id().with(("mfm_btn", k)), if enabled { Sense::click() } else { Sense::hover() });
-            p.rect_filled(br, 2.0, hex(0x141414));
-            p.rect_filled(br.shrink(1.0), 1.5, if enabled && resp.is_pointer_button_down_on() { hex(0x2E2E2E) } else if enabled && resp.hovered() { hex(0x4A4A4A) } else { hex(0x3C3C3C) });
+            p.rect_filled(br, 2.0, Color32::BLACK);
+            let (top, foot) = if enabled && resp.is_pointer_button_down_on() { (hex(0x2E2E2E), hex(0x2E2E2E)) } else if enabled && resp.hovered() { (hex(0x525252), hex(0x484848)) } else { (hex(0x474747), hex(0x3D3D3D)) };
+            kit::vgrad_rect(&p, br.shrink(0.5), top, foot);
             p.text(br.center(), Align2::CENTER_CENTER, label, font.clone(), if enabled { hex(0xC8C8C8) } else { hex(0x787878) });
             if resp.clicked() {
                 match k {

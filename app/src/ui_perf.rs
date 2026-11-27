@@ -215,12 +215,13 @@ pub(crate) fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, 
     }
     let ky = by + 32.0;
     let kl = ui.interact(Rect::from_center_size(pos2(rx - 157.0, ky), vec2(12.0, 14.0)), ui.id().with("keydn"), Sense::click());
-    crate::icons_player::chevron_left(&p, pos2(rx - 157.0, ky), 0.9, if loaded { WHITE } else { dim });
+    // (#646464 on an empty deck: reference performance/05, decks 2-4.)
+    crate::icons_player::chevron_left(&p, pos2(rx - 157.0, ky), 0.9, if loaded { WHITE } else { hex(0x646464) });
     if tip(kl, app, "Key Shift Down").clicked() {
         app.key_shift_step(-1);
     }
     let kr = ui.interact(Rect::from_center_size(pos2(rx - 97.0, ky), vec2(12.0, 14.0)), ui.id().with("keyup"), Sense::click());
-    crate::icons_player::chevron_right(&p, pos2(rx - 97.0, ky), 0.9, if loaded { WHITE } else { dim });
+    crate::icons_player::chevron_right(&p, pos2(rx - 97.0, ky), 0.9, if loaded { WHITE } else { hex(0x646464) });
     if tip(kr, app, "Key Shift Up").clicked() {
         app.key_shift_step(1);
     }

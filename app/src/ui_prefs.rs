@@ -569,7 +569,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
     let before = format!("{:?}", app.prefs);
     // The cards, from 38 pt down to 40 pt above the bottom edge. DJ System > General has no
     // "Reset to defaults" in the original: its cards run to 4 pt above the bottom edge.
-    let no_reset = false;
+    let no_reset = page == rb::DJ_SYSTEM && tabs[sub_tab] == "General" && !searching;
     let area = Rect::from_min_max(at(164.0, 38.0), at(WIN.x, height - if no_reset { 4.0 } else { 40.0 }));
     let mut content = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Min)));
     let mut scroll = egui::ScrollArea::vertical().id_salt(("prefs_scroll", page, sub_tab, searching)).max_height(area.height()).auto_shrink([false, false]);

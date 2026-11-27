@@ -779,22 +779,27 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let c = ((w - 80.0) / 2.0).floor();
     let mut sp = app.prefs.sampler.clone();
     let mut changed = false;
-    if let Some(v) = crate::ui_perf::knob(ui, pos2(x0 + c + 22.0, y0 + 24.0), "smp_gain", sp.gain / 100.0, 0.5, BLUE) {
+    // (Reference performance/08: the strip's knob, labels, CUE, BPM and + / - stand 3 pt higher
+    // than first drawn; the knob's ring is filled in blue up to the value with a white
+    // pointer; labels are Arial 9 regular in #969696.)
+    let kc = pos2(x0 + c + 22.0, y0 + 21.0);
+    if let Some(v) = crate::ui_perf::knob(ui, kc, "smp_gain", sp.gain / 100.0, 0.5, BLUE) {
         sp.gain = (v * 100.0).round();
         changed = true;
     }
-    p.text(pos2(x0 + c + 22.0, y0 + 39.0), Align2::CENTER_CENTER, "GAIN", caps(8.0), hex(0x8C8C8C));
+    crate::ui_perf_layouts::ring_knob(&p, kc, 8.5, 3.0, sp.gain / 100.0, hex(0x323232), BLUE, WHITE);
+    p.text(pos2(x0 + c + 22.0, y0 + 36.0), Align2::CENTER_CENTER, "GAIN", crate::ui_perf_layouts::arial(9.5), hex(0x969696));
     let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-    let cr = at(c + 7.0, 50.0, 30.0, 14.0);
+    let cr = at(c + 7.0, 47.5, 30.0, 14.0);
     let cresp = ui.interact(cr, ui.id().with("smp_cue"), Sense::click());
-    p.rect_filled(cr, 2.0, if sp.cue { hex(0xFFA500) } else if cresp.hovered() { lighten(BTN) } else { BTN });
-    p.text(cr.center(), Align2::CENTER_CENTER, "CUE", caps(8.0), if sp.cue { BG } else { hex(0x8C8C8C) });
+    p.rect_filled(cr, 2.0, if sp.cue { hex(0xFFA500) } else if cresp.hovered() { lighten(hex(0x323232)) } else { hex(0x323232) });
+    p.text(cr.center() - vec2(0.0, 1.0), Align2::CENTER_CENTER, "CUE", crate::ui_perf_layouts::arial(9.5), if sp.cue { BG } else { hex(0x969696) });
     if cresp.on_hover_text(if hp_on { "Headphones CUE of the sampler" } else { "Headphones CUE of the sampler.\nNo headphones output is set: choose one in Preferences > Audio > Input/Output." }).clicked() {
         sp.cue = !sp.cue;
         changed = true;
     }
     // Volume fader (26 x 47).
-    let fr = at(c + 46.0, 17.0, 26.0, 47.0);
+    let fr = at(c + 46.0, 14.5, 26.0, 47.0);
     let (ft, fb, fx) = (fr.min.y + 3.5, fr.max.y - 2.0, fr.center().x);
     let fresp = ui.interact(fr, ui.id().with("smp_vol"), Sense::click_and_drag());
     if let Some(pp) = fresp.interact_pointer_pos().filter(|_| fresp.dragged() || fresp.is_pointer_button_down_on() || fresp.clicked()) {
@@ -802,15 +807,20 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
         changed = true;
     }
     let hy = fb - sp.volume / 100.0 * (fb - ft);
+    // Two scale marks across the fader, 20 and 40 pt under the top of its travel (reference 08).
+    for k in [19.0, 39.0] {
+        p.rect_filled(Rect::from_min_max(pos2(fr.min.x, ft + k), pos2(fr.max.x, ft + k + 1.0)), 0.0, hex(0x323232));
+    }
     p.rect_filled(Rect::from_min_max(pos2(fx - 1.0, ft), pos2(fx + 1.0, fb)), 0.0, OFF);
     p.rect_filled(Rect::from_min_max(pos2(fx - 1.0, hy), pos2(fx + 1.0, fb)), 0.0, BLUE);
-    p.rect_filled(Rect::from_center_size(pos2(fx, hy), vec2(24.0, 2.0)), 0.0, if fresp.hovered() || fresp.dragged() { WHITE } else { hex(0x646464) });
+    p.rect_filled(Rect::from_center_size(pos2(fx, hy), vec2(fr.width(), 2.0)), 0.0, if fresp.hovered() || fresp.dragged() { WHITE } else { hex(0x646464) });
 
     // BPM (bold 18, 52 x 20): drag up or down, or the wheel; + and - under it.
     // (While it follows the master deck, + / - and typing are off; as the MASTER it is free.)
     let synced = sp.sync && !app.px.sampler.master;
     let shown = app.sampler_shown_bpm();
-    let br = at(w / 2.0 - 26.0, 68.0, 52.0, 20.0);
+    // (Centred 2 pt left of the panel's middle: reference 08.)
+    let br = at(w / 2.0 - 28.0, 64.5, 52.0, 20.0);
     let typing = app.px.sampler.bpm_edit.is_some();
     let bresp = ui.interact(br, ui.id().with("smp_bpm"), if typing { Sense::hover() } else { Sense::click_and_drag() });
     if let Some(mut text) = app.px.sampler.bpm_edit.take() {
@@ -861,12 +871,14 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     // + / -: 0.01 on the press; held, it repeats every 100 ms after 500 ms: nine steps of
     // 0.01, twenty of 0.1, then 0.2.
     for (dir, x, label) in [(1.0f32, w / 2.0 - 22.0, "+"), (-1.0, w / 2.0 + 2.0, "-")] {
-        let rr = at(x, h - 25.0, 20.0, 20.0);
+        // (20 pt #282828 tiles with a white 10 x 1.5 pt sign: reference 08.)
+        let rr = at(x, h - 28.0, 20.0, 20.0);
         let resp = ui.interact(rr, ui.id().with(("smp_bpm_step", label)), Sense::click_and_drag());
-        let col = if synced { hex(0x424242) } else if resp.hovered() { WHITE } else { hex(0xC8C8C8) };
-        p.rect_filled(Rect::from_center_size(rr.center(), vec2(9.0, 1.2)), 0.0, col);
+        p.rect_filled(rr, 1.0, if resp.hovered() && !synced { lighten(hex(0x282828)) } else { hex(0x282828) });
+        let col = if synced { hex(0x424242) } else { WHITE };
+        p.rect_filled(Rect::from_center_size(rr.center(), vec2(10.0, 1.5)), 0.0, col);
         if dir > 0.0 {
-            p.rect_filled(Rect::from_center_size(rr.center(), vec2(1.2, 9.0)), 0.0, col);
+            p.rect_filled(Rect::from_center_size(rr.center(), vec2(1.5, 10.0)), 0.0, col);
         }
         if synced {
             continue;

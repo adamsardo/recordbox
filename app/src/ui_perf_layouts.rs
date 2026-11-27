@@ -884,10 +884,10 @@ pub(crate) fn overview(app: &mut App, ui: &mut Ui, o: Pos2, w: f32, g: &DeckGeo,
         // Playhead: a 1 pt line over the waveform's height.
         let px = x_of(pos);
         p.rect_filled(Rect::from_min_max(pos2(px - 0.5, top), pos2(px + 0.5, base)), 0.0, hex(0xC8C8C8));
-        // The current cue (rekordbox's `CurrentCueImageUp`): 10.7 pt wide, from 4.5 pt above
-        // the base line to 4 pt under it.
+        // The current cue (rekordbox's `CurrentCueImageUp`): 10.7 pt wide, from 5 pt above
+        // the base line to 3.5 pt under it (references performance/01, 02, 05: 250..258.5).
         let cx = x_of(app.deck.cue_point);
-        p.with_clip_rect(bx).add(egui::Shape::convex_polygon(vec![pos2(cx, base - 4.5), pos2(cx + 5.35, base + 4.0), pos2(cx - 5.35, base + 4.0)], CUE_MARK, Stroke::NONE));
+        p.with_clip_rect(bx).add(egui::Shape::convex_polygon(vec![pos2(cx, base - 5.0), pos2(cx + 5.35, base + 3.5), pos2(cx - 5.35, base + 3.5)], CUE_MARK, Stroke::NONE));
     }
     let hit = Rect::from_min_max(pos2(x0, base - full_h - 3.0), pos2(x1, base + 6.0));
     let resp = ui.interact(hit, ui.id().with("overview"), Sense::click_and_drag());
@@ -1161,7 +1161,9 @@ pub(crate) fn control_strip(app: &mut App, ui: &mut Ui, area: Rect, vertical: bo
     let at = |x: f32, y: f32, bw: f32, bh: f32| Rect::from_min_size(r.min + vec2(x, y), vec2(bw, bh));
     let icon = |ui: &mut Ui, br: Rect, id: &str, name: &str, tipt: &str| -> egui::Response {
         let resp = ui.interact(br.expand(2.0), ui.id().with(("wctl", id)), Sense::click());
-        let col = if resp.hovered() { WHITE } else { hex(0xF0F0F0) };
+        // (White, hovered or not: the arrows peak at #FEFEFE in reference performance/01.)
+        let col = WHITE;
+        let _ = resp.hovered();
         let img = Rect::from_center_size(br.center(), if name.contains("zoom") { vec2(14.0, 14.0) } else if name.starts_with("wave_m") || name.starts_with("wave_c") { vec2(15.0, 15.0) } else { vec2(10.0, 10.0) });
         if !skin_at(ui.painter(), name, img, col) {
             let c = br.center();
@@ -2051,7 +2053,7 @@ pub(crate) fn link_button(ui: &mut Ui, bar: Rect, last_right: f32) {
     let p = ui.painter().clone();
     let r = Rect::from_min_size(pos2(last_right + 35.0, bar.min.y + 4.0), vec2(40.0, 19.0));
     let resp = ui.interact(r, ui.id().with("ablink"), Sense::click());
-    p.text(pos2(r.center().x + 0.25, bar.min.y + 11.0), Align2::CENTER_CENTER, "LINK", arial_b(14.0), if resp.hovered() { WHITE } else { hex(0xF0F0F0) });
+    p.text(pos2(r.center().x + 0.25, bar.min.y + 11.0), Align2::CENTER_CENTER, "LINK", arial_b(14.0), WHITE);
     p.rect_filled(Rect::from_min_size(pos2(r.min.x, bar.min.y + 20.0), vec2(40.0, 2.0)), 0.0, hex(0x292929));
     let _ = resp.on_hover_text("Ableton Link: not built in recordbox yet.");
 }
@@ -2067,12 +2069,20 @@ pub(crate) fn top_right(app: &mut App, ui: &mut Ui, bar: Rect) {
         let r = Rect::from_center_size(pos2(rx - 482.0, ty + 16.0), vec2(30.0, 16.0));
         let resp = ui.interact(r, ui.id().with(("top", "PAD")), Sense::click());
         let on = app.pads.editor_open;
-        p.text(pos2(rx - 482.0, ty + 15.75), Align2::CENTER_CENTER, "PAD", arial_b(12.0), if on { WHITE } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x646464) });
+        p.text(pos2(rx - 482.0, ty + 15.75), Align2::CENTER_CENTER, "PAD", arial_b(12.0), if on { WHITE } else if resp.hovered() { hex(0x8C8C8C) } else { hex(0x343434) });
         if resp.on_hover_text("Open/Close the PAD EDITOR window.").clicked() {
             app.pads.editor_open = !on;
         }
     }
     crate::ui_midi::header_button(app, ui, Rect::from_min_size(pos2(rx - 457.0, ty + 8.0), vec2(30.0, 16.0)));
+    top_right_common(app, ui, bar);
+}
+
+/// The right-hand items EXPORT and PERFORMANCE share (EXPORT has no PAD and MIDI): information,
+/// Preferences, master volume knob, level meter, audio dropout meter, clock.
+pub(crate) fn top_right_common(app: &mut App, ui: &mut Ui, bar: Rect) {
+    let p = ui.painter().clone();
+    let (rx, ty) = (bar.max.x, bar.min.y);
     // Information: rekordbox's hexagon (12 x 14); here it opens About.
     let ir = Rect::from_min_size(pos2(rx - 404.0, ty + 9.0), vec2(12.0, 14.0));
     let iresp = ui.interact(ir.expand(5.0), ui.id().with("topinfo"), Sense::click());
@@ -2203,6 +2213,19 @@ pub(crate) fn shot_view(app: &mut App, name: &str) -> bool {
         }
         "perfctlshut" => {
             app.prefs.perf_lay.ctl_open = false;
+            return true;
+        }
+        // The sampler panel with every slot empty and the decks' own pad modes (reference
+        // performance/08); in memory only.
+        "perfsampler0" => {
+            app.prefs.app_mode = 1;
+            app.prefs.perf_four = false;
+            app.prefs.perf_fx = false;
+            app.prefs.perf_sampler = true;
+            app.prefs.perf_lay = LayoutPrefs::default();
+            for s in app.prefs.sampler.slots.iter_mut() {
+                *s = None;
+            }
             return true;
         }
         _ => return false,

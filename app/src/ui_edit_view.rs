@@ -183,43 +183,26 @@ pub fn header(app: &mut App, ui: &mut Ui, r: Rect) {
     }
     let p = ui.painter().clone();
     let (rx, ty) = (r.max.x, r.min.y);
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, egui::FontId::proportional(10.7), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
-    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("edit_gear"), Sense::click());
-    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if gear.on_hover_text("Preferences").clicked() {
-        app.dialogs.prefs_open = true;
-    }
+    // The right side as in EXPORT (reference edit/01): information, Preferences, master volume
+    // knob, level meter, audio dropout meter, clock; the meter shows the editor's output.
+    crate::ui_perf_layouts::top_right_common(app, ui, r);
     let busy = app.analysis_total > 0 || app.edit.job.is_some() || app.edit.loading.is_some() || app.importing.is_some();
-    let spin = if busy { ui.input(|i| i.time) as f32 * 4.0 } else { 0.0 };
-    crate::icons_player::sync_mark(&p, pos2(rx - 223.0, ty + 14.0), spin, BLUE);
     if busy {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     }
-    // Level meter: what the editor is putting out.
     let peak = std::mem::take(&mut EDIT.lock().peak);
     for (c, y) in [(0usize, 9.0), (1, 15.0)] {
         let b = Rect::from_min_max(pos2(rx - 204.0, ty + y), pos2(rx - 124.0, ty + y + 3.0));
-        p.rect_filled(b, 0.0, FRAME);
         let db = 20.0 * peak[c].max(1e-6).log10();
         let f = ((db + 40.0) / 40.0).clamp(0.0, 1.0);
         if f > 0.0 {
-            p.rect_filled(Rect::from_min_size(b.min, vec2(b.width() * f, 3.0)), 0.0, hex(0xB0B0B0));
+            let g = b.width() * f.min(34.0 / 40.0);
+            p.rect_filled(Rect::from_min_size(b.min, vec2(g, 3.0)), 0.0, hex(0x2DD728));
+            if f > 34.0 / 40.0 {
+                p.rect_filled(Rect::from_min_max(pos2(b.min.x + g, b.min.y), pos2(b.min.x + b.width() * f, b.max.y)), 0.0, if db >= -0.1 { hex(0xF00000) } else { hex(0xFF8C19) });
+            }
         }
     }
-    let sl = Rect::from_min_max(pos2(rx - 102.0, ty + 8.0), pos2(rx - 70.0, ty + 21.0));
-    let sresp = ui.interact(sl.expand2(vec2(3.0, 0.0)), ui.id().with("edit_vol"), Sense::click_and_drag());
-    let mut v = app.player.state.lock().volume;
-    if sresp.dragged() || sresp.clicked() {
-        if let Some(pp) = sresp.interact_pointer_pos() {
-            v = ((pp.x - sl.min.x) / sl.width()).clamp(0.0, 1.0);
-            app.player.state.lock().volume = v;
-        }
-    }
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.max.x, ty + 16.0)), 0.0, FRAME);
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.min.x + (sl.width() * v).max(2.0), ty + 16.0)), 0.0, BLUE);
-    let _ = sresp.on_hover_text("Master volume");
 }
 
 // ---------------------------------------------------------------------------- the panel

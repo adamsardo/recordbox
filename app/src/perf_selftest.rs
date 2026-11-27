@@ -122,7 +122,8 @@ impl App {
                 st("SMP Q", p(510.5, py + 104.0)),
                 st("SMP BPM +", p(744.0, py + 103.0)),
                 st("SMP BPM SYNC", p(570.0, py + 103.0)),
-                ("SMP volume fader down", pos2(775.0, py + 22.0), pos2(775.0, py + 42.0)),
+                // (The fader stands 2.5 pt higher since the pixel pass of 2026-11-28.)
+                ("SMP volume fader down", pos2(775.0, py + 19.5), pos2(775.0, py + 39.5)),
                 st("SMP BANK 2", p(82.0, py + 104.0)),
                 st("SMP BANK 1", p(54.0, py + 104.0)),
                 // The sequencer strip (from x 796, the panel's last 30 pt). Slot 1 is a gate

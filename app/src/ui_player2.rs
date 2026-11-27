@@ -316,13 +316,37 @@ fn grid_icon(p: &Painter, r: Rect, icon: GridIcon, c: Color32) {
             p.add(Shape::convex_polygon(vec![mm(9.0, 10.8), mm(13.6, 7.9), mm(13.6, 13.7)], c, Stroke::NONE));
         }
         GridIcon::Metronome(on) => {
-            // A solid body (white; blue while it ticks) with the pendulum cut out of it.
+            // The skin's glyph (Grid_Export_Button_Metronome, 29 x 30): a base, a short post at
+            // the left, a pendulum leaning right, a top bar and a rounded column at the right;
+            // white (blue while it ticks), as reference 03 shows it.
             let col = if c == OFF { c } else if on { SKIN_BLUE } else { WHITE };
-            p.add(Shape::convex_polygon(vec![m(11.5, 7.0), m(18.5, 7.0), m(21.0, 23.0), m(9.0, 23.0)], col, Stroke::NONE));
-            let cut = Stroke::new(1.6 * k / 0.8, hex(0x282828));
-            p.line_segment([m(11.0, 8.0), m(18.6, 18.6)], cut);
-            p.line_segment([m(9.5, 18.8), m(20.5, 18.8)], cut);
-            p.add(Shape::closed_line(vec![m(12.4, 8.2), m(17.6, 8.2), m(19.4, 18.0), m(10.6, 18.0)], Stroke::new(0.9 * k / 0.8, hex(0x282828))));
+            let quad = |pts: [(f32, f32); 4]| {
+                p.add(Shape::convex_polygon(pts.iter().map(|(x, y)| m(*x, *y)).collect(), col, Stroke::NONE));
+            };
+            quad([(8.989, 18.257), (20.0, 18.257), (20.0, 22.0), (8.989, 22.0)]);
+            quad([(8.989, 12.341), (11.75, 16.386), (11.75, 18.257), (8.989, 18.257)]);
+            quad([(9.0, 7.965), (10.833, 7.029), (16.333, 18.257), (14.5, 18.257)]);
+            quad([(12.667, 7.029), (17.099, 7.010), (17.25, 8.901), (13.583, 8.901)]);
+            quad([(18.167, 14.515), (20.0, 14.515), (20.0, 18.257), (18.167, 18.257)]);
+            let bez = |a: (f32, f32), b: (f32, f32), c2: (f32, f32), d: (f32, f32), t: f32| {
+                let u = 1.0 - t;
+                (u * u * u * a.0 + 3.0 * u * u * t * b.0 + 3.0 * u * t * t * c2.0 + t * t * t * d.0, u * u * u * a.1 + 3.0 * u * u * t * b.1 + 3.0 * u * t * t * c2.1 + t * t * t * d.1)
+            };
+            let mut mesh = egui::Mesh::default();
+            let n = 10;
+            for i in 0..=n {
+                let t = i as f32 / n as f32;
+                let o = bez((17.099, 7.010), (17.927, 7.010), (20.0, 7.172), (20.0, 14.515), t);
+                let q = bez((17.25, 8.901), (17.481, 8.901), (18.166, 8.388), (18.167, 14.515), t);
+                mesh.colored_vertex(m(o.0, o.1), col);
+                mesh.colored_vertex(m(q.0, q.1), col);
+                if i > 0 {
+                    let j = (2 * i) as u32;
+                    mesh.add_triangle(j - 2, j - 1, j);
+                    mesh.add_triangle(j - 1, j + 1, j);
+                }
+            }
+            p.add(Shape::mesh(mesh));
         }
         GridIcon::Volume(v) => {
             for (i, (x, y0, y1)) in [(9.0, 12.0, 17.0), (13.0, 10.0, 19.0), (17.0, 8.0, 22.0)].iter().enumerate() {
@@ -797,8 +821,8 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
     let (d1, d2, d3) = (mx1 - 372.5 - shift, mx1 - 231.5 - shift, mx1 - 175.5 - shift);
     if let Some(tr) = &track {
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(mx0 + 49.0, y0 - 4.0), pos2(d1 - 8.0, y0 + 38.0)));
-        clip.text(pos2(mx0 + 49.5, y0 + 8.3), Align2::LEFT_CENTER, tr.display_title(), bold(15.5), WHITE);
-        clip.text(pos2(mx0 + 49.5, y0 + 28.7), Align2::LEFT_CENTER, &tr.artist, FontId::proportional(12.25), DIM);
+        clip.text(pos2(mx0 + 49.5, y0 + 8.3), Align2::LEFT_CENTER, tr.display_title(), caps(16.2), WHITE);
+        clip.text(pos2(mx0 + 49.5, y0 + 28.7), Align2::LEFT_CENTER, &tr.artist, FontId::proportional(12.25), crate::ui_player::HDR_GREY);
     }
     let ty = y0 + 28.0;
     for x in [d1, d2, d3] {
@@ -807,7 +831,7 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
     // Remaining and elapsed time; a click switches which one is bright.
     {
         let remain = (app.deck.duration - pos).max(0.0);
-        let (dim_t, bright_t) = if loaded { (DIM, WHITE) } else { (hex(0x323232), hex(0x323232)) };
+        let (dim_t, bright_t) = if loaded { (crate::ui_player::HDR_GREY, WHITE) } else { (hex(0x323232), hex(0x323232)) };
         let (c1, c2) = if app.prefs.time_remain { (bright_t, dim_t) } else { (dim_t, bright_t) };
         let (big, small) = split_time(if loaded { remain } else { 0.0 });
         p.text(pos2(d1 + 22.0, ty), Align2::LEFT_CENTER, format!("-{big}.{small}"), FontId::proportional(12.0), c1);
@@ -881,8 +905,9 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
     let s = Rect::from_min_max(pos2(mx0, t + rows.strip), pos2(mx1, t + rows.strip + 26.0));
     p.rect_filled(s, 0.0, BG2);
     let cy = s.min.y + 13.5;
-    let b = |x: f32, w: f32| Rect::from_min_size(pos2(mx0 + x, cy - 8.5), vec2(w, 17.0));
-    let br = |x: f32, w: f32| Rect::from_min_size(pos2(mx1 - x, cy - 8.5), vec2(w, 17.0));
+    // (Buttons 18 pt tall, 4 pt under the strip's top: reference 05, 117..135 pt.)
+    let b = |x: f32, w: f32| Rect::from_min_size(pos2(mx0 + x, cy - 9.5), vec2(w, 18.0));
+    let br = |x: f32, w: f32| Rect::from_min_size(pos2(mx1 - x, cy - 9.5), vec2(w, 18.0));
     let ink = if loaded { WHITE } else { hex(0x404040) };
     let fine = ui.input(|i| i.modifiers.shift);
     let step = if fine { 0.005 } else { 0.001 };
@@ -912,7 +937,10 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
         let lb = app.prefs.loop_beats;
         let active = app.loop_active().is_some();
         let field = b(359.0, 66.0);
-        if tip(button(ui, field, "lbeat", &beats_text(lb), if active { LOOP.gamma_multiply(0.7) } else { BTN }, WHITE, 11.0), app, "Auto Beat Loop:\nSet/Reset Loop of displayed beat length.").clicked() {
+        let lresp = button(ui, field, "lbeat", "", if active { LOOP.gamma_multiply(0.7) } else { BTN }, WHITE, 11.0);
+        // (The figures sit 1 pt above the field's middle: reference 05.)
+        p.text(field.center() - vec2(0.0, 1.0), Align2::CENTER_CENTER, beats_text(lb), FontId::proportional(11.0), WHITE);
+        if tip(lresp, app, "Auto Beat Loop:\nSet/Reset Loop of displayed beat length.").clicked() {
             if active {
                 app.loop_exit();
             } else {
@@ -967,7 +995,8 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
     } else {
         let bpm = app.effective_bpm();
         if loaded && bpm > 0.0 {
-            p.text(field.center(), Align2::CENTER_CENTER, format!("{bpm:.2}"), FontId::proportional(11.0), if follower { hex(0x6FA8F5) } else { WHITE });
+            // (2 pt left of the field's middle and 1 pt above it: reference 05.)
+            p.text(field.center() - vec2(2.0, 1.0), Align2::CENTER_CENTER, format!("{bpm:.2}"), FontId::proportional(11.0), if follower { hex(0x6FA8F5) } else { WHITE });
         }
         let resp = ui.interact(field, ui.id().with("tempofield"), Sense::click());
         if tip(resp, app, "Display the BPM of the track currently playing.\nClick here to enter a BPM value (within the Tempo Range) directly.").clicked() && loaded && bpm > 0.0 {
@@ -1026,7 +1055,8 @@ fn shared_controls(app: &mut App, ui: &mut Ui, g: &TwoGeom) {
     // Crossfader: A at the top, B at the bottom; the fader runs from y 162 to 215.
     let cx = l + if g.dual { 97.0 } else { 38.0 };
     let (y0, y1) = (t + 162.0, t + 215.0);
-    let label = hex(0x757575);
+    // (#989898 in reference 05.)
+    let label = hex(0x989898);
     p.text(pos2(cx, t + 150.0), Align2::CENTER_CENTER, "A", bold(10.0), label);
     p.text(pos2(cx, t + if g.dual { 226.0 } else { 230.0 }), Align2::CENTER_CENTER, "B", bold(10.0), label);
     let rail = hex(0x323232);
@@ -1114,9 +1144,9 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
     let (x_artist, x_time, x_key, x_bpm) = (x(640.0), x(1011.0), x(1168.0), x(1224.0));
     if let Some(tr) = &track {
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(l + 120.0, t), pos2(x_artist - 8.0, t + 27.0)));
-        clip.text(pos2(l + 119.3, t + 16.3), Align2::LEFT_CENTER, tr.display_title(), bold(15.5), WHITE);
+        clip.text(pos2(l + 119.3, t + 16.3), Align2::LEFT_CENTER, tr.display_title(), caps(16.2), WHITE);
         let clip = p.with_clip_rect(Rect::from_min_max(pos2(x_artist, t), pos2(x_time - 8.0, t + 27.0)));
-        clip.text(pos2(x_artist + 16.5, t + 16.7), Align2::LEFT_CENTER, &tr.artist, FontId::proportional(12.25), DIM);
+        clip.text(pos2(x_artist + 16.5, t + 16.7), Align2::LEFT_CENTER, &tr.artist, FontId::proportional(12.25), crate::ui_player::HDR_GREY);
         p.text(pos2((x_key + x_bpm) / 2.0 + 0.5, t + 16.2), Align2::CENTER_CENTER, tr.key_label(app.prefs.key_alnum), FontId::proportional(13.0), WHITE);
         let b = app.current_bpm();
         p.text(pos2(x(1263.0), t + 16.2), Align2::CENTER_CENTER, if b > 0.0 { format!("{b:.2}") } else { "--.--".into() }, FontId::proportional(13.0), WHITE);
@@ -1126,7 +1156,7 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
     }
     // Remaining and elapsed time; tenths smaller on the same baseline.
     let remain = (app.deck.duration - pos).max(0.0);
-    let (dim_t, bright_t) = if loaded { (DIM, WHITE) } else { (OFF, OFF) };
+    let (dim_t, bright_t) = if loaded { (crate::ui_player::HDR_GREY, WHITE) } else { (OFF, OFF) };
     let (c1, c2) = if app.prefs.time_remain { (bright_t, dim_t) } else { (dim_t, bright_t) };
     let ty = t + 15.4;
     let (big, small) = split_time(if loaded { remain } else { 0.0 });
@@ -1140,7 +1170,8 @@ pub fn simple_player(app: &mut App, ui: &mut Ui) {
         app.prefs.time_remain = !app.prefs.time_remain;
     }
     // Overview: base line 47 pt below the top.
-    draw_overview(app, ui, Rect::from_min_max(pos2(l + 128.0, t + 17.0), pos2(x(1290.0), t + 50.0)), pos);
+    // (Base line at 76 pt in reference 07: one point under the 1 Player's proportion.)
+    draw_overview(app, ui, Rect::from_min_max(pos2(l + 128.0, t + 18.0), pos2(x(1290.0), t + 51.0)), pos);
     // The INFO sheet: rating, colour and comment (scroll for the rows below the first).
     p.rect_filled(Rect::from_min_max(pos2(r - 209.0, t + 1.0), pos2(r - 3.0, full.max.y)), 0.0, BG2);
     let sheet = Rect::from_min_max(pos2(r - 201.0, t + 6.0), pos2(r - 11.0, t + 54.0));

@@ -187,54 +187,10 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     if tipf(rec, "Show/Hide Rec panel").clicked() {
         app.rec_toggle_panel();
     }
-    // Right side, measured from the right edge (1512 pt window): gear 14 pt centred at −261,
-    // sync mark 18 pt centred at −223, level meter −204..−124, volume −102..−70, clock ends −21.5.
-    let rx = r.max.x;
-    let ty = r.min.y;
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    p.text(pos2(rx - 21.4, ty + 13.8), Align2::RIGHT_CENTER, now, FontId::proportional(10.7), WHITE);
-    let gear_r = Rect::from_center_size(pos2(rx - 261.0, ty + 13.0), vec2(14.0, 14.0));
-    let gear = ui.interact(gear_r.expand(4.0), ui.id().with("gear"), Sense::click());
-    crate::icons_player::gear(&p, gear_r.center(), 1.0, WHITE, BG1);
-    if tipf(gear, "Preferences").clicked() {
-        app.dialogs.prefs_open = true;
-    }
-    // Sync / analysis activity mark (turns while work is running).
-    let busy = app.analysis_total > 0 || app.export_job.is_some() || app.importing.is_some();
-    let spin = if busy { ui.input(|i| i.time) as f32 * 4.0 } else { 0.0 };
-    crate::icons_player::sync_mark(&p, pos2(rx - 223.0, ty + 14.0), spin, BLUE);
-    if busy {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-    }
-    // Level meter (left and right): two 80 × 3 pt bars at y 9–12 and 15–18.
-    let bars = [Rect::from_min_max(pos2(rx - 204.0, ty + 9.0), pos2(rx - 124.0, ty + 12.0)), Rect::from_min_max(pos2(rx - 204.0, ty + 15.0), pos2(rx - 124.0, ty + 18.0))];
-    for b in bars {
-        p.rect_filled(b, 0.0, hex(0x323232));
-    }
-    if app.playing() {
-        if let Some(w) = &app.deck.wave {
-            let f = (app.pos() * WAVE_FPS) as usize;
-            if let Some(fr) = w.frames.get(f) {
-                let lvl = (fr[0] as f32 / 255.0).min(1.0);
-                for b in bars {
-                    p.rect_filled(Rect::from_min_max(b.min, pos2(b.min.x + b.width() * lvl, b.max.y)), 0.0, hex(0xB0B0B0));
-                }
-            }
-        }
-    }
-    // Master volume slider: a 32 × 3 pt bar at y 13–16.
-    let sl = Rect::from_min_max(pos2(rx - 102.0, ty + 8.0), pos2(rx - 70.0, ty + 21.0));
-    let sresp = ui.interact(sl.expand2(vec2(3.0, 0.0)), ui.id().with("vol"), Sense::click_and_drag());
-    let mut v = app.player.state.lock().volume;
-    if sresp.dragged() || sresp.clicked() {
-        if let Some(pp) = sresp.interact_pointer_pos() {
-            v = ((pp.x - sl.min.x) / sl.width()).clamp(0.0, 1.0);
-            app.player.state.lock().volume = v;
-        }
-    }
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.max.x, ty + 16.0)), 0.0, hex(0x323232));
-    p.rect_filled(Rect::from_min_max(pos2(sl.min.x, ty + 13.0), pos2(sl.min.x + (sl.width() * v).max(2.0), ty + 16.0)), 0.0, BLUE);
-    let _ = tipf(sresp, "Master volume (preview)");
+    // Right side (as in PERFORMANCE, without PAD and MIDI): information, Preferences, master
+    // volume knob, level meter, audio dropout meter, clock (reference export/01).
+    let _ = tipf;
+    crate::ui_perf_layouts::top_right_common(app, ui, r);
 }
 
 fn menus(app: &mut App, ui: &mut Ui) {
@@ -391,7 +347,23 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     let h = (secs / 3600.0).floor();
     let m = ((secs - h * 3600.0) / 60.0).floor();
     let total = format!("{n} Tracks, {} hours {} minutes, {:.1} GB", h, m, bytes as f64 / 1e9);
-    p.text(pos2(r.max.x - 34.5, r.center().y), Align2::RIGHT_CENTER, total, rb_bold(11.5), DIM);
+    // (Capitals from 905 pt in every mode: 16 pt above the window's foot. PERFORMANCE has the
+    // Split Screen button at the right, skin split_off / split_on, 16 pt at x 1484, y 901, and
+    // the text ends 40 pt further left: reference performance/01.)
+    let perf = app.performance();
+    p.text(pos2(r.max.x - if perf { 74.5 } else { 34.5 }, r.max.y - 11.0), Align2::RIGHT_CENTER, total, rb_bold(11.5), DIM);
+    if perf {
+        let br = Rect::from_min_size(pos2(r.max.x - 28.0, r.max.y - 20.0), vec2(16.0, 16.0));
+        let resp = ui.interact(br.expand(3.0), ui.id().with("split_btn"), Sense::click());
+        let name = if app.split.open { "split_on.svg" } else { "split_off.svg" };
+        if !crate::ui_perf_layouts::skin_at(&p, name, br, WHITE) {
+            p.rect_stroke(Rect::from_min_max(pos2(br.min.x, br.min.y + 3.2), pos2(br.min.x + 14.4, br.max.y - 1.6)), 0.0, Stroke::new(0.8, WHITE), egui::StrokeKind::Inside);
+        }
+        let resp = if app.prefs.tooltips { resp.on_hover_text("Split Screen: Open a browser screen as an independent window.") } else { resp };
+        if resp.clicked() {
+            app.split_toggle();
+        }
+    }
     // status / messages
     let mid = Rect::from_min_max(pos2(r.min.x + 120.0, r.min.y + 3.0), pos2(r.max.x - 300.0, r.max.y - 3.0));
     app.toasts.retain(|t| t.until > std::time::Instant::now());
@@ -424,10 +396,15 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
 /// track list 253..1485.5, right icon strip 1488..1512; top row of the tree area 20 pt high.
 pub fn browser(app: &mut App, ui: &mut Ui) {
     app.poll_library_ext();
-    // rekordbox's browser starts 283 pt below the window top: one point above this panel (the
-    // player's last point is empty), so the browser is drawn from there.
+    // EXPORT (references export/01-15): a 3 pt black gap under the player (the browser starts
+    // 287 pt below the window top in 1 Player), or a 1 pt line under the header in Full Browser.
     let mut full = ui.max_rect();
-    if !app.prefs.browser_only {
+    let export = !app.performance() && !crate::ui_edit::is_edit(app);
+    if export {
+        full.min.y += if app.prefs.browser_only { 1.0 } else { 3.0 };
+    } else if app.performance() {
+        // (PERFORMANCE: from the panel's own top, references performance/01-09.)
+    } else if !app.prefs.browser_only {
         full.min.y -= 1.0;
         let mut clip = ui.clip_rect();
         clip.min.y = clip.min.y.min(full.min.y);
@@ -441,10 +418,11 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
     crate::ui_browser_ext::sync_right_panels(app);
     let whole = full;
     let track_view = !matches!(app.view, View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. });
-    // Sub-browser under the browser (reference 15): the browser keeps the upper 298 of 608 pt.
+    // Sub-browser under the browser (reference 15): the browser keeps the upper 301 of 608 pt,
+    // then a 5 pt gap and the sub-browser (the halves of what is left, the upper one rounded down).
     let sub_below = if app.prefs.bx.sub_horizontal {
-        let split = full.min.y + (full.height() * 0.49).round();
-        let sub = Rect::from_min_max(pos2(full.min.x, split + 8.0), full.max);
+        let split = full.min.y + ((full.height() - 5.0) / 2.0).floor();
+        let sub = Rect::from_min_max(pos2(full.min.x, split + 5.0), full.max);
         full.max.y = split;
         Some(sub)
     } else {
@@ -475,12 +453,17 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
         _ => 0.0,
     };
     let pw = if rp == 0 { 0.0 } else { f32::min(pw, (avail - 200.0).max(120.0)) };
-    let panel = Rect::from_min_max(pos2(right_strip.min.x - pw, full.min.y), pos2(right_strip.min.x, full.max.y));
+    // (The sub-browser ends 4 pt before the right strip, the gap in the strip's colour:
+    // reference 14.)
+    let panel = Rect::from_min_max(pos2(right_strip.min.x - pw, full.min.y), pos2(right_strip.min.x - if rp == 5 { 4.0 } else { 0.0 }, full.max.y));
     let list = Rect::from_min_max(pos2(full.min.x + tw + 5.0, full.min.y), pos2(if rp == 0 { right_strip.min.x } else { panel.min.x - 5.0 }, full.max.y));
     let p = ui.painter().clone();
     p.rect_filled(whole, 0.0, BG);
     p.rect_filled(Rect::from_min_max(pos2(full.min.x + 2.0, full.min.y), tree.max), 0.0, BG2);
     p.rect_filled(right_strip, 0.0, BG2);
+    if rp == 5 {
+        p.rect_filled(Rect::from_min_max(pos2(panel.max.x, full.min.y), pos2(right_strip.min.x, full.max.y)), 0.0, BG2);
+    }
     // Top row of the tree area: collapse chevron and the tile that puts the sub-browser under
     // the browser (skin subBrowse_vertical; lit: blue with a white frame).
     crate::icons_src::chevron(&p, Rect::from_min_size(pos2(full.min.x + 12.0, full.min.y + 5.0), vec2(6.0, 10.0)), OFF);
@@ -687,7 +670,12 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
             src::tile(p, rr, false, resp.hovered(), *tile != Tile::Off, BG2)
         };
         let col = if *tile == Tile::Off { hex(0x4A4A4A) } else { WHITE };
-        draw(p, rr, col, bg);
+        // iTunes is rekordbox's own colour logo (the 18 pt PNG of skins/MediaSelect, which the
+        // reference shows; the SVG is a different, newer logo).
+        let skin_icon = matches!(tile, Tile::Side(SideMode::Itunes)) && crate::ui_perf_layouts::skin_at(p, if on { "MediaSelect/brws_icon_iTunes_on.png" } else { "MediaSelect/brws_icon_iTunes_off.png" }, rr, WHITE);
+        if !skin_icon {
+            draw(p, rr, col, bg);
+        }
         let tip = match tile {
             Tile::Suggest => crate::browser_ext::SUGGEST_TIPS[0],
             _ => name,

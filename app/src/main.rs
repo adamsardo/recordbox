@@ -276,7 +276,19 @@ impl eframe::App for Gui {
         egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
             step!(ui_browser::header_bar(app, ui));
         });
-        egui::TopBottomPanel::bottom("footer").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        // The browser ends 895 pt down (a 26 pt footer) in EXPORT, PERFORMANCE's Browse layouts
+        // and with the recording panel open, and 893 (28 pt) in the other PERFORMANCE screens and
+        // in EDIT (whose tool panel draws to 895 itself): the rule fitted to the 7.2.19 captures
+        // (not traced).
+        let foot_h = if app.performance() {
+            let browse = matches!(ui_perf_layouts::layout(app), ui_perf_layouts::Layout::Browse2 | ui_perf_layouts::Layout::Browse4);
+            if browse || app.prefs.rec.panel { 26.0 } else { 28.0 }
+        } else if ui_edit::is_edit(app) {
+            28.0
+        } else {
+            26.0
+        };
+        egui::TopBottomPanel::bottom("footer").exact_height(foot_h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
         // EXPORT mode's recording panel, a strip under the top bar.
@@ -588,6 +600,11 @@ fn main() -> eframe::Result<()> {
     }
     if shot_mode {
         viewport = viewport.with_active(false);
+        // PREPDECK_SHOT_FULL=1: no title bar, so the window gets rekordbox's full 921 pt of
+        // content even on a screen too short for 921 pt plus a title bar (pixel comparisons).
+        if std::env::var("PREPDECK_SHOT_FULL").is_ok() {
+            viewport = viewport.with_decorations(false);
+        }
         #[cfg(target_os = "windows")]
         {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);

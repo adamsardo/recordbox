@@ -197,7 +197,9 @@ pub fn window_split(p: &Painter, r: Rect, c: Color32, bg: Color32) {
     let k = r.width() / 16.0;
     let q = |x: f32, y: f32| r.min + vec2(x, y) * k;
     p.rect_filled(Rect::from_min_max(q(2.0, 3.17), q(14.0, 12.83)), 0.0, c);
-    p.rect_filled(Rect::from_min_max(q(3.17, 7.0), q(12.83, 11.67)), 0.0, bg);
+    // (rekordbox draws the cut-out as the glyph colour at a quarter strength over the tile:
+    // 85 on #1E1E1E, 151 on the lit tile, in references export/08, 14 and 15.)
+    p.rect_filled(Rect::from_min_max(q(3.17, 7.0), q(12.83, 11.67)), 0.0, bg.lerp_to_gamma(c, 0.245));
 }
 
 /// Library sync mark (skin: syncManager, 18 x 12): two half-circle arrows.
@@ -468,6 +470,15 @@ pub fn plus_disc(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
     p.circle_filled(c, 6.0, col);
     p.rect_filled(Rect::from_center_size(c, vec2(8.0, 2.0)), 0.0, bg);
     p.rect_filled(Rect::from_center_size(c, vec2(2.0, 8.0)), 0.0, bg);
+}
+
+/// Skin brws_tree_addIcon (11 x 11): a #969696 disc with a 1 pt #191919 cross 7 pt long
+/// (My Tag's "Create a new My Tag." button).
+pub fn add_disc11(p: &Painter, c: Pos2, col: Color32) {
+    p.circle_filled(c, 5.5, col);
+    let x = Color32::from_rgb(25, 25, 25);
+    p.rect_filled(Rect::from_center_size(c, vec2(7.0, 1.0)), 0.0, x);
+    p.rect_filled(Rect::from_center_size(c, vec2(1.0, 7.0)), 0.0, x);
 }
 
 /// Skin brws_setting (14 x 14): a gear with eight teeth and a round hole.

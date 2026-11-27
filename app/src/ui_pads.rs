@@ -472,9 +472,10 @@ fn hot_cue_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, pi
                 }
             }
             None => {
-                // An empty pad: its letter in #646464 where the chip would be.
+                // An empty pad: its letter in #646464 where the chip would be (also on a deck with
+                // nothing loaded: deck 2 of reference performance/01).
                 let at = if pad_layout { pr.center() } else { pos2(pr.min.x + 15.5, cy) };
-                p.text(at, Align2::CENTER_CENTER, &letter, font.clone(), if loaded { hex(0x646464) } else { PAD_OFF });
+                p.text(at, Align2::CENTER_CENTER, &letter, font.clone(), hex(0x646464));
             }
         }
         if press_fired(ui, &resp) && loaded && !over_delete {

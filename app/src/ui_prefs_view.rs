@@ -76,7 +76,8 @@ fn display_type(app: &mut App, ui: &mut Ui, mode: Mode) {
         if played {
             it.sep(340.0);
             it.child(20.0, 356.0, |it| {
-                it.sub(32.0, 0.0, "Coloring of played tracks ");
+                // (EXPORT's heading names LINK EXPORT: reference/06-preferences-view.)
+                it.sub(32.0, 0.0, if mode == Mode::Export { "Coloring of played tracks  (LINK EXPORT)" } else { "Coloring of played tracks " });
                 // (LINK EXPORT and the play history colouring are not part of recordbox.)
                 let why = "recordbox has no LINK EXPORT, so no tracks are coloured as played.";
                 it.hint(why);
@@ -205,6 +206,11 @@ fn layout(app: &mut App, ui: &mut Ui, mode: Mode) {
             let [left, right] = crate::prefs_ext::MEDIA_BROWSER;
             for i in 0..left.len() {
                 for (col, name) in [left[i], right[i]].into_iter().enumerate() {
+                    // (Hot Cue Bank List is an EXPORT item: PERFORMANCE's page ends its right
+                    // column at SEARCH MOBILE button, reference preferences/05.)
+                    if name == "Hot Cue Bank List" && mode != Mode::Export {
+                        continue;
+                    }
                     let (x, y) = (64.0 + 287.0 * col as f32, 36.0 + 26.0 * i as f32);
                     if crate::prefs_ext::tree_item_available(name) {
                         let mut on = p.tree_item(name);

@@ -830,3 +830,16 @@ mod slider_tests {
         assert_eq!(frame(&ctx, vec![moved(300.0), button(300.0, true), moved(150.0), button(150.0, false)]), None);
     }
 }
+
+/// A rectangle filled with a vertical gradient (`top` to `bottom`), square-cornered.
+pub fn vgrad_rect(p: &egui::Painter, r: Rect, top: Color32, bottom: Color32) {
+    let mut m = egui::Mesh::default();
+    let i = m.vertices.len() as u32;
+    m.colored_vertex(r.left_top(), top);
+    m.colored_vertex(r.right_top(), top);
+    m.colored_vertex(r.left_bottom(), bottom);
+    m.colored_vertex(r.right_bottom(), bottom);
+    m.add_triangle(i, i + 1, i + 2);
+    m.add_triangle(i + 1, i + 3, i + 2);
+    p.add(egui::Shape::mesh(m));
+}

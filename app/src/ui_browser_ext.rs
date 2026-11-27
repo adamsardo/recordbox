@@ -75,7 +75,7 @@ pub fn bar_style(ui: &mut Ui) {
 
 // ------------------------------------------------------------------------------ My Tag window
 
-pub const MYTAG_FONT: f32 = 13.5;
+pub const MYTAG_FONT: f32 = 14.25;
 
 /// A text field in a list row: returns the text once the field gives up focus.
 fn row_edit(ui: &mut Ui, r: Rect, text: &mut String, hint: &str) -> bool {
@@ -126,7 +126,7 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     app.reload_tags();
                 }
             } else {
-                ui.painter().with_clip_rect(hr).text(pos2(hr.min.x + 7.5, hr.center().y + 0.75), Align2::LEFT_CENTER, &c.name, rb(MYTAG_FONT), DIM);
+                ui.painter().with_clip_rect(hr).text(pos2(hr.min.x + 7.0, hr.center().y + 1.25), Align2::LEFT_CENTER, &c.name, rb(MYTAG_FONT - 0.25), DIM);
             }
             if hresp.double_clicked() {
                 app.dialogs.rename_tag = Some((c.id, c.name.clone()));
@@ -156,11 +156,12 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let (rr, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
                 let last = row + 1 == n_rows;
                 // The disc that adds a tag to this category.
-                let plus = Rect::from_center_size(pos2(rr.max.x - 13.5, rr.center().y), vec2(14.0, 14.0));
+                // (skin brws_tree_addIcon, 11 pt, centred 1.5 pt above the row's middle: reference 10)
+                let plus = Rect::from_center_size(pos2(rr.max.x - 13.5, rr.center().y - 1.5), vec2(14.0, 14.0));
                 let mut plus_clicked = false;
                 if last && !adding {
                     let presp = ui.interact(plus, ui.id().with(("mytag_plus", c.id)), Sense::click());
-                    crate::icons_src::plus_disc(ui.painter(), plus.center(), if presp.hovered() { WHITE } else { hex(0xA0A0A0) }, BG);
+                    crate::icons_src::add_disc11(ui.painter(), plus.center(), if presp.hovered() { WHITE } else { hex(0x969696) });
                     let presp = if app.prefs.tooltips { presp.on_hover_text("Create a new My Tag.") } else { presp };
                     plus_clicked = presp.clicked();
                     if plus_clicked {
@@ -198,7 +199,7 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 } else if partial {
                     pt.rect_filled(Rect::from_center_size(bx.center(), vec2(6.0, 1.5)), 0.0, DIM2);
                 }
-                pt.with_clip_rect(Rect::from_min_max(rr.min, pos2(rr.max.x - 24.0, rr.max.y))).text(pos2(rr.min.x + 28.5, rr.center().y + 0.75), Align2::LEFT_CENTER, &tg.name, rb(MYTAG_FONT), if filtering { CUE_ORANGE } else { WHITE });
+                pt.with_clip_rect(Rect::from_min_max(rr.min, pos2(rr.max.x - 24.0, rr.max.y))).text(pos2(rr.min.x + 27.0, rr.center().y + 0.75), Align2::LEFT_CENTER, &tg.name, rb(MYTAG_FONT), if filtering { CUE_ORANGE } else { WHITE });
                 if resp.clicked() && !plus_clicked {
                     if ui.input(|i| i.modifiers.alt) {
                         if !app.filter_tags.insert(tg.id) {
@@ -376,10 +377,13 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
             }
         });
     } else {
-        // Skin subBrows_trackSuggestion_btn: a 16 pt #323232 tile with a #969696 atom.
+        // Skin subBrows_trackSuggestion_btn: a 16 pt #323232 tile with an atom, drawn white
+        // (the skin's #969696 is not what shows: reference 12 peaks at 238). The header has
+        // the same divider 60 pt from the right as Related Tracks.
         let st = Rect::from_center_size(tile.center(), vec2(16.0, 16.0));
         p.rect_filled(st, 2.0, if tresp.hovered() { hex(0x3E3E3E) } else { hex(0x323232) });
-        crate::icons_src::atom(&p, st.center(), 6.0, 2.2, 1.0, DIM);
+        crate::icons_src::atom(&p, st.center(), 6.0, 2.2, 1.0, WHITE);
+        p.rect_filled(Rect::from_min_max(pos2(right - 60.0, t), pos2(right - 59.0, t + 26.0)), 0.0, BG);
         let kind = app.prefs.bx.suggest_kind.min(3);
         if kind > 0 {
             p.text(pos2(l + 30.5, t + 13.0), Align2::LEFT_CENTER, SUGGEST_KINDS[kind as usize], rb(SUB_NAME_FONT), WHITE);
