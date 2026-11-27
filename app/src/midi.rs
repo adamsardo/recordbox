@@ -878,6 +878,17 @@ pub fn probe(port: &str, secs: f64) {
     say(format!("{} distinct codes Learn would take; {}", codes.len(), if codes.is_empty() { "nothing was touched on the controller during the run" } else { "PASS (every received control can be learned)" }));
 }
 
+/// The mapping rekordbox keeps for a port the user set up there
+/// (`~/Library/Application Support/Pioneer/rekordbox6/MidiMappings/<port>.midi.csv`). Only
+/// ever read. (Not in unit tests, which must not depend on this computer's rekordbox.)
+pub fn rekordbox_user_file(port: &str) -> Option<PathBuf> {
+    if cfg!(test) && std::env::var_os("PREPDECK_MIDI_RB_USER").is_none() {
+        return None;
+    }
+    let f = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Pioneer/rekordbox6/MidiMappings").join(format!("{port}.midi.csv"));
+    f.is_file().then_some(f)
+}
+
 /// MIDI Learn on received messages: the codes its filter passes, whether each binds to a
 /// learnable command (PlayPause, deck 1) of an empty mapping, and what `rb` (rekordbox's
 /// mapping for the port, when there is one) runs for it.
@@ -997,7 +1008,11 @@ impl Hub {
     /// the user's file on top. A user file that cannot be read as this device's is left out.
     pub fn load_map(&self, device: &str) -> (MidiMap, bool) {
         let factory = crate::midi_csv::factory_file(&self.factory_dir, device).and_then(|p| std::fs::read(p).ok());
-        let user = std::fs::read(self.user_file(device)).ok();
+        // recordbox's own file for the device first. Without one, the mapping the user made
+        // for it in rekordbox is used as it is (read only, re-read at every connect), so a
+        // controller set up there works here at once; a change made in recordbox's MIDI
+        // window is saved to recordbox's folder and takes over from then on.
+        let user = std::fs::read(self.user_file(device)).ok().or_else(|| rekordbox_user_file(device).and_then(|f| std::fs::read(f).ok()));
         let map = MidiMap::load(device, factory.as_deref(), user.as_deref()).or_else(|_| MidiMap::load(device, factory.as_deref(), None)).unwrap_or_else(|_| MidiMap::new(device));
         (map, factory.is_some())
     }
@@ -2803,6 +2818,41 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
 mod tests {
     use super::*;
     use midir::os::unix::{VirtualInput, VirtualOutput};
+
+    /// Opt-in (reads this computer's rekordbox folder, read only): the mappings the user made
+    /// in rekordbox for the named ports, and which of their rows recordbox can act on.
+    /// PREPDECK_MIDI_RB_USER="PIONEER DDJ-S1|DDJ-S1 Jog Helper"
+    #[test]
+    #[ignore]
+    fn rekordbox_user_mappings_are_usable() {
+        let Ok(ports) = std::env::var("PREPDECK_MIDI_RB_USER") else { return };
+        let reg = registry();
+        for port in ports.split('|') {
+            let Some(f) = rekordbox_user_file(port) else {
+                eprintln!("RBUSER {port}: no file");
+                continue;
+            };
+            let bytes = std::fs::read(&f).unwrap();
+            let map = match MidiMap::load(port, None, Some(&bytes)) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("RBUSER {port}: not readable: {e:?}");
+                    continue;
+                }
+            };
+            let ins: Vec<&Input> = map.inputs.iter().flatten().collect();
+            let mut names: Vec<String> = ins.iter().map(|i| i.e.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            let missing: Vec<&String> = names.iter().filter(|n| reg.tag(n.split('.').next().unwrap_or(n)) == 0 && reg.tag(n) == 0).collect();
+            let mut outs: Vec<String> = map.outputs.iter().map(|e| e.name.clone()).collect();
+            outs.sort();
+            outs.dedup();
+            let out_missing: Vec<&String> = outs.iter().filter(|n| reg.tag(n.split('.').next().unwrap_or(n)) == 0 && reg.tag(n) == 0).collect();
+            eprintln!("RBUSER {port}: {} input codes, {} functions, {} rejected rows; functions recordbox has no action for: {missing:?}", ins.len(), names.len(), map.rejected);
+            eprintln!("RBUSER {port}: {} output rows, {} functions; without an output in recordbox: {out_missing:?}", map.outputs.len(), outs.len());
+        }
+    }
 
     #[test]
     fn learn_binds_what_a_controller_sends_and_names_rekordboxs_function() {
