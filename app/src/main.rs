@@ -41,6 +41,7 @@ mod menus;
 mod midi;
 mod midi_csv;
 mod midi_map;
+mod midi_cover;
 mod mix_selftest;
 mod mixer;
 mod groove;
@@ -406,7 +407,7 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
             app.hot_cue_up();
         }
         // A Search key held when the window lost focus is never seen released.
-        if app.searching() != 0 && !ctx.input(|i| i.pointer.any_down()) {
+        if app.searching() != 0 && !ctx.input(|i| i.pointer.any_down()) && !app.midi.search_held[app.px.active.min(3) as usize] {
             app.search(0);
         }
     }
@@ -566,6 +567,9 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if midi::cli(&args) {
+        return Ok(());
+    }
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
     let shot_mode = screenshot.is_some();
     let mut viewport = egui::ViewportBuilder::default().with_title("recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);

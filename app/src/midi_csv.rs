@@ -38,10 +38,23 @@ pub enum Kind {
     JogIndicator,
     JogIndicatorHiRes,
     Parameter,
-    Pad,
+    /// A pad: the LED family is the device's (`Pad`) or named by the type (`DdjRzPad` ...).
+    Pad(PadType),
 }
 
-const KINDS: [(Kind, &str, u8); 21] = [
+/// The pad family a `Pad` row's type names (rekordbox's switch types 29 to 33, `getSwitchType`
+/// 0x101ecc400): `Pad` leaves it to the device name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum PadType {
+    ByDevice,
+    Rz,
+    Rx,
+    Sz,
+    Sx2,
+    Sx,
+}
+
+const KINDS: [(Kind, &str, u8); 26] = [
     (Kind::Button, "Button", 0),
     (Kind::Toggle, "Toggle", 27),
     (Kind::Slider, "Slider", 4),
@@ -62,7 +75,12 @@ const KINDS: [(Kind, &str, u8); 21] = [
     (Kind::JogIndicator, "JogIndicator", 19),
     (Kind::JogIndicatorHiRes, "JogIndicatorHiRes", 20),
     (Kind::Parameter, "Parameter", 28),
-    (Kind::Pad, "Pad", 33),
+    (Kind::Pad(PadType::ByDevice), "Pad", 33),
+    (Kind::Pad(PadType::Rz), "DdjRzPad", 29),
+    (Kind::Pad(PadType::Rx), "DdjRxPad", 30),
+    (Kind::Pad(PadType::Sz), "DdjSzPad", 31),
+    (Kind::Pad(PadType::Sx2), "DdjSx2Pad", 32),
+    (Kind::Pad(PadType::Sx), "DdjSxPad", 33),
 ];
 
 impl Kind {
@@ -86,7 +104,7 @@ impl Kind {
     }
     /// The row can light something (rekordbox's mask 0x3E0460001 over the switch type).
     pub fn can_light(self) -> bool {
-        matches!(self, Kind::Button | Kind::Indicator | Kind::IndicatorHiRes | Kind::Pad)
+        matches!(self, Kind::Button | Kind::Indicator | Kind::IndicatorHiRes | Kind::Pad(_))
     }
 }
 

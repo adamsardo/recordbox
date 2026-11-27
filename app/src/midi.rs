@@ -121,7 +121,7 @@ pub fn kind_of_type(t: u8) -> Kind {
         T_KNOB7 => Kind::KnobSlider,
         T_KNOB14 => Kind::KnobSliderHiRes,
         T_INDICATOR => Kind::Indicator,
-        T_PAD => Kind::Pad,
+        T_PAD => Kind::Pad(crate::midi_csv::PadType::ByDevice),
         T_VALUE => Kind::Value,
         _ => Kind::Button,
     }
@@ -136,9 +136,85 @@ pub fn type_of_entry(e: &Entry) -> u8 {
         Kind::Rotary => T_ROTARY,
         Kind::Value => T_VALUE,
         Kind::Indicator => T_INDICATOR,
-        Kind::Pad => T_PAD,
+        Kind::Pad(_) => T_PAD,
         _ => T_BUTTON,
     }
+}
+
+/// What a row of a mapping-file type gives its function: a press / release, an absolute
+/// position, relative steps, jog counts, or a device parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum InClass {
+    Press,
+    Abs,
+    Rel,
+    Jog,
+    Param,
+}
+
+/// The value class of an input row's type (None: output only).
+pub fn in_class(k: Kind) -> Option<InClass> {
+    Some(match k {
+        Kind::Button | Kind::Toggle | Kind::Pad(_) | Kind::JogTouch => InClass::Press,
+        Kind::KnobSlider | Kind::KnobSliderHiRes | Kind::Slider | Kind::Knob | Kind::Value | Kind::RawValue | Kind::RotaryAsKnob => InClass::Abs,
+        Kind::Rotary => InClass::Rel,
+        Kind::JogRotate | Kind::JogRotateAbsPos | Kind::Difference | Kind::JogTimestamp => InClass::Jog,
+        Kind::Parameter => InClass::Param,
+        Kind::Indicator | Kind::IndicatorHiRes | Kind::JogIndicator | Kind::JogIndicatorHiRes => return None,
+    })
+}
+
+/// The device parameters (`Parameter` rows) recordbox uses: the output pacing and the jog
+/// indicator's update interval. (`JogRatency`: rekordbox's files call it "unused", and it is
+/// read but not used here either.)
+pub const PARAMS: [&str; 3] = ["MidiOutInterval", "JogIndicatorInterval", "JogRatency"];
+
+/// Outputs that follow the engine and are sent by row name (`Hub::engine_outputs`).
+pub const NAMED_OUTPUTS: [&str; 7] = ["JogPlayPauseIndicator", "JogPlayPauseIndicatorShort", "ChannelLevel", "LoadedIndicator", "GetLoopActive", "SlipStateForFlashing", "PlayingState"];
+
+/// recordbox acts on an input row of this function and type.
+pub fn input_acts(name: &str, kind: Kind) -> bool {
+    let Some(c) = in_class(kind) else { return false };
+    if c == InClass::Param {
+        return PARAMS.contains(&name);
+    }
+    registry().by_name(name).map(|f| act_accepts(f.act, c)).unwrap_or(false)
+}
+
+/// recordbox drives an output row of this function (a light, a meter, the jog ring).
+pub fn output_source(name: &str) -> bool {
+    NAMED_OUTPUTS.contains(&name) || registry().by_name(name).map(|f| act_has_led(f.act) || echo_led(f.act)).unwrap_or(false)
+}
+
+/// Which value classes an action does something with (`apply`, `Hub::fast`).
+pub fn act_accepts(a: Act, c: InClass) -> bool {
+    use Act as A;
+    match a {
+        A::SamplerVolume | A::FxUnitBeatRot(_) => matches!(c, InClass::Abs | InClass::Rel),
+        A::Needle | A::Tempo | A::FxLevel(..) | A::CfxColor(_) | A::SamplerGain | A::Trim | A::Eq(_) | A::StemIsoKnob(_) | A::ChFader | A::HpMix | A::HpLevel | A::CrossFader | A::MasterLevel => c == InClass::Abs,
+        A::LoopSize | A::FxReleaseType(_) | A::Browse | A::Zoom | A::LoopMoveRot => c == InClass::Rel,
+        A::FxSelect(..) => matches!(c, InClass::Press | InClass::Rel),
+        A::VinylAdjust(_) | A::XfAssignKnob => c == InClass::Abs,
+        A::Jog(_) | A::JogSearch => c == InClass::Jog,
+        A::TempoLed(_) => false,
+        A::Stub(Stub::VinylBrake(_)) => c == InClass::Abs,
+        _ => c == InClass::Press,
+    }
+}
+
+/// Buttons whose light shows the button held (they have no state to show).
+pub fn echo_led(a: Act) -> bool {
+    act_accepts(a, InClass::Press) && !act_has_led(a) && !matches!(a, Act::Shift | Act::JogTouch | Act::Stub(Stub::Reverse))
+}
+
+/// The actions whose state `leds` sends to an output row.
+pub fn act_has_led(a: Act) -> bool {
+    use Act as A;
+    use crate::sampler_ext::SmpAct;
+    matches!(
+        a,
+        A::PlayPause | A::Cue | A::Search(_) | A::Slip | A::Quantize | A::QuantizeAll | A::MasterTempo | A::Sync | A::Master | A::KeySync | A::TempoLed(_) | A::AutoLoop | A::Loop4 | A::Reloop | A::LoopIn | A::LoopOut | A::PitchBend(_) | A::PadMode(_) | A::HotCue(_) | A::HotCueDelete(_) | A::BeatJumpPad(_) | A::BeatLoopPad(_) | A::StemPart(_) | A::StemFx(_) | A::StemSolo | A::FxOn(..) | A::FxMode(_) | A::FxAuto(_) | A::FxTap(_) | A::FxReleaseOn(_) | A::FxAssign(..) | A::SamplerPad(..) | A::SamplerPadStop(_) | A::Smp(SmpAct::Sync | SmpAct::Master | SmpAct::Quantize | SmpAct::SeqPlay | SmpAct::SeqRec) | A::SamplerCue | A::SeqCall(..) | A::HeadCue | A::XfAssign(_) | A::StemIso | A::Panel(_) | A::Related | A::Stub(Stub::Vinyl) | A::Stub(Stub::Reverse)
+    )
 }
 
 /// Features other parts of recordbox are building: the registry has their commands, and
@@ -269,6 +345,21 @@ pub enum Act {
     JogSearch,
     JogTouch,
     Shift,
+    /// Loop Move as an encoder: one move right or left per message (`deviceLoop(int)`).
+    LoopMoveRot,
+    /// The top bar's panels in turn: FX, SAMPLER, MIXER, REC, none.
+    PanelStep(i32),
+    /// The Browse layout and back (`MainComponent::switchActiveWindow`).
+    BrowseView,
+    CallStep(i32),
+    /// Vinyl Speed Adjust: 0 brake, 1 start, 2 both.
+    VinylAdjust(u8),
+    FxTapLong(u8),
+    FxAssignHold(u8, u8),
+    XfAssignKnob,
+    CfxCenter(u8),
+    /// An FX slot's effect by its place in `fx::INFO`.
+    FxSelectKind(u8, u8, u8),
     Stub(Stub),
 }
 
@@ -370,6 +461,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "Loop", "Loop Size", "LoopHalfDouble", rot, true, A::LoopSize);
     add(t, "Loop", "LoopMove Right", "LoopMoveRight", b, true, A::Stub(Stub::LoopMove(1)));
     add(t, "Loop", "LoopMove Left", "LoopMoveLeft", b, true, A::Stub(Stub::LoopMove(-1)));
+    add(t, "Loop", "Loop Move", "LoopMove", rot, true, A::LoopMoveRot);
     add(t, "Loop", "Loop In", "LoopIn", b, true, A::LoopIn);
     add(t, "Loop", "Loop ReTrigger", "ReTrigger", b, true, A::ReTrigger);
     add(t, "Loop", "Loop Out", "LoopOut", b, true, A::LoopOut);
@@ -570,6 +662,9 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "RecPanel", "RecPanel", b, false, A::Stub(Stub::RecPanel));
     add(t, "", "WaveZoom", "Zoom", rot, false, A::Zoom);
     add(t, "", "AutoMix StartStop", "AutoMixStartStop", b, false, A::Stub(Stub::AutoMixStartStop));
+    add(t, "", "PanelSelect Next", "PanelForward", b, false, A::PanelStep(1));
+    add(t, "", "PanelSelect Back", "PanelBack", b, false, A::PanelStep(-1));
+    add(t, "", "BrowseView", "SwitchActiveWindow", b, false, A::BrowseView);
 
     // ---- MIXPOINTLINK
     let t = Tab::MixPointLink;
@@ -586,6 +681,42 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "", "WheelSearch", b, true, A::JogSearch);
     add(t, "", "", "JogTouch", b, true, A::JogTouch);
     add(t, "", "", "Shift", b, true, A::Shift);
+    // (CDJ-style CALL buttons: the next / previous memory cue; while a loop plays, the loop
+    // doubles / halves. `UiPlayer::deviceMemoryCue` 0x1020281dc.)
+    // (A long press of LOOP IN, sent by the hardware as its own code: the 4-beat loop.)
+    add(t, "", "", "4BeatLoopLongPress", b, true, A::Loop4);
+    // (A crossfader-assign switch as a knob: A at 0x00, THRU at 0x40, B at 0x7F.)
+    add(t, "", "", "CrossfaderAssign", k7, true, A::XfAssignKnob);
+    for ch in 0..4u8 {
+        // (The CFX knob's centre click: the knob back to the middle.)
+        add(t, "", "", &format!("CFXParameterCH{}Center", ch + 1), b, false, A::CfxCenter(ch));
+    }
+    add(t, "", "", "CallNext", b, true, A::CallStep(1));
+    add(t, "", "", "CallPrev", b, true, A::CallStep(-1));
+    // (Vinyl Speed Adjust knobs of a deck: brake, start, or both. `deviceVinylAdjust`.)
+    add(t, "", "", "VinylAdjustBrake", k7, true, A::VinylAdjust(0));
+    add(t, "", "", "VinylAdjustStart", k7, true, A::VinylAdjust(1));
+    add(t, "", "", "VinylAdjustTouchRelease", k7, true, A::VinylAdjust(2));
+    for u in 0..2u8 {
+        let cat = if u == 0 { "FX1" } else { "FX2" };
+        // TAP pressed: a tap; held for a second: back to AUTO (`RbxBpmPanelDeviceComponent`).
+        add(t, "", "", &format!("{cat}TapBeatWithLongPress"), b, false, A::FxTapLong(u));
+        // A channel switch's positions: the assign follows the switch (on while its code is
+        // held, off when released; `RbxFxDeviceComponent::eventOnChanged` $_1 with "set").
+        for (i, ch) in ["CH1", "CH2", "CH3", "CH4"].iter().enumerate() {
+            add(t, "", "", &format!("{cat}Assign.{ch}"), b, false, A::FxAssignHold(u, i as u8));
+        }
+        add(t, "", "", &format!("{cat}Assign.SAMPLER"), b, false, A::FxAssignHold(u, crate::fx::SAMPLER as u8));
+        // A slot's effect chosen by name (`FX1-1Select.ECHO`): rekordbox's effect names in
+        // capitals without spaces or brackets.
+        for sl in 0..3u8 {
+            for (i, info) in crate::fx::INFO.iter().enumerate() {
+                let key: String = info.name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase();
+                add(t, "", "", &format!("{cat}-{}Select.{key}", sl + 1), b, false, A::FxSelectKind(u, sl, i as u8));
+            }
+        }
+        add(t, "", "", &format!("{cat}Assign.MASTER"), b, false, A::FxAssignHold(u, crate::fx::MASTER as u8));
+    }
     v
 }
 
@@ -694,11 +825,12 @@ pub struct Device {
     out_index: Mutex<HashMap<(u32, u8), Vec<Entry>>>,
     leds: Mutex<HashMap<(u32, u8), Led>>,
     /// Last values sent to outputs the registry does not name (jog ring, level meters).
-    named: Mutex<HashMap<u16, u8>>,
+    named: Mutex<HashMap<u16, u16>>,
     out: Mutex<OutState>,
     out_cv: Condvar,
     interval_ms: AtomicU64,
     jog: Mutex<[Jog; 4]>,
+    scan: Mutex<[Scan; 4]>,
     /// Last Load press per deck (the DDJ-400 family's double press = Instant Doubles).
     load_at: Mutex<[Option<Instant>; 4]>,
     in_conn: Mutex<Option<midir::MidiInputConnection<()>>>,
@@ -764,10 +896,12 @@ impl Device {
 
     /// Send a value to the outputs of a row by its name (rows the function registry does
     /// not have: the jog ring, the channel level meters, the loaded indicator). `value` gets
-    /// the row and returns the byte to send; a byte equal to the last one sent is not sent.
-    /// 14-bit (HiRes) rows are left out.
-    pub fn set_named(&self, name: &str, deck: u8, value: &dyn Fn(&Entry) -> u8) {
-        let entries: Vec<Entry> = self.map.lock().outputs.iter().filter(|e| e.name == name && e.deck == deck && !matches!(e.kind, Kind::IndicatorHiRes | Kind::JogIndicatorHiRes)).cloned().collect();
+    /// the row and returns the value to send; a value equal to the last one sent is not sent.
+    /// 14-bit rows (IndicatorHiRes, JogIndicatorHiRes) are sent as rekordbox's
+    /// `MidiData::getLongMessage` 0x10132107c builds them: the upper seven bits on the code,
+    /// the lower seven on the code + 0x10.
+    pub fn set_named(&self, name: &str, deck: u8, value: &dyn Fn(&Entry) -> u16) {
+        let entries: Vec<Entry> = self.map.lock().outputs.iter().filter(|e| e.name == name && e.deck == deck).cloned().collect();
         if entries.is_empty() {
             return;
         }
@@ -776,12 +910,19 @@ impl Device {
             let mut last = self.named.lock();
             let mut out = self.out.lock();
             for e in entries {
-                let v = value(&e) & 0x7F;
+                let hires = matches!(e.kind, Kind::IndicatorHiRes | Kind::JogIndicatorHiRes);
+                let v = value(&e) & if hires { 0x3FFF } else { 0x7F };
                 if last.get(&e.code) == Some(&v) {
                     continue;
                 }
                 last.insert(e.code, v);
-                out.queue.push([(e.code >> 8) as u8, (e.code & 0xFF) as u8, v], e.opts.priority);
+                let (st, d1) = ((e.code >> 8) as u8, (e.code & 0xFF) as u8);
+                if hires {
+                    out.queue.push([st, d1, (v >> 7) as u8 & 0x7F], e.opts.priority);
+                    out.queue.push([st, d1.wrapping_add(0x10), v as u8 & 0x7F], e.opts.priority);
+                } else {
+                    out.queue.push([st, d1, v as u8], e.opts.priority);
+                }
                 sent = true;
             }
         }
@@ -849,6 +990,10 @@ pub fn probe(port: &str, secs: f64) {
     input.ignore(midir::Ignore::None);
     let names: Vec<String> = input.ports().iter().filter_map(|p| input.port_name(p).ok()).collect();
     say(format!("input ports: {names:?}"));
+    if let Ok(o) = midir::MidiOutput::new("recordbox-probe-list") {
+        let outs: Vec<String> = o.ports().iter().filter_map(|p| o.port_name(p).ok()).collect();
+        say(format!("output ports (listed only, none is opened): {outs:?}"));
+    }
     let Some(p) = input.ports().into_iter().find(|p| input.port_name(p).map(|n| n == port).unwrap_or(false)) else { return say(format!("{port}: no such input port")) };
     let log: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
     let l2 = log.clone();
@@ -878,14 +1023,85 @@ pub fn probe(port: &str, secs: f64) {
     say(format!("{} distinct codes Learn would take; {}", codes.len(), if codes.is_empty() { "nothing was touched on the controller during the run" } else { "PASS (every received control can be learned)" }));
 }
 
+/// `PREPDECK_MIDI_LOG=1`: every message a port receives is logged ("midilog:" on stderr) with
+/// the function its row names and the value it gave.
+pub fn log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PREPDECK_MIDI_LOG").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `recordbox --midi-probe "<port>" [secs]`: the read-only probe without a window.
+/// `recordbox --midi-run "<port>|<port>" [secs]`: the named real ports are opened as
+/// controllers on four engine decks (silence of 5 minutes on decks 1 and 2, no audio
+/// output), with every message logged; the function each one ran and what it did to the
+/// decks is printed. `PREPDECK_MIDI_NO_OUT=1` keeps the output ports closed. The mappings
+/// are read from a throwaway folder (`PREPDECK_DATA`) or rekordbox's folder (read only).
+pub fn cli(args: &[String]) -> bool {
+    let at = |flag: &str| args.iter().position(|a| a == flag);
+    if let Some(i) = at("--midi-probe") {
+        let port = args.get(i + 1).cloned().unwrap_or_default();
+        let secs = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+        probe(&port, secs);
+        return true;
+    }
+    let Some(i) = at("--midi-run") else { return false };
+    let ports: Vec<String> = args.get(i + 1).map(|s| s.split('|').map(|p| p.to_string()).collect()).unwrap_or_default();
+    let secs: f64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
+    for d in &decks[..2] {
+        let n = 44100 * 300;
+        d.lock().audio = Some(Arc::new(crate::audio::Decoded { sr: 44100, samples: vec![0.0; n * 2], raw_frames: n, damaged: 0, truncated: false }));
+    }
+    let (hub, rx) = Hub::new(decks.clone(), crate::db::data_dir().join("MidiMappings"));
+    {
+        let mut s = hub.snap.lock();
+        s.decks[0].loaded = true;
+        s.decks[1].loaded = true;
+    }
+    *hub.only.lock() = Some(ports.clone());
+    hub.scan();
+    let devs: Vec<String> = hub.devices.lock().iter().map(|d| format!("{} (mapping: {}, output {})", d.name, hub.user_source(&d.name).map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()), if d.has_output { "open" } else { "closed" })).collect();
+    eprintln!("midirun: opened {devs:?} for {secs:.1} s");
+    let t0 = Instant::now();
+    let mut handled = 0;
+    let mut by_fn: std::collections::BTreeMap<String, usize> = Default::default();
+    while t0.elapsed().as_secs_f64() < secs {
+        // The outputs that follow the engine (PLAY / CUE, jog ring, meters, loaded), as the
+        // app's light thread sends them; the app's own lights need the interface.
+        hub.engine_outputs();
+        let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) else { continue };
+        if let UiEvent::Control { device, tag, deck, val, fast_done, .. } = ev {
+            let Some(f) = registry().get(tag) else { continue };
+            handled += 1;
+            *by_fn.entry(f.name.clone()).or_default() += 1;
+            let n = hub.deck_ix(deck).unwrap_or(0);
+            let s = hub.decks[n].lock();
+            eprintln!("midirun: [{device}] {} deck {deck} {val:?} -> {}; deck {}: playing {} pos {:.3} s tempo {:+.3} % bend {:+.4} jog {:?} ch_fader {:.3}", f.name, if fast_done { "done on the port's thread" } else { "for the interface thread" }, n + 1, s.playing, s.pos / 44100.0, (s.tempo - 1.0) * 100.0, s.bend, s.dk.jog, s.ch_fader);
+        }
+    }
+    let rec: u64 = hub.devices.lock().iter().map(|d| d.received.load(Relaxed)).sum();
+    let sent: u64 = hub.devices.lock().iter().map(|d| d.sent.load(Relaxed)).sum();
+    eprintln!("midirun: {rec} messages received, {handled} ran a function, {sent} sent; by function: {by_fn:?}");
+    for d in hub.devices.lock().iter() {
+        d.alive.store(false, Relaxed);
+        d.in_conn.lock().take();
+    }
+    true
+}
+
 /// The mapping rekordbox keeps for a port the user set up there
 /// (`~/Library/Application Support/Pioneer/rekordbox6/MidiMappings/<port>.midi.csv`). Only
 /// ever read. (Not in unit tests, which must not depend on this computer's rekordbox.)
 pub fn rekordbox_user_file(port: &str) -> Option<PathBuf> {
-    if cfg!(test) && std::env::var_os("PREPDECK_MIDI_RB_USER").is_none() {
+    if cfg!(test) && std::env::var_os("PREPDECK_MIDI_RB_USER").is_none() && std::env::var_os("PREPDECK_MIDI_RB_DIR").is_none() {
         return None;
     }
-    let f = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Pioneer/rekordbox6/MidiMappings").join(format!("{port}.midi.csv"));
+    let dir = match std::env::var_os("PREPDECK_MIDI_RB_DIR") {
+        // (A stand-in folder for tests and scripted runs.)
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Pioneer/rekordbox6/MidiMappings"),
+    };
+    let f = dir.join(format!("{port}.midi.csv"));
     f.is_file().then_some(f)
 }
 
@@ -955,6 +1171,8 @@ pub struct Hub {
     /// thread keeps the lights that follow the engine going.
     pub ui_seen_ms: AtomicU64,
     pub born: Instant,
+    /// Where rekordbox's user mappings are read from, when not rekordbox's own folder (tests).
+    pub rb_dir: Mutex<Option<PathBuf>>,
 }
 
 fn nan_bits() -> u64 {
@@ -986,6 +1204,7 @@ impl Hub {
             only: Mutex::new(None),
             ui_seen_ms: AtomicU64::new(0),
             born: Instant::now(),
+            rb_dir: Mutex::new(None),
         };
         (Arc::new(hub), rx)
     }
@@ -1012,14 +1231,43 @@ impl Hub {
         // for it in rekordbox is used as it is (read only, re-read at every connect), so a
         // controller set up there works here at once; a change made in recordbox's MIDI
         // window is saved to recordbox's folder and takes over from then on.
-        let user = std::fs::read(self.user_file(device)).ok().or_else(|| rekordbox_user_file(device).and_then(|f| std::fs::read(f).ok()));
+        let user = self.user_source(device).and_then(|f| std::fs::read(f).ok());
         let map = MidiMap::load(device, factory.as_deref(), user.as_deref()).or_else(|_| MidiMap::load(device, factory.as_deref(), None)).unwrap_or_else(|_| MidiMap::new(device));
         (map, factory.is_some())
     }
 
+    /// The user mapping a device is read from: recordbox's own file when it has a row, else
+    /// the one the user made in rekordbox (read only). recordbox writes its own file with the
+    /// header alone the first time it sees a port, as rekordbox does, so a file without a
+    /// single row counts as none.
+    pub fn user_source(&self, device: &str) -> Option<PathBuf> {
+        let own = self.user_file(device);
+        let has_rows = std::fs::read(&own).ok().map(|b| crate::midi_csv::CsvFile::parse(&b).map(|f| f.rows().next().is_some()).unwrap_or(true)).unwrap_or(false);
+        if has_rows {
+            return Some(own);
+        }
+        let rb = match self.rb_dir.lock().as_ref() {
+            Some(d) => Some(d.join(format!("{device}.midi.csv"))).filter(|f| f.is_file()),
+            None => rekordbox_user_file(device),
+        };
+        rb.or_else(|| own.is_file().then_some(own))
+    }
+
+    /// The mapping of the device comes from rekordbox's folder (recordbox has none of its own).
+    pub fn from_rekordbox(&self, device: &str) -> bool {
+        self.user_source(device).map(|p| p != self.user_file(device)).unwrap_or(false)
+    }
+
+    /// The device's mapping to recordbox's own folder (never rekordbox's). A mapping read
+    /// from rekordbox's folder and not changed here is not written, so that recordbox keeps
+    /// following what the user sets up in rekordbox until a change is made in recordbox.
     pub fn save_map(&self, dev: &Device) -> std::io::Result<()> {
+        let text = dev.map.lock().save_text();
+        if self.from_rekordbox(&dev.name) && self.load_map(&dev.name).0.save_text() == text {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.user_dir)?;
-        std::fs::write(self.user_file(&dev.name), dev.map.lock().save_text())
+        std::fs::write(self.user_file(&dev.name), text)
     }
 
     /// Look at the MIDI ports: connect controllers that appeared, drop those that left.
@@ -1071,8 +1319,10 @@ impl Hub {
             let _ = std::fs::write(&uf, crate::midi_csv::empty_user_file(name));
         }
         let (map, factory) = self.load_map(name);
-        // The output port of the same name, when the device has one.
-        let conn = midir::MidiOutput::new("recordbox").ok().and_then(|out| {
+        // The output port of the same name, when the device has one. `PREPDECK_MIDI_NO_OUT=1`:
+        // inputs only, nothing is ever sent to a device.
+        let no_out = std::env::var("PREPDECK_MIDI_NO_OUT").map(|v| v == "1").unwrap_or(false);
+        let conn = (!no_out).then(|| midir::MidiOutput::new("recordbox").ok()).flatten().and_then(|out| {
             let p = out.ports().into_iter().find(|p| out.port_name(p).map(|n| n == name).unwrap_or(false))?;
             out.connect(&p, "recordbox-out").ok()
         });
@@ -1092,6 +1342,7 @@ impl Hub {
             out_cv: Condvar::new(),
             interval_ms: AtomicU64::new(1),
             jog: Mutex::new(std::array::from_fn(|_| Jog::new(cpr))),
+            scan: Mutex::new(Default::default()),
             load_at: Mutex::new([None; 4]),
             in_conn: Mutex::new(None),
             received: AtomicU64::new(0),
@@ -1119,7 +1370,7 @@ impl Hub {
     fn run_input(self: Arc<Self>, dev: Arc<Device>, rx: crossbeam_channel::Receiver<(u64, Vec<u8>)>) {
         let mut last: Option<(f64, Instant)> = None;
         while dev.alive.load(Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(20)) {
+            match rx.recv_timeout(Duration::from_millis(5)) {
                 Ok((t, msg)) => {
                     let t_ms = t as f64 / 1000.0;
                     last = Some((t_ms, Instant::now()));
@@ -1133,8 +1384,29 @@ impl Hub {
                         self.wake();
                     }
                     let ev = dev.map.lock().handle(&msg, t_ms);
+                    if log_on() {
+                        let hex = msg.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                        let what = match &ev {
+                            Some(e) => {
+                                let name = dev.map.lock().inputs.get(e.entry).and_then(|i| i.as_ref()).map(|i| i.e.name.clone()).unwrap_or_default();
+                                format!("{name} deck {} {:?}{}{}", e.deck, e.val, if e.fast { " fast" } else { "" }, if e.tag == 0 { " (no action in recordbox)" } else { "" })
+                            }
+                            None => match dev.map.lock().input_at(((msg[0] as u16) << 8) | msg.get(1).copied().unwrap_or(0) as u16) {
+                                Some(e) => format!("{} (half of a 14-bit pair, or no value)", e.name),
+                                None => "not mapped".into(),
+                            },
+                        };
+                        eprintln!("midilog: {:>8.1} ms [{}] {hex} -> {what}", t_ms, dev.name);
+                    }
                     if let Some(ev) = ev {
+                        let peer = dev.map.lock().dual_message(&msg, &ev);
                         self.dispatch(&dev, ev);
+                        if let Some(p) = peer {
+                            let pev = dev.map.lock().handle(&p, t_ms);
+                            if let Some(pev) = pev {
+                                self.dispatch(&dev, pev);
+                            }
+                        }
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1461,13 +1733,9 @@ impl Hub {
                 true
             }
             Act::JogSearch => {
-                let Val::Jog { delta, .. } = val else { return true };
-                // Search: the track moves ten times as far as the platter turns.
-                let (cpr, rpm) = {
-                    let j = dev.jog.lock();
-                    (j[n].cpr, j[n].rpm)
-                };
-                let secs = delta as f64 / cpr * (60.0 / rpm) * 10.0;
+                let Val::Jog { delta, t_ms } = val else { return true };
+                let k = dev.jog.lock()[n].k();
+                let Some(secs) = dev.scan.lock()[n].value(delta, t_ms, k) else { return true };
                 let mut s = self.decks[n].lock();
                 if let Some(a) = s.audio.clone() {
                     s.pos = (s.pos + secs * a.sr as f64).clamp(0.0, a.frames() as f64);
@@ -1493,15 +1761,16 @@ impl Hub {
         let count = self.snap.lock().count.min(4) as usize;
         for n in 0..count {
             self.transport_leds(n);
-            let (loaded, angle, level) = {
+            let (loaded, angle, level, looping, slipping, playing) = {
                 let s = self.decks[n].lock();
+                let (looping, slipping, playing) = (s.loop_range.is_some(), s.slip && s.slip_pos.is_some(), s.playing);
                 match s.audio.as_ref() {
                     Some(a) => {
                         let secs = s.pos / a.sr.max(1) as f64;
                         let turn = (secs * (100.0 / 3.0) / 60.0 * 360.0).rem_euclid(360.0);
-                        (true, turn as i32, s.peak[0].max(s.peak[1]))
+                        (true, turn as i32, s.peak[0].max(s.peak[1]), looping, slipping, playing)
                     }
-                    None => (false, 360, 0.0),
+                    None => (false, 360, 0.0, false, false, false),
                 }
             };
             let lvl = ((level.clamp(0.0, 1.0) * 100.0) as i32).clamp(0, 127) as u8;
@@ -1511,10 +1780,15 @@ impl Hub {
                         continue;
                     }
                     for name in ["JogPlayPauseIndicator", "JogPlayPauseIndicatorShort"] {
-                        d.set_named(name, deck, &|e: &Entry| crate::midi_map::jog_ring(angle, &e.opts));
+                        d.set_named(name, deck, &|e: &Entry| crate::midi_map::jog_ring(angle, &e.opts) as u16);
                     }
-                    d.set_named("ChannelLevel", deck, &|_| lvl);
+                    d.set_named("ChannelLevel", deck, &|_| lvl as u16);
                     d.set_named("LoadedIndicator", deck, &|_| if loaded { 127 } else { 0 });
+                    // (Not traced: lit while a loop plays / while SLIP runs underneath / while
+                    // the deck plays.)
+                    d.set_named("GetLoopActive", deck, &|_| if looping { 127 } else { 0 });
+                    d.set_named("SlipStateForFlashing", deck, &|_| if slipping { 127 } else { 0 });
+                    d.set_named("PlayingState", deck, &|_| if playing { 127 } else { 0 });
                 }
             }
         }
@@ -1588,11 +1862,15 @@ pub struct MidiState {
     started: bool,
     /// Messages that were mapped, for the scripted check.
     pub handled: u64,
+    /// FX1 / FX2 TapBeatWithLongPress held since (a second makes it AUTO).
+    pub tap_held: [Option<Instant>; 2],
+    /// A controller holds SEARCH FWD / REV on the deck (the window may have no focus then).
+    pub search_held: [bool; 4],
 }
 
 impl Default for MidiState {
     fn default() -> MidiState {
-        MidiState { hub: None, rx: None, _keeper: None, win: Default::default(), devices: vec![], jump_page: [5; 4], pending_double: None, stub_log: vec![], last_tempo: [0.0; 4], last_iso: [false; 4], last_follow: [false; 4], started: false, handled: 0 }
+        MidiState { hub: None, rx: None, _keeper: None, win: Default::default(), devices: vec![], jump_page: [5; 4], pending_double: None, stub_log: vec![], last_tempo: [0.0; 4], last_iso: [false; 4], last_follow: [false; 4], started: false, handled: 0, tap_held: [None; 2], search_held: [false; 4] }
     }
 }
 
@@ -1619,7 +1897,7 @@ fn start(app: &mut App) {
     }
     // The window's scripted runs use their own virtual controller only: a real controller on
     // the machine is not opened by them.
-    if std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "miditest")).unwrap_or(false) || std::env::var("PREPDECK_SHOT_MIDI").is_ok() {
+    if std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| matches!(x.trim(), "miditest" | "mids1test"))).unwrap_or(false) || std::env::var("PREPDECK_SHOT_MIDI").is_ok() {
         *hub.only.lock() = Some(vec![crate::ui_midi::TEST_NAME.to_string()]);
     }
     // The first client is made here, on the main thread, whose run loop delivers CoreMIDI's
@@ -1747,6 +2025,12 @@ pub fn poll(app: &mut App) {
         app.midi.last_tempo[n] = app.deck_of(n as u8).x.tempo_adj;
     }
     finish_double(app);
+    for u in 0..2 {
+        if app.midi.tap_held[u].map(|t| t.elapsed() >= Duration::from_millis(1000)).unwrap_or(false) {
+            app.midi.tap_held[u] = None;
+            app.px.fx[u].auto = true;
+        }
+    }
     if have {
         *hub.snap.lock() = snapshot(app);
         leds(app, &hub);
@@ -1853,6 +2137,15 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
     }
     let Some(n) = deck_of(app, deck) else { return };
     let ni = n as usize;
+    // A button without a state of its own is lit while it is held: rekordbox's handlers end
+    // with `operateOnChange(pressed)` on the function's own component (deviceMemoryCue,
+    // devicePitchBend, deviceActiveLoop, deviceLoop ...).
+    if (press || release) && echo_led(f.act) {
+        let tag = registry().tag(&f.name);
+        for d in hub.devices.lock().iter() {
+            d.set_led(tag, deck, if press { Led::On } else { Led::Off });
+        }
+    }
     // An absolute value a worker already put into the engine: the app's own value follows.
     let settle = |app: &mut App| {
         hub.overlay.lock().retain(|o| o.3 > seq);
@@ -1922,10 +2215,13 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
             }
         }
         Act::Search(dir) => {
+            // (FF / REW held: rekordbox's scan, also on a paused deck, `UiPlayer::eventFFOn`.)
             if press {
-                app.with_deck(n, |a| a.search(dir));
+                app.midi.search_held[ni] = true;
+                app.with_deck(n, |a| a.scan(dir));
             } else if release {
-                app.with_deck(n, |a| if a.searching() == dir { a.search(0) });
+                app.midi.search_held[ni] = false;
+                app.with_deck(n, |a| if a.searching() == dir { a.scan(0) });
             }
         }
         Act::Needle => {
@@ -2178,7 +2474,9 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
             }
         }
         Act::FxSelect(u, s, dir) => {
-            if press {
+            // (A Rotary row steps the list by its direction, one effect per message.)
+            let dir = if rel != 0 { rel.signum() } else { dir };
+            if press || rel != 0 {
                 let fx = &mut app.px.fx[u as usize % 2];
                 let single = fx.params.single;
                 if single && s != 0 {
@@ -2206,6 +2504,19 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         Act::FxUnitBeatRot(u) => {
             if rel != 0 {
                 fx_beat(&mut app.px.fx[u as usize % 2], None, rel.signum());
+            } else if let Some(p) = unit {
+                // A knob (`RbxFxDeviceComponent::eventAbsoluteValueChanged` 0x1005fe09c): its
+                // position across the beat values (`setEffectBeatArea(v x 0.000061039)`), the
+                // unit's effect in single mode, all three slots in multi mode.
+                let fx = &mut app.px.fx[u as usize % 2];
+                let slots: Vec<usize> = if fx.params.single { vec![3] } else { vec![0, 1, 2] };
+                for sl in slots {
+                    let kind = if sl < 3 { fx.params.slots[sl].kind } else { fx.params.one.kind };
+                    let len = crate::fx::beat_table(kind).0.len();
+                    if len > 0 {
+                        fx.set_index(sl, ((p as f64 * len as f64) as usize).min(len - 1));
+                    }
+                }
             }
         }
         Act::FxMode(u) => {
@@ -2307,6 +2618,9 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         Act::SamplerVolume => {
             if let Some(p) = unit {
                 app.prefs.sampler.volume = p * 100.0;
+            } else if rel != 0 {
+                // (An encoder, as the DDJ-ERGO has: one percent a step; not traced.)
+                app.prefs.sampler.volume = (app.prefs.sampler.volume + rel as f32).clamp(0.0, 100.0);
             }
         }
         Act::SamplerCue => {
@@ -2496,7 +2810,170 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         }
         // The jog is the worker's alone.
         Act::Jog(_) | Act::JogSearch | Act::JogTouch => {}
+        Act::LoopMoveRot => {
+            if rel != 0 {
+                app.with_deck(n, |a| a.loop_move(rel.signum()));
+            }
+        }
+        Act::PanelStep(dir) => {
+            if press {
+                panel_step(app, dir);
+            }
+        }
+        Act::BrowseView => {
+            if press && app.performance() {
+                if app.prefs.perf_lay.browse {
+                    app.prefs.perf_lay.browse = false;
+                    app.poll_decks();
+                    app.save_prefs();
+                } else {
+                    crate::ui_perf_layouts::set_row(app, 4);
+                }
+            }
+        }
+        Act::CallStep(dir) => {
+            if press {
+                app.with_deck(n, |a| {
+                    if a.loop_active().is_some() {
+                        a.resize_loop(if dir > 0 { 2.0 } else { 0.5 });
+                    } else {
+                        a.memory_jump(dir);
+                    }
+                });
+            }
+        }
+        Act::VinylAdjust(which) => {
+            if let Val::Abs { v, .. } = val {
+                vinyl_adjust(app, ni % 2, which, v);
+            }
+        }
+        Act::FxTapLong(u) => {
+            let u = u as usize % 2;
+            if press {
+                let now = app.ctx.input(|i| i.time);
+                let fx = &mut app.px.fx[u];
+                fx.auto = false;
+                if let Some(bpm) = fx.tap.tap(now) {
+                    fx.tap_bpm = bpm;
+                }
+                app.midi.tap_held[u] = Some(Instant::now());
+            } else if release {
+                app.midi.tap_held[u] = None;
+            }
+        }
+        Act::FxSelectKind(u, sl, i) => {
+            if press {
+                let fx = &mut app.px.fx[u as usize % 2];
+                let single = fx.params.single;
+                let k = crate::fx::INFO[(i as usize).min(crate::fx::INFO.len() - 1)].kind;
+                // (Only an effect the mode's list has; in single mode the unit's one effect.)
+                if crate::fx::list(single).any(|x| x.kind == k) && (!single || sl == 0) {
+                    fx.set_kind(if single { 3 } else { sl as usize % 3 }, k);
+                }
+            }
+        }
+        Act::XfAssignKnob => {
+            if let Some(p) = unit {
+                app.px.mix[ni].assign = if p < 0.25 { 1 } else if p > 0.75 { 2 } else { 0 };
+            }
+        }
+        Act::CfxCenter(ch) => {
+            if press {
+                app.px.cfx_color[(ch as usize).min(4)] = 0.5;
+            }
+        }
+        Act::FxAssignHold(u, ch) => {
+            if press || release {
+                fx_assign_set(&mut app.px.fx[u as usize % 2].params.assign, ch as usize, press);
+            }
+        }
         Act::Stub(s) => stub(app, hub, s, n, val),
+    }
+}
+
+/// PanelSelect Next / Back (`MainComponent::eventOnChanged`, PanelForward / PanelBack): the
+/// panels in rekordbox's order FX, SAMPLER, MIXER, REC (VIDEO is not in recordbox), then
+/// none; the one after (or before) the last one showing is shown alone. Panels the layout
+/// does not have are left as they are and passed over.
+fn panel_step(app: &mut App, dir: i32) {
+    use crate::ui_perf_layouts::{mixer_shown, panel_enabled};
+    // (Tile numbers of `panel_enabled`: 0 FX, 2 Sampler, 3 Mixer, 4 Rec.)
+    let tiles = [0usize, 2, 3, 4];
+    let on = [app.prefs.perf_fx, app.prefs.perf_sampler, mixer_shown(app), app.prefs.rec.panel];
+    let enabled: [bool; 4] = std::array::from_fn(|i| panel_enabled(app, tiles[i]));
+    let pick = panel_next(on, enabled, dir);
+    let want = |i: usize| pick == Some(i);
+    if enabled[0] {
+        app.prefs.perf_fx = want(0);
+    }
+    if enabled[1] {
+        app.prefs.perf_sampler = want(1);
+    }
+    if enabled[2] && mixer_shown(app) != want(2) {
+        crate::ui_perf_layouts::toggle_mixer(app);
+    }
+    if enabled[3] {
+        app.prefs.rec.panel = want(3);
+    }
+    app.save_prefs();
+}
+
+/// The panel PanelForward (`dir` 1) or PanelBack (-1) shows next, of FX, SAMPLER, MIXER,
+/// REC (None: none). The current one is the last one lit.
+pub fn panel_next(on: [bool; 4], enabled: [bool; 4], dir: i32) -> Option<usize> {
+    let cur = (0..4).rev().find(|i| on[*i] && enabled[*i]);
+    let mut next: i32 = match (dir > 0, cur) {
+        (true, Some(c)) => c as i32 + 1,
+        (true, None) => 0,
+        (false, Some(c)) => c as i32 - 1,
+        (false, None) => 3,
+    };
+    while (0..4).contains(&next) && !enabled[next as usize] {
+        next += dir.signum();
+    }
+    (0..4).contains(&next).then_some(next as usize)
+}
+
+/// The speed table index a Vinyl Speed Adjust knob position (0..16383) gives.
+pub fn vinyl_index(v: i32) -> u8 {
+    (((v.max(0) as f64) * 0.0155649149) as i32).clamp(0, 255) as u8
+}
+
+/// A Vinyl Speed Adjust knob (`UiPlayer::deviceVinylAdjust` 0x102029430): the knob's 14-bit
+/// position times 0.0155649149 (0..255) is the speed table index; 0 sets Touch/Brake, 1
+/// Release/Start, 2 both. Kept per side, as Preferences keeps them.
+fn vinyl_adjust(app: &mut App, side: usize, which: u8, v: i32) {
+    let idx = vinyl_index(v);
+    let side = side.min(1);
+    if which != 1 {
+        app.prefs.rb.brake[side] = idx;
+        app.prefs.deck.vinyl_brake[side] = idx;
+    }
+    if which != 0 {
+        app.prefs.rb.start[side] = idx;
+        app.prefs.deck.vinyl_start[side] = idx;
+    }
+    app.push_deck_controls();
+}
+
+/// An FX assign set to on or off as the on-screen button does it when it is clicked: the
+/// master alone, or channels without the master.
+pub fn fx_assign_set(a: &mut [bool; crate::fx::CHANNELS], c: usize, on: bool) {
+    let c = c.min(crate::fx::CHANNELS - 1);
+    if a[c] == on {
+        return;
+    }
+    a[c] = on;
+    if on {
+        if c == crate::fx::MASTER {
+            for (i, d) in a.iter_mut().enumerate() {
+                if i != crate::fx::MASTER {
+                    *d = false;
+                }
+            }
+        } else {
+            a[crate::fx::MASTER] = false;
+        }
     }
 }
 
@@ -2678,8 +3155,9 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
         }
         // Vinyl Speed Adjust (Touch/Brake) of the left / right decks: 0..1.
         Stub::VinylBrake(side) => {
-            if let Some(p) = val.unit() {
-                note(app, format!("VinylBrake side {side} {p:.3}"));
+            if let Val::Abs { v, .. } = val {
+                vinyl_adjust(app, side as usize, 0, v);
+                note(app, format!("VinylBrake side {side} {v}"));
             }
         }
         Stub::AutoCue => {
@@ -2699,8 +3177,16 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
                 note(app, format!("LoopMove {dir:+} deck {} ({})", deck + 1, if moved { "moved" } else { "no loop" }));
             }
         }
+        // The memory loop at the cue point is made an active loop or not (`eventActiveLoop`).
         Stub::ActiveLoop => {
             if press {
+                app.with_deck(deck, |a| {
+                    let cp = a.deck.cue_point;
+                    if let Some(mut c) = a.deck.cues.iter().find(|c| c.kind == CueKind::Memory && c.end.is_some() && (c.start - cp).abs() < 0.005).cloned() {
+                        c.active_loop = !c.active_loop;
+                        a.update_cue(c);
+                    }
+                });
                 note(app, format!("ActiveLoop deck {}", deck + 1));
             }
         }
@@ -2729,16 +3215,17 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
         looping: bool,
         slip: bool,
         searching: i32,
+        reverse: bool,
     }
     let ds: Vec<D> = (0..4u8)
         .map(|n| {
             if n >= count {
-                return D { loaded: false, playing: false, at_cue: false, looping: false, slip: false, searching: 0 };
+                return D { loaded: false, playing: false, at_cue: false, looping: false, slip: false, searching: 0, reverse: false };
             }
             let cue = app.deck_of(n).cue_point;
             let s = app.player.decks[n as usize].lock();
             let pos = s.audio.as_ref().map(|a| s.pos / a.sr as f64);
-            D { loaded: pos.is_some(), playing: s.playing, at_cue: pos.map(|p| (p - cue).abs() < 0.01).unwrap_or(false), looping: s.loop_range.is_some(), slip: s.slip, searching: if s.search > 0.0 { 1 } else if s.search < 0.0 { -1 } else { 0 } }
+            D { loaded: pos.is_some(), playing: s.playing, at_cue: pos.map(|p| (p - cue).abs() < 0.01).unwrap_or(false), looping: s.loop_range.is_some(), slip: s.slip, searching: if s.search > 0.0 { 1 } else if s.search < 0.0 { -1 } else { 0 }, reverse: s.dk.reverse }
         })
         .collect();
     let on = |b: bool| if b { Led::On } else { Led::Off };
@@ -2807,6 +3294,8 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
                 Act::Panel(p) => on(if p == 0 { app.prefs.perf_fx } else { app.prefs.perf_sampler }),
                 Act::Related => on(app.view == View::Related),
                 Act::Stub(Stub::Vinyl) => on(hub.vinyl[ni].load(Relaxed)),
+                // (Blinking while the deck plays backwards: `deviceUpdateLed` 0x10202a7f4.)
+                Act::Stub(Stub::Reverse) => if d.reverse { Led::Blink } else { Led::Off },
                 _ => continue,
             };
             dev.set_led(tag, deck, led);
@@ -2826,14 +3315,15 @@ mod tests {
     #[ignore]
     fn rekordbox_user_mappings_are_usable() {
         let Ok(ports) = std::env::var("PREPDECK_MIDI_RB_USER") else { return };
-        let reg = registry();
         for port in ports.split('|') {
             let Some(f) = rekordbox_user_file(port) else {
                 eprintln!("RBUSER {port}: no file");
                 continue;
             };
             let bytes = std::fs::read(&f).unwrap();
-            let map = match MidiMap::load(port, None, Some(&bytes)) {
+            // (With the installed rekordbox's factory mapping under it, when it has one.)
+            let factory = crate::midi_csv::factory_file(&crate::midi_csv::factory_dir(), port).and_then(|p| std::fs::read(p).ok());
+            let map = match MidiMap::load(port, factory.as_deref(), Some(&bytes)) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("RBUSER {port}: not readable: {e:?}");
@@ -2841,14 +3331,15 @@ mod tests {
                 }
             };
             let ins: Vec<&Input> = map.inputs.iter().flatten().collect();
-            let mut names: Vec<String> = ins.iter().map(|i| i.e.name.clone()).collect();
-            names.sort();
+            let mut names: Vec<(String, Kind)> = ins.iter().map(|i| (i.e.name.clone(), i.e.kind)).collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
             names.dedup();
-            let missing: Vec<&String> = names.iter().filter(|n| reg.tag(n.split('.').next().unwrap_or(n)) == 0 && reg.tag(n) == 0).collect();
+            // Each row's function with its own type: does recordbox act on it?
+            let missing: Vec<String> = names.iter().filter(|(n, k)| !input_acts(n, *k)).map(|(n, k)| format!("{n} ({})", k.text())).collect();
             let mut outs: Vec<String> = map.outputs.iter().map(|e| e.name.clone()).collect();
             outs.sort();
             outs.dedup();
-            let out_missing: Vec<&String> = outs.iter().filter(|n| reg.tag(n.split('.').next().unwrap_or(n)) == 0 && reg.tag(n) == 0).collect();
+            let out_missing: Vec<&String> = outs.iter().filter(|n| !output_source(n)).collect();
             eprintln!("RBUSER {port}: {} input codes, {} functions, {} rejected rows; functions recordbox has no action for: {missing:?}", ins.len(), names.len(), map.rejected);
             eprintln!("RBUSER {port}: {} output rows, {} functions; without an output in recordbox: {out_missing:?}", map.outputs.len(), outs.len());
         }
@@ -2928,6 +3419,308 @@ mod tests {
         for d in ["DDJ-FLX4", "DDJ-FLX2", "DDJ-GRV6", "DDJ-REV5", "DDJ-FLX10", "XDJ-RX3", "PIONEER DDJ-SX2", "Launchpad Mini"] {
             assert!(!needs_auth(d), "{d}");
         }
+    }
+
+    // ------------------------------------------------------------------ the user's DDJ-S1
+    // The rows below are the codes, types and options of the two mappings the user made in
+    // rekordbox for the DDJ-S1 and its jog helper (comments left out), and of the factory
+    // DDJ-ERGO port the helper sends the platter on.
+
+    const S1: &str = "@file,1,PIONEER DDJ-S1\r\n\
+        ActiveLoop,,Button,,9050,9150,,,,,,,,,\r\n\
+        CallNext,,Button,,9015,9115,,,,,,,,,\r\n\
+        CallPrev,,Button,,9051,9151,,,,,,,,,\r\n\
+        FX1TapBeatWithLongPress,,Button,9241,,,,,,,,,,,\r\n\
+        FX2TapBeatWithLongPress,,Button,9341,,,,,,,,,,,\r\n\
+        LoopMove,,Rotary,,B04F,B14F,,,,,,,,,\r\n\
+        PanelForward,,Button,9446,,,,,,,,,,,\r\n\
+        SwitchActiveWindow,,Button,9447,,,,,,,,,,,\r\n\
+        VinylAdjustBrake,,KnobSlider,,B009,B109,,,,,,,,,\r\n\
+        VinylAdjustTouchRelease,,KnobSlider,,B004,B104,,,,,,,,,\r\n\
+        PAD1_HotCue,,DdjSxPad,,902A,912A,,,,902A,912A,,,Fast;,\r\n\
+        PlayPause,,Button,,900B,910B,,,,900B,910B,,,Fast;,\r\n\
+        PlayPause,,Button,,9047,9147,,,,9047,9147,,,Fast;,\r\n\
+        TempoSlider,,KnobSliderHiRes,,B000,B100,,,,,,,,Fast;,\r\n\
+        TempoSlider,,KnobSliderHiRes,,B005,B105,,,,,,,,Fast;,\r\n\
+        NeedleSearch,,Value,,B003,B103,,,,,,,,Max=16383;,\r\n\
+        Reverse,,Button,,906A,916A,,,,906A,916A,,,,\r\n\
+        Load,,Button,,903D,913D,,,,903D,913D,,,,\r\n\
+        Area,,Button,9443,,,,,9443,,,,,,\r\n\
+        ChannelLevel,,Indicator,,,,,,,B469,B46B,,,,\r\n\
+        JogPlayPauseIndicatorShort,,JogIndicator,,,,,,,B039,B139,,,Min=1;Max=48;Priority=100;,\r\n";
+
+    const HELPER: &str = "@file,1,DDJ-S1 Jog Helper\r\n\
+        FX1Assign.CH1,,Button,9210,,,,,,,,,,,\r\n\
+        FX1Assign.CH2,,Button,9211,,,,,,,,,,,\r\n\
+        FX1Assign.MASTER,,Button,9212,,,,,,,,,,,\r\n\
+        FX2Assign.CH1,,Button,9310,,,,,,,,,,,\r\n\
+        JogScratch,,JogRotate,,B022,B122,,,,,,,,RO;,\r\n\
+        JogTouch,,JogTouch,,9036,9136,,,,,,,,RO;,\r\n\
+        JogTouch,,JogTouch,,9068,9168,,,,,,,,RO;,\r\n\
+        PitchBendDown,,Button,,9072,9172,,,,,,,,,\r\n\
+        PitchBendUp,,Button,,9071,9171,,,,,,,,,\r\n\
+        SearchFwd,,Button,,9073,9173,,,,,,,,,\r\n\
+        SearchRev,,Button,,9074,9174,,,,,,,,,\r\n\
+        WheelPitchBend,,JogRotate,,B021,B121,,,,,,,,RO;,\r\n\
+        WheelSearch,,JogRotate,,B026,B126,,,,,,,,RO;,\r\n";
+
+    /// A device with a mapping and no ports, on a hub of four decks (1 and 2 loaded).
+    fn test_device(name: &str, csv: &str) -> (Arc<Hub>, Arc<Device>, crossbeam_channel::Receiver<UiEvent>) {
+        let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
+        for d in &decks[..2] {
+            d.lock().audio = Some(tone(120.0));
+        }
+        let (hub, rx) = Hub::new(decks, std::env::temp_dir());
+        {
+            let mut s = hub.snap.lock();
+            s.decks[0].loaded = true;
+            s.decks[1].loaded = true;
+        }
+        let map = MidiMap::load(name, None, Some(csv.as_bytes())).expect("the mapping reads");
+        let dev = Arc::new(Device {
+            name: name.into(),
+            map: Mutex::new(map),
+            factory: false,
+            needs_auth: false,
+            has_output: false,
+            learning: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            out_index: Mutex::new(HashMap::new()),
+            leds: Mutex::new(HashMap::new()),
+            named: Mutex::new(HashMap::new()),
+            out: Mutex::new(OutState { queue: OutQueue::default(), blink: Blinker::default(), blinking: HashMap::new(), conn: None }),
+            out_cv: Condvar::new(),
+            interval_ms: AtomicU64::new(1),
+            jog: Mutex::new(std::array::from_fn(|_| Jog::new(jog_counts(name)))),
+            scan: Mutex::new(Default::default()),
+            load_at: Mutex::new([None; 4]),
+            in_conn: Mutex::new(None),
+            received: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+        });
+        dev.reindex();
+        hub.devices.lock().push(dev.clone());
+        (hub, dev, rx)
+    }
+
+    /// A message through the map and the port's worker side: the function it named, its
+    /// deck and value.
+    fn feed(hub: &Hub, dev: &Device, msg: &[u8], t_ms: f64) -> Option<(String, u8, Val)> {
+        let ev = dev.map.lock().handle(msg, t_ms)?;
+        let name = registry().get(ev.tag).map(|f| f.name.clone()).unwrap_or_else(|| format!("<no action: {}>", dev.map.lock().inputs[ev.entry].as_ref().unwrap().e.name));
+        let (deck, val) = (ev.deck, ev.val);
+        hub.dispatch(dev, ev);
+        Some((name, deck, val))
+    }
+
+    #[test]
+    fn every_function_of_the_users_ddj_s1_mappings_has_an_action() {
+        let (hub, dev, _rx) = test_device("PIONEER DDJ-S1", S1);
+        // Each code names its function, for its deck, with its row type's value.
+        let cases: &[(&[u8], &str, u8)] = &[
+            (&[0x90, 0x50, 0x7F], "ActiveLoop", 1),
+            (&[0x91, 0x15, 0x7F], "CallNext", 2),
+            (&[0x90, 0x51, 0x7F], "CallPrev", 1),
+            (&[0x92, 0x41, 0x7F], "FX1TapBeatWithLongPress", 0),
+            (&[0x93, 0x41, 0x7F], "FX2TapBeatWithLongPress", 0),
+            (&[0xB1, 0x4F, 0x01], "LoopMove", 2),
+            (&[0x94, 0x46, 0x7F], "PanelForward", 0),
+            (&[0x94, 0x47, 0x7F], "SwitchActiveWindow", 0),
+            (&[0xB0, 0x09, 0x40], "VinylAdjustBrake", 1),
+            (&[0xB1, 0x04, 0x7F], "VinylAdjustTouchRelease", 2),
+            (&[0x91, 0x2A, 0x7F], "PAD1_HotCue", 2),
+            (&[0x90, 0x47, 0x7F], "PlayPause", 1),
+            (&[0x90, 0x0B, 0x00], "PlayPause", 1),
+        ];
+        for (msg, name, deck) in cases {
+            let (n, d, v) = feed(&hub, &dev, msg, 0.0).unwrap_or_else(|| panic!("{msg:02X?} found nothing"));
+            assert_eq!((n.as_str(), d), (*name, *deck), "{msg:02X?}");
+            let e = dev.map.lock().input_at(((msg[0] as u16) << 8) | msg[1] as u16).cloned().unwrap();
+            assert!(input_acts(name, e.kind), "{name} ({:?}) acts", e.kind);
+            match e.kind {
+                Kind::Rotary => assert_eq!(v, Val::Rel(1)),
+                Kind::KnobSlider => assert!(matches!(v, Val::Abs { .. })),
+                _ => assert!(matches!(v, Val::On(..))),
+            }
+        }
+        // The pad row's own type: the SX pad family, whatever the device.
+        assert!(matches!(dev.map.lock().input_at(0x902A).unwrap().kind, Kind::Pad(crate::midi_csv::PadType::Sx)));
+        // The Shift tempo fader is the same tempo slider, 14-bit.
+        assert_eq!(feed(&hub, &dev, &[0xB0, 0x05, 0x40], 0.0), None);
+        assert_eq!(feed(&hub, &dev, &[0xB0, 0x25, 0x00], 0.0).map(|x| x.0), Some("TempoSlider".into()));
+        // The needle strip: 0..16383.
+        assert_eq!(feed(&hub, &dev, &[0xB0, 0x03, 0x7F], 0.0).map(|x| x.2.unit().unwrap()), Some(1.0));
+        // Every output row has a source: lights that follow a state, a held button, the meter
+        // and the jog ring.
+        for o in dev.map.lock().outputs.iter() {
+            assert!(output_source(&o.name), "{} has no source", o.name);
+        }
+    }
+
+    #[test]
+    fn every_function_of_the_users_jog_helper_mapping_has_an_action() {
+        let (hub, dev, _rx) = test_device("DDJ-S1 Jog Helper", HELPER);
+        for (msg, name, deck) in [([0x92u8, 0x10, 0x7F], "FX1Assign.CH1", 0u8), ([0x92, 0x12, 0x7F], "FX1Assign.MASTER", 0), ([0x93, 0x10, 0x7F], "FX2Assign.CH1", 0), ([0x91, 0x71, 0x7F], "PitchBendUp", 2), ([0x90, 0x72, 0x7F], "PitchBendDown", 1), ([0x90, 0x73, 0x7F], "SearchFwd", 1), ([0x91, 0x74, 0x7F], "SearchRev", 2)] {
+            let (n, d, _) = feed(&hub, &dev, &msg, 0.0).unwrap();
+            assert_eq!((n.as_str(), d), (name, deck));
+        }
+        // Both touch codes are the platter top of their deck; the jog rows give counts.
+        assert_eq!(feed(&hub, &dev, &[0x90, 0x68, 0x7F], 0.0).map(|x| (x.0, x.1)), Some(("JogTouch".into(), 1)));
+        assert_eq!(feed(&hub, &dev, &[0x90, 0x68, 0x00], 1.0).map(|x| x.2), Some(Val::On(false, 0)));
+        for (cc, name) in [(0x22u8, "JogScratch"), (0x21, "WheelPitchBend"), (0x26, "WheelSearch")] {
+            let (n, _, v) = feed(&hub, &dev, &[0xB1, cc, 0x41], 2.0).unwrap();
+            assert_eq!(n, name);
+            assert_eq!(v, Val::Jog { delta: 1, t_ms: 2.0 });
+        }
+    }
+
+    #[test]
+    fn the_platter_scratches_the_distance_it_turns_and_the_rim_bends() {
+        // The helper sends the platter on the "PIONEER DDJ-ERGO" port: 2300 counts a turn.
+        let (hub, dev, _rx) = test_device("PIONEER DDJ-ERGO", "@file,1,PIONEER DDJ-ERGO\r\nJogScratch,,JogRotate,,B022,B122,,,,,,,,RO;,\r\nJogPitchBend,,JogRotate,,B023,B123,,,,,,,,RO;,\r\nJogTouch,,JogTouch,,9036,9136,,,,,,,,RO;,\r\nJogSearch,,Difference,,B027,B127,,,,,,,,RO;,\r\n");
+        // Touched (vinyl on): the record is held.
+        feed(&hub, &dev, &[0x90, 0x36, 0x7F], 0.0);
+        assert_eq!(hub.decks[0].lock().dk.jog, crate::deck::Jog::Speed(0.0));
+        // 23 counts every 10 ms = 2300 counts a second, one turn: at 33 1/3 rpm that is
+        // 1.8 turns' worth of playing speed, i.e. speed 1.8.
+        let mut speed = 0.0;
+        for i in 1..=10 {
+            feed(&hub, &dev, &[0xB0, 0x22, 0x40 + 23], i as f64 * 10.0);
+            if let crate::deck::Jog::Speed(s) = hub.decks[0].lock().dk.jog {
+                speed = s;
+            }
+        }
+        assert!((speed - 1.8).abs() < 1e-9, "{speed}");
+        // Distance: one message's speed stands for its own 10 ms, then the record stops.
+        let mut j = dev.jog.lock()[0].clone();
+        assert_eq!(j.idle(105.0), JogOut::Nothing);
+        assert_eq!(j.idle(111.0), JogOut::Scratch(0.0));
+        // Above the cap of 8 the rest is carried, not lost: 25 counts in 1 ms is speed 19.6.
+        let mut j = Jog::new(2300.0);
+        j.touch(true, true);
+        j.rotate(1, 0.0, true);
+        let first = j.rotate(25, 1.0, true);
+        assert_eq!(first, JogOut::Scratch(8.0));
+        // The rest is played at 8 for as long as it stands for.
+        let JogOut::Scratch(s) = j.idle(2.0) else { panic!() };
+        assert_eq!(s, 8.0);
+        // Let go: back to the record's own play.
+        feed(&hub, &dev, &[0x90, 0x36, 0x00], 200.0);
+        // The untouched platter bends: positive counts, a positive bend while it turns.
+        for i in 0..6 {
+            feed(&hub, &dev, &[0xB0, 0x23, 0x50], 300.0 + i as f64 * 8.0);
+        }
+        assert!(hub.decks[0].lock().bend > 0.0);
+        // Vinyl off and playing: touching bends instead of scratching.
+        hub.vinyl[0].store(false, Relaxed);
+        hub.decks[0].lock().playing = true;
+        hub.decks[0].lock().dk.jog = crate::deck::Jog::None;
+        feed(&hub, &dev, &[0x90, 0x36, 0x7F], 500.0);
+        assert_eq!(hub.decks[0].lock().dk.jog, crate::deck::Jog::None);
+        assert_eq!(dev.jog.lock()[0].state, 4);
+        // JogSearch: a jump by the scan step at most every 200 ms (a slow turn: 666 ms).
+        hub.decks[1].lock().pos = 44100.0 * 10.0;
+        feed(&hub, &dev, &[0xB1, 0x27, 0x41], 1000.0);
+        assert!((hub.decks[1].lock().pos / 44100.0 - 10.666).abs() < 1e-6);
+        feed(&hub, &dev, &[0xB1, 0x27, 0x41], 1100.0);
+        assert!((hub.decks[1].lock().pos / 44100.0 - 10.666).abs() < 1e-6, "not again within 200 ms");
+        feed(&hub, &dev, &[0xB1, 0x27, 0x3F], 1300.0);
+        assert!((hub.decks[1].lock().pos / 44100.0 - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_mapping_from_rekordboxs_folder_is_shown_and_changes_are_saved_to_recordboxs() {
+        let base = std::env::temp_dir().join(format!("recordbox-midi-rbdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (rb, own) = (base.join("rekordbox"), base.join("recordbox"));
+        std::fs::create_dir_all(&rb).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        let name = "PIONEER DDJ-S1";
+        let rb_file = rb.join(format!("{name}.midi.csv"));
+        let with_comments = S1.replace("CallNext,,Button,,9015,9115,,,,,,,,,", "CallNext,,Button,,9015,9115,,,,,,,,,Loop Select: next").replace("ActiveLoop,,Button,,9050,9150,,,,,,,,,", "ActiveLoop,,Button,,9050,9150,,,,,,,,,Shift + press Auto Loop");
+        std::fs::write(&rb_file, &with_comments).unwrap();
+        // recordbox's own file as it is written at first sight of the port: the header only.
+        std::fs::write(own.join(format!("{name}.midi.csv")), crate::midi_csv::empty_user_file(name)).unwrap();
+        let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
+        let (hub, _rx) = Hub::new(decks, own.clone());
+        *hub.rb_dir.lock() = Some(rb.clone());
+        assert!(hub.from_rekordbox(name));
+        let (map, _) = hub.load_map(name);
+        // The window's tabs: the learnable rows, with their codes and comments.
+        let rows = crate::ui_midi::rows_of(&map);
+        let deck: Vec<(String, u8, Option<u16>, Option<u16>, String)> = rows[0].iter().map(|r| (r.name.clone(), r.deck, r.input, r.output, r.comment.clone())).collect();
+        assert!(deck.contains(&("ActiveLoop".into(), 1, Some(0x9050), None, "Shift + press Auto Loop".into())), "{deck:?}");
+        assert!(deck.contains(&("PlayPause".into(), 2, Some(0x9147), Some(0x9147), String::new())));
+        assert!(deck.iter().any(|r| r.0 == "LoopMove" && r.2 == Some(0xB04F)));
+        // Not learnable in rekordbox either: CALL, the Vinyl knobs, the jog ring, the meter.
+        for n in ["CallNext", "VinylAdjustBrake", "JogPlayPauseIndicatorShort", "ChannelLevel", "FX1TapBeatWithLongPress"] {
+            assert!(rows.iter().flatten().all(|r| r.name != n), "{n} shown");
+        }
+        let other: Vec<&str> = rows[6].iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(other, vec!["PanelForward", "SwitchActiveWindow"]);
+        assert_eq!(rows[1].iter().filter(|r| r.name == "PAD1_HotCue").map(|r| type_text(r.ty)).collect::<Vec<_>>(), vec!["Pad", "Pad"]);
+        // Closing the window without a change writes nothing.
+        let (_, dev, _r) = test_device(name, &with_comments);
+        *dev.map.lock() = hub.load_map(name).0;
+        hub.save_map(&dev).unwrap();
+        assert_eq!(std::fs::read_to_string(own.join(format!("{name}.midi.csv"))).unwrap(), crate::midi_csv::empty_user_file(name));
+        // A change goes to recordbox's folder, with the rest of the mapping; rekordbox's file
+        // is untouched.
+        let reg = registry();
+        {
+            let mut m = dev.map.lock();
+            let row = LearnEntry { name: "Sync".into(), deck: 1, kind: Kind::Button, min: -1, max: -1, comment: String::new() };
+            m.change_input(&row, None, Some(0x9058), &|n: &str| reg.learnable(n)).unwrap();
+        }
+        hub.save_map(&dev).unwrap();
+        let saved = std::fs::read_to_string(own.join(format!("{name}.midi.csv"))).unwrap();
+        assert!(saved.starts_with("@file,1,PIONEER DDJ-S1\r\n") && saved.contains("Sync,Sync,Button,,9058,") && saved.contains("CallNext,,Button,,9015,9115,") && saved.contains("Loop Select: next"), "{saved}");
+        assert_eq!(std::fs::read_to_string(&rb_file).unwrap(), with_comments);
+        // From now on recordbox's own file is the one read.
+        assert!(!hub.from_rekordbox(name));
+        assert!(hub.load_map(name).0.input_at(0x9058).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fourteen_bit_outputs_send_the_upper_and_lower_seven_bits() {
+        let (_hub, dev, _rx) = test_device("DDJ-RZX", "@file,1,DDJ-RZX\r\nJogPlayPauseIndicator,,JogIndicatorHiRes,,,,,,,BB00,BB01,,,RO;Min=1;Max=135;Priority=100;,\r\n");
+        // Half a turn: 1 + 135 x 180 / 360 = 68.
+        dev.set_named("JogPlayPauseIndicator", 1, &|e: &Entry| crate::midi_map::jog_ring(180, &e.opts) as u16);
+        let mut out = dev.out.lock();
+        assert_eq!(out.queue.pop(), Some([0xBB, 0x00, 0]));
+        assert_eq!(out.queue.pop(), Some([0xBB, 0x10, 68]));
+        drop(out);
+        dev.set_named("JogPlayPauseIndicator", 1, &|_| 300);
+        let mut out = dev.out.lock();
+        assert_eq!((out.queue.pop(), out.queue.pop()), (Some([0xBB, 0x00, 2]), Some([0xBB, 0x10, 44])));
+    }
+
+    #[test]
+    fn the_new_functions_follow_rekordboxs_rules() {
+        // Vinyl Speed Adjust: knob position x 0.0155649149.
+        assert_eq!((vinyl_index(0), vinyl_index(8192), vinyl_index(16383)), (0, 127, 255));
+        // FX assign following a switch: master alone.
+        let mut a = [true, false, false, false, false, false];
+        fx_assign_set(&mut a, crate::fx::MASTER, true);
+        assert_eq!(a, [false, false, false, false, true, false]);
+        fx_assign_set(&mut a, 1, true);
+        assert_eq!(a, [false, true, false, false, false, false]);
+        fx_assign_set(&mut a, 1, false);
+        assert_eq!(a, [false; 6]);
+        // PanelSelect: FX, SAMPLER, MIXER, REC, none, in turn; back the other way.
+        let all = [true; 4];
+        assert_eq!(panel_next([false; 4], all, 1), Some(0));
+        assert_eq!(panel_next([true, false, false, false], all, 1), Some(1));
+        assert_eq!(panel_next([true, true, true, false], all, 1), Some(3));
+        assert_eq!(panel_next([false, false, false, true], all, 1), None);
+        assert_eq!(panel_next([false; 4], all, -1), Some(3));
+        assert_eq!(panel_next([true, false, false, false], all, -1), None);
+        // A panel the layout does not have is passed over.
+        assert_eq!(panel_next([true, false, false, false], [true, false, true, true], 1), Some(2));
+        // Lights: a button with no state of its own is lit while held; REVERSE blinks.
+        assert!(echo_led(Act::Load) && echo_led(Act::CallStep(1)) && echo_led(Act::Stub(Stub::SlipReverse)));
+        assert!(!echo_led(Act::Sync) && act_has_led(Act::Stub(Stub::Reverse)));
     }
 
     fn tone(secs: f64) -> Arc<crate::audio::Decoded> {

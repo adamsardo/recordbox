@@ -92,6 +92,19 @@ pub fn pad_family(device: &str) -> PadFamily {
     }
 }
 
+/// The family of a pad row: the one its type names, else the device's.
+pub fn pad_type_family(t: crate::midi_csv::PadType, device: PadFamily) -> PadFamily {
+    use crate::midi_csv::PadType as T;
+    match t {
+        T::ByDevice => device,
+        T::Rz => PadFamily::Rz,
+        T::Rx => PadFamily::Rx,
+        T::Sz => PadFamily::Sz,
+        T::Sx2 => PadFamily::Sx2,
+        T::Sx => PadFamily::Sx,
+    }
+}
+
 /// The value a pad LED is sent for the value the app asks for (`Midi*Pad::setCharValue`).
 pub fn pad_led(family: PadFamily, v: u8) -> u8 {
     // The RX family's remap of the codes 31 to 41 (two of the device's codes are skipped).
@@ -231,6 +244,10 @@ pub struct MidiMap {
     stamp: [u16; 5],
     /// Rows that were not taken because their code was already in use (factory files).
     pub rejected: usize,
+    /// Dual deck (DDJ-RX): the deck each side controls (left 1 or 3, right 2 or 4) and
+    /// whether that side's DUAL DECK switch is on.
+    pub host: [u8; 2],
+    pub dual_on: [bool; 2],
 }
 
 fn key_of(msg: &[u8]) -> Option<usize> {
@@ -242,7 +259,7 @@ fn key_of(msg: &[u8]) -> Option<usize> {
 
 impl MidiMap {
     pub fn new(device: &str) -> MidiMap {
-        MidiMap { device: device.to_string(), inputs: vec![], outputs: vec![], table: vec![Slot::Empty; 65536], params: HashMap::new(), family: pad_family(device), stamp: [0; 5], rejected: 0 }
+        MidiMap { device: device.to_string(), inputs: vec![], outputs: vec![], table: vec![Slot::Empty; 65536], params: HashMap::new(), family: pad_family(device), stamp: [0; 5], rejected: 0, host: [1, 2], dual_on: [false; 2] }
     }
 
     /// The factory file, when the installed rekordbox has one for the device, then the user's
@@ -375,6 +392,7 @@ impl MidiMap {
         if m[0] & 0xF0 == 0x80 {
             m = [0x90 | (m[0] & 0x0F), m[1], 0];
         }
+        self.note_host(&m);
         let k = key_of(&m)?;
         let (i, lsb) = match self.table[k] {
             Slot::Whole(i) => (i as usize, false),
@@ -393,7 +411,7 @@ impl MidiMap {
                 }
                 Val::On(b != 0, b)
             }
-            Kind::Pad => match family {
+            Kind::Pad(pt) => match pad_type_family(pt, family) {
                 // These families report pressure: 127 is the press, 0 the release.
                 PadFamily::Rz | PadFamily::Rx => match b {
                     127 => Val::On(true, 127),
@@ -455,11 +473,50 @@ impl MidiMap {
         Some(Event { entry: i, deck, val, fast, tag: inp.tag })
     }
 
+    /// Dual deck (`DeviceMidi::midiInDataForThread` 0x1021bbe7c with `getMidiInputDataDual`
+    /// and `getLeft/RightHostDeck`): a `Dual` row's message from the deck its side controls
+    /// also goes to its peer deck (1 with 3, 2 with 4) while that side's DUAL DECK switch is
+    /// on. Only the maps that keep host decks do this; of those the DDJ-RX was traced
+    /// (`MidiMapDDJRX::getMidiInputData` 0x101f0a89c): its deck buttons (note 0x3C on channels
+    /// 1-4) choose the side's deck, notes 0x7C / 0x7D on channel 7 switch DUAL DECK left /
+    /// right. Every other map (base `MidiMap`: -1) ignores `Dual`. Returns the peer's message.
+    pub fn dual_message(&mut self, msg: &[u8], ev: &Event) -> Option<[u8; 3]> {
+        if msg.len() < 3 || !self.device.to_ascii_uppercase().contains("DDJ-RX") || self.device.to_ascii_uppercase().contains("DDJ-RX3") {
+            return None;
+        }
+        let inp = self.inputs.get(ev.entry)?.as_ref()?;
+        if !inp.e.opts.dual || inp.e.deck == 0 {
+            return None;
+        }
+        let side = if inp.e.deck % 2 == 1 { 0 } else { 1 };
+        if !self.dual_on[side] || self.host[side] != inp.e.deck {
+            return None;
+        }
+        let peer = inp.peer?;
+        Some([(peer >> 8) as u8, (peer & 0xFF) as u8, msg[2]])
+    }
+
+    /// The DDJ-RX's deck and DUAL DECK switches, seen before the lookup.
+    fn note_host(&mut self, m: &[u8; 3]) {
+        if !self.device.to_ascii_uppercase().contains("DDJ-RX") || self.device.to_ascii_uppercase().contains("DDJ-RX3") || m[0] & 0xF0 != 0x90 {
+            return;
+        }
+        let ch = m[0] & 0x0F;
+        if m[1] == 0x3C && ch < 4 && m[2] != 0 {
+            // (Choosing a deck switches that side's DUAL DECK off.)
+            self.host[(ch % 2) as usize] = ch + 1;
+            self.dual_on[(ch % 2) as usize] = false;
+        }
+        if ch == 6 && (m[1] == 0x7C || m[1] == 0x7D) {
+            self.dual_on[(m[1] - 0x7C) as usize] = m[2] != 0;
+        }
+    }
+
     /// The message that sets an output entry's LED to `v` (0 = off, 127 = on, or a pad's
     /// colour value): status, data1, the value after the row's rule.
     pub fn led_message(&self, e: &Entry, v: u8) -> [u8; 3] {
         let val = match e.kind {
-            Kind::Pad => pad_led(self.family, v),
+            Kind::Pad(pt) => pad_led(pad_type_family(pt, self.family), v),
             Kind::Button => button_led(v, &e.opts),
             _ => v,
         };
@@ -922,11 +979,59 @@ pub struct Jog {
     slow_releases: u32,
     /// Counts of the last 60 ms (time, delta), for the bend.
     window: VecDeque<(f64, i32)>,
+    /// Movement above the speed cap of +-8 carried to the next message, as track
+    /// milliseconds (rekordbox carries the excess speed; this keeps the distance it stands for).
+    carry: f64,
+    /// The message time up to which the last scratch speed stands for the platter's movement
+    /// (its time plus its interval): after it, with nothing new, the record stands.
+    until: f64,
+}
+
+/// JogSearch (`DjController::ScanProcessor::processValueSearch` 0x101b5d174): every 200 ms at
+/// most, the track jumps by a fixed step chosen by how fast the wheel turns (the scan speeds
+/// x5, x10, x20, x60, x120 of `rbxfrm::DjPlayerDef`: 666, 1333, 2666, 12000, 24000 ms).
+#[derive(Clone, Debug, Default)]
+pub struct Scan {
+    last_t: Option<f64>,
+    last_skip: Option<f64>,
+}
+
+impl Scan {
+    /// Counts at `t_ms`, with `k` the counts-to-speed factor of the deck's jog: the jump to
+    /// make now (seconds, signed), if any.
+    pub fn value(&mut self, delta: i32, t_ms: f64, k: f64) -> Option<f64> {
+        let dt = match self.last_t {
+            Some(l) if t_ms > l => (t_ms - l).min(56.0),
+            Some(_) => 1.0,
+            None => 56.0,
+        };
+        self.last_t = Some(t_ms);
+        if delta == 0 {
+            return None;
+        }
+        if self.last_skip.map(|l| t_ms - l < 200.0).unwrap_or(false) {
+            return None;
+        }
+        self.last_skip = Some(t_ms);
+        let speed = (k * delta as f64 / dt).abs();
+        let ms = if speed < 0.5 {
+            666.0
+        } else if speed < 1.0 {
+            1333.0
+        } else if speed < 2.0 {
+            2666.0
+        } else if speed < 3.5 {
+            12000.0
+        } else {
+            24000.0
+        };
+        Some(ms / 1000.0 * delta.signum() as f64)
+    }
 }
 
 impl Jog {
     pub fn new(cpr: f64) -> Jog {
-        Jog { cpr, bend_ratio: 1.5, rpm: 100.0 / 3.0, vinyl: true, spin_over: 3, state: 0, touched: false, last_t: None, last_speed: 0.0, slow_releases: 0, window: VecDeque::new() }
+        Jog { cpr, bend_ratio: 1.5, rpm: 100.0 / 3.0, vinyl: true, spin_over: 3, state: 0, touched: false, last_t: None, last_speed: 0.0, slow_releases: 0, window: VecDeque::new(), carry: 0.0, until: 0.0 }
     }
 
     /// Counts per millisecond to speed: 1.0 when the platter turns at its nominal rpm.
@@ -950,6 +1055,7 @@ impl Jog {
         if on {
             self.last_t = None;
             self.window.clear();
+            self.carry = 0.0;
             // Vinyl on: the hand has the record. Vinyl off: a bend while the deck plays.
             self.state = if self.vinyl || !playing { 1 } else { 4 };
             return if self.state == 1 { JogOut::Scratch(0.0) } else { JogOut::Nothing };
@@ -977,22 +1083,36 @@ impl Jog {
         }
     }
 
-    /// Counts from the platter top (`scratch`) or the outer ring at `t_ms`.
-    pub fn rotate(&mut self, delta: i32, t_ms: f64, scratch_row: bool) -> JogOut {
-        // The time since the last message, 56 ms for the first one and at most.
+    /// Counts from any jog row (`JogScratch`, `JogPitchBend`, `WheelPitchBend`, `WheelSearch`:
+    /// rekordbox binds every JogRotate row of a deck to the one scratch processor,
+    /// `setMidiInputMap` 0x101ece624) at `t_ms`. While the platter top is held (scratch) the
+    /// record follows the counts; otherwise they bend. (`_row`: which row, kept for the log.)
+    pub fn rotate(&mut self, delta: i32, t_ms: f64, _row: bool) -> JogOut {
+        // The time since the last message, 56 ms for the first one and at most
+        // (`AudioCallbackTimeStampProcessor2`). Messages sent at the same moment count as
+        // one millisecond apart.
         let dt = match self.last_t {
             Some(l) if t_ms > l => (t_ms - l).min(56.0),
             Some(_) => 1.0,
             None => 56.0,
         };
         self.last_t = Some(t_ms);
-        if scratch_row && self.state == 1 {
-            let speed = self.k() * delta as f64 / dt;
-            if speed.abs() > 25.0 {
-                // "illegal scratch speed": dropped.
+        if self.state == 1 {
+            // `ScratchProcessor::processValue` 0x101b501cc: speed = k x counts / ms; above
+            // 25 it is "illegal" and dropped; the speed sent is held to +-8 and the rest
+            // carried to the next message.
+            let raw = self.k() * delta as f64 / dt;
+            if raw.abs() > 25.0 {
                 return JogOut::Nothing;
             }
+            let mut speed = raw + self.carry / dt;
+            self.carry = 0.0;
+            if speed.abs() > 8.0 {
+                self.carry = (speed - 8.0 * speed.signum()) * dt;
+                speed = 8.0 * speed.signum();
+            }
             self.last_speed = if speed.abs() < 1.19e-7 { 0.0 } else { speed };
+            self.until = t_ms + dt.max(1.0);
             return JogOut::Scratch(self.last_speed);
         }
         // A bend: the counts of the last 60 ms.
@@ -1008,10 +1128,27 @@ impl Jog {
         JogOut::Bend(self.bend_for(speed))
     }
 
+    fn idle_scratch(&mut self, now_ms: f64) -> JogOut {
+        if self.carry != 0.0 {
+            // What the cap held back is played out at the cap.
+            let s = 8.0 * self.carry.signum();
+            self.until = now_ms + (self.carry / s).abs();
+            self.carry = 0.0;
+            self.last_speed = s;
+            return JogOut::Scratch(s);
+        }
+        self.last_speed = 0.0;
+        JogOut::Scratch(0.0)
+    }
+
     /// Nothing came for a while (`now_ms`): a bend ends 60 ms after its last count, and a
     /// held platter that stopped moving holds the record still.
     pub fn idle(&mut self, now_ms: f64) -> JogOut {
         let Some(l) = self.last_t else { return JogOut::Nothing };
+        // A held platter: the record has moved as far as the last counts said.
+        if self.state == 1 && self.last_speed != 0.0 && now_ms >= self.until {
+            return self.idle_scratch(now_ms);
+        }
         if now_ms - l <= 60.0 {
             return JogOut::Nothing;
         }
@@ -1043,6 +1180,32 @@ mod tests {
             m.add_row(&Row::parse(r).unwrap(), false, false);
         }
         m
+    }
+
+    #[test]
+    fn dual_deck_rows_reach_the_peer_deck_only_on_the_ddj_rx_with_dual_on() {
+        let row = "LoopIn,LoopIn,Button,9010,0,1,2,3,9010,0,1,2,3,Dual;Fast,";
+        let mut m = MidiMap::new("DDJ-RX");
+        m.add_row(&Row::parse(row).unwrap(), false, false);
+        let ev = m.handle(&[0x90, 0x10, 0x7F], 0.0).unwrap();
+        assert_eq!(m.dual_message(&[0x90, 0x10, 0x7F], &ev), None, "DUAL DECK off");
+        m.handle(&[0x96, 0x7C, 0x7F], 0.0);
+        let ev = m.handle(&[0x90, 0x10, 0x7F], 0.0).unwrap();
+        assert_eq!(m.dual_message(&[0x90, 0x10, 0x7F], &ev), Some([0x92, 0x10, 0x7F]));
+        // Deck 3 chosen on the left: deck 1's messages no longer go across; choosing a deck
+        // switched DUAL off.
+        m.handle(&[0x92, 0x3C, 0x7F], 0.0);
+        m.handle(&[0x96, 0x7C, 0x7F], 0.0);
+        let ev = m.handle(&[0x92, 0x10, 0x7F], 0.0).unwrap();
+        assert_eq!(m.dual_message(&[0x92, 0x10, 0x7F], &ev), Some([0x90, 0x10, 0x7F]));
+        let ev = m.handle(&[0x90, 0x10, 0x7F], 0.0).unwrap();
+        assert_eq!(m.dual_message(&[0x90, 0x10, 0x7F], &ev), None);
+        // The ERGO (base map) ignores Dual.
+        let mut e = MidiMap::new("PIONEER DDJ-ERGO");
+        e.add_row(&Row::parse(row).unwrap(), false, false);
+        e.handle(&[0x96, 0x7C, 0x7F], 0.0);
+        let ev = e.handle(&[0x90, 0x10, 0x7F], 0.0).unwrap();
+        assert_eq!(e.dual_message(&[0x90, 0x10, 0x7F], &ev), None);
     }
 
     #[test]
@@ -1480,11 +1643,11 @@ mod tests {
         assert_eq!(j.idle(1100.0), JogOut::Scratch(0.0));
         // Let go while standing: back to normal play.
         assert_eq!(j.touch(false, true), JogOut::Release);
-        // Let go while spinning backwards: the record runs on (a back spin).
+        // Let go while spinning backwards: the record runs on (a back spin), at the cap of 8.
         j.touch(true, true);
         j.rotate(-40, 2000.0, true);
         j.rotate(-40, 2010.0, true);
-        assert_eq!(j.touch(false, true), JogOut::Spin(-10.0));
+        assert_eq!(j.touch(false, true), JogOut::Spin(-8.0));
         assert_eq!(j.state, 2);
         // Vinyl off on a playing deck: the platter top bends; on a stopped deck it scratches.
         let mut j = Jog::new(720.0);

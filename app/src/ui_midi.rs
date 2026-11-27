@@ -201,10 +201,21 @@ pub fn select_device(app: &mut App, name: &str) {
 /// read-only and whose function is one of the window's commands, with its output; then the
 /// outputs that have no input (indicators).
 pub fn rebuild_rows(app: &mut App) {
+    let rows = match device(app) {
+        Some(dev) => rows_of(&dev.map.lock()),
+        None => vec![vec![]; TABS.len()],
+    };
+    let w = &mut app.midi.win;
+    w.rows = rows;
+    w.sel = vec![None; TABS.len()];
+    w.sort = None;
+}
+
+/// The rows of each tab for a mapping.
+pub fn rows_of(map: &crate::midi_map::MidiMap) -> Vec<Vec<LearnRow>> {
     let reg = registry();
     let mut rows: Vec<Vec<LearnRow>> = vec![vec![]; TABS.len()];
-    if let Some(dev) = device(app) {
-        let map = dev.map.lock();
+    {
         let mut ins: Vec<&crate::midi_csv::Entry> = map.live_inputs().map(|i| &i.e).collect();
         ins.sort_by_key(|e| e.code);
         let mut used = vec![false; map.outputs.len()];
@@ -236,10 +247,7 @@ pub fn rebuild_rows(app: &mut App) {
             }
         }
     }
-    let w = &mut app.midi.win;
-    w.rows = rows;
-    w.sel = vec![None; TABS.len()];
-    w.sort = None;
+    rows
 }
 
 /// The device list changed.
@@ -1174,6 +1182,21 @@ impl App {
         format!("open {} device {:?} tab {} learn {} sel {:?} rows {} {:?} alert {:?} ask {:?}", w.open, w.device, TABS[w.tab.min(9)].1, w.learn, w.sel.get(w.tab).copied().flatten(), rows.len(), rows, w.alert.as_ref().map(|a| a.1.replace('\n', " | ")), w.ask)
     }
 
+    fn s1_state(&self) -> String {
+        let s = self.player.decks[0].lock();
+        let sr = s.audio.as_ref().map(|a| a.sr as f64).unwrap_or(44100.0);
+        let d = self.deck_of(0);
+        let mem: Vec<String> = d.cues.iter().filter(|c| c.kind == crate::model::CueKind::Memory).map(|c| format!("{:.2}{}{}", c.start, c.end.map(|e| format!("-{e:.2}")).unwrap_or_default(), if c.active_loop { " active" } else { "" })).collect();
+        let fx = &self.px.fx[0];
+        format!(
+            "deck 1 playing {} pos {:.2} s cue {:.2} loop {:?} bend {:+.4} search {:+.1} reverse {} memory {:?} | panels fx {} sampler {} mixer {} rec {} browse {} | vinyl brake {:?} start {:?} | FX1 auto {} assign {:?} | jog vinyl deck 1 {}",
+            s.playing, s.pos / sr, d.cue_point, s.loop_range.map(|(a, b)| (format!("{a:.2}"), format!("{b:.2}"))), s.bend, s.search, s.dk.reverse, mem,
+            self.prefs.perf_fx, self.prefs.perf_sampler, crate::ui_perf_layouts::mixer_shown(self), self.prefs.rec.panel, self.prefs.perf_lay.browse,
+            self.prefs.rb.brake, self.prefs.rb.start, fx.auto, fx.params.assign,
+            self.midi.hub.as_ref().map(|h| h.vinyl[0].load(Relaxed)).unwrap_or(true)
+        )
+    }
+
     /// PREPDECK_SHOT_MIDI=window|learn|add|alert|empty (with --screenshot,
     /// PREPDECK_SHOT_VIEW=performance): the MIDI setting window in that state, with a test
     /// controller. PREPDECK_SHOT_PLAYER=miditest (with PREPDECK_BENCH=<frames> to keep the
@@ -1188,7 +1211,8 @@ impl App {
             }
         }
         let shot = std::env::var("PREPDECK_SHOT_MIDI").unwrap_or_default();
-        let test = std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "miditest")).unwrap_or(false);
+        let s1 = std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "mids1test")).unwrap_or(false);
+        let test = s1 || std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "miditest")).unwrap_or(false);
         if shot.is_empty() && !test {
             return;
         }
@@ -1292,6 +1316,114 @@ impl App {
             ("Cancel: nothing changes", S::Click("ask:Cancel")),
             ("the window closes", S::Click("close")),
         ];
+        // `PREPDECK_SHOT_PLAYER=mids1test` with `PREPDECK_MIDI_RB_DIR=<folder>` holding the user's
+        // DDJ-S1 and Jog Helper rows as "<test controller>.midi.csv" (a copy, header renamed):
+        // the window shows that mapping as read from rekordbox's folder, each function the
+        // two mappings use is sent with its own code, and a change made in the window is saved
+        // to recordbox's folder.
+        let steps = if !s1 { steps } else {
+            vec![
+                ("the MIDI button opens the window", S::Click("MIDI")),
+                ("the device list opens", S::Click("device")),
+                ("the test controller (with the DDJ-S1 rows) is picked: DECK", S::Click("item:recordbox test controller")),
+                ("PAD tab", S::Click("tab:PAD")),
+                ("FX tab", S::Click("tab:FX")),
+                ("MIXER tab", S::Click("tab:MIXER")),
+                ("BROWSE tab", S::Click("tab:BROWSE")),
+                ("OTHER tab", S::Click("tab:OTHER")),
+                ("back to DECK", S::Click("tab:DECK")),
+                ("before", S::Note("state")),
+                ("PlayPause 900B", S::Send([0x90, 0x0B, 0x7F])),
+                ("release", S::Send([0x90, 0x0B, 0x00])),
+                ("Memory 902F (a memory cue here)", S::Send([0x90, 0x2F, 0x7F])),
+                ("release", S::Send([0x90, 0x2F, 0x00])),
+                ("CallPrev 9051 (not looping: previous memory cue)", S::Send([0x90, 0x51, 0x7F])),
+                ("release", S::Send([0x90, 0x51, 0x00])),
+                ("state", S::Note("state")),
+                ("AutoLoop 9014", S::Send([0x90, 0x14, 0x7F])),
+                ("release", S::Send([0x90, 0x14, 0x00])),
+                ("state", S::Note("state")),
+                ("CallNext 9015 (looping: the loop doubles)", S::Send([0x90, 0x15, 0x7F])),
+                ("release", S::Send([0x90, 0x15, 0x00])),
+                ("state", S::Note("state")),
+                ("LoopMove B04F +1", S::Send([0xB0, 0x4F, 0x01])),
+                ("state", S::Note("state")),
+                ("LoopMove B04F -1", S::Send([0xB0, 0x4F, 0x7F])),
+                ("state", S::Note("state")),
+                ("ActiveLoop 9050", S::Send([0x90, 0x50, 0x7F])),
+                ("release", S::Send([0x90, 0x50, 0x00])),
+                ("ReloopExit 9012 (loop off)", S::Send([0x90, 0x12, 0x7F])),
+                ("release", S::Send([0x90, 0x12, 0x00])),
+                ("VinylAdjustBrake B009 = 0x40", S::Send([0xB0, 0x09, 0x40])),
+                ("VinylAdjustTouchRelease B104 = 0x7F", S::Send([0xB1, 0x04, 0x7F])),
+                ("state", S::Note("state")),
+                ("PanelForward 9446", S::Send([0x94, 0x46, 0x7F])),
+                ("release", S::Send([0x94, 0x46, 0x00])),
+                ("state", S::Note("state")),
+                ("PanelForward 9446", S::Send([0x94, 0x46, 0x7F])),
+                ("release", S::Send([0x94, 0x46, 0x00])),
+                ("state", S::Note("state")),
+                ("SwitchActiveWindow 9447", S::Send([0x94, 0x47, 0x7F])),
+                ("release", S::Send([0x94, 0x47, 0x00])),
+                ("state", S::Note("state")),
+                ("SwitchActiveWindow 9447 again", S::Send([0x94, 0x47, 0x7F])),
+                ("release", S::Send([0x94, 0x47, 0x00])),
+                ("state", S::Note("state")),
+                ("FX1TapBeatWithLongPress 9241 held", S::Send([0x92, 0x41, 0x7F])),
+                ("tap: TAP mode", S::Note("state")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held", S::Note("wait")),
+                ("held a second: AUTO", S::Note("state")),
+                ("release", S::Send([0x92, 0x41, 0x00])),
+                ("FX1Assign.CH2 9211 (helper)", S::Send([0x92, 0x11, 0x7F])),
+                ("state", S::Note("state")),
+                ("the switch leaves CH2 (9211 off) for MASTER (9212)", S::Send([0x92, 0x11, 0x00])),
+                ("on MASTER", S::Send([0x92, 0x12, 0x7F])),
+                ("state", S::Note("state")),
+                ("PitchBendUp 9071 held (helper nudge)", S::Send([0x90, 0x71, 0x7F])),
+                ("state", S::Note("state")),
+                ("release", S::Send([0x90, 0x71, 0x00])),
+                ("SearchFwd 9073 held", S::Send([0x90, 0x73, 0x7F])),
+                ("state", S::Note("state")),
+                ("release", S::Send([0x90, 0x73, 0x00])),
+                ("Vinyl 9035 (off)", S::Send([0x90, 0x35, 0x7F])),
+                ("release", S::Send([0x90, 0x35, 0x00])),
+                ("state", S::Note("state")),
+                ("Reverse 906A", S::Send([0x90, 0x6A, 0x7F])),
+                ("release", S::Send([0x90, 0x6A, 0x00])),
+                ("state", S::Note("state")),
+                ("Reverse 906A off", S::Send([0x90, 0x6A, 0x7F])),
+                ("release", S::Send([0x90, 0x6A, 0x00])),
+                ("PlayPause 900B (pause)", S::Send([0x90, 0x0B, 0x7F])),
+                ("release", S::Send([0x90, 0x0B, 0x00])),
+                ("the lights sent", S::Note("leds")),
+                ("the first DECK row is selected", S::Click("row:0")),
+                ("LEARN is armed", S::Click("LEARN")),
+                ("a new code (9058) for it", S::Send([0x90, 0x58, 0x7F])),
+                ("release", S::Send([0x90, 0x58, 0x00])),
+                ("LEARN is switched off", S::Click("LEARN")),
+                ("the window closes (saves)", S::Click("close")),
+                ("the files", S::Note("files")),
+            ]
+        };
         let Some((name, s)) = steps.get(step) else {
             if step == steps.len() && phase == 0 {
                 eprintln!("miditest: done; {} mapped messages handled, {} codes learned", self.midi.handled, self.midi.win.learned);
@@ -1325,7 +1457,16 @@ impl App {
             }
             S::Note(kind) => {
                 if phase == 6 {
-                    if *kind == "leds" {
+                    if *kind == "state" {
+                        eprintln!("miditest: {name}: {}", self.s1_state());
+                    } else if *kind == "wait" {
+                    } else if *kind == "files" {
+                        let own = crate::db::data_dir().join("MidiMappings").join(format!("{TEST_NAME}.midi.csv"));
+                        let rb = std::env::var("PREPDECK_MIDI_RB_DIR").map(|d| std::path::PathBuf::from(d).join(format!("{TEST_NAME}.midi.csv"))).unwrap_or_default();
+                        let o = std::fs::read_to_string(&own).unwrap_or_else(|e| format!("<{e}>"));
+                        let r = std::fs::read_to_string(&rb).unwrap_or_else(|e| format!("<{e}>"));
+                        eprintln!("miditest: {name}: recordbox's file {} ({} lines, Sync at 9058: {}); stand-in rekordbox file {} ({} lines, Sync at 9058: {})", own.display(), o.lines().count(), o.contains(",9058,"), rb.display(), r.lines().count(), r.contains(",9058,"));
+                    } else if *kind == "leds" {
                         let l: Vec<String> = test_leds().iter().map(|m| format!("{:02X}{:02X}={}", m[0], m[1], m[2])).collect();
                         eprintln!("miditest: {name}: {}", l.join(" "));
                     } else {
