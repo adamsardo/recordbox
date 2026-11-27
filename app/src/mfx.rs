@@ -24,7 +24,8 @@
 //! file is gone is silent, as in rekordbox.
 //! recordbox's own: the effect bodies (see `fx.rs` / `cfx.rs`), the release echoes' pitch as
 //! a change of speed, the repeats' tempo (the deck's; rekordbox's sequence player starts at
-//! 120 BPM and its sync was not traced), a repeat restarting the sample without a fade.
+//! 120 BPM and its sync was not traced). The repeats restart the sample through the clip
+//! player's 1 ms fade (`Attenuator`).
 //! ROLL's beat steps are the echoes' step table, as the parameter table says.
 
 use crate::cfx::Cfx;
@@ -333,6 +334,16 @@ pub fn load_user(path: &str) -> Option<Arc<Sample>> {
     (data.len() >= 4).then(|| Arc::new(Sample { data, rate: d.sr as f32 }))
 }
 
+/// The clip player's fade length (`Attenuator(rate, 1.0 ms)`: (1.0 x 0.001) x rate, rounded).
+fn restart_fade_frames(rate: f32) -> i32 {
+    (((1.0f32 * 0.001) * rate) as f64).round().max(2.0) as i32
+}
+
+/// `Attenuator::createCurve`: 0.5 + 0.5 sin(i pi / (n - 1) - pi / 2), from 0 to 1 over n frames.
+fn restart_curve(i: i32, n: i32) -> f32 {
+    (((i.clamp(0, n - 1)) as f64 * 3.14159265 / (n - 1) as f64 - 1.57079633).sin() * 0.5 + 0.5) as f32
+}
+
 /// A sample being played: its place (frames of the file) or `None`.
 #[derive(Clone, Copy, Default)]
 struct Voice {
@@ -373,6 +384,8 @@ struct UnitEng {
     /// starts from.
     npb: u32,
     grid0: f64,
+    /// Frames since the build sample last restarted (its fade-in; `i32::MAX`: none).
+    rfade: i32,
     /// REPEAT UP: CFX PITCH on the build sample, and the buffer it is made in.
     pitch: Cfx,
     sbuf: Vec<f32>,
@@ -385,7 +398,7 @@ struct UnitEng {
 
 impl UnitEng {
     fn new() -> UnitEng {
-        let mut e = UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2], pe_line: vec![0.0; PE_LEN * 2], pe_w: 0, pe_ps: crate::fx_core::PitchShifter::new(48000.0) };
+        let mut e = UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, rfade: i32::MAX, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2], pe_line: vec![0.0; PE_LEN * 2], pe_w: 0, pe_ps: crate::fx_core::PitchShifter::new(48000.0) };
         // (Made by the interface: the echo cores of the slots, so that MERGE FX runs rekordbox's
         // echo and not the old shared line.)
         for s in e.slots.iter_mut() {
@@ -652,6 +665,7 @@ impl Engine {
                             let (a, b) = ((before - e.grid0) * e.npb as f64, (e.clock - e.grid0) * e.npb as f64);
                             if b >= 0.0 && (a < 0.0 || a.floor() != b.floor() || before == e.grid0) {
                                 e.build.pos = Some(0.0);
+                                e.rfade = 0;
                             }
                         }
                         match id {
@@ -687,14 +701,32 @@ impl Engine {
                             _ => {}
                         }
                     }
-                    // The build sample, into its own buffer (it may be pitched).
+                    // The build sample, into its own buffer (it may be pitched). A repeat restarts
+                    // it through the clip player's `Attenuator` (1 ms raised-sine curve,
+                    // `rbxfrm::f2dsp::Attenuator::createCurve` 0x102887b84, made by
+                    // `AudioPlayerCore`'s constructor 0x1028f3668): a sample still playing fades out
+                    // into the restart point and the restart fades in (`AudioClipPlayer::
+                    // launchAudioClip` 0x10294c620, `doMovePlayingPosWithDelay` /
+                    // `letSmoothDiscontinuousPoints`); a finished one only fades in.
+                    let fade_g = if building && repeat && e.npb > 0 {
+                        let nf = restart_fade_frames(r);
+                        let step = e.npb as f64 * bpm as f64 / 60.0 / r as f64;
+                        let b = (e.clock - e.grid0) * e.npb as f64;
+                        let to_next = if b >= 0.0 { ((b.floor() + 1.0 - b) / step).floor() as i32 } else { i32::MAX };
+                        let g_out = if e.build.pos.is_some() && to_next < nf { restart_curve(to_next, nf) } else { 1.0 };
+                        let g_in = if e.rfade < nf { restart_curve(e.rfade, nf) } else { 1.0 };
+                        e.rfade = e.rfade.saturating_add(1);
+                        g_out * g_in
+                    } else {
+                        1.0
+                    };
                     if let Some(pos) = e.build.pos {
                         match find(e.build.no) {
                             Some(smp) if (pos as usize + 1) * 2 + 1 < smp.data.len() => {
                                 let i = pos as usize;
                                 let t = (pos - i as f64) as f32;
-                                sb[k * 2] += smp.data[i * 2] + (smp.data[i * 2 + 2] - smp.data[i * 2]) * t;
-                                sb[k * 2 + 1] += smp.data[i * 2 + 1] + (smp.data[i * 2 + 3] - smp.data[i * 2 + 1]) * t;
+                                sb[k * 2] += (smp.data[i * 2] + (smp.data[i * 2 + 2] - smp.data[i * 2]) * t) * fade_g;
+                                sb[k * 2 + 1] += (smp.data[i * 2 + 1] + (smp.data[i * 2 + 3] - smp.data[i * 2 + 1]) * t) * fade_g;
                                 e.build.pos = Some(pos + rate_ratio(smp));
                             }
                             _ => e.build.pos = None,
@@ -1071,7 +1103,8 @@ mod tests {
             let mut e = Engine::new();
             e.cmd[0].comps = [44, 15, 23, 44];
             let mut click = vec![0.0f32; 200 * 2];
-            click[..20].iter_mut().for_each(|v| *v = 0.5);
+            // (fx7b: 150 frames, longer than the restart's 1 ms fade-in.)
+            click[..300].iter_mut().for_each(|v| *v = 0.5);
             e.set_samples(&[(101, Arc::new(Sample { data: click, rate: 48000.0 }))]);
             e.cmd[0].on = true;
             e.cmd[0].knob = knob;
@@ -1090,6 +1123,35 @@ mod tests {
         }
     }
 
+    /// fx7b: a repeat restarts the sample through the clip player's `Attenuator` (1 ms
+    /// raised-sine): a held tone fades out into each restart and in after it.
+    #[test]
+    fn repeat_restarts_fade_through_the_clip_players_attenuator() {
+        assert_eq!(restart_fade_frames(48000.0), 48);
+        assert!(restart_curve(0, 48) == 0.0 && (restart_curve(47, 48) - 1.0).abs() < 1e-6 && (restart_curve(24, 48) - 0.5).abs() < 0.04);
+        let mut e = Engine::new();
+        e.cmd[0].comps = [44, 15, 23, 44];
+        // A long constant "sample": the repeats restart it while it still plays.
+        e.set_samples(&[(101, Arc::new(Sample { data: vec![0.5f32; 48000 * 2 * 2], rate: 48000.0 }))]);
+        e.cmd[0].on = true;
+        e.cmd[0].knob = 0.0;
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            let mut d = vec![0.0f32; 480 * 2];
+            e.deck(0, &mut d, 48000, None);
+            let mut m = vec![0.0f32; 480 * 2];
+            e.master(&mut m, 48000);
+            out.extend(m);
+        }
+        let l: Vec<f32> = out.chunks_exact(2).map(|c| c[0]).collect();
+        // Restarts every 24,000 frames: the level dips to 0 at each and is whole between.
+        let dips: Vec<usize> = (1..l.len()).filter(|&i| l[i].abs() < 1e-6 && l[i - 1].abs() > 1e-6).collect();
+        assert!(dips.len() >= 2, "{dips:?}");
+        let mid = dips[0] + 12000;
+        assert!(l[mid].abs() > 0.1 && (l[dips[0] + 24] / l[mid] - 0.5).abs() < 0.1, "{} {}", l[dips[0] + 24], l[mid]);
+        assert!((dips[1] - dips[0]).abs_diff(24000) <= 1, "{dips:?}");
+    }
+
     #[test]
     fn repeat_grid_restarts_on_a_playing_deck_and_keeps_phase_on_a_stopped_one() {
         for playing in [false, true] {
@@ -1097,7 +1159,7 @@ mod tests {
             e.cmd[0].comps = [44, 15, 23, 44];
             e.cmd[0].playing = playing;
             let mut click = vec![0.0f32; 200 * 2];
-            click[..20].iter_mut().for_each(|v| *v = 0.5);
+            click[..300].iter_mut().for_each(|v| *v = 0.5);
             e.set_samples(&[(101, Arc::new(Sample { data: click, rate: 48000.0 }))]);
             e.cmd[0].on = true;
             let mut out = Vec::new();
@@ -1113,14 +1175,16 @@ mod tests {
                 out.extend(m);
             }
             let o = onsets(&out);
-            assert!(o[0] == 0 && o[1].abs_diff(24000) <= 1, "{o:?}");
+            // (fx7b: every onset is the fade-in's few frames late: `z`.)
+            let z = o[0];
+            assert!(z <= 48 && o[1].abs_diff(24000 + z) <= 1, "{o:?}");
             // The knob reaches 25 % about 9 ms after it is turned (frame 29,760 + 432).
             if playing {
                 // A note 0.02 beats (480 frames) after the change, then every half beat.
                 assert!(o[2].abs_diff(29760 + 432 + 480) <= 480 && (o[3] - o[2]).abs_diff(12000) <= 1, "{o:?}");
             } else {
                 // The grid goes on from the start: the next half beat is 36,000.
-                assert!(o[2].abs_diff(36000) <= 1 && o[3].abs_diff(48000) <= 1, "{o:?}");
+                assert!(o[2].abs_diff(36000 + z) <= 1 && o[3].abs_diff(48000 + z) <= 1, "{o:?}");
             }
         }
     }

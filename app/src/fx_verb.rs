@@ -535,6 +535,12 @@ impl VerbCore {
         self.call_left = 0;
     }
 
+    /// A new law for the calls still to come in this buffer (the FX+ reverbs' parameters
+    /// worked out after each piece).
+    pub fn set_law(&mut self, law: VerbLaw) {
+        self.law = law;
+    }
+
     /// `ReverbCore::processEffect` for the next call of the buffer.
     fn call(&mut self) {
         let p = self.pct;
@@ -617,8 +623,98 @@ impl VerbCore {
     }
 }
 
+/// The FX+ reverbs' knobs (`FxPlusReverbUp` / `FxPlusReverbDown`): the main knob, TIME and
+/// FILTER are `SmoothShiftInteger`s (0 .. 255, a step per 0.66667 ms, made at 127; set once a
+/// buffer from knob x 255.9), advanced a piece at a time ((int)(fs x 0.00066667) frames, 32
+/// at 48 kHz); after each piece the main knob is followed by a float (made at 127) that moves
+/// 1 / k toward it, k moving one a piece toward 15 - the distance (at most 5)
+/// (`updateReverbUpParameter` 0x1029e9ba8 / `updateReverbDownParameter` 0x1029e6f7c, +792 / +776
+/// and +720 / +722); the laws then take its whole part.
+#[derive(Clone, Copy)]
+pub struct FxRevKnobs {
+    rate: f32,
+    main: crate::fx_core::ShiftInt,
+    time: crate::fx_core::ShiftInt,
+    filt: crate::fx_core::ShiftInt,
+    pub f: f32,
+    k: i16,
+}
+
+impl FxRevKnobs {
+    pub fn new(rate: f32) -> FxRevKnobs {
+        let si = || crate::fx_core::ShiftInt::new(127, 0.66667, rate);
+        FxRevKnobs { rate, main: si(), time: si(), filt: si(), f: 127.0, k: 0 }
+    }
+
+    pub fn rate(&self) -> f32 {
+        self.rate
+    }
+
+    /// Frames of a piece (`(int)(fs x 0x3A2EC33F)`).
+    pub fn piece(rate: f32) -> usize {
+        ((rate * f32::from_bits(0x3A2E_C33F)) as i32).max(1) as usize
+    }
+
+    /// `updateAndSetParameter`: the three knobs (0 .. 1).
+    pub fn begin(&mut self, main: f32, time: f32, filt: f32) {
+        self.main.set(((main * 255.9) as i32).clamp(0, 255));
+        self.time.set(((time * 255.9) as i32).clamp(0, 255));
+        self.filt.set(((filt * 255.9) as i32).clamp(0, 255));
+    }
+
+    /// The end of a piece of `n` frames: the knobs step, then the follower.
+    pub fn piece_end(&mut self, n: usize) {
+        self.main.advance(n as i32);
+        self.time.advance(n as i32);
+        self.filt.advance(n as i32);
+        let v2 = self.main.cur;
+        let fi = self.f as i32;
+        let (dir, d) = if v2 > fi { (1.0f32, v2 - fi) } else if v2 < fi { (-1.0, fi - v2) } else { (0.0, 0) };
+        if d >= 1 {
+            let want = (15 - d.min(5)) as i16;
+            let k = self.k;
+            let v14 = if want <= k { k } else { k + 1 };
+            let v16 = v14 - (want < v14) as i16;
+            if want > k || want < v14 {
+                self.k = v16;
+            }
+            self.f = (dir / v16 as f32 + self.f).max(0.0).min(255.0);
+        }
+    }
+
+    /// REVERB DOWN's dry gain (`FxPlusReverbDown::calculateMixRatio` 0x1029e72cc): from the
+    /// main knob's stepped value, 2 - v x 0.0078431 above the centre.
+    pub fn down_dry(&self) -> f32 {
+        let v = self.main.cur as f32;
+        if v * 0.0039216 > 0.5 { v * -0.0078431 + 2.0 } else { 1.0 }
+    }
+
+    /// (main knob as the laws take it, TIME, FILTER).
+    pub fn values(&self) -> (i32, i32, i32) {
+        (self.f as i32, self.time.cur, self.filt.cur)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The FX+ reverbs' main-knob follower: a jump from 127 to 255 is followed 1, 1/2, 1/3 ...
+    /// a piece (the step count rising toward 10), never all at once.
+    #[test]
+    fn fx_plus_reverb_knob_follower_is_rekordbox_s() {
+        assert_eq!(FxRevKnobs::piece(48000.0), 32);
+        let mut k = FxRevKnobs::new(48000.0);
+        k.begin(1.0, 0.5, 0.0);
+        // The SmoothShiftInteger: a step per 32 frames (0.66667 ms), so 32 frames a step.
+        k.piece_end(32);
+        assert_eq!(k.values().0, 128, "{}", k.f);
+        k.piece_end(32);
+        assert!((k.f - 128.5).abs() < 1e-5, "{}", k.f);
+        for _ in 0..20000 {
+            k.piece_end(32);
+        }
+        assert_eq!(k.values(), (255, 127, 0));
+    }
+
     use super::*;
 
     fn run(v: &mut VerbCore, p: i32, law: VerbLaw, frames: usize, x: impl Fn(usize) -> f32) -> Vec<f32> {

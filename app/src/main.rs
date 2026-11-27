@@ -28,6 +28,11 @@ mod fx_core;
 mod fx_lfo;
 mod fx_verb;
 mod fx_spin;
+mod fx_spiral;
+mod fx_helix;
+mod fx_noise;
+#[cfg(test)]
+mod fx7b_tests;
 mod fx_roll;
 mod fx_sweep;
 mod fx_rev;
