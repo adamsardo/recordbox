@@ -451,6 +451,13 @@ pub fn strip(app: &mut App, ui: &mut Ui, r: Rect) {
         // The playhead.
         let xp = x_of(pos).round();
         lp.rect_filled(Rect::from_min_max(pos2(xp, lr.min.y), pos2(xp + 1.0, lr.max.y)), 0.0, hex(0x717171));
+        // A linked MIX IN deck counts its bars from the MIX IN point
+        // (`operateWaveViewSetMixPointBeatCountMode`, set by `doMixPointLinkStart`): "-1.2Bars"
+        // three beats before it, in the beat count's blue, ending 2 pt left of the playhead.
+        if m.link_set[d] && m.mix_in[d] != -1 {
+            let label = crate::mpl::mix_point_bars(&dk.beats, m.mix_in[d] as f64 / 1000.0, pos);
+            lp.text(pos2(xp as f32 - 2.0, lr.min.y + 9.0), Align2::RIGHT_CENTER, label, crate::ui_perf_layouts::arial_b(if four { 11.0 } else { 13.0 }), crate::theme::BEAT_BLUE);
+        }
         // Clicks and drags.
         let resp = ui.interact(lr, ui.id().with(("mpl_lane", d)), Sense::click_and_drag());
         if app.mixx.mpl.move_mode {

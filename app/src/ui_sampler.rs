@@ -249,6 +249,7 @@ impl App {
             return;
         }
         self.sampler_put(idx, id, t.path.clone(), t.display_title(), t.bpm as f32);
+        self.sampler_apply_track_type(idx, id);
     }
 
     /// Load an audio file that need not be in the collection (a file dropped from Finder, a
@@ -738,6 +739,14 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                         app.sampler_load(idx, *id);
                     }
                 }
+            }
+        }
+        // Sampler list rows dragged here (sampler_lib.rs).
+        crate::ui_sampler_lib::note_slot(app, idx, sr);
+        if app.mixx.lib.drag.is_some() && app.drag.is_none() && hovered {
+            p.rect_stroke(sr.shrink(3.0), 0.0, Stroke::new(2.0_f32, BLUE), egui::StrokeKind::Inside);
+            if released {
+                app.smplib_drop_on_slot(idx);
             }
         }
         // Another slot's sample dragged here moves here.

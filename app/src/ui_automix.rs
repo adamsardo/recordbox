@@ -30,6 +30,8 @@ use egui::{pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Shap
 /// Where the pane's controls were last drawn (the scripted run aims at these).
 #[derive(Default, Clone)]
 pub struct PaneMap {
+    /// The mixer's on-screen crossfader (for the scripted run).
+    pub xfader: Option<egui::Rect>,
     pub tile: Option<Rect>,
     pub pane: Option<Rect>,
     pub play: Option<Rect>,

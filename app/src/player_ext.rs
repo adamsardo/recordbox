@@ -543,6 +543,9 @@ impl App {
 
     /// SLIP on / off for the active deck.
     pub fn toggle_slip(&mut self) {
+        if self.slip_refused_by_slicer() {
+            return;
+        }
         self.deck.x.slip = !self.deck.x.slip;
         self.push_deck_controls();
     }

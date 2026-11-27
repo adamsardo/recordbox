@@ -49,15 +49,27 @@ struct Geom {
     /// A left-hand deck (1 or 3): pull-down at the left, controls at the right.
     left: bool,
     c4: bool,
+    /// 2Deck Vertical: the LIST views run down one column (`v2_list`).
+    v2: bool,
 }
 
 impl Geom {
     fn new(r: Rect, n: u8, c4: bool) -> Geom {
-        let ah = if c4 { 77.0 } else { 87.0 };
         let left = n % 2 == 0;
+        // 2Deck Vertical (`MemoryCuePanel::resized`, layout 274): the views get W - 78 x
+        // H - 43 from y 10 (160 pt) and the pull-down sits at H - 30 (173 pt into the deck's
+        // lower part; reference 02).
+        if crate::ui_perf_layouts::dk(c4) == crate::ui_perf_layouts::Dk::V2 {
+            // (W - 78 is 269 pt at the reference size: 264 pt pads, then the 5 pt scroll
+            // strip; the pads rect handed in for deck 2 is 5 pt narrower than that.)
+            let area = Rect::from_min_size(r.min, vec2(r.width().floor().max(264.0 + BAR), 160.0));
+            let pull = Rect::from_min_size(pos2(if left { area.min.x - 2.0 } else { area.max.x + 2.0 - 70.0 }, area.min.y + 163.0), vec2(70.0, 20.0));
+            return Geom { area, pull, ctrl_y: pull.min.y + 2.0, left, c4, v2: true };
+        }
+        let ah = if c4 { 77.0 } else { 87.0 };
         let area = Rect::from_min_size(r.min, vec2(r.width().floor(), ah));
         let pull = Rect::from_min_size(pos2(if left { area.min.x - 2.0 } else { area.max.x + 2.0 - 70.0 }, area.max.y + 3.0), vec2(70.0, 20.0));
-        Geom { area, pull, ctrl_y: area.max.y + 5.0, left, c4 }
+        Geom { area, pull, ctrl_y: area.max.y + 5.0, left, c4, v2: false }
     }
     /// A control strip `w` wide at the end opposite the pull-down.
     fn ctrl(&self, w: f32) -> Rect {
@@ -217,6 +229,19 @@ fn scroll_area(app: &mut App, ui: &mut Ui, area: Rect, n: u8, mode: PadMode, con
     Scroll { view, off: (frac * over).round(), vertical }
 }
 
+/// LIST Display in 2Deck Vertical: `count` items in one column of 19 pt pads on a 21 pt
+/// pitch, the scroll bar at the right (reference 02: HOT CUE A..H, STEMS' eight rows).
+/// Returns the scroll, the pad width and a cell's rectangle by index.
+fn v2_list(app: &mut App, ui: &mut Ui, g: Geom, n: u8, mode: PadMode, count: usize) -> (Scroll, f32, f32) {
+    let sc = scroll_area(app, ui, g.area, n, mode, count as f32 * 21.0 - 2.0, true);
+    let cw = sc.view.width().floor();
+    (sc, cw, 19.0)
+}
+
+fn v2_cell(sc: &Scroll, cw: f32, i: usize) -> Rect {
+    Rect::from_min_size(sc.origin() + vec2(0.0, i as f32 * 21.0), vec2(cw, 19.0))
+}
+
 /// The pull-down's rectangle and the pads' viewport of deck `n` (for the scripted run).
 pub fn layout_of(r: Rect, n: u8, c4: bool) -> (Rect, Rect) {
     let g = Geom::new(r, n, c4);
@@ -291,7 +316,16 @@ fn pull_down_at(app: &mut App, ui: &mut Ui, g: Geom, n: u8) {
     let resp = crate::ui_player::tip(resp, app, "Displays the PAD mode.");
     let ctx = app.pad_select_ctx();
     let stems_on = app.prefs.show_stems;
-    crate::ui_browser::dropdown(ui, &resp, "padmodepop", |ui| {
+    // (The lower decks of the 4-deck layouts open the menu upwards, over their pads: below
+    // them there is only the browser. JUCE's `PopupMenu` puts it where it fits.)
+    let up = g.c4 && n >= 2;
+    let pid = ui.id().with(("dropdown", "padmodepop"));
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(pid));
+    }
+    let side = if up { egui::AboveOrBelow::Above } else { egui::AboveOrBelow::Below };
+    egui::popup::popup_above_or_below_widget(ui, pid, &resp, side, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(160.0);
         let mut pick = None;
         for m in menu_for(ctx) {
             let (enabled, why) = match m {
@@ -377,6 +411,9 @@ fn hot_cue_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, pi
         let ch = ((2.0 * h + 1.0 - 6.0) / 4.0).floor();
         let sc = scroll_area(app, ui, g.area, n, PadMode::HotCue, 4.0 * (ch + 2.0) - 2.0, true);
         (((sc.view.width() - 6.0) / 4.0).floor(), ch, sc)
+    } else if g.v2 {
+        let (sc, cw, ch) = v2_list(app, ui, g, n, PadMode::HotCue, 16);
+        (cw, ch, sc)
     } else {
         let cw = ((2.0 * w + 1.0 - 6.0) / 4.0).floor();
         let sc = scroll_area(app, ui, g.area, n, PadMode::HotCue, 4.0 * (cw + 2.0) - 2.0, false);
@@ -387,8 +424,8 @@ fn hot_cue_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, pi
     let font = arial(ui, if pad_layout { 15.0 } else { 12.0 });
     let key_cue = app.pads.deck[(n as usize).min(3)].key_cue;
     for slot in 0..16usize {
-        let (col, row) = if pad_layout { (slot % 4, slot / 4) } else { (slot / 4, slot % 4) };
-        let pr = Rect::from_min_size(o + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch));
+        let (col, row) = if pad_layout { (slot % 4, slot / 4) } else if g.v2 { (0, slot) } else { (slot / 4, slot % 4) };
+        let pr = if g.v2 && !pad_layout { v2_cell(&sc, cw, slot) } else { Rect::from_min_size(o + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch)) };
         if !pr.intersects(sc.view) {
             continue;
         }
@@ -524,14 +561,19 @@ fn beat_jump_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) 
         }
         return;
     }
-    // LIST Display: twelve cells in three columns of four.
-    let cw = ((g.area.width() - 2.0) / 2.0).floor();
-    let sc = scroll_area(app, ui, g.area, n, PadMode::BeatJump, 3.0 * (cw + 2.0) - 2.0, false);
-    let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+    // LIST Display: twelve cells in three columns of four (one column in 2Deck Vertical).
+    let (sc, cw, ch) = if g.v2 {
+        v2_list(app, ui, g, n, PadMode::BeatJump, 12)
+    } else {
+        let cw = ((g.area.width() - 2.0) / 2.0).floor();
+        let sc = scroll_area(app, ui, g.area, n, PadMode::BeatJump, 3.0 * (cw + 2.0) - 2.0, false);
+        let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+        (sc, cw, ch)
+    };
     let p = ui.painter().with_clip_rect(sc.view);
     let o = sc.origin();
     for cell in 0..12usize {
-        let r = Rect::from_min_size(o + vec2((cell / 4) as f32 * (cw + 2.0), (cell % 4) as f32 * (ch + 2.0)), vec2(cw, ch));
+        let r = if g.v2 { v2_cell(&sc, cw, cell) } else { Rect::from_min_size(o + vec2((cell / 4) as f32 * (cw + 2.0), (cell % 4) as f32 * (ch + 2.0)), vec2(cw, ch)) };
         if r.intersects(sc.view) {
             jump_cell(app, ui, &p, r, sc.view, n, cell, false);
         }
@@ -547,6 +589,9 @@ fn beat_loop_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) 
         let ch = ((g.area.height() - 2.0) / 2.0).floor();
         let sc = scroll_area(app, ui, g.area, n, PadMode::BeatLoop, 4.0 * (ch + 2.0) - 2.0, true);
         (((sc.view.width() - 6.0) / 4.0).floor(), ch, sc)
+    } else if g.v2 {
+        let (sc, cw, ch) = v2_list(app, ui, g, n, PadMode::BeatLoop, 16);
+        (cw, ch, sc)
     } else {
         let cw = ((g.area.width() - 2.0) / 2.0).floor();
         let sc = scroll_area(app, ui, g.area, n, PadMode::BeatLoop, 4.0 * (cw + 2.0) - 2.0, false);
@@ -557,7 +602,7 @@ fn beat_loop_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) 
     let font = arial(ui, if pad_layout { 14.0 } else { 12.0 });
     for i in 0..16usize {
         let (col, row) = if pad_layout { (i % 4, i / 4) } else { (i / 4, i % 4) };
-        let r = Rect::from_min_size(o + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch));
+        let r = if g.v2 && !pad_layout { v2_cell(&sc, cw, i) } else { Rect::from_min_size(o + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch)) };
         if !r.intersects(sc.view) {
             continue;
         }
@@ -587,8 +632,9 @@ fn key_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, keyboa
     }
     let current = app.pad_current_key();
     let key_sync = app.deck.x.key_sync;
+    let s1 = app.key_scale1();
     let look_of = |pos: usize| -> Look {
-        let key = key_at(pos);
+        let key = key_at_in(pos, s1);
         let lit = match key {
             KEY_SYNC => key_sync,
             k => key_semis(k).is_some_and(|s| s == current) && (-12..=12).contains(&k),
@@ -617,13 +663,13 @@ fn key_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, keyboa
         for k in 0..8usize {
             let pos = (page as usize - 1) * 8 + k;
             let r = Rect::from_min_size(g.area.min + vec2((k % 4) as f32 * (cw + 2.0), (k / 4) as f32 * (ch + 2.0)), vec2(cw, ch));
-            if key_at(pos) == KEY_NONE {
+            if key_at_in(pos, s1) == KEY_NONE {
                 p.rect_filled(r, 0.0, PAD_BG);
                 continue;
             }
             let look = look_of(pos);
             let resp = pad_body(ui, &p, r, g.area, ui.id().with(("keypad", pos)), look, loaded);
-            pad_text(&p, r, &key_label(pos, false), font.clone(), look.text);
+            pad_text(&p, r, &key_label_in(pos, false, s1), font.clone(), look.text);
             press(app, ui, &resp, pos);
         }
         let tip = if keyboard { "Change the page of the KEYBOARD mode." } else { "Change the page of the KEY SHIFT mode." };
@@ -638,22 +684,27 @@ fn key_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool, keyboa
         }
     } else {
         // LIST Display: the 32 listed keys in columns of four, from +12 down.
-        let list = key_list();
-        let cw = ((g.area.width() - 2.0) / 2.0).floor();
+        let list = key_list_in(s1);
         let cols = list.len().div_ceil(4);
-        let sc = scroll_area(app, ui, g.area, n, mode, cols as f32 * (cw + 2.0) - 2.0, false);
-        let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+        let (sc, cw, ch) = if g.v2 {
+            v2_list(app, ui, g, n, mode, list.len())
+        } else {
+            let cw = ((g.area.width() - 2.0) / 2.0).floor();
+            let sc = scroll_area(app, ui, g.area, n, mode, cols as f32 * (cw + 2.0) - 2.0, false);
+            let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+            (sc, cw, ch)
+        };
         let p = ui.painter().with_clip_rect(sc.view);
         let o = sc.origin();
         let font = arial(ui, 12.0);
         for (li, pos) in list.iter().enumerate() {
-            let r = Rect::from_min_size(o + vec2((li / 4) as f32 * (cw + 2.0), (li % 4) as f32 * (ch + 2.0)), vec2(cw, ch));
+            let r = if g.v2 { v2_cell(&sc, cw, li) } else { Rect::from_min_size(o + vec2((li / 4) as f32 * (cw + 2.0), (li % 4) as f32 * (ch + 2.0)), vec2(cw, ch)) };
             if !r.intersects(sc.view) {
                 continue;
             }
             let look = look_of(*pos);
             let resp = pad_body(ui, &p, r, sc.view, ui.id().with(("keypad", *pos)), look, loaded);
-            pad_text(&p, r, &key_label(*pos, true), font.clone(), look.text);
+            pad_text(&p, r, &key_label_in(*pos, true, s1), font.clone(), look.text);
             press(app, ui, &resp, *pos);
         }
     }
@@ -721,14 +772,15 @@ fn slicer_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) {
     let active = app.pads.deck[ni].slicer.active;
     let (now, _) = app.slicer_now();
     let p = ui.painter().with_clip_rect(g.area);
-    let (cols, rows) = if pad_layout { (4usize, 2usize) } else { (2, 4) };
+    let (cols, rows) = if pad_layout { (4usize, 2usize) } else if g.v2 { (1, 8) } else { (2, 4) };
+    let _ = rows;
     let cw = ((g.area.width() - 2.0 * (cols as f32 - 1.0)) / cols as f32).floor();
     // (The view is the pad area and the 23 pt row under it: (h - 29) / 4, or (h - 25) / 2.)
-    let ch = if pad_layout { ((g.area.height() + 23.0 - 25.0) / 2.0).floor() } else { ((g.area.height() + 23.0 - 29.0) / 4.0).floor() };
+    let ch = if pad_layout { ((g.area.height() + 23.0 - 25.0) / 2.0).floor() } else if g.v2 { 19.0 } else { ((g.area.height() + 23.0 - 29.0) / 4.0).floor() };
     let font = arial(ui, 12.0);
     let released = ui.input(|i| i.pointer.any_released()) || !ui.input(|i| i.pointer.any_down());
     for i in 0..8usize {
-        let (col, row) = if pad_layout { (i % 4, i / 4) } else { (i / 4, i % 4) };
+        let (col, row) = if pad_layout { (i % 4, i / 4) } else if g.v2 { (0, i) } else { (i / 4, i % 4) };
         let r = Rect::from_min_size(g.area.min + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch));
         let held = app.pads.deck[ni].slicer.held.contains(&(i as u8));
         let mut look = Look::pad(active, now == Some(i));
@@ -864,20 +916,21 @@ fn censor_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) {
         let c = &app.pads.deck[ni].censor;
         (c.kind as usize, c.on, c.pending_in.is_some())
     };
-    let inside = censor_at(&app.pads.deck[ni].censor.regions, app.pos()).is_some();
+    let (inside, adjust) = app.censor_adjust_state();
     let p = ui.painter().with_clip_rect(g.area);
-    let (cols, rows) = if pad_layout { (4usize, 2usize) } else { (2, 4) };
+    let (cols, rows) = if pad_layout { (4usize, 2usize) } else if g.v2 { (1, 8) } else { (2, 4) };
     let _ = rows;
     let cw = ((g.area.width() - 2.0 * (cols as f32 - 1.0)) / cols as f32).floor();
-    let ch = if pad_layout { ((g.area.height() + 23.0 - 25.0) / 2.0).floor() } else { ((g.area.height() + 23.0 - 29.0) / 4.0).floor() };
+    let ch = if pad_layout { ((g.area.height() + 23.0 - 25.0) / 2.0).floor() } else if g.v2 { 19.0 } else { ((g.area.height() + 23.0 - 29.0) / 4.0).floor() };
     let font = arial(ui, 12.0);
     let beat = app.censor_beat_text();
     for i in 0..8usize {
-        let (col, row) = if pad_layout { (i % 4, i / 4) } else { (i / 4, i % 4) };
+        let (col, row) = if pad_layout { (i % 4, i / 4) } else if g.v2 { (0, i) } else { (i / 4, i % 4) };
         let r = Rect::from_min_size(g.area.min + vec2(col as f32 * (cw + 2.0), row as f32 * (ch + 2.0)), vec2(cw, ch));
         let lit = match i {
             0..=3 => kind == i,
-            4 => pending,
+            4 => pending || adjust == 1,
+            5 => adjust == 2,
             7 => on,
             _ => false,
         };
@@ -885,7 +938,9 @@ fn censor_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, pad_layout: bool) {
         let resp = pad_body(ui, &p, r, g.area, ui.id().with(("acpad", i)), look, loaded);
         let label = match i {
             0..=3 => CENSOR_FX[i],
+            4 if inside => "IN ADJ",
             4 => "IN",
+            5 if inside => "OUT ADJ",
             5 => "OUT",
             6 => "CLEAR",
             _ => "ON/OFF",
@@ -972,9 +1027,14 @@ fn censor_overlay(app: &mut App, ui: &mut Ui) {
 fn user_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, u: usize) {
     let loaded = app.deck.track.is_some();
     let items = app.user_items(u);
-    let cw = ((g.area.width() - 2.0) / 2.0).floor();
-    let sc = scroll_area(app, ui, g.area, n, PadMode::User(u as u8), 4.0 * (cw + 2.0) - 2.0, false);
-    let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+    let (sc, cw, ch) = if g.v2 {
+        v2_list(app, ui, g, n, PadMode::User(u as u8), 16)
+    } else {
+        let cw = ((g.area.width() - 2.0) / 2.0).floor();
+        let sc = scroll_area(app, ui, g.area, n, PadMode::User(u as u8), 4.0 * (cw + 2.0) - 2.0, false);
+        let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+        (sc, cw, ch)
+    };
     let p = ui.painter().with_clip_rect(sc.view);
     let o = sc.origin();
     let font = arial(ui, 12.0);
@@ -982,14 +1042,14 @@ fn user_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, u: usize) {
     let lit_loop = app.beat_loop_lit();
     let key = app.pad_current_key();
     for (i, item) in items.iter().enumerate().take(16) {
-        let r = Rect::from_min_size(o + vec2((i / 4) as f32 * (cw + 2.0), (i % 4) as f32 * (ch + 2.0)), vec2(cw, ch));
+        let r = if g.v2 { v2_cell(&sc, cw, i) } else { Rect::from_min_size(o + vec2((i / 4) as f32 * (cw + 2.0), (i % 4) as f32 * (ch + 2.0)), vec2(cw, ch)) };
         if !r.intersects(sc.view) {
             continue;
         }
         let act = user_act(item);
         // (Sampler and sequence pads work without a track on the deck.)
         let enabled = match act {
-            UserAct::Sampler(_) | UserAct::SeqCall(_) => true,
+            UserAct::Sampler(_) | UserAct::SeqCall(_) | UserAct::PadFx(..) | UserAct::SampleScratch(_) | UserAct::Transport(Transport::Track(_)) => true,
             UserAct::Other => false,
             _ => loaded,
         };
@@ -1038,8 +1098,11 @@ fn user_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8, u: usize) {
     }
 }
 
-/// The Pad Editor (rekordbox opens it with PAD in the top bar): what each pad of USER 1..8
-/// does, and which USER modes the pull-down lists.
+/// The Pad Editor (rekordbox opens it with PAD in the top bar), laid out as rekordbox's
+/// `PadEditorComponent` (`pads::editor_geo`, traced): the ASSIGN 1 / ASSIGN 2 tabs, the eight
+/// PERFORMANCE MODE buttons (the mode each of a controller's pad mode buttons selects), the
+/// TEMPLATES button and the sixteen PERFORMANCE PADS of the mode picked; a USER mode's pads
+/// can be changed with their pull-down.
 fn pad_editor(app: &mut App, ui: &mut Ui) {
     if !app.pads.editor_open {
         return;
@@ -1054,60 +1117,181 @@ fn pad_editor(app: &mut App, ui: &mut Ui) {
     if seen {
         return;
     }
+    use crate::pads::editor_geo as eg;
+    static MODES: std::sync::OnceLock<Vec<ModeEntry>> = std::sync::OnceLock::new();
+    let modes = MODES.get_or_init(read_mode_csv);
+    // The eight buttons' modes for the assign shown (rekordbox's `select` column by default).
+    let assign = (app.prefs.pads.editor_assign as usize).min(1);
+    while app.prefs.pads.editor_modes.len() < 2 {
+        let defaults: Vec<String> = (1..=8u8).map(|k| modes.iter().find(|m| m.select == Some(k)).map(|m| m.function.clone()).unwrap_or_default()).collect();
+        app.prefs.pads.editor_modes.push(defaults);
+    }
+    let slot = (app.prefs.pads.editor_slot as usize).min(7);
+    let slot_fn = app.prefs.pads.editor_modes[assign].get(slot).cloned().unwrap_or_default();
+    let user_of = |f: &str| f.strip_prefix("User").and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=8).contains(n)).map(|n| n - 1);
+    let text_of = |f: &str| modes.iter().find(|m| m.function == f).map(|m| m.text.clone()).unwrap_or_else(|| f.to_string());
     let mut open = true;
-    let u = app.pads.editor_user.min(7);
-    egui::Window::new("PAD EDITOR").id(egui::Id::new("pad_editor")).open(&mut open).resizable(false).collapsible(false).default_width(520.0).show(ui.ctx(), |ui| {
-        ui.horizontal(|ui| {
-            for k in 0..8usize {
-                if ui.selectable_label(u == k, format!("USER {}", k + 1)).clicked() {
-                    app.pads.editor_user = k;
-                }
+    let mut changed = false;
+    egui::Window::new("PAD EDITOR").id(egui::Id::new("pad_editor")).open(&mut open).resizable(false).collapsible(false).frame(egui::Frame::window(&ui.ctx().style()).inner_margin(0.0).fill(hex(eg::BG))).show(ui.ctx(), |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(eg::W, eg::H), Sense::hover());
+        let o = rect.min;
+        let at = |g: (f32, f32, f32, f32)| Rect::from_min_size(o + vec2(g.0, g.1), vec2(g.2, g.3));
+        let p = ui.painter().clone();
+        p.rect_filled(rect, 0.0, hex(eg::BG));
+        p.rect_filled(Rect::from_min_size(o, vec2(eg::W, eg::TAB_H)), 0.0, hex(eg::STRIP));
+        // Tabs: 124 wide, no overlap; the front one in the window's colour, the other #191919;
+        // text 0.45 of the bar's height.
+        for (k, name) in ["ASSIGN 1", "ASSIGN 2"].iter().enumerate() {
+            let tr = at((124.0 * k as f32, 0.0, 124.0, eg::TAB_H));
+            let resp = ui.interact(tr, ui.id().with(("petab", k)), Sense::click());
+            let front = k == assign;
+            p.rect_filled(tr, 0.0, if front { hex(eg::BG) } else { hex(eg::FILL) });
+            p.text(tr.center(), Align2::CENTER_CENTER, *name, arial(ui, eg::TAB_H * 0.45), if front { WHITE } else { hex(eg::TEXT) });
+            if resp.clicked() && !front {
+                app.prefs.pads.editor_assign = k as u8;
+                changed = true;
             }
-        });
-        ui.separator();
-        let mut shown = app.prefs.pads.user_shown[u];
-        if ui.checkbox(&mut shown, format!("List USER {} in the pad mode pull-down", u + 1)).changed() {
-            app.prefs.pads.user_shown[u] = shown;
-            app.save_prefs();
         }
-        ui.add_space(4.0);
-        let items = app.user_items(u);
-        let functions = pad_functions();
-        egui::Grid::new("pad_editor_grid").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
-            for half in 0..2usize {
-                ui.label(egui::RichText::new(if half == 0 { "PAD 1 - 8" } else { "SHIFT + PAD 1 - 8" }).color(DIM));
-                ui.end_row();
-                for i in 0..8usize {
-                    let pad = half * 8 + i;
-                    let item = &items[pad];
-                    ui.label(format!("{}", i + 1));
-                    let fname = functions.iter().find(|f| f.0 == item.function).map(|f| f.1.to_string()).unwrap_or_else(|| item.function.clone());
-                    egui::ComboBox::from_id_salt(("padfn", pad)).width(120.0).selected_text(fname).show_ui(ui, |ui| {
-                        for (f, name, values) in &functions {
-                            if ui.selectable_label(item.function == *f, *name).clicked() {
-                                app.user_set_item(u, pad, Some((f, &values[0])));
-                            }
-                        }
-                    });
-                    let values = functions.iter().find(|f| f.0 == item.function).map(|f| f.2.clone()).unwrap_or_default();
-                    egui::ComboBox::from_id_salt(("padval", pad)).width(110.0).selected_text(item.value.clone()).show_ui(ui, |ui| {
-                        for v in &values {
-                            if ui.selectable_label(item.value == *v, v).clicked() {
-                                app.user_set_item(u, pad, Some((&item.function, v)));
-                            }
-                        }
-                    });
-                    if ui.small_button("Reset").on_hover_text("Back to rekordbox's template for this pad.").clicked() {
-                        app.user_set_item(u, pad, None);
+        let label_font = arial(ui, 12.0);
+        p.text(o + vec2(25.0, eg::MODE_LABEL_Y + eg::LABEL_H / 2.0), Align2::LEFT_CENTER, "PERFORMANCE MODE", label_font.clone(), hex(eg::TEXT));
+        p.text(o + vec2(25.0, eg::PADS_LABEL_Y + eg::LABEL_H / 2.0), Align2::LEFT_CENTER, "PERFORMANCE PADS", label_font, hex(eg::TEXT));
+        // The eight mode buttons: outlined, square; the picked one in blue; the pull-down
+        // (`pullDown.svg` at 122, 4, 10 x 16) lists the modes of `Mode.pad.csv`.
+        let mode_font = arial(ui, 14.0);
+        for i in 0..8usize {
+            let br = at(eg::mode_button(i));
+            let resp = ui.interact(br, ui.id().with(("pemode", i)), Sense::click());
+            let on = i == slot;
+            let f = app.prefs.pads.editor_modes[assign].get(i).cloned().unwrap_or_default();
+            p.rect_filled(br, 0.0, hex(eg::FILL));
+            p.rect_stroke(br, 0.0, Stroke::new(1.0_f32, if on { hex(eg::ON) } else { hex(eg::OUTLINE) }), egui::StrokeKind::Inside);
+            let col = if on { hex(eg::ON) } else { hex(eg::TEXT) };
+            p.with_clip_rect(br).text(br.min + vec2(10.0, br.height() / 2.0), Align2::LEFT_CENTER, text_of(&f), mode_font.clone(), col);
+            let arrow = Rect::from_min_size(br.min + vec2(122.0, 4.0), vec2(10.0, 16.0));
+            triangle_down(&p, arrow.center(), 7.0, 4.0, col);
+            if resp.clicked() {
+                if ui.input(|i| i.pointer.interact_pos()).is_some_and(|pp| pp.x >= br.min.x + 110.0) {
+                    ui.memory_mut(|m| m.toggle_popup(egui::Id::new(("pemodepop", i))));
+                }
+                app.prefs.pads.editor_slot = i as u8;
+                changed = true;
+            }
+            egui::popup::popup_below_widget(ui, egui::Id::new(("pemodepop", i)), &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(160.0);
+                for m in modes.iter() {
+                    if m.kind == "separator" {
+                        ui.separator();
+                        continue;
                     }
-                    ui.end_row();
+                    if !m.mode {
+                        continue;
+                    }
+                    if ui.selectable_label(m.function == f, &m.text).clicked() {
+                        if let Some(v) = app.prefs.pads.editor_modes[assign].get_mut(i) {
+                            *v = m.function.clone();
+                        }
+                        changed = true;
+                    }
+                }
+            });
+        }
+        // TEMPLATES: copies a template's sixteen pads into the USER mode picked (rounded
+        // corners 2, no outline; its arrow 10 x 4 at 122, 13).
+        let tr = at(eg::TEMPLATES);
+        let user = user_of(&slot_fn);
+        let tresp = ui.interact(tr, ui.id().with("petemplates"), Sense::click());
+        p.rect_filled(tr, 2.0, hex(eg::FILL));
+        let tcol = if user.is_some() { hex(eg::TEXT) } else { hex(0x646464) };
+        p.text(tr.min + vec2(10.0, tr.height() / 2.0), Align2::LEFT_CENTER, "TEMPLATES", mode_font.clone(), tcol);
+        triangle_down(&p, tr.min + vec2(127.0, 15.0), 10.0, 4.0, tcol);
+        if tresp.clicked() && user.is_some() {
+            ui.memory_mut(|m| m.toggle_popup(egui::Id::new("petemplpop")));
+        }
+        egui::popup::popup_below_widget(ui, egui::Id::new("petemplpop"), &tresp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(180.0);
+            for m in modes.iter().filter(|m| m.template) {
+                if ui.button(&m.text).clicked() {
+                    if let Some(u) = user {
+                        let items = match user_of(&m.function) {
+                            Some(src) => app.user_items(src),
+                            None => mode_items(&m.function),
+                        };
+                        for (k, it) in items.iter().enumerate().take(16) {
+                            app.user_set_item(u, k, Some((&it.function, &it.value)));
+                        }
+                    }
                 }
             }
         });
+        // The sixteen pads: the function (Arial Bold 14 at 10, 0, 120 x 29) and the value
+        // under it; a USER mode's pads have a pull-down (10 x 16 at 122, 6).
+        let items: Vec<PadItem> = match user {
+            Some(u) => app.user_items(u),
+            None => mode_items(&slot_fn),
+        };
+        let functions = pad_functions();
+        let bold = egui::FontId::new(14.0 * 0.87, egui::FontFamily::Proportional);
+        for k in 0..16usize {
+            let pr = at(eg::pad(k));
+            p.rect_filled(pr, 2.0, hex(eg::FILL));
+            let Some(it) = items.get(k) else { continue };
+            let name = functions.iter().find(|f| f.0 == it.function).map(|f| f.1.to_string()).unwrap_or_else(|| text_of(&it.function));
+            let pc = p.with_clip_rect(pr);
+            pc.text(pr.min + vec2(10.0, 14.5), Align2::LEFT_CENTER, &name, bold.clone(), hex(eg::TEXT));
+            pc.text(pr.min + vec2(10.0, 45.0), Align2::LEFT_CENTER, &it.value, arial(ui, 12.0), WHITE);
+            if let Some(u) = user {
+                let ar = Rect::from_min_size(pr.min + vec2(122.0, 6.0), vec2(10.0, 16.0));
+                triangle_down(&p, ar.center(), 7.0, 4.0, hex(eg::TEXT));
+                let resp = ui.interact(pr, ui.id().with(("pepad", k)), Sense::click());
+                if resp.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(egui::Id::new(("pepadpop", k))));
+                }
+                egui::popup::popup_below_widget(ui, egui::Id::new(("pepadpop", k)), &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                    ui.set_min_width(170.0);
+                    for (f, fname, values) in &functions {
+                        ui.menu_button(*fname, |ui| {
+                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                for v in values {
+                                    if ui.selectable_label(it.function == *f && it.value == *v, v).clicked() {
+                                        app.user_set_item(u, k, Some((f, v)));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    ui.separator();
+                    if ui.button("Reset").clicked() {
+                        app.user_set_item(u, k, None);
+                        ui.close_menu();
+                    }
+                });
+            }
+        }
+        // (USER modes listed in the decks' pull-down: those assigned to a button.)
     });
+    // A USER mode assigned to one of the buttons is listed in the decks' pad mode pull-down.
+    let mut shown = [false; 8];
+    for f in app.prefs.pads.editor_modes.iter().flatten() {
+        if let Some(u) = f.strip_prefix("User").and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=8).contains(n)) {
+            shown[u - 1] = true;
+        }
+    }
+    if shown != app.prefs.pads.user_shown {
+        app.prefs.pads.user_shown = shown;
+        changed = true;
+    }
+    if changed {
+        app.save_prefs();
+    }
     if !open {
         app.pads.editor_open = false;
     }
+}
+
+/// A small downward triangle (`pullDown.svg`).
+fn triangle_down(p: &Painter, c: Pos2, w: f32, h: f32, col: Color32) {
+    p.add(egui::Shape::convex_polygon(vec![pos2(c.x - w / 2.0, c.y - h / 2.0), pos2(c.x + w / 2.0, c.y - h / 2.0), pos2(c.x, c.y + h / 2.0)], col, Stroke::NONE));
 }
 
 // ------------------------------------------------------------------------------- MEMORY CUE
@@ -1120,14 +1304,19 @@ fn memory_view(app: &mut App, ui: &mut Ui, g: Geom, n: u8) {
         v.sort_by(|a, b| a.start.total_cmp(&b.start));
         v
     };
-    let cw = ((g.area.width() - 2.0) / 2.0).floor();
     let cols = cues.len().div_ceil(4).max(2);
-    let sc = scroll_area(app, ui, g.area, n, PadMode::MemoryCue, cols as f32 * (cw + 2.0) - 2.0, false);
-    let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+    let (sc, cw, ch) = if g.v2 {
+        v2_list(app, ui, g, n, PadMode::MemoryCue, cols * 4)
+    } else {
+        let cw = ((g.area.width() - 2.0) / 2.0).floor();
+        let sc = scroll_area(app, ui, g.area, n, PadMode::MemoryCue, cols as f32 * (cw + 2.0) - 2.0, false);
+        let ch = ((sc.view.height() - 6.0) / 4.0).floor();
+        (sc, cw, ch)
+    };
     let p = ui.painter().with_clip_rect(sc.view);
     let o = sc.origin();
     for i in 0..cols * 4 {
-        let r = Rect::from_min_size(o + vec2((i / 4) as f32 * (cw + 2.0), (i % 4) as f32 * (ch + 2.0)), vec2(cw, ch));
+        let r = if g.v2 { v2_cell(&sc, cw, i) } else { Rect::from_min_size(o + vec2((i / 4) as f32 * (cw + 2.0), (i % 4) as f32 * (ch + 2.0)), vec2(cw, ch)) };
         if !r.intersects(sc.view) {
             continue;
         }

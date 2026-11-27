@@ -689,6 +689,8 @@ pub struct Device {
     pub alive: AtomicBool,
     out_index: Mutex<HashMap<(u32, u8), Vec<Entry>>>,
     leds: Mutex<HashMap<(u32, u8), Led>>,
+    /// Last values sent to outputs the registry does not name (jog ring, level meters).
+    named: Mutex<HashMap<u16, u8>>,
     out: Mutex<OutState>,
     out_cv: Condvar,
     interval_ms: AtomicU64,
@@ -756,6 +758,34 @@ impl Device {
         self.out_cv.notify_one();
     }
 
+    /// Send a value to the outputs of a row by its name (rows the function registry does
+    /// not have: the jog ring, the channel level meters, the loaded indicator). `value` gets
+    /// the row and returns the byte to send; a byte equal to the last one sent is not sent.
+    /// 14-bit (HiRes) rows are left out.
+    pub fn set_named(&self, name: &str, deck: u8, value: &dyn Fn(&Entry) -> u8) {
+        let entries: Vec<Entry> = self.map.lock().outputs.iter().filter(|e| e.name == name && e.deck == deck && !matches!(e.kind, Kind::IndicatorHiRes | Kind::JogIndicatorHiRes)).cloned().collect();
+        if entries.is_empty() {
+            return;
+        }
+        let mut sent = false;
+        {
+            let mut last = self.named.lock();
+            let mut out = self.out.lock();
+            for e in entries {
+                let v = value(&e) & 0x7F;
+                if last.get(&e.code) == Some(&v) {
+                    continue;
+                }
+                last.insert(e.code, v);
+                out.queue.push([(e.code >> 8) as u8, (e.code & 0xFF) as u8, v], e.opts.priority);
+                sent = true;
+            }
+        }
+        if sent {
+            self.out_cv.notify_one();
+        }
+    }
+
     /// The output thread: one message per `MidiOutInterval`, and the 50 ms blink tick.
     fn run_output(self: Arc<Self>) {
         let mut next_tick = Instant::now() + Duration::from_millis(50);
@@ -792,6 +822,84 @@ impl Device {
     }
 }
 
+/// The value a hot cue pad's light gets (`UiPlayer::deviceUpdateHotCueLed` 0x10202af74): the
+/// cue's colour code when it has one, else the colour of its slot in the HOT CUE colour set
+/// (`rekordbox::hotCueColorIndex*`; 36 for a loop). Pad rows then map it for their family
+/// (`midi_map::pad_led`), button rows light for it. Codes above 64 are not sent (0).
+pub fn hot_cue_led(color: u8, slot: i32, is_loop: bool, set: u8) -> u8 {
+    let v = if color != 0 { color } else { crate::pads::hot_cue_set_color(set, slot, is_loop) };
+    if v <= 64 { v } else { 0 }
+}
+
+/// `PREPDECK_MIDI_PROBE=<port name>` (with `PREPDECK_SHOT_PLAYER=midiprobe`): a real
+/// controller's input port is opened for `secs` seconds and every message is logged
+/// ("midiprobe:" lines on stderr). Its output port is never opened, so nothing at all is sent
+/// to the device. Afterwards each message goes through MIDI Learn's filter
+/// (`LearnFilter`): the code Learn would write is checked against an empty mapping (it binds
+/// to a learnable command) and looked up, read-only, in the user mapping rekordbox keeps for
+/// the port (`~/Library/Application Support/Pioneer/rekordbox6/MidiMappings/<port>.midi.csv`),
+/// to name the function rekordbox would run.
+pub fn probe(port: &str, secs: f64) {
+    let say = |s: String| eprintln!("midiprobe: {s}");
+    let Ok(mut input) = midir::MidiInput::new("recordbox-probe") else { return say("CoreMIDI client could not be made".into()) };
+    input.ignore(midir::Ignore::None);
+    let names: Vec<String> = input.ports().iter().filter_map(|p| input.port_name(p).ok()).collect();
+    say(format!("input ports: {names:?}"));
+    let Some(p) = input.ports().into_iter().find(|p| input.port_name(p).map(|n| n == port).unwrap_or(false)) else { return say(format!("{port}: no such input port")) };
+    let log: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
+    let l2 = log.clone();
+    let t0 = Instant::now();
+    let conn = input.connect(&p, "recordbox-probe-in", move |_, m, _| l2.lock().push((t0.elapsed().as_millis() as u64, m.to_vec())), ());
+    let Ok(conn) = conn else { return say(format!("{port}: could not be opened")) };
+    say(format!("{port}: listening for {secs:.1} s (input only; nothing is sent to the device)"));
+    std::thread::sleep(Duration::from_secs_f64(secs));
+    drop(conn);
+    let msgs = log.lock().clone();
+    for (t, m) in &msgs {
+        say(format!("{t:>6} ms  {}", m.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")));
+    }
+    say(format!("{} messages in {secs:.1} s", msgs.len()));
+    // rekordbox's own mapping for the port (read only).
+    let rb_user = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Pioneer/rekordbox6/MidiMappings").join(format!("{port}.midi.csv")));
+    let rb_map = rb_user.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| MidiMap::load(port, None, Some(&b)).ok());
+    say(format!("rekordbox's user mapping for the port: {}", match (&rb_user, &rb_map) { (Some(f), Some(m)) => format!("{} ({} output rows)", f.display(), m.outputs.len()), _ => "none".into() }));
+    let factory = crate::midi_csv::factory_file(&crate::midi_csv::factory_dir(), port);
+    say(format!("factory mapping in the installed rekordbox: {}", factory.map(|f| f.display().to_string()).unwrap_or_else(|| "none".into())));
+    let raw: Vec<Vec<u8>> = msgs.iter().map(|m| m.1.clone()).collect();
+    let learned = probe_learn(port, &raw, rb_map.as_ref());
+    for (c, ok, in_rb) in &learned {
+        say(format!("Learn code {c:04X}: binds {ok} | rekordbox's mapping: {in_rb}"));
+    }
+    let codes = learned;
+    say(format!("{} distinct codes Learn would take; {}", codes.len(), if codes.is_empty() { "nothing was touched on the controller during the run" } else { "PASS (every received control can be learned)" }));
+}
+
+/// MIDI Learn on received messages: the codes its filter passes, whether each binds to a
+/// learnable command (PlayPause, deck 1) of an empty mapping, and what `rb` (rekordbox's
+/// mapping for the port, when there is one) runs for it.
+pub fn probe_learn(port: &str, msgs: &[Vec<u8>], rb: Option<&MidiMap>) -> Vec<(u16, bool, String)> {
+    let mut filter = LearnFilter::default();
+    let mut codes: Vec<u16> = vec![];
+    for m in msgs {
+        if let Some(c) = filter.feed(m) {
+            if !codes.contains(&c) {
+                codes.push(c);
+            }
+        }
+    }
+    let reg = registry();
+    codes
+        .into_iter()
+        .map(|c| {
+            let mut map = MidiMap::new(port);
+            let row = LearnEntry { name: "PlayPause".into(), deck: 1, kind: Kind::Button, min: -1, max: -1, comment: String::new() };
+            let ok = map.change_input(&row, None, Some(c), &|n: &str| reg.learnable(n)).is_ok() && map.input_at(c).is_some();
+            let in_rb = rb.and_then(|m| m.input_at(c)).map(|e| format!("{} (deck {})", e.name, e.deck)).unwrap_or_else(|| "-".into());
+            (c, ok, in_rb)
+        })
+        .collect()
+}
+
 /// The models whose MIDI side rekordbox authenticates (`getDeviceAuth` overrides).
 pub fn needs_auth(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
@@ -824,6 +932,14 @@ pub struct Hub {
     pub shift: [AtomicBool; 4],
     /// Ports recordbox opened itself, by name: never taken as controllers.
     pub ignore: Mutex<Vec<String>>,
+    /// When set, only these ports are opened (tests and the hardware scripted run: a real
+    /// controller on the machine is then neither opened nor sent anything).
+    pub only: Mutex<Option<Vec<String>>>,
+    /// When the interface last ran `poll` (ms since the hub was made): while it is not
+    /// called (the window is hidden or minimised, so no frames are drawn), the hub's own
+    /// thread keeps the lights that follow the engine going.
+    pub ui_seen_ms: AtomicU64,
+    pub born: Instant,
 }
 
 fn nan_bits() -> u64 {
@@ -852,6 +968,9 @@ impl Hub {
             vinyl: std::array::from_fn(|_| AtomicBool::new(true)),
             shift: std::array::from_fn(|_| AtomicBool::new(false)),
             ignore: Mutex::new(vec![]),
+            only: Mutex::new(None),
+            ui_seen_ms: AtomicU64::new(0),
+            born: Instant::now(),
         };
         (Arc::new(hub), rx)
     }
@@ -890,6 +1009,7 @@ impl Hub {
         input.ignore(midir::Ignore::None);
         let ports = input.ports();
         let ignore = self.ignore.lock().clone();
+        let only = self.only.lock().clone();
         let names: Vec<String> = ports.iter().filter_map(|p| input.port_name(p).ok()).collect();
         // Gone: their threads end and their ports close.
         let mut changed = false;
@@ -908,6 +1028,9 @@ impl Hub {
         }
         for (port, name) in ports.iter().zip(input.ports().iter().filter_map(|p| input.port_name(p).ok())) {
             // rekordbox passes over its own port, "<error>" and "Arduino Leonardo".
+            if only.as_ref().is_some_and(|o| !o.contains(&name)) {
+                continue;
+            }
             if ignore.contains(&name) || name == "<error>" || name == "Arduino Leonardo" || name.is_empty() || self.device(&name).is_some() {
                 continue;
             }
@@ -945,6 +1068,7 @@ impl Hub {
             alive: AtomicBool::new(true),
             out_index: Mutex::new(HashMap::new()),
             leds: Mutex::new(HashMap::new()),
+            named: Mutex::new(HashMap::new()),
             out: Mutex::new(OutState { queue: OutQueue::default(), blink: Blinker::default(), blinking: HashMap::new(), conn }),
             out_cv: Condvar::new(),
             interval_ms: AtomicU64::new(1),
@@ -1335,6 +1459,48 @@ impl Hub {
         }
     }
 
+    /// The outputs that follow the engine alone, sent from the interface every frame and,
+    /// while it draws no frames, from the hub's own thread: PLAY / CUE, the jog ring
+    /// (`JogPlayPauseIndicator(Short)`, a `JogIndicator` row: `Min + Max * angle / 360`,
+    /// `MidiJogIndicator::setLongValue` 0x101324334; the platter turns at 33 1/3 rpm), the
+    /// channel level meter (`ChannelLevel`, an `Indicator` row: `max(L, R) * 100`,
+    /// `ChannelLevelDeviceUnit::timerCallback` 0x1000d5ca0, here the deck's level before the
+    /// faders as the engine meters it) and `LoadedIndicator` (127 loaded, 0 empty: not traced).
+    pub fn engine_outputs(&self) {
+        let devs: Vec<Arc<Device>> = self.devices.lock().iter().filter(|d| d.has_output).cloned().collect();
+        if devs.is_empty() {
+            return;
+        }
+        let count = self.snap.lock().count.min(4) as usize;
+        for n in 0..count {
+            self.transport_leds(n);
+            let (loaded, angle, level) = {
+                let s = self.decks[n].lock();
+                match s.audio.as_ref() {
+                    Some(a) => {
+                        let secs = s.pos / a.sr.max(1) as f64;
+                        let turn = (secs * (100.0 / 3.0) / 60.0 * 360.0).rem_euclid(360.0);
+                        (true, turn as i32, s.peak[0].max(s.peak[1]))
+                    }
+                    None => (false, 360, 0.0),
+                }
+            };
+            let lvl = ((level.clamp(0.0, 1.0) * 100.0) as i32).clamp(0, 127) as u8;
+            for d in &devs {
+                for deck in [n as u8 + 1, if n as u8 == self.snap.lock().active { 0 } else { 255 }] {
+                    if deck == 255 {
+                        continue;
+                    }
+                    for name in ["JogPlayPauseIndicator", "JogPlayPauseIndicatorShort"] {
+                        d.set_named(name, deck, &|e: &Entry| crate::midi_map::jog_ring(angle, &e.opts));
+                    }
+                    d.set_named("ChannelLevel", deck, &|_| lvl);
+                    d.set_named("LoadedIndicator", deck, &|_| if loaded { 127 } else { 0 });
+                }
+            }
+        }
+    }
+
     /// PLAY and CUE lights straight from the engine (so they follow a press without waiting
     /// for a frame): PLAY lit while playing and blinking while a loaded deck stands; CUE lit
     /// while playing or standing on the cue point, blinking elsewhere.
@@ -1428,6 +1594,15 @@ fn start(app: &mut App) {
     }
     let (hub, rx) = Hub::new(app.player.decks.clone(), crate::db::data_dir().join("MidiMappings"));
     *hub.ctx.lock() = Some(app.ctx.clone());
+    // The hardware probe (`probe`) has the port to itself: the hub opens nothing.
+    if std::env::var("PREPDECK_MIDI_PROBE").is_ok() {
+        *hub.only.lock() = Some(vec![]);
+    }
+    // The window's scripted runs use their own virtual controller only: a real controller on
+    // the machine is not opened by them.
+    if std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "miditest")).unwrap_or(false) || std::env::var("PREPDECK_SHOT_MIDI").is_ok() {
+        *hub.only.lock() = Some(vec![crate::ui_midi::TEST_NAME.to_string()]);
+    }
     // The first client is made here, on the main thread, whose run loop delivers CoreMIDI's
     // notices of devices coming and going.
     app.midi._keeper = midir::MidiInput::new("recordbox").ok();
@@ -1435,6 +1610,17 @@ fn start(app: &mut App) {
     let _ = std::thread::Builder::new().name("midi-ports".into()).spawn(move || loop {
         h.scan();
         std::thread::sleep(Duration::from_millis(1000));
+    });
+    // While the window draws no frames (hidden, minimised: macOS sends it no redraws), the
+    // lights that follow the engine are kept going from here, every 50 ms.
+    let w = Arc::downgrade(&hub);
+    let _ = std::thread::Builder::new().name("midi-leds".into()).spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let Some(h) = w.upgrade() else { return };
+        let now = h.born.elapsed().as_millis() as u64;
+        if now.saturating_sub(h.ui_seen_ms.load(Relaxed)) > 150 {
+            h.engine_outputs();
+        }
     });
     app.midi.hub = Some(hub);
     app.midi.rx = Some(rx);
@@ -1498,6 +1684,7 @@ pub fn poll(app: &mut App) {
         start(app);
     }
     let Some(hub) = app.midi.hub.clone() else { return };
+    hub.ui_seen_ms.store(hub.born.elapsed().as_millis() as u64, Relaxed);
     let have = !hub.devices.lock().is_empty();
     let pending = app.midi.rx.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
     if !have && !pending {
@@ -1544,6 +1731,7 @@ pub fn poll(app: &mut App) {
     if have {
         *hub.snap.lock() = snapshot(app);
         leds(app, &hub);
+        hub.engine_outputs();
     }
 }
 
@@ -2565,7 +2753,10 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
                 Act::AutoLoop | Act::Loop4 | Act::Reloop | Act::LoopIn | Act::LoopOut => on(d.looping),
                 Act::PitchBend(dir) => on(dk.x.bend == dir),
                 Act::PadMode(mode) => on(pad_mode == mode),
-                Act::HotCue(slot) | Act::HotCueDelete(slot) => on(dk.cues.iter().any(|c| c.kind == CueKind::Hot && c.slot == slot as i32)),
+                Act::HotCue(slot) | Act::HotCueDelete(slot) => match dk.cues.iter().find(|c| c.kind == CueKind::Hot && c.slot == slot as i32) {
+                    Some(c) => Led::Value(hot_cue_led(c.color, slot as i32, c.end.is_some(), app.prefs.pads.hot_cue_color)),
+                    None => Led::Off,
+                },
                 Act::BeatJumpPad(_) | Act::BeatLoopPad(_) => on(d.loaded),
                 Act::StemPart(src) => on(app.player.decks[ni].try_lock().map(|s| s.stem_on[(src as usize).min(3)]).unwrap_or(true)),
                 Act::StemFx(row) => on(app.px.stem_fx[(row as usize).min(3)]),
@@ -2607,6 +2798,33 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
 mod tests {
     use super::*;
     use midir::os::unix::{VirtualInput, VirtualOutput};
+
+    #[test]
+    fn learn_binds_what_a_controller_sends_and_names_rekordboxs_function() {
+        // A button pressed and let go (Note On, then velocity 0), and a 14-bit fader (MSB, LSB).
+        let msgs = vec![vec![0x90, 0x0B, 0x7F], vec![0x90, 0x0B, 0x00], vec![0xB0, 0x13, 0x40], vec![0xB0, 0x33, 0x00]];
+        let rb = MidiMap::load("TEST", None, Some(b"@file,1,TEST\r\nPlayPause,,Button,,900B,910B,,,,,,,,,Play\r\n")).ok();
+        let got = probe_learn("TEST", &msgs, rb.as_ref());
+        // The release and the LSB are passed over, as rekordbox's Learn does.
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![0x900B, 0xB013]);
+        assert!(got.iter().all(|g| g.1), "both bind");
+        assert_eq!(got[0].2, "PlayPause (deck 1)");
+        assert_eq!(got[1].2, "-");
+    }
+
+    #[test]
+    fn hot_cue_pad_lights_take_the_cue_colour_or_the_colour_set() {
+        // A cue with a colour: that code.
+        assert_eq!(hot_cue_led(42, 0, false, 4), 42);
+        // Without one: the slot's colour in the set (COLORFUL A = 43, C = 23; CDJ I = 26).
+        assert_eq!(hot_cue_led(0, 0, false, 4), 43);
+        assert_eq!(hot_cue_led(0, 2, false, 4), 23);
+        assert_eq!(hot_cue_led(0, 8, false, 1), 26);
+        // A loop without a colour: rekordbox's loop entry (index 16 of the tables, 36).
+        assert_eq!(hot_cue_led(0, 3, true, 2), crate::model::HOTCUE_LOOP_DEFAULT);
+        // Codes above 64 are not sent.
+        assert_eq!(hot_cue_led(70, 0, false, 4), 0);
+    }
 
     #[test]
     fn registry_names_are_unique_per_tab_and_typed() {
@@ -2692,7 +2910,9 @@ mod tests {
              EQLow,EQLow,KnobSlider,,B00F,B10F,,,,,,,,Fast;,\r\n\
              TempoSlider,TempoSlider,KnobSliderHiRes,,B000,B100,,,,,,,,Fast;,\r\n\
              JogPitchBend,JogPitchBend,JogRotate,,B023,B123,,,,,,,,RO;,\r\n\
-             Sync,Sync,Button,,9058,9158,,,,9058,9158,,,,\r\n"
+             Sync,Sync,Button,,9058,9158,,,,9058,9158,,,,\r\n\
+             JogPlayPauseIndicatorShort,JogPlayPauseIndicatorShort,JogIndicator,,,,,,,BB00,BB01,,,RO;Min=1;Max=72;Priority=100;,\r\n\
+             ChannelLevel,ChannelLevel,Indicator,,,,,,B002,0,1,,,RO;Priority=50;,\r\n"
         );
         std::fs::write(dir.join(format!("{name}.midi.csv")), csv).unwrap();
 
@@ -2710,6 +2930,9 @@ mod tests {
             d.lock().audio = Some(tone(60.0));
         }
         let (hub, rx) = Hub::new(decks.clone(), dir.clone());
+        // Only this test's own port: a real controller on the machine (a DDJ-S1 was) is not
+        // opened, so nothing is sent to it.
+        *hub.only.lock() = Some(vec![name.clone()]);
         {
             let mut s = hub.snap.lock();
             s.decks[0].loaded = true;
@@ -2726,8 +2949,26 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(UiEvent::Ports)));
         // A second scan does not connect it twice.
         hub.scan();
-        assert_eq!(hub.devices.lock().len(), 1);
+        assert_eq!(hub.devices.lock().iter().filter(|d| d.name == name).count(), 1);
+        assert_eq!(hub.devices.lock().len(), 1, "no other port was opened");
 
+        // The outputs that follow the engine: deck 1 half a turn in (0.9 s at 33 1/3 rpm =
+        // 180 degrees: ring step 1 + 72 * 180 / 360 = 37), its level at 0.5 (50).
+        {
+            let mut d = decks[0].lock();
+            d.pos = 0.9 * 44100.0;
+            d.peak = [0.5, 0.4];
+        }
+        hub.engine_outputs();
+        wait("the jog ring and the level meter", || {
+            let l = leds.lock();
+            l.iter().any(|m| m == &[0xBB, 0x00, 37]) && l.iter().any(|m| m == &[0xB0, 0x02, 50])
+        });
+        {
+            let mut d = decks[0].lock();
+            d.pos = 0.0;
+            d.peak = [0.0, 0.0];
+        }
         // PLAY on deck 1: the engine plays, and the PLAY LED goes on (it was not lit).
         ctl_out.send(&[0x90, 0x0B, 0x7F]).unwrap();
         wait("deck 1 playing", || decks[0].lock().playing);

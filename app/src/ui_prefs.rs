@@ -14,7 +14,7 @@ use egui::{pos2, vec2, Color32, Context, Rect, RichText, Ui};
 // Settings another part of the app has to act on. While one is false its control is shown
 // switched off with the reason, so nothing in the window pretends to work.
 /// Analysis reads `prefs.high_precision_grid`.
-const HIGH_PRECISION_WIRED: bool = false;
+const HIGH_PRECISION_WIRED: bool = true;
 /// The device writer deletes an imported history (reads `prefs.delete_history_after_import`).
 const HISTORY_DELETE_WIRED: bool = true;
 /// The device writer stores `prefs.device_bg_color`.

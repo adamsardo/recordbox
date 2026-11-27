@@ -334,12 +334,19 @@ impl Voice {
     }
 }
 
-/// What the audio callback plays in EDIT mode: the timeline and one palette clip.
+/// Palette clips that can sound at the same time (rekordbox gives every palette clip a
+/// player of its own, `EditPlayerSlotManager`; here eight are mixed at once and a ninth start
+/// takes the place of the one started longest ago).
+pub const PAL_VOICES: usize = 8;
+
+/// What the audio callback plays in EDIT mode: the timeline and the palette clips.
 pub struct Engine {
     pub main: Voice,
-    pub pal: Voice,
-    /// Which palette entry `pal` holds.
-    pub pal_id: u32,
+    pub pals: [Voice; PAL_VOICES],
+    /// Which palette entry each palette player holds (0 = none) and when it was started.
+    pub pal_ids: [u32; PAL_VOICES],
+    pub pal_started: [u64; PAL_VOICES],
+    pub pal_seq: u64,
     /// Master volume and the track's auto gain (as a deck applies them); mute.
     pub volume: f32,
     pub gain: f32,
@@ -350,7 +357,30 @@ pub struct Engine {
 
 impl Engine {
     pub const fn new() -> Engine {
-        Engine { main: Voice::new(), pal: Voice::new(), pal_id: 0, volume: 0.9, gain: 1.0, muted: false, peak: [0.0; 2] }
+        Engine { main: Voice::new(), pals: [Voice::new(), Voice::new(), Voice::new(), Voice::new(), Voice::new(), Voice::new(), Voice::new(), Voice::new()], pal_ids: [0; PAL_VOICES], pal_started: [0; PAL_VOICES], pal_seq: 0, volume: 0.9, gain: 1.0, muted: false, peak: [0.0; 2] }
+    }
+
+    /// The player holding a palette entry.
+    pub fn pal_of(&self, id: u32) -> Option<usize> {
+        (0..PAL_VOICES).find(|k| self.pal_ids[*k] == id && id != 0)
+    }
+
+    /// A palette entry is playing.
+    pub fn pal_playing(&self, id: u32) -> bool {
+        self.pal_of(id).map(|k| self.pals[k].playing).unwrap_or(false)
+    }
+
+    pub fn any_pal_playing(&self) -> bool {
+        self.pals.iter().any(|v| v.playing)
+    }
+
+    /// A player for a palette entry: its own, else a silent one, else the one started first.
+    pub fn pal_slot(&mut self, id: u32) -> usize {
+        let k = self.pal_of(id).or_else(|| (0..PAL_VOICES).find(|k| !self.pals[*k].playing && self.pals[*k].gate <= 0.0)).unwrap_or_else(|| (0..PAL_VOICES).min_by_key(|k| self.pal_started[*k]).unwrap_or(0));
+        self.pal_ids[k] = id;
+        self.pal_seq += 1;
+        self.pal_started[k] = self.pal_seq;
+        k
     }
 }
 
@@ -378,17 +408,65 @@ pub fn mix(out: &mut [f32], channels: usize, rate: u32) {
         }
     };
     let e = &mut *g;
-    if !e.main.playing && e.main.gate <= 0.0 && !e.pal.playing && e.pal.gate <= 0.0 {
+    if !e.main.playing && e.main.gate <= 0.0 && e.pals.iter().all(|v| !v.playing && v.gate <= 0.0) {
         return;
     }
     let gain = if e.muted { 0.0 } else { e.volume * e.gain };
     let a = e.main.render(out, channels, rate, gain);
-    let b = e.pal.render(out, channels, rate, gain);
-    e.peak = [e.peak[0].max(a[0]).max(b[0]), e.peak[1].max(a[1]).max(b[1])];
+    let mut pk = a;
+    for v in e.pals.iter_mut() {
+        if v.playing || v.gate > 0.0 {
+            let b = v.render(out, channels, rate, gain);
+            pk = [pk[0].max(b[0]), pk[1].max(b[1])];
+        }
+    }
+    e.peak = [e.peak[0].max(pk[0]), e.peak[1].max(pk[1])];
 }
 
 #[cfg(test)]
 pub mod tests {
+    #[test]
+    fn palette_clips_have_players_of_their_own() {
+        let mut e = Engine::new();
+        let tones = beat_tones(8, &[22050]);
+        let sc = Arc::new(score(8, &[22050], 120.0));
+        let mut start = |e: &mut Engine, id: u32| {
+            let k = e.pal_slot(id);
+            e.pals[k].audio = Some(tones.clone());
+            e.pals[k].score = Some(sc.clone());
+            e.pals[k].playing = true;
+            k
+        };
+        let a = start(&mut e, 1);
+        let b = start(&mut e, 2);
+        assert_ne!(a, b, "two clips, two players");
+        assert!(e.pal_playing(1) && e.pal_playing(2));
+        // Both sound: rendering the two players adds up to twice one of them.
+        let mut one = vec![0.0f32; 1024];
+        let mut both = vec![0.0f32; 1024];
+        {
+            let mut solo = Voice::new();
+            solo.audio = Some(tones.clone());
+            solo.score = Some(sc.clone());
+            solo.playing = true;
+            solo.render(&mut one, 2, SR, 1.0);
+        }
+        for k in [a, b] {
+            e.pals[k].render(&mut both, 2, SR, 1.0);
+        }
+        let (p1, p2) = (one.iter().fold(0.0f32, |m, v| m.max(v.abs())), both.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+        assert!((p2 - 2.0 * p1).abs() < 1e-3 * p1.max(1e-6) + 1e-4, "{p1} {p2}");
+        // Starting the same clip again reuses its player; a ninth clip takes the oldest one's.
+        assert_eq!(start(&mut e, 1), a);
+        for id in 3..=8 {
+            start(&mut e, id);
+        }
+        assert!((1..=8).all(|id| e.pal_playing(id)));
+        let k9 = start(&mut e, 9);
+        assert_eq!(k9, b, "the player started longest ago (clip 2) is taken");
+        assert!(!e.pal_playing(2) && e.pal_playing(9));
+    }
+
     use super::*;
     use crate::edit_model::*;
 

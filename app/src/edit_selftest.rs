@@ -88,6 +88,24 @@ const STEPS: &[&str] = &[
     "WAIT|rendering",
     "WAIT|rendered and imported",
     "CALL:rendered|the new track in the collection",
+    "CLICK:render|Render Audio (again)",
+    "CALL:fmt0|format: the dialog's pull-down set to its first entry",
+    "CLICK:dlg_render|Render",
+    "WAIT|rendering",
+    "WAIT|rendered and imported",
+    "CALL:rendered|the new track in the collection",
+    "CLICK:render|Render Audio (again)",
+    "CALL:fmt2|format: the dialog's pull-down set to its third entry",
+    "CLICK:dlg_render|Render",
+    "WAIT|rendering",
+    "WAIT|rendered and imported",
+    "CALL:rendered|the new track in the collection",
+    "CLICK:render|Render Audio (again)",
+    "CALL:fmt3|format: the dialog's pull-down set to its fourth entry",
+    "CLICK:dlg_render|Render",
+    "WAIT|rendering",
+    "WAIT|rendered and imported",
+    "CALL:rendered|the new track in the collection",
     "CLICK:eject|artwork: unload (asks to save)",
     "CLICK:dlg_cancel|Cancel (still loaded)",
     "CLICK:browser|BROWSER tab (browser shown)",
@@ -186,6 +204,18 @@ impl App {
                     self.prefs.edit.no_render_tip = false;
                     self.prefs.edit.render_format = 1;
                     self.prefs.edit.render_show = true;
+                    // PREPDECK_EDIT_RENDER_DIR: renders go there instead of ~/Music/recordbox.
+                    if let Ok(d) = std::env::var("PREPDECK_EDIT_RENDER_DIR") {
+                        let _ = std::fs::create_dir_all(&d);
+                        self.prefs.edit.render_dir = d;
+                    }
+                }
+                f if f.starts_with("fmt") => {
+                    // (What choosing the entry in the dialog's Format pull-down does.)
+                    if let Ok(n) = f[3..].parse::<u8>() {
+                        self.prefs.edit.render_format = n;
+                    }
+                    eprintln!("edittest: format now {:?}", crate::edit_render::FORMATS.get(self.prefs.edit.render_format as usize).map(|x| x.0));
                 }
                 "reopen" => {
                     if let Some(f) = self.prefs.edit.recent.first().cloned() {
@@ -247,7 +277,7 @@ impl App {
         };
         let (pos, playing, loop_on, loop_range, pal_playing) = {
             let e = EDIT.lock();
-            ((e.main.pos * 100.0).round() / 100.0, e.main.playing, e.main.loop_on, e.main.loop_range, e.pal.playing)
+            ((e.main.pos * 100.0).round() / 100.0, e.main.playing, e.main.loop_on, e.main.loop_range, e.pals.iter().filter(|v| v.playing).count())
         };
         let shell = format!("zoom {} unit {} browser {} tool {} pad tab {} modal {modal}", self.edit.zoom, self.edit.unit(), self.prefs.edit.show_browser, self.prefs.edit.show_tool, self.prefs.edit.pad_tab);
         let Some(p) = &self.edit.project else { return format!("not loaded | {shell}") };

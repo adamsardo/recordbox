@@ -87,8 +87,68 @@ pub struct LibState {
     /// The OSC pack being unpacked in the background.
     pub osc_job: Option<crossbeam_channel::Receiver<Result<(PathBuf, Pack), String>>>,
     pub osc_tried: bool,
+    /// Samples whose length and loop BPM are being read in the background (pack samples come
+    /// without them): (sample id, length s, BPM).
+    pub measure_job: Option<crossbeam_channel::Receiver<(i64, f64, f64)>>,
+    pub measured_all: bool,
+    /// Where the sampler slots were drawn (the scripted run's drop targets).
+    pub slots_ui: Vec<(usize, eframe::egui::Rect)>,
+    /// Sampler list rows being dragged (to a sampler slot, a deck or a playlist).
+    pub drag: Option<Vec<Sample>>,
+    /// A dragged sample that is not in the collection: imported first for a deck or playlist.
+    pub drag_import: Option<String>,
     /// Where the tree's rows were drawn (for the scripted run).
     pub ui: Vec<(String, eframe::egui::Rect)>,
+}
+
+// ---------------------------------------------------------------- track types
+
+/// The track menu's Track Type (`cue_tools.rs`: 0 Normal, 1 Oneshot, 2 Loop) as a sample mode.
+pub fn mode_of_type(t: u8) -> i64 {
+    match t {
+        1 => MODE_ONESHOT,
+        2 => MODE_LOOP,
+        _ => MODE_NORMAL,
+    }
+}
+
+pub fn type_of_mode(m: i64) -> u8 {
+    match m {
+        MODE_ONESHOT => 1,
+        MODE_LOOP => 2,
+        _ => 0,
+    }
+}
+
+/// The mode of the sample row made from a collection track, if there is one.
+pub fn track_mode(conn: &Connection, track_id: i64) -> Option<i64> {
+    conn.query_row("SELECT mode FROM sampler_samples WHERE track_id=?1 ORDER BY id LIMIT 1", [track_id], |r| r.get(0)).ok()
+}
+
+/// Set the mode of the sample rows made from these collection tracks.
+pub fn set_track_mode(conn: &Connection, track_ids: &[i64], mode: i64) {
+    for t in track_ids {
+        let _ = conn.execute("UPDATE sampler_samples SET mode=?1 WHERE track_id=?2", params![mode, t]);
+    }
+}
+
+/// A loop's BPM: the analysed tempo when the loop is long enough to have one, else the BPM
+/// that makes its length a whole number of beats (1, 2, 4 .. 64) nearest 120 within 70..180.
+pub fn loop_bpm(secs: f64, detected: f64) -> f64 {
+    if detected > 0.0 {
+        return detected;
+    }
+    if secs <= 0.0 {
+        return 0.0;
+    }
+    let mut best = 0.0f64;
+    for n in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
+        let b = 60.0 * n / secs;
+        if (70.0..=180.0).contains(&b) && (best == 0.0 || (b - 120.0).abs() < (best - 120.0).abs()) {
+            best = b;
+        }
+    }
+    (best * 100.0).round() / 100.0
 }
 
 // ---------------------------------------------------------------- the database
@@ -625,8 +685,11 @@ impl App {
         self.smplib_ready();
         let mut out = vec![];
         for id in ids {
-            if let Some(t) = self.track(*id) {
-                if let Ok(s) = sample_for(&self.db.conn, &t.path, &t.display_title(), MODE_ONESHOT, (t.bpm * 100.0) as i64, t.duration, t.id) {
+            if let Some(t) = self.track(*id).cloned() {
+                let (path, title, bpm, dur, tid) = (t.path.clone(), t.display_title(), t.bpm, t.duration, t.id);
+                let ty = self.cue_tools_type_only(tid);
+                let mode = if ty == 0 { MODE_ONESHOT } else { mode_of_type(ty) };
+                if let Ok(s) = sample_for(&self.db.conn, &path, &title, mode, (bpm * 100.0) as i64, dur, tid) {
                     out.push(s);
                 }
             }
@@ -682,6 +745,87 @@ impl App {
         n
     }
 
+    /// Pack samples (and samples made from files) come without their length and, for loops,
+    /// without a BPM: they are read in the background once (rekordbox analyses the tracks a
+    /// pack brings in). Called by `smplib_poll`.
+    fn smplib_measure(&mut self) {
+        if let Some(rx) = &self.mixx.lib.measure_job {
+            let got: Vec<(i64, f64, f64)> = rx.try_iter().collect();
+            let done = rx.is_empty() && got.iter().any(|g| g.0 == -1);
+            for (id, secs, bpm) in got.into_iter().filter(|g| g.0 > 0) {
+                let _ = self.db.conn.execute("UPDATE sampler_samples SET duration=?1, bpm100=CASE WHEN mode=?2 AND bpm100=0 THEN ?3 ELSE bpm100 END WHERE id=?4", params![secs, MODE_LOOP, (bpm * 100.0).round() as i64, id]);
+                self.mixx.lib.rows_dirty = true;
+            }
+            if done {
+                self.mixx.lib.measure_job = None;
+            }
+            return;
+        }
+        if self.mixx.lib.measured_all || !self.mixx.lib.ready {
+            return;
+        }
+        self.mixx.lib.measured_all = true;
+        let todo: Vec<(i64, String, i64)> = all_samples(&self.db.conn).unwrap_or_default().into_iter().filter(|s| s.duration <= 0.0 || (s.mode == MODE_LOOP && s.bpm100 == 0)).map(|s| (s.id, s.path, s.mode)).collect();
+        if todo.is_empty() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            for (id, path, mode) in todo {
+                if let Ok(d) = crate::audio::decode_file(&path) {
+                    let secs = d.frames() as f64 / d.sr.max(1) as f64;
+                    let bpm = if mode == MODE_LOOP {
+                        let detected = if secs >= 4.0 { crate::analysis::tempo_and_grid(&d.mono(), d.sr as f64, 70.0, 180.0).0 } else { 0.0 };
+                        loop_bpm(secs, detected)
+                    } else {
+                        0.0
+                    };
+                    let _ = tx.send((id, secs, bpm));
+                }
+            }
+            let _ = tx.send((-1, 0.0, 0.0));
+            ctx.request_repaint();
+        });
+        self.mixx.lib.measure_job = Some(rx);
+    }
+
+    /// A collection track's Track Type (one setting for the track menu and the sampler list).
+    pub fn smplib_track_type(&mut self, track_id: i64) -> Option<u8> {
+        self.smplib_ready();
+        track_mode(&self.db.conn, track_id).map(type_of_mode)
+    }
+
+    pub fn smplib_set_track_type(&mut self, track_ids: &[i64], t: u8) {
+        self.smplib_ready();
+        set_track_mode(&self.db.conn, track_ids, mode_of_type(t));
+        self.mixx.lib.rows_dirty = true;
+    }
+
+    /// A collection track went into a sampler slot: its Track Type decides whether the slot
+    /// loops (Loop) or plays once (Oneshot); Normal leaves the slot's mode as it was.
+    pub fn sampler_apply_track_type(&mut self, idx: usize, track_id: i64) {
+        let t = self.track_type(track_id);
+        if t == 0 {
+            return;
+        }
+        if let Some(Some(slot)) = self.prefs.sampler.slots.get_mut(idx) {
+            slot.looped = t == 2;
+            self.sampler_push_slot(idx);
+            self.save_prefs();
+        }
+    }
+
+    /// Sampler list rows dropped on a slot: the first one loads there, in its mode.
+    pub fn smplib_drop_on_slot(&mut self, idx: usize) {
+        if let Some(rows) = self.mixx.lib.drag.take() {
+            if let Some(s) = rows.first() {
+                self.smplib_load_slot(idx, s);
+            }
+        }
+        self.mixx.lib.drag_import = None;
+    }
+
     /// Load one sample into a slot, in the play mode its Track Type says.
     pub fn smplib_load_slot(&mut self, idx: usize, s: &Sample) {
         self.sampler_load_file(idx, s.path.clone(), s.name.clone(), s.bpm100 as f32 / 100.0);
@@ -703,6 +847,7 @@ impl App {
                     if id > 0 {
                         self.mixx.lib.open.insert(id);
                     }
+                    self.mixx.lib.measured_all = false;
                     self.smplib_reload();
                     self.toast(format!("Imported {} samples.", pack.tracks.len()));
                 }
@@ -718,6 +863,7 @@ impl App {
         if !self.performance() {
             return;
         }
+        self.smplib_measure();
         if self.prefs.mixx.lib.osc_list_id == -1 && !self.mixx.lib.osc_tried {
             self.mixx.lib.osc_tried = true;
             let zip = osc_zip();
@@ -739,6 +885,7 @@ impl App {
                 Ok(id) => {
                     self.prefs.mixx.lib.osc_list_id = id;
                     self.save_prefs();
+                    self.mixx.lib.measured_all = false;
                     self.smplib_reload();
                 }
                 Err(e) => eprintln!("OSC sampler pack: {e}"),

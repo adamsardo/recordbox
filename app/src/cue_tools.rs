@@ -5,10 +5,15 @@
 //!   memory cues and memory loops, in time order, become hot cues in the lowest free slots of
 //!   A..P. One that sits exactly where a hot cue already is stays a memory cue.
 //! - Sort Hot Cues by time (`ListViewer::popupSortHotCueByTime` 0x1004035a0), after rekordbox's
-//!   "cannot be undone" question. Not traced: whether rekordbox closes gaps between used
-//!   slots; here the used slots stay the same and the cues are dealt onto them in time order
-//!   (which agrees with its "already sorted" answer for a track whose letters rise with time).
-//! - Track Type (Oneshot / Loop / Normal): the track's sampler play mode, kept per track.
+//!   "cannot be undone" question. Traced (`HotCueTimeSortService` thread 0x10010a9e8 ->
+//!   `DatabaseIF::sortCues` -> `CueManager::SortCues` 0x1000587d8 ->
+//!   `TimedBaseSortStrategy::sort` 0x100878718): the hot cues are stable-sorted by time and
+//!   the i-th one goes to the i-th slot (A, B, C, ... from rekordbox's kind table), so gaps
+//!   between used slots are closed up; a track whose cues already sit that way is "already
+//!   sorted" (`HotCueVisitor::isApplicatedTimedBaseSort` 0x100878ae8).
+//! - Track Type (Oneshot / Loop / Normal): the track's sampler play mode, kept per track and
+//!   shared with the sampler list's Track Type (`sampler_lib.rs`); a track loaded into a
+//!   sampler slot loops or plays once by it.
 
 use crate::app::*;
 use crate::model::*;
@@ -73,18 +78,26 @@ pub fn convert(cues: &mut [Cue]) -> Converted {
     out
 }
 
-/// Deal the hot cues onto the slots they use in time order. False when nothing changed.
+/// Put the hot cues into A, B, C, ... in time order (gaps close up). False when nothing
+/// changed.
 pub fn sort_hot(cues: &mut [Cue]) -> bool {
     let mut idx: Vec<usize> = (0..cues.len()).filter(|i| cues[*i].kind == CueKind::Hot).collect();
-    let mut slots: Vec<i32> = idx.iter().map(|i| cues[*i].slot).collect();
-    slots.sort();
     idx.sort_by(|a, b| cues[*a].start.partial_cmp(&cues[*b].start).unwrap_or(std::cmp::Ordering::Equal).then(cues[*a].slot.cmp(&cues[*b].slot)));
     let mut changed = false;
-    for (i, slot) in idx.into_iter().zip(slots) {
+    for (i, slot) in idx.into_iter().zip(0..SLOTS) {
         changed |= cues[i].slot != slot;
         cues[i].slot = slot;
     }
     changed
+}
+
+impl CueTools {
+    pub fn cached_type(&self, id: i64) -> Option<u8> {
+        self.types.as_ref().and_then(|m| m.get(&id).copied()).filter(|t| *t != 0)
+    }
+    pub fn has_type(&self, id: i64) -> bool {
+        self.cached_type(id).is_some()
+    }
 }
 
 #[derive(Default)]
@@ -181,12 +194,28 @@ impl App {
         self.cue_tools.types.as_mut().unwrap()
     }
 
-    /// A track's sampler play mode: 0 Normal, 1 Oneshot, 2 Loop.
+    /// A track's sampler play mode: 0 Normal, 1 Oneshot, 2 Loop. One setting with the sampler
+    /// list's Track Type: the sample row made from the track wins when there is one
+    /// (`sampler_lib.rs`), else the value kept here.
     pub fn track_type(&mut self, id: i64) -> u8 {
+        match self.smplib_track_type(id) {
+            Some(t) => t,
+            None => self.cue_tools_type_only(id),
+        }
+    }
+
+    /// Read the kept Track Types once (for drawing, which then reads `cue_tools.cached_type`).
+    pub fn track_types_ready(&mut self) {
+        let _ = self.track_types();
+    }
+
+    /// The value kept for tracks that have no sample row.
+    pub fn cue_tools_type_only(&mut self, id: i64) -> u8 {
         self.track_types().get(&id).copied().unwrap_or(0)
     }
 
     pub fn set_track_type(&mut self, ids: &[i64], mode: u8) {
+        self.smplib_set_track_type(ids, mode);
         let m = self.track_types();
         for id in ids {
             if mode == 0 {
@@ -269,10 +298,15 @@ mod tests {
     }
 
     #[test]
-    fn sorting_keeps_the_used_slots() {
+    fn sorting_closes_the_gaps_as_rekordbox_does() {
         let mut c = vec![cue(CueKind::Hot, 0, 50.0, None, 0), cue(CueKind::Hot, 4, 10.0, None, 0), cue(CueKind::Hot, 2, 30.0, None, 0), cue(CueKind::Memory, -1, 1.0, None, 0)];
         assert!(sort_hot(&mut c));
-        assert_eq!((c[1].slot, c[2].slot, c[0].slot, c[3].slot), (0, 2, 4, -1));
+        // A, C, E by time become A, B, C; the memory cue is not touched.
+        assert_eq!((c[1].slot, c[2].slot, c[0].slot, c[3].slot), (0, 1, 2, -1));
+        // In time order already but with a gap: the gap closes, so it is not "already sorted".
+        let mut g = vec![cue(CueKind::Hot, 0, 1.0, None, 0), cue(CueKind::Hot, 3, 2.0, None, 0)];
+        assert!(sort_hot(&mut g));
+        assert_eq!((g[0].slot, g[1].slot), (0, 1));
         assert!(!sort_hot(&mut c));
         assert!(!sort_hot(&mut []));
     }

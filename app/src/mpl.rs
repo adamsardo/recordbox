@@ -147,6 +147,48 @@ pub struct MplState {
     pub seen_at: Option<std::time::Instant>,
     /// Where the strip's controls were drawn (for the scripted run).
     pub ui: crate::ui_mpl::StripMap,
+    /// Decks switched to BPM SYNC (tempo only) by a link (see `needs_bpm_sync`); it lasts
+    /// until the deck's sync is turned off.
+    pub bpm_sync: [bool; 4],
+}
+
+/// The rule of `doMixPointLinkStart` (0x1014fa050) for a MIX IN deck that is in BEAT SYNC:
+/// it changes to BPM SYNC unless both MIX points sit on beats and the "constant BPM" test
+/// does not apply (`auto` is "Automatically changes the BEAT/BPM SYNC setting").
+pub fn needs_bpm_sync(both_on_beats: bool, out_variable_bpm: bool, auto: bool) -> bool {
+    !both_on_beats || (out_variable_bpm && auto)
+}
+
+/// A grid with more than one BPM value (rekordbox compares the BPM of its beat entries).
+pub fn variable_bpm(beats: &[Beat]) -> bool {
+    beats.len() >= 2 && beats.iter().any(|b| (b.bpm - beats[0].bpm).abs() > 1e-6)
+}
+
+/// Decks a link put into BPM SYNC (read by the deck engine: their tempo follows the master,
+/// their beats do not).
+pub fn bpm_sync_decks(app: &App) -> [bool; 4] {
+    let mut v = app.mixx.mpl.bpm_sync;
+    for (d, x) in v.iter_mut().enumerate() {
+        *x &= d < app.deck_count() as usize && app.deck_of(d as u8).x.beat_sync;
+    }
+    v
+}
+
+/// The MIX IN deck's bar count while its link is set (`operateWaveViewSetMixPointBeatCountMode`
+/// on the deck's wave view): bars and beats counted from the MIX IN point, which is 1.1; the
+/// beats before it count down from -1.4 ("-1.2Bars" is three beats before the point).
+pub fn mix_point_bars(beats: &[Beat], mix_in_s: f64, t: f64) -> String {
+    if beats.is_empty() {
+        return String::new();
+    }
+    let k = beats.partition_point(|b| b.time <= mix_in_s + 1e-3).max(1) - 1;
+    let i = beats.partition_point(|b| b.time <= t + 1e-4).max(1) - 1;
+    if i < k {
+        let back = k - i;
+        return format!("-{}.{}Bars", (back + 3) / 4, 4 - (back - 1) % 4);
+    }
+    let d = i - k;
+    format!("{}.{}Bars", d / 4 + 1, d % 4 + 1)
 }
 
 impl Default for MplState {
@@ -158,6 +200,7 @@ impl Default for MplState {
             in_deck: None,
             out_deck: None,
             mix_in: [-1; 4],
+            bpm_sync: [false; 4],
             mix_out: [-1; 4],
             silent_on: [false; 4],
             silent_edit: [false; 4],
@@ -910,18 +953,16 @@ impl App {
                     a.seek(mi);
                 }
             });
-            // BEAT SYNC would pull the deck onto the other deck's beats and move the points
-            // apart unless both sit on beats. rekordbox changes to BPM SYNC (tempo only);
-            // recordbox has no such mode, so the tempo is matched once and sync goes off.
+            // `doMixPointLinkStart` 0x1014fa050: a MIX IN deck in BEAT SYNC goes to BPM SYNC
+            // (tempo only) with the MIX OUT deck as master unless both points sit on beats,
+            // or, with "Automatically changes the BEAT/BPM SYNC setting" on, also when the
+            // MIX OUT deck's grid has more than one BPM.
             if was_sync {
                 let on_beat = |app: &App, d: usize, ms: i64| app.deck_of(d as u8).beats.iter().any(|b| (b.time * 1000.0 - ms as f64).abs() < 1.0);
                 let both = on_beat(self, o, self.mixx.mpl.mix_out[o]) && on_beat(self, i, self.mixx.mpl.mix_in[i]);
-                if !both {
-                    let sp = self.player.decks[i].lock().tempo;
+                if needs_bpm_sync(both, variable_bpm(&self.deck_of(o as u8).beats), prefs.bpm_sync_auto) {
                     self.px.master = o as u8;
-                    let dk = self.deck_of_mut(i as u8);
-                    dk.x.beat_sync = false;
-                    dk.x.tempo_adj = sp - 1.0;
+                    self.mixx.mpl.bpm_sync[i] = true;
                     self.push_deck_controls();
                 }
             }
@@ -953,6 +994,12 @@ impl App {
 
     /// Once per frame: what the audio thread reported, and the changes that end a link.
     pub fn mpl_poll(&mut self) {
+        // BPM SYNC from a link lasts until the deck's sync is turned off.
+        for d in 0..4 {
+            if self.mixx.mpl.bpm_sync[d] && (d >= self.deck_count() as usize || !self.deck_of(d as u8).x.beat_sync) {
+                self.mixx.mpl.bpm_sync[d] = false;
+            }
+        }
         let active = self.mixx.mpl.shown || self.mixx.mpl.any_linked() || self.mixx.mpl.any_ready() || self.mixx.mpl.mix_in.iter().chain(self.mixx.mpl.mix_out.iter()).any(|t| *t != -1);
         if !active {
             self.mixx.mpl.seen_at = None;
@@ -1049,6 +1096,33 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_switches_to_bpm_sync_as_rekordbox_does() {
+        // Both points on beats and a constant grid: BEAT SYNC stays.
+        assert!(!needs_bpm_sync(true, false, false));
+        assert!(!needs_bpm_sync(true, false, true));
+        // A point off the beat: BPM SYNC, whatever the setting.
+        assert!(needs_bpm_sync(false, false, false));
+        // A grid with more than one BPM: only with "Automatically changes ..." on.
+        assert!(!needs_bpm_sync(true, true, false));
+        assert!(needs_bpm_sync(true, true, true));
+        let b = |t: f64, bpm: f64| Beat { time: t, bpm, beat: 1, index: 0 };
+        assert!(!variable_bpm(&[b(0.0, 128.0), b(0.47, 128.0)]));
+        assert!(variable_bpm(&[b(0.0, 128.0), b(0.47, 127.5)]));
+    }
+
+    #[test]
+    fn bar_count_runs_from_the_mix_in_point() {
+        let beats: Vec<Beat> = (0..40).map(|i| Beat { time: i as f64 * 0.5, bpm: 120.0, beat: (i % 4 + 1) as u8, index: i }).collect();
+        // MIX IN on beat 8 (4.0 s): there it is 1.1, three beats before -1.2, one bar on 2.1.
+        assert_eq!(mix_point_bars(&beats, 4.0, 4.0), "1.1Bars");
+        assert_eq!(mix_point_bars(&beats, 4.0, 2.5), "-1.2Bars");
+        assert_eq!(mix_point_bars(&beats, 4.0, 3.6), "-1.4Bars");
+        assert_eq!(mix_point_bars(&beats, 4.0, 1.9), "-2.4Bars");
+        assert_eq!(mix_point_bars(&beats, 4.0, 6.1), "2.1Bars");
+        assert_eq!(mix_point_bars(&[], 4.0, 6.1), "");
+    }
+
     use super::*;
     use std::sync::Arc;
 

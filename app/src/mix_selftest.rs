@@ -54,6 +54,25 @@ pub fn shot_setup(app: &mut App) {
                 app.mixx.automix.settings_open = std::env::var("PREPDECK_SHOT_MIX_DIALOG").is_ok();
             }
         }
+        "mplshot4" => {
+            // The strip with four decks, each loaded.
+            app.prefs.app_mode = 1;
+            app.prefs.perf_four = true;
+            app.poll_decks();
+            app.prefs.mixx.mpl = Default::default();
+            app.mixx.mpl.shown = true;
+            let t = app.prefs.mixx.mpl.default_type;
+            app.mixx.mpl.set_mode(t);
+            app.mixx.mpl.guidance = 0;
+            let ids = playable(app, 6);
+            for d in 1..4u8 {
+                if let Some(id) = ids.get(d as usize).copied() {
+                    app.with_deck(d, |x| x.load_track_here(id));
+                    wait_load(app, d);
+                }
+            }
+            eprintln!("mixtest: mplshot4: {} decks, strip height {}", app.deck_count(), crate::ui_mpl::strip_height(app));
+        }
         "mpl" | "mplshot" => {
             app.prefs.mixx.mpl = Default::default();
             app.mixx.mpl.shown = true;
@@ -88,6 +107,8 @@ pub fn shot_setup(app: &mut App) {
 enum Act {
     Click(fn(&App) -> Option<Pos2>),
     Call(fn(&mut App)),
+    /// Press at the first point, move to the second over a few frames, let go there.
+    Drag(fn(&App) -> Option<Pos2>, fn(&App) -> Option<Pos2>),
     Until(fn(&App) -> bool, f32),
     Wait(f32),
 }
@@ -114,13 +135,17 @@ fn amx_state(app: &App) -> String {
         format!("deck {} {:?} row {:?} track {:?} {} pos {:.1}/{:.1} tempo {:+.2}% sync {} in {:?} out {:?}", n + 1, p.state, p.row.map(|r| r + 1), app.deck_of(n as u8).track, if s.playing { "playing" } else { "paused" }, pos, app.deck_of(n as u8).duration, (s.tempo - 1.0) * 100.0, app.deck_of(n as u8).x.beat_sync, (p.fade_in.start, p.fade_in.end), (p.fade_out.start, p.fade_out.end))
     };
     format!(
-        "processing {} | {} | {} | crossfader {:.3} assign {:?} master {} | crossfade {:?} len {} | transitions {} | list {} pane {} dialog {} | repeat {} random {} | ask {:?} alert {:?}",
+        "processing {} | {} | {} | crossfader {:.3} assign {:?} master {} locked {} curve {} (prefs {}) tempo dimmed {:?} | crossfade {:?} len {} | transitions {} | list {} pane {} dialog {} | repeat {} random {} | ask {:?} alert {:?}",
         e.processing,
         d(0),
         d(1),
         app.px.crossfader,
         [app.px.mix[0].assign, app.px.mix[1].assign],
         app.px.master + 1,
+        crate::automix::crossfader_locked(app),
+        crate::automix::curve_override(app).unwrap_or(app.prefs.deck.crossfader_curve),
+        app.prefs.deck.crossfader_curve,
+        [crate::automix::tempo_dimmed(app, 0), crate::automix::tempo_dimmed(app, 1)],
         e.crossfade.map(|c| (c.incoming + 1, c.ramp.len_ms)),
         e.crossfade_len,
         e.transitions,
@@ -139,7 +164,8 @@ fn mpl_state(app: &App) -> String {
     let d = |n: usize| {
         let s = app.player.decks[n].lock();
         let pos = s.audio.as_ref().map(|a| s.pos / a.sr as f64 * 1000.0).unwrap_or(0.0);
-        format!("deck {} {} at {:.1} ms{}", n + 1, if s.playing { "playing" } else { "paused" }, pos, if s.muted { " muted" } else { "" })
+        let bars = if m.link_set[n] && m.mix_in[n] != -1 { format!(" bars {}", crate::mpl::mix_point_bars(&app.deck_of(n as u8).beats, m.mix_in[n] as f64 / 1000.0, pos / 1000.0)) } else { String::new() };
+        format!("deck {} {} at {:.1} ms{} sync {}{} follows beats {}{}", n + 1, if s.playing { "playing" } else { "paused" }, pos, if s.muted { " muted" } else { "" }, app.deck_of(n as u8).x.beat_sync, if crate::mpl::bpm_sync_decks(app)[n] { " (BPM SYNC)" } else { "" }, s.sync_follow, bars)
     };
     let l = crate::mpl::ENGINE.lock().links[1];
     format!(
@@ -172,17 +198,24 @@ fn smp_state(app: &App) -> String {
     let bank = app.prefs.sampler.bank.min(3) as usize;
     let slots: Vec<String> = (0..16).filter_map(|k| app.prefs.sampler.slots.get(bank * 16 + k).and_then(|s| s.as_ref()).map(|s| format!("{}:{}{}", k + 1, s.name, if s.looped { "(loop)" } else { "" }))).collect();
     format!(
-        "side sampler {} view {:?} | OSC list id {} | lists {:?} | counts {:?} | rows {} | bank {} slots [{}] | toast {:?}",
+        "side sampler {} view {:?} | OSC list id {} | lists {:?} | counts {:?} | rows {} {:?} | bank {} slots [{}] | toast {:?}",
         app.side == SideMode::Sampler,
         app.view,
         app.prefs.mixx.lib.osc_list_id,
         lib.lists.iter().map(|l| format!("{}#{}{}", l.name, l.id, if l.attribute == crate::sampler_lib::ATTR_FOLDER { "/" } else { "" })).collect::<Vec<_>>(),
         { let mut c: Vec<_> = lib.counts.iter().collect(); c.sort(); c },
         lib.rows.len(),
+        lib.rows.iter().take(4).map(|s| format!("{} {:.2}s bpm {} mode {}", s.name, s.duration, s.bpm100 as f64 / 100.0, s.mode)).collect::<Vec<_>>(),
         bank + 1,
         slots.join(", "),
         app.toasts.last().map(|t| t.text.chars().take(70).collect::<String>())
     )
+}
+
+/// A point on the on-screen crossfader (where `ui_perf` draws it: x 711..801 of the 1512 pt
+/// mixer layout, on the mixer's bottom row).
+fn xfader_at(app: &App, v: f32) -> Option<Pos2> {
+    app.mixx.automix.ui.xfader.map(|r| egui::pos2(r.min.x + 6.0 + v * (r.width() - 12.0), r.center().y))
 }
 
 fn active_deck(app: &App) -> Option<usize> {
@@ -232,6 +265,7 @@ fn steps(m: &str) -> Vec<(&'static str, Act)> {
             ("time skip: 2.5 s before the fade point", Call(skip_to_fade)),
             ("wait: the crossfade has started", Until(|a| a.mixx.automix.engine.crossfade.is_some(), 10.0)),
             ("1 s into the ramp", Wait(1.0)),
+            ("drag the on-screen crossfader during the ramp (disabled: it does not move)", Drag(|a| xfader_at(a, a.px.crossfader), |a| xfader_at(a, 0.0))),
             ("4 s into the ramp", Wait(3.0)),
             ("wait: transition 1 done", Until(|a| a.mixx.automix.engine.transitions >= 1, 30.0)),
             ("wait: the next track is ready and the ranges are set", Until(|a| active_deck(a).is_some_and(|d| a.mixx.automix.engine.players[d].fade_out.is_valid()), 30.0)),
@@ -278,6 +312,11 @@ fn steps(m: &str) -> Vec<(&'static str, Act)> {
             ("click deck 2's waveform (chooses the deck)", Click(|a| lane_x(a, 1, 10.0))),
             ("click deck 2's waveform at 3 s (MIX IN point)", Click(|a| lane_x(a, 1, 3.0))),
             ("SILENT", Click(|a| center(a.mixx.mpl.ui.rect("silent")))),
+            ("SYNC on for deck 2 (BEAT SYNC; the MIX OUT point is off the beat)", Call(|a| {
+                if !a.deck_of(1).x.beat_sync {
+                    a.with_deck(1, |x| x.toggle_beat_sync());
+                }
+            })),
             ("MIX POINT LINK", Click(|a| center(a.mixx.mpl.ui.rect("link")))),
             ("wait: deck 2 started by the link", Until(|a| a.mixx.mpl.auto_started[1], 20.0)),
             ("1 s later", Wait(1.0)),
@@ -329,6 +368,27 @@ fn steps(m: &str) -> Vec<(&'static str, Act)> {
                 }
             })),
             ("tree: PRESET ONESHOT", Click(|a| a.mixx.lib.ui.iter().find(|x| x.0 == "PRESET ONESHOT").map(|x| x.1.center()))),
+            ("wait: the pack samples' lengths are read", Until(|a| a.mixx.lib.measure_job.is_none() && a.mixx.lib.measured_all && a.mixx.lib.rows.iter().all(|s| s.duration > 0.0), 20.0)),
+            ("slots noted on screen", Call(|a| {
+                eprintln!("mixtest:   targets {:?} slots {:?}", a.mixx.lib.ui.iter().map(|x| x.0.clone()).collect::<Vec<_>>(), a.mixx.lib.slots_ui.iter().map(|x| x.0).collect::<Vec<_>>());
+            })),
+            ("drag the list's second row onto slot 6 (empty)", Drag(|a| a.mixx.lib.ui.iter().find(|x| x.0 == "row1").map(|x| x.1.center()), |a| {
+                let idx = a.prefs.sampler.bank.min(3) as usize * 16 + 5;
+                a.mixx.lib.slots_ui.iter().find(|x| x.0 == idx).map(|x| x.1.center())
+            })),
+            ("Track Type of a collection track set to Loop in the track menu: the sampler list's row says Loop too", Call(|a| {
+                let ids: Vec<i64> = a.tracks.iter().filter(|t| !t.missing).take(1).map(|t| t.id).collect();
+                let s = a.smplib_samples_for_tracks(&ids);
+                a.set_track_type(&ids, 2);
+                let row_mode = crate::sampler_lib::all_samples(&a.db.conn).unwrap_or_default().into_iter().find(|x| s.contains(&x.id)).map(|x| x.mode);
+                eprintln!("mixtest:   track type {} / sample row mode {:?} (Loop = {})", a.track_type(ids[0]), row_mode, crate::sampler_lib::MODE_LOOP);
+                // ... and the track loads into slot 15 as a loop.
+                let idx = a.prefs.sampler.bank.min(3) as usize * 16 + 14;
+                a.sampler_eject(idx);
+                a.sampler_load(idx, ids[0]);
+                eprintln!("mixtest:   slot 15 loops: {:?}", a.prefs.sampler.slots.get(idx).and_then(|x| x.as_ref()).map(|x| x.looped));
+                a.set_track_type(&ids, 0);
+            })),
         ],
         _ => vec![],
     }
@@ -387,6 +447,44 @@ impl App {
                     5 => raw.events.push(egui::Event::PointerMoved(egui::pos2(700.0, 5.0))),
                     9 => {
                         eprintln!("mixtest: {name} [click at {:.0}, {:.0}]: {}", at.map(|p| p.x).unwrap_or(0.0), at.map(|p| p.y).unwrap_or(0.0), state(self));
+                        next = true;
+                    }
+                    _ => {}
+                }
+            }
+            Act::Drag(from, to) => {
+                static AT: std::sync::Mutex<Option<(Pos2, Pos2)>> = std::sync::Mutex::new(None);
+                let mut at = AT.lock().unwrap();
+                let btn = |p: Pos2, down: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+                match f {
+                    0 => {
+                        *at = from(self).zip(to(self));
+                        match *at {
+                            Some((a, _)) => raw.events.push(egui::Event::PointerMoved(a)),
+                            None => {
+                                eprintln!("mixtest: {name}: NOT ON SCREEN");
+                                next = true;
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some((a, _)) = *at {
+                            raw.events.push(btn(a, true));
+                        }
+                    }
+                    3..=14 => {
+                        if let Some((a, b)) = *at {
+                            raw.events.push(egui::Event::PointerMoved(a + (b - a) * ((f - 2) as f32 / 12.0)));
+                        }
+                    }
+                    16 => {
+                        if let Some((_, b)) = *at {
+                            raw.events.push(btn(b, false));
+                        }
+                    }
+                    18 => raw.events.push(egui::Event::PointerMoved(egui::pos2(700.0, 5.0))),
+                    24 => {
+                        eprintln!("mixtest: {name}: {}", state(self));
                         next = true;
                     }
                     _ => {}

@@ -253,6 +253,72 @@ fn view_name(app: &App, id: i64) -> String {
 }
 
 /// The first empty slot of the current bank (None when the bank is full).
+/// Note where something was drawn (the scripted run's targets).
+pub fn note(app: &mut App, key: String, r: Rect) {
+    let v = &mut app.mixx.lib.ui;
+    v.retain(|x| x.0 != key);
+    v.push((key, r));
+}
+
+pub fn note_slot(app: &mut App, idx: usize, r: Rect) {
+    let v = &mut app.mixx.lib.slots_ui;
+    v.retain(|x| x.0 != idx);
+    v.push((idx, r));
+}
+
+/// Start dragging sampler list rows (see `list`).
+pub fn start_drag(app: &mut App, picked: Vec<Sample>) {
+    if picked.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = picked.iter().map(|s| s.track_id).filter(|t| *t > 0 && app.track(*t).is_some()).collect();
+    if ids.len() == picked.len() {
+        app.drag = Some(ids);
+    } else if let Some(s) = picked.iter().find(|s| s.track_id <= 0 || app.track(s.track_id).is_none()) {
+        if let Some(id) = app.db.track_by_path(&s.path) {
+            app.drag = Some(vec![id]);
+        }
+    }
+    app.mixx.lib.drag = Some(picked);
+    app.mixx.lib.drag_import = None;
+}
+
+/// Once per frame while sampler rows are dragged: the imported sample joins the drag, and
+/// letting go ends it; a label follows the pointer.
+pub fn drag_frame(app: &mut App, ctx: &egui::Context) {
+    let Some(rows) = app.mixx.lib.drag.clone() else { return };
+    // A sample that is not in the collection is imported once it is dragged over a deck (a
+    // sampler slot takes the file as it is); the drag then carries the new track.
+    let over_deck = ctx.pointer_latest_pos().map(|pp| app.px.sampler.deck_rects.iter().any(|r| r.contains(pp))).unwrap_or(false);
+    if app.drag.is_none() && app.mixx.lib.drag_import.is_none() && over_deck {
+        if let Some(s) = rows.first() {
+            app.mixx.lib.drag_import = Some(s.path.clone());
+            app.import_paths(vec![std::path::PathBuf::from(&s.path)], None);
+        }
+    }
+    if let Some(path) = app.mixx.lib.drag_import.clone() {
+        if let Some(id) = app.db.track_by_path(&path).filter(|id| app.track(*id).is_some()) {
+            if app.drag.is_none() {
+                app.drag = Some(vec![id]);
+            }
+            app.mixx.lib.drag_import = None;
+        }
+    }
+    if let Some(pp) = ctx.pointer_latest_pos() {
+        let lp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("smplib_drag")));
+        let name = if rows.len() == 1 { rows[0].name.clone() } else { format!("{} samples", rows.len()) };
+        let r = Rect::from_min_size(pp + vec2(12.0, 6.0), vec2(8.0 + name.chars().count().min(40) as f32 * 6.5, 18.0));
+        lp.rect_filled(r, 3.0, hex(0x2A2A2A));
+        lp.text(r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(10.5), WHITE);
+        ctx.request_repaint();
+    }
+    // (Kept through the frame the button is let go in, so that the slot under it sees it.)
+    if !ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+        app.mixx.lib.drag = None;
+        app.mixx.lib.drag_import = None;
+    }
+}
+
 fn free_slot(app: &App) -> Option<usize> {
     let bank = app.prefs.sampler.bank.min(3) as usize;
     (0..app.sampler_pads()).map(|k| bank * 16 + k).find(|i| !app.sampler_loaded(*i))
@@ -306,7 +372,17 @@ pub fn list(app: &mut App, ui: &mut Ui, id: i64) {
     egui::ScrollArea::vertical().id_salt(("smp_rows", id)).auto_shrink([false, false]).show_rows(&mut bui, ROW_H, rows.len(), |ui, range| {
         for ri in range {
             let s = &rows[ri];
-            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
+            note(app, format!("row{ri}"), rr);
+            // Dragged to a sampler slot (loads in its mode), a deck or a playlist (as the
+            // collection track it is; a pack sample is imported first).
+            if resp.drag_started() {
+                if !app.mixx.lib.selected.contains(&ri) {
+                    app.mixx.lib.selected = [ri].into_iter().collect();
+                }
+                let picked: Vec<Sample> = app.mixx.lib.selected.iter().filter_map(|i| rows.get(*i).cloned()).collect();
+                start_drag(app, picked);
+            }
             let sel = app.mixx.lib.selected.contains(&ri);
             ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
             let vals = [format!("{}", ri + 1), String::new(), s.name.clone(), if s.bpm100 > 0 { format!("{:.2}", s.bpm100 as f64 / 100.0) } else { String::new() }, if s.duration > 0.0 { fmt_time(s.duration, false) } else { String::new() }, s.path.clone()];
@@ -392,6 +468,11 @@ pub fn list(app: &mut App, ui: &mut Ui, id: i64) {
     if let Some(m) = set_type {
         let ids: Vec<i64> = picked.iter().map(|s| s.id).filter(|i| *i > 0).collect();
         let _ = set_mode(&app.db.conn, &ids, m);
+        // A sample made from a collection track: the track menu's Track Type is the same one.
+        let tracks: Vec<i64> = picked.iter().map(|s| s.track_id).filter(|t| *t > 0).collect();
+        if !tracks.is_empty() {
+            app.set_track_type(&tracks, crate::sampler_lib::type_of_mode(m));
+        }
         app.smplib_reload();
     } else if remove {
         let members: Vec<i64> = picked.iter().map(|s| s.member).filter(|m| *m > 0).collect();

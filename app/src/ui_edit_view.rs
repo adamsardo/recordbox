@@ -1169,7 +1169,7 @@ fn palette_row(app: &mut App, ui: &mut Ui, r: Rect, id: u32, index: usize, del: 
     }
     let (pal_playing, pal_pos) = {
         let e = EDIT.lock();
-        (e.pal_id == id && e.pal.playing, e.pal.pos)
+        (e.pal_playing(id), e.pal_of(id).map(|k| e.pals[k].pos).unwrap_or(0.0))
     };
     if pal_playing {
         let x = wr.min.x + (pal_pos * ppb) as f32;

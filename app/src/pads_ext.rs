@@ -40,6 +40,17 @@ pub struct CensorUi {
     pub regions: Vec<CensorRegion>,
     /// IN was pressed: the in point waiting for OUT.
     pub pending_in: Option<f64>,
+    /// IN / OUT adjust (1 / 2) of region `adjust_i`: its edge follows the playhead.
+    pub adjust: u8,
+    pub adjust_i: usize,
+}
+
+/// What a held USER pad lets go of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UserHeld {
+    Cue,
+    Bend,
+    PadFx(u8),
 }
 
 /// What one deck keeps for its pads while the app runs.
@@ -56,11 +67,14 @@ pub struct DeckPadState {
     pub jump_down: Option<u8>,
     /// A sampler pad of a USER mode is down.
     pub user_sampler: Option<usize>,
+    /// A USER pad that acts while held: a transport item (CUE, PITCH BEND) or a PAD FX pad
+    /// (its index in the deck's PAD FX pads).
+    pub user_held: Option<UserHeld>,
 }
 
 impl Default for DeckPadState {
     fn default() -> DeckPadState {
-        DeckPadState { scroll: [None; 21], slicer: Default::default(), censor: Default::default(), key_cue: None, key_edit: false, jump_down: None, user_sampler: None }
+        DeckPadState { scroll: [None; 21], slicer: Default::default(), censor: Default::default(), key_cue: None, key_edit: false, jump_down: None, user_sampler: None, user_held: None }
     }
 }
 
@@ -102,6 +116,10 @@ fn decode_beats(s: &str) -> [(u16, u16); 4] {
     }
     out
 }
+
+/// rekordbox's status messages for the slicer (7.2.19 `kSlicerOperateError`,
+/// `kSlipOperateErrorSlipOff`).
+pub const SLIP_OFF_BY_SLICER: &str = "Slip off. Slip can not be turned on when Slicer is on.";
 
 impl App {
     fn pd(&mut self) -> &mut DeckPadState {
@@ -168,6 +186,7 @@ impl App {
         if self.pdr().censor.track != self.deck.track {
             self.censor_load();
         }
+        self.censor_follow();
     }
 
     // ------------------------------------------------------------------ BEAT JUMP / BEAT LOOP
@@ -220,10 +239,8 @@ impl App {
         if self.deck.audio.is_none() {
             return;
         }
-        if self.pdr().slicer.active {
-            self.toast_err(MSG_SLICER_ON);
-            return;
-        }
+        // (rekordbox refuses nothing here while the slicer is on: `kSlicerOperateError` is
+        // used by SLIP alone; a loop only pauses the slicer's rolls, `isRollableState`.)
         let b = crate::player_ext::LOOP_SIZES[i.min(15)];
         if self.beat_loop_lit() == Some(i) {
             self.loop_exit();
@@ -253,7 +270,7 @@ impl App {
         if self.deck.track.is_none() {
             return;
         }
-        match key_press(key_at(pos), self.pad_current_key(), self.deck.x.master_tempo) {
+        match key_press(key_at_in(pos, self.key_scale1()), self.pad_current_key(), self.deck.x.master_tempo) {
             KeyAct::Set(n) => {
                 self.deck.x.key_sync = false;
                 self.deck.x.key_shift = n.clamp(-12, 12);
@@ -271,7 +288,7 @@ impl App {
         if self.deck.track.is_none() {
             return;
         }
-        let key = key_at(pos);
+        let key = key_at_in(pos, self.key_scale1());
         self.pad_key(pos);
         if key_semis(key).is_none() {
             return;
@@ -302,7 +319,24 @@ impl App {
         }
     }
 
+    /// KEYBOARD and KEY SHIFT use `KeyPositioner`'s scale 1 while a DDJ-GRV6 or XDJ-AN is
+    /// connected (`KeyboardView::updateScale`); otherwise scale 0.
+    pub fn key_scale1(&self) -> bool {
+        self.midi.devices.iter().any(|d| key_scale1_device(d))
+    }
+
     // ------------------------------------------------------------------ SLICER
+
+    /// SLIP on a deck whose slicer is on is refused (`WidgetPlayerDJ::operateEnableSlip`).
+    /// Returns true when it was refused. Loop controls are not refused while the slicer is on
+    /// (no check in 7.2.19; a running loop only pauses the slicer's rolls).
+    pub fn slip_refused_by_slicer(&mut self) -> bool {
+        if self.pdr().slicer.active {
+            self.toast_err(MSG_SLICER_ON);
+            return true;
+        }
+        false
+    }
 
     fn slicer_grid(&mut self) -> Arc<Vec<f64>> {
         let g = &self.deck.beats;
@@ -349,6 +383,8 @@ impl App {
         self.hot_cue_up();
         self.loop_exit();
         if self.deck.x.slip {
+            // (`MemoryCuePanel::setSlicerTabVisible` says so when SLIP was on.)
+            self.toast_err(SLIP_OFF_BY_SLICER);
             self.deck.x.slip = false;
             self.push_deck_controls();
         }
@@ -624,6 +660,7 @@ impl App {
         c.on = on;
         c.kind = kind;
         c.pending_in = None;
+        c.adjust = 0;
         self.censor_push();
     }
 
@@ -669,27 +706,80 @@ impl App {
         self.censor_push();
     }
 
-    /// IN (`onIn` 0x101084534): outside a region, the in point is the playing time (on the
-    /// quantize step with Q on).
+    /// The region IN / OUT act on: the one being adjusted, else the one under the play head.
+    fn censor_here(&self) -> Option<usize> {
+        let c = &self.pdr().censor;
+        if c.adjust != 0 && c.adjust_i < c.regions.len() {
+            return Some(c.adjust_i);
+        }
+        censor_at(&c.regions, self.pos())
+    }
+
+    /// A time on the deck's SNAP lattice with Q on (`addRange` quantizes with type 0).
+    fn censor_q(&self, t: f64) -> f64 {
+        if self.performance() { self.quantize_action(t, crate::deck::QType::Snap) } else { self.quantized(t) }
+    }
+
+    /// IN (`onIn` 0x101084534). While IN adjust runs: it ends and the in point is saved.
+    /// Inside a region ("IN ADJ"): OUT adjust ends (saved) and IN adjust starts, the playhead
+    /// going to the in point (`doAdjustInPoint`). Outside: the in point is the playing time.
     pub fn censor_in(&mut self) {
         if self.deck.track.is_none() {
             return;
         }
-        let t = self.quantized(self.pos());
-        if censor_at(&self.pdr().censor.regions, t).is_some() {
+        if self.pdr().censor.adjust == 1 {
+            self.censor_end_adjust();
             return;
         }
+        if let Some(i) = self.censor_here() {
+            if self.pdr().censor.adjust == 2 {
+                self.censor_end_adjust();
+            }
+            let a = self.pdr().censor.regions[i].a;
+            let c = &mut self.pd().censor;
+            c.adjust = 1;
+            c.adjust_i = i;
+            c.pending_in = None;
+            self.seek(a);
+            return;
+        }
+        let t = self.censor_q(self.pos());
         self.pd().censor.pending_in = Some(t);
     }
 
-    /// OUT (`onOut` 0x101084744): with an in point waiting, the region up to the playing time
-    /// is added and saved.
+    /// OUT (`onOut` 0x101084744). While OUT adjust runs: it ends and the out point is saved.
+    /// Inside a region ("OUT ADJ"): IN adjust ends (saved) and OUT adjust starts, the playhead
+    /// going to the out point. Outside, with an in point waiting: the region up to the playing
+    /// time is added (`addRange`: both ends on the SNAP lattice with Q on, an out that lands on
+    /// the in point moves one step on, then one sample back; refused under 6.667 ms or over
+    /// another region) and saved.
     pub fn censor_out(&mut self) -> bool {
+        if self.deck.track.is_some() && self.pdr().censor.adjust == 2 {
+            self.censor_end_adjust();
+            return true;
+        }
+        if self.deck.track.is_some() {
+            if let Some(i) = self.censor_here() {
+                if self.pdr().censor.adjust == 1 {
+                    self.censor_end_adjust();
+                }
+                let b = self.pdr().censor.regions[i].b;
+                let c = &mut self.pd().censor;
+                c.adjust = 2;
+                c.adjust_i = i;
+                self.seek(b);
+                return true;
+            }
+        }
         let (Some(a), Some(track)) = (self.pdr().censor.pending_in, self.deck.track) else { return false };
-        let mut b = self.quantized(self.pos());
-        if self.prefs.quantize && (b - a).abs() < 1e-6 {
-            // (rekordbox: an out point that lands on the in point moves one quantize step on.)
-            b = a + self.beat_len() / self.prefs.quantize_div.max(1) as f64;
+        let sr = self.deck.audio.as_ref().map(|x| x.sr as f64).unwrap_or(44100.0);
+        let mut b = self.censor_q(self.pos());
+        if self.prefs.quantize && (b - a).abs() < 1e-6 && self.deck.beats.len() >= 2 {
+            let unit = if self.performance() { self.quantize_unit(crate::deck::QType::Snap) } else { 1.0 / self.prefs.quantize_div.max(1) as f64 };
+            b = crate::deck::grid_pos(&self.deck.beats, a).and_then(|p| crate::deck::grid_time(&self.deck.beats, p + unit)).unwrap_or(a + self.beat_len() * unit);
+        }
+        if self.prefs.quantize {
+            b -= 1.0 / sr;
         }
         if !censor_can_add(&self.pdr().censor.regions, a, b) {
             return false;
@@ -707,8 +797,53 @@ impl App {
         true
     }
 
+    /// Adjust running: the edge follows the playhead where `setInPoint` / `setOutPoint`
+    /// allow it (`doActiveCensorIfNeeded`, before each block). Called every frame.
+    fn censor_follow(&mut self) {
+        let (adj, i) = (self.pdr().censor.adjust, self.pdr().censor.adjust_i);
+        if adj == 0 {
+            return;
+        }
+        if i >= self.pdr().censor.regions.len() {
+            self.pd().censor.adjust = 0;
+            return;
+        }
+        let t = self.pos();
+        let r = self.pdr().censor.regions[i].clone();
+        let (a, b) = if adj == 1 { (t, r.b) } else { (r.a, t) };
+        if (a - r.a).abs() < 1e-4 && (b - r.b).abs() < 1e-4 {
+            return;
+        }
+        if censor_edge_ok(&self.pdr().censor.regions, i, a, b) {
+            let reg = &mut self.pd().censor.regions[i];
+            reg.a = a;
+            reg.b = b;
+            self.censor_push();
+        }
+    }
+
+    /// End IN / OUT adjust and save the region's points (`setInPointToDb` / `setOutPointToDb`).
+    pub fn censor_end_adjust(&mut self) {
+        let i = self.pdr().censor.adjust_i;
+        self.pd().censor.adjust = 0;
+        let Some(r) = self.pdr().censor.regions.get(i).cloned() else { return };
+        if r.id > 0 {
+            let _ = self.db.conn.execute("UPDATE active_censor SET in_ms=?1, out_ms=?2 WHERE id=?3", rusqlite::params![r.a * 1000.0, r.b * 1000.0, r.id]);
+        }
+    }
+
+    /// The IN / OUT pads read "IN ADJ" / "OUT ADJ" while the playhead is in a region or an
+    /// adjust runs (`ActiveCensorPad::paintButton`, flag +532); and which adjust runs.
+    pub fn censor_adjust_state(&self) -> (bool, u8) {
+        (self.censor_here().is_some(), self.pdr().censor.adjust)
+    }
+
     /// CLEAR (`onClear` 0x101084ab0): the region under the play head goes.
     pub fn censor_clear(&mut self) -> bool {
+        // (Not while adjusting, `onClear`.)
+        if self.pdr().censor.adjust != 0 {
+            return false;
+        }
         let t = self.pos();
         let Some(i) = censor_at(&self.pdr().censor.regions, t) else {
             // (Nothing under the play head: an in point that waits is dropped.)
@@ -834,7 +969,8 @@ impl App {
                 }
             }
             UserAct::Key(k) => {
-                let pos = (0..40).find(|p| key_at(*p) == k);
+                let s1 = self.key_scale1();
+                let pos = (0..40).find(|p| key_at_in(*p, s1) == k);
                 if let Some(p) = pos {
                     self.pad_key(p);
                 }
@@ -845,13 +981,122 @@ impl App {
                 self.pd().user_sampler = Some(slot);
             }
             UserAct::SeqCall(slot) => self.sampler_seq_call(slot, shift),
+            UserAct::PadFx(bank, pad) => {
+                let n = (self.px.active as usize).min(3);
+                let idx = if bank == 2 {
+                    self.pad_fx_combination_ready(n);
+                    32 + pad
+                } else {
+                    bank * 16 + pad
+                };
+                crate::ui_padfx::pad_down(self, n, idx);
+                self.pd().user_held = Some(UserHeld::PadFx(idx));
+            }
+            UserAct::Transport(t) => self.user_transport(t),
+            UserAct::SampleScratch(slot) => self.sample_scratch_pad(slot),
             UserAct::Other => {}
+        }
+    }
+
+    /// A transport item of a USER pad, through the deck's own functions.
+    fn user_transport(&mut self, t: Transport) {
+        match t {
+            Transport::PlayPause => self.play_pause_synced(),
+            Transport::Cue => {
+                self.cue_down();
+                self.pd().user_held = Some(UserHeld::Cue);
+            }
+            Transport::PitchBend(d) => {
+                self.pitch_bend(d as i32);
+                self.pd().user_held = Some(UserHeld::Bend);
+            }
+            Transport::Bpm(dir, hundredths) => {
+                // The tempo slider moves by `hundredths` / 100 percent (never past its range).
+                if self.sync_follower() {
+                    self.toast_err("Invalid operation. In Sync mode, Tempo Slider is only available for Master Deck.");
+                    return;
+                }
+                let range = self.tempo_range();
+                let v = self.deck.x.tempo_adj + dir as f64 * hundredths as f64 * 0.0001;
+                self.deck.x.tempo_adj = v.clamp(-range, range);
+                self.push_deck_controls();
+            }
+            Transport::CueLoopCall(d) => self.memory_jump(d as i32),
+            Transport::TempoReset => self.tempo_reset(),
+            Transport::Slip => self.toggle_slip(),
+            Transport::Track(d) => {
+                if d < 0 {
+                    self.previous_track();
+                } else {
+                    self.load_adjacent(1);
+                }
+            }
+            Transport::ActiveLoop => {
+                // (The memory loop at the cue point becomes active or not, `eventActiveLoop`.)
+                let cp = self.deck.cue_point;
+                if let Some(c) = self.deck.cues.iter_mut().find(|c| c.kind == CueKind::Memory && c.end.is_some() && (c.start - cp).abs() < 0.005) {
+                    c.active_loop = !c.active_loop;
+                }
+            }
+        }
+    }
+
+    /// PAD FX's combination bank (16 pads, `padFxCombinationPreset`) sits after the deck's two
+    /// banks, so that a USER pad can play it through the PAD FX engine (indices 32..47).
+    fn pad_fx_combination_ready(&mut self, n: usize) {
+        let d = &mut self.prefs.fx.padfx.decks[n.min(3)];
+        if d.len() < 48 {
+            let std = crate::ui_padfx::preset(0);
+            while d.len() < 32 {
+                let k = d.len();
+                d.push(std[k]);
+            }
+            d.truncate(32);
+            d.extend(crate::ui_padfx::preset(2));
+        }
+    }
+
+    /// SP.SCRATCH pad `pad` (0..15; `SamplerControlPanel::SampleScratch::doSampleScratch`):
+    /// the sampler slot of the bank in use is loaded onto the deck to be scratched there, with
+    /// the slot's sync; pads 9-16 only with 16 slots. A playing deck under Load Lock refuses
+    /// (rekordbox's message). The pad mode is a controller's (rekordbox shows no view for it:
+    /// `MemoryCuePanel::setPadMode` case 8 sets only the controller's pad mode).
+    pub fn sample_scratch_pad(&mut self, pad: usize) {
+        if pad > 15 || (pad >= 8 && !self.prefs.sampler.slots16) {
+            return;
+        }
+        let idx = self.prefs.sampler.bank.min(3) as usize * 16 + pad;
+        let Some(slot) = self.prefs.sampler.slots.get(idx).cloned().flatten() else { return };
+        if slot.track <= 0 {
+            return;
+        }
+        let before = self.deck.track;
+        self.load_track_here(slot.track);
+        if self.deck.track != Some(slot.track) || (before == Some(slot.track) && self.deck.audio.is_none()) {
+            return;
+        }
+        if !slot.looped && slot.offset_ms > 0.0 {
+            let t = slot.offset_ms as f64 / 1000.0;
+            self.deck.cue_point = t;
+            self.seek(t);
+        }
+        if self.deck.x.beat_sync != slot.sync {
+            self.toggle_beat_sync();
         }
     }
 
     pub fn user_pad_up(&mut self) {
         if let Some(slot) = self.pd().user_sampler.take() {
             self.sampler_pad_up(slot);
+        }
+        match self.pd().user_held.take() {
+            Some(UserHeld::Cue) => self.cue_up(),
+            Some(UserHeld::Bend) => self.pitch_bend(0),
+            Some(UserHeld::PadFx(idx)) => {
+                let n = (self.px.active as usize).min(3);
+                crate::ui_padfx::pad_up(self, n, idx);
+            }
+            None => {}
         }
         let held = self.deck.hot_preview.is_some() || self.player.state.lock().slip_hold;
         if held {
@@ -869,7 +1114,7 @@ impl App {
         let sl = &st.pads.slicer;
         let hot: Vec<char> = self.deck.cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (b'A' + c.slot as u8) as char).collect();
         format!(
-            "deck {} mode {} | playing {} pos {:.3}s loop {:?} key {:+} MT {} | jump page {} | slicer on {} loop-mode {} start-beat {} length {} roll {} held {:?} roll {:?} waiting {:?} bg {:?} starts {} | censor on {} fx {} regions {:?} in {:?} active {:?} | key cue {:?} hot {:?}",
+            "deck {} mode {} | playing {} pos {:.3}s loop {:?} key {:+} MT {} | jump page {} | slicer on {} loop-mode {} start-beat {} length {} roll {} held {:?} roll {:?} waiting {:?} bg {:?} starts {} | censor on {} fx {} regions {:?} in {:?} active {:?} adjust {} | key cue {:?} hot {:?} | tempo {:+.2}% padfx held {:?} | last message {:?}",
             n + 1,
             PadMode::from_code(self.px.pad_mode[n]).label(),
             st.playing,
@@ -893,8 +1138,12 @@ impl App {
             d.censor.regions.iter().map(|r| ((r.a * 1000.0).round() / 1000.0, (r.b * 1000.0).round() / 1000.0, fraction_text(r.beats[(d.censor.kind as usize).min(3)]))).collect::<Vec<_>>(),
             d.censor.pending_in.map(|t| (t * 1000.0).round() / 1000.0),
             st.pads.censor.active,
+            d.censor.adjust,
             d.key_cue.map(|c| (b'A' + c as u8) as char),
             hot,
+            self.deck.x.tempo_adj * 100.0,
+            self.px.fxx.pad.decks[n].held,
+            self.toasts.last().map(|t| t.text.as_str()),
         )
     }
 }

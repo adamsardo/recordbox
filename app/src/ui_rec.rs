@@ -189,6 +189,18 @@ pub struct RecUi {
     ready: bool,
     /// Where the tag information window's title field and OK button are (the scripted run).
     tag_pts: Option<(Pos2, Pos2)>,
+    /// "Now recording. Quit rekordbox?" is asking; the answer was Yes (the window may close).
+    pub quit_ask: bool,
+    pub quit_ok: bool,
+    /// Where the question's Yes and No are (the scripted run).
+    quit_pts: Option<(Pos2, Pos2)>,
+    /// The separate-files window's top left (the scripted run).
+    split_o: Option<Pos2>,
+    /// A recording dragged from the Recordings list that is not in the collection yet: it is
+    /// imported, and the drag carries it once it is there.
+    drag_file: Option<String>,
+    /// Tracks made from the files of the Recordings list (their tags), by path and size.
+    rows: std::collections::HashMap<(String, u64), crate::model::Track>,
 }
 
 impl RecUi {
@@ -712,6 +724,7 @@ fn hms_ms(ms: f64) -> String {
 /// The windows a finished recording brings up: "separate?", the progress of a file being
 /// rewritten, the tag information window, and "Remove Recording File".
 pub fn windows(app: &mut App, ctx: &egui::Context) {
+    quit_guard(app, ctx);
     remove_window(app, ctx);
     let Some(mut post) = app.rec.posts.pop_front() else { return };
     match post.stage {
@@ -733,15 +746,71 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     app.rec.posts.push_front(post);
 }
 
+/// Quitting while recording (`RekordboxApplication::systemRequestedQuit` 0x10084394c): an
+/// alert with no title and no icon, "Now recording. Quit rekordbox?" (here with recordbox's
+/// name), Yes / No. Yes stops the recording at once (`RecControlPanel::stopRecSync`: the file
+/// is finished, the steps after a recording are not run) and the app quits; No keeps both.
+pub const MSG_QUIT: &str = "Now recording. Quit recordbox?";
+
+fn quit_guard(app: &mut App, ctx: &egui::Context) {
+    if ctx.input(|i| i.viewport().close_requested()) && app.rec.recording() && !app.rec.quit_ok {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        app.rec.quit_ask = true;
+    }
+    if !app.rec.quit_ask {
+        return;
+    }
+    if !app.rec.recording() {
+        app.rec.quit_ask = false;
+        return;
+    }
+    let mut answer = None;
+    let mut pts = None;
+    kit::dialog(ctx, " ").id(egui::Id::new("rec_quit")).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+        kit::apply_style(ui);
+        ui.set_width(360.0);
+        kit::message(ui, MSG_QUIT);
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.add_space(((ui.available_width() - 200.0) / 2.0).max(0.0));
+            let y = ui.add(btn("Yes").min_size(vec2(96.0, 24.0)));
+            let n = ui.add(btn("No").min_size(vec2(96.0, 24.0)));
+            pts = Some((y.rect.center(), n.rect.center()));
+            if y.clicked() {
+                answer = Some(0);
+            }
+            if n.clicked() {
+                answer = Some(1);
+            }
+        });
+    });
+    app.rec.quit_pts = pts;
+    match answer {
+        Some(0) => {
+            app.rec.quit_ask = false;
+            app.rec.quit_ok = true;
+            app.rec_stop();
+            // (Only the file is finished; the questions and the tag window are not shown.)
+            app.rec.posts.clear();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        Some(_) => app.rec.quit_ask = false,
+        None => {}
+    }
+}
+
 /// "You can separate the recorded file ..." (`RecAutoTrackSplitComponent`, 580 x 400).
 fn split_window(app: &mut App, ctx: &egui::Context, post: &mut Post) {
     let total = post.files.first().map(|f| f.1).unwrap_or(0.0);
     let lengths = rec::split_lengths(total, &post.splits);
     let mut answer: Option<bool> = None;
+    let mut split_o = None;
     kit::dialog(ctx, "recordbox").id(egui::Id::new("rec_split")).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
         kit::apply_style(ui);
         let (r, _) = ui.allocate_exact_size(vec2(580.0 - 32.0, 400.0 - 32.0), Sense::hover());
         let o = r.min - vec2(16.0, 16.0);
+        split_o = Some(o);
         let p = ui.painter().clone();
         let text = |x: f32, y: f32, s: &str| {
             p.text(pos2(o.x + x, o.y + y + 12.0), Align2::LEFT_CENTER, s, inter(13.0), WHITE);
@@ -777,6 +846,7 @@ fn split_window(app: &mut App, ctx: &egui::Context, post: &mut Post) {
             answer = Some(false);
         }
     });
+    app.rec.split_o = split_o;
     match answer {
         Some(true) => {
             let file = post.files[0].0.clone();
@@ -831,7 +901,9 @@ fn tag_window(app: &mut App, ctx: &egui::Context, post: &mut Post) {
         kit::apply_style(ui);
         let (r, _) = ui.allocate_exact_size(vec2(600.0 - 32.0, 400.0 - 32.0), Sense::hover());
         let o = r.min - vec2(16.0, 16.0);
-        pts = Some((o + vec2(290.0, 220.0 + 24.0), o + vec2(210.0, 360.0)));
+        // The Mix Title / Track Title field's centre (the third field: 184 + 24 .. + 48) and
+        // OK's. (The scripted run once aimed 24 pt below the field, so it could not type.)
+        pts = Some((o + vec2(290.0, 184.0 + 24.0 + 12.0), o + vec2(210.0, 360.0)));
         let p = ui.painter().clone();
         let text = |x: f32, y: f32, s: &str, c: Color32| {
             p.text(pos2(o.x + x, o.y + y + 12.0), Align2::LEFT_CENTER, s, inter(13.0), c);
@@ -1043,6 +1115,32 @@ pub fn tree(app: &mut App, ui: &mut Ui) {
     });
 }
 
+/// A recording as a row of the track list: its tags, length, size and file details.
+fn row_track(f: &Path, size: u64, secs: f64) -> crate::model::Track {
+    let tag = rec::read_tags(f);
+    let mut t = crate::model::Track { path: f.to_string_lossy().to_string(), key: -1, ..Default::default() };
+    t.title = if tag.title.is_empty() { f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default() } else { tag.title };
+    t.artist = tag.artist;
+    t.album = tag.album;
+    t.duration = secs;
+    t.file_size = size;
+    t.file_type = "wav".into();
+    t.sample_rate = rec::REC_RATE as u32;
+    t.bitrate = 1411;
+    t.track_no = tag.track_no as i32;
+    if let Ok(m) = std::fs::metadata(f).and_then(|m| m.modified()) {
+        let d: chrono::DateTime<chrono::Local> = m.into();
+        t.date_created = d.format("%Y-%m-%d").to_string();
+    }
+    t
+}
+
+/// The collection's columns as the Recordings list shows them (order and widths of the
+/// collection's list).
+pub fn rec_columns(app: &App) -> Vec<(Col, f32)> {
+    app.prefs.columns.iter().copied().filter(|c| !matches!(c, Col::Artwork)).map(|c| (c, crate::ui_browser::col_width(app, c))).collect()
+}
+
 /// The recordings in a folder of the Recordings source. A double click loads one (importing
 /// it first when it is not in the collection yet); the menu has rekordbox's "Remove Recording
 /// File".
@@ -1068,6 +1166,28 @@ pub fn list(app: &mut App, ui: &mut Ui, dir: &str) {
     };
     let in_collection: std::collections::HashMap<&str, i64> = app.tracks.iter().map(|t| (t.path.as_str(), t.id)).collect();
     let ids: Vec<Option<i64>> = files.iter().map(|f| in_collection.get(f.0.to_string_lossy().as_ref()).copied()).collect();
+    // A row as the collection shows it: the collection's own track, else one made from the
+    // file's tags (read once per file and size).
+    let rows: Vec<crate::model::Track> = files
+        .iter()
+        .zip(&ids)
+        .map(|((f, size, secs), id)| {
+            if let Some(t) = id.and_then(|id| app.track(id)) {
+                return t.clone();
+            }
+            let key = (f.to_string_lossy().to_string(), *size);
+            app.rec.rows.entry(key).or_insert_with(|| row_track(f, *size, *secs)).clone()
+        })
+        .collect();
+    // A dragged recording that had to be imported first: the drag carries it once it is in.
+    if let Some(df) = app.rec.drag_file.clone() {
+        if !ui.input(|i| i.pointer.any_down()) {
+            app.rec.drag_file = None;
+        } else if let Some(id) = app.tracks.iter().find(|t| t.path == df).map(|t| t.id) {
+            app.drag = Some(vec![id]);
+            app.rec.drag_file = None;
+        }
+    }
     let bar = Rect::from_min_size(r.min, vec2(r.width(), 26.0));
     let p = ui.painter().clone();
     p.rect_filled(bar, 0.0, BG2);
@@ -1078,42 +1198,49 @@ pub fn list(app: &mut App, ui: &mut Ui, dir: &str) {
     };
     p.text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, title, rb(crate::ui_browser::TITLE_FONT), WHITE);
     let mut body = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(r.min.x, r.min.y + 26.0), r.max)));
-    let cols = [("Track Title", 360.0), ("Artist", 180.0), ("Album", 180.0), ("Time", 70.0), ("Size", 80.0), ("In Collection", 100.0)];
+    // The collection's columns in its order and widths (the ones drawn rather than written,
+    // such as the artwork and the attribute icons, stay empty: a recording has none).
+    let cols: Vec<(Col, f32)> = rec_columns(app);
     let hdr = body.allocate_exact_size(vec2(body.available_width(), 14.0), Sense::hover()).0;
     body.painter().rect_filled(hdr, 0.0, BG2);
-    let mut x = hdr.min.x + 8.0;
-    for (c, w) in cols {
-        body.painter().text(pos2(x, hdr.center().y), Align2::LEFT_CENTER, c, rb(10.5), WHITE);
+    let mut x = hdr.min.x;
+    for (c, w) in &cols {
+        body.painter().with_clip_rect(Rect::from_min_max(pos2(x, hdr.min.y), pos2(x + w - 2.0, hdr.max.y))).text(pos2(x + 4.0, hdr.center().y), Align2::LEFT_CENTER, c.label(), rb(10.5), WHITE);
+        body.painter().rect_filled(Rect::from_min_max(pos2(x + w - 1.0, hdr.min.y), pos2(x + w, hdr.max.y)), 0.0, BG);
         x += w;
     }
     let mut sel = app.rec.list_sel.clone();
     let mut remove = None;
     egui::ScrollArea::vertical().id_salt("rec_list").auto_shrink([false, false]).show_rows(&mut body, crate::ui_browser::ROW_H, files.len(), |ui, range| {
         for i in range {
-            let (f, size, secs) = &files[i];
+            let (f, _, _) = &files[i];
             let fs = f.to_string_lossy().to_string();
-            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), crate::ui_browser::ROW_H), Sense::click());
+            let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), crate::ui_browser::ROW_H), Sense::click_and_drag());
             if sel.as_deref() == Some(fs.as_str()) {
                 ui.painter().rect_filled(rr, 0.0, ROW_SEL);
             } else if i % 2 == 1 {
                 ui.painter().rect_filled(rr, 0.0, hex(0x0E0E0E));
             }
-            // The tags are read once per listing (they sit at the end of the file).
-            let tk = egui::Id::new(("rec_tag", fs.clone(), *size));
-            let tag: TagInfo = ui.ctx().data(|d| d.get_temp::<(String, String, String)>(tk)).map(|t| TagInfo { title: t.0, artist: t.1, album: t.2, track_no: 0 }).unwrap_or_else(|| {
-                let t = rec::read_tags(f);
-                ui.ctx().data_mut(|d| d.insert_temp(tk, (t.title.clone(), t.artist.clone(), t.album.clone())));
-                t
-            });
-            let name = if tag.title.is_empty() { f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default() } else { tag.title.clone() };
-            let vals = [name, tag.artist.clone(), tag.album.clone(), rec::hms(*secs as u64), format!("{:.1} MB", *size as f64 / 1e6), if ids[i].is_some() { "✓".into() } else { String::new() }];
-            let mut x = rr.min.x + 8.0;
-            for (v, (_, w)) in vals.iter().zip(cols) {
-                ui.painter().with_clip_rect(Rect::from_min_max(pos2(x, rr.min.y), pos2(x + w - 6.0, rr.max.y))).text(pos2(x, rr.center().y), Align2::LEFT_CENTER, v, rb(10.5), WHITE);
+            let t = &rows[i];
+            let mut x = rr.min.x;
+            for (c, w) in &cols {
+                let v = if *c == Col::Num { (i + 1).to_string() } else { crate::ui_library_ext::col_text(app, t, *c).unwrap_or_default() };
+                ui.painter().with_clip_rect(Rect::from_min_max(pos2(x, rr.min.y), pos2(x + w - 4.0, rr.max.y))).text(pos2(x + 4.0, rr.center().y), Align2::LEFT_CENTER, v, rb(10.5), WHITE);
                 x += w;
             }
-            if resp.clicked() {
+            if resp.clicked() || resp.drag_started() {
                 sel = Some(fs.clone());
+            }
+            // Dragged onto a deck, a sampler slot or a playlist, as a collection row is; a
+            // recording the collection does not have yet is imported first.
+            if resp.drag_started() {
+                match ids[i] {
+                    Some(id) => app.drag = Some(vec![id]),
+                    None => {
+                        app.rec.drag_file = Some(fs.clone());
+                        app.import_paths(vec![f.clone()], None);
+                    }
+                }
             }
             if resp.double_clicked() {
                 match ids[i] {
@@ -1426,6 +1553,8 @@ impl App {
             ("wait 2", c, c),
             ("wait 3", c, c),
             ("wait 4", c, c),
+            ("QUIT:close|the window's close button while recording (asks, the recording goes on)", c, c),
+            ("QUIT:No|No (keeps recording)", c, c),
             ("REC (stop: the tag information window opens)", rec_btn, rec_btn),
             ("wait 5", c, c),
             ("TAGS:Mix Title field", c, c),
@@ -1442,6 +1571,17 @@ impl App {
             ("KEY:Cmd+Enter|Start/Pause REC (stops)", c, c),
             ("wait 11", c, c),
             ("CHECK:second", c, c),
+            ("PREFS2:optimize level on (the level window runs)", c, c),
+            ("REC (a third recording)", rec_btn, rec_btn),
+            ("wait 12", c, c),
+            ("wait 13", c, c),
+            ("wait 14", c, c),
+            ("STOPSPLIT:stop, with a silence split point half way (the separate-files window asks)", c, c),
+            ("SPLITYES:Yes in the separate-files window", c, c),
+            ("wait 15 (separating, then optimizing the level)", c, c),
+            ("wait 16", c, c),
+            ("wait 17", c, c),
+            ("CHECK:third", c, c),
         ];
         const START: u32 = 150;
         const SPAN: u32 = 40;
@@ -1481,6 +1621,25 @@ impl App {
             }
             return;
         }
+        if let Some(rest) = name.strip_prefix("QUIT:") {
+            let what = rest.split('|').next().unwrap_or("");
+            match (what, f) {
+                ("close", 3) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                ("No", 0) => {
+                    if let Some((_, no)) = self.rec.quit_pts {
+                        raw.events.push(egui::Event::PointerMoved(no));
+                    }
+                }
+                ("No", 3) | ("No", 5) => {
+                    if let Some((_, no)) = self.rec.quit_pts {
+                        raw.events.push(egui::Event::PointerButton { pos: no, button: egui::PointerButton::Primary, pressed: f == 3, modifiers: Default::default() });
+                    }
+                }
+                (_, 30) => eprintln!("rectest: {name}: asking {} | {}", self.rec.quit_ask, self.rec_state()),
+                _ => {}
+            }
+            return;
+        }
         if name.starts_with("TAGS:") {
             // The tag information window sits in the middle of the window: 600 x 400.
             let (field, ok) = self.rec.tag_pts.unwrap_or((a, a));
@@ -1509,6 +1668,44 @@ impl App {
                 self.side = SideMode::Recordings;
                 let root = rec_dir(&self.prefs.rec).to_string_lossy().to_string();
                 self.set_view(View::Explorer(self.rec.last.first().and_then(|p| p.parent()).map(|p| p.to_string_lossy().to_string()).unwrap_or(root)));
+            }
+            if f == 30 {
+                say(self, name);
+            }
+            return;
+        }
+        if name.starts_with("PREFS2:") {
+            if f == 3 {
+                self.prefs.rec.normalize = true;
+            }
+            if f == 30 {
+                say(self, name);
+            }
+            return;
+        }
+        if name.starts_with("STOPSPLIT:") {
+            if f == 3 {
+                self.rec_stop();
+                // (A silence split point needs 20 s of quiet; the run puts one half way.)
+                if let Some(p) = self.rec.posts.back_mut() {
+                    let half = p.files.first().map(|f| f.1 / 2.0).unwrap_or(0.0);
+                    p.splits = vec![half];
+                    p.stage = Stage::AskSplit;
+                }
+            }
+            if f == 30 {
+                say(self, name);
+            }
+            return;
+        }
+        if name.starts_with("SPLITYES:") {
+            let yes = self.rec.split_o.map(|o| o + vec2(240.0, 360.0));
+            if let Some(y) = yes {
+                match f {
+                    0 => raw.events.push(egui::Event::PointerMoved(y)),
+                    3 | 5 => raw.events.push(egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: f == 3, modifiers: Default::default() }),
+                    _ => {}
+                }
             }
             if f == 30 {
                 say(self, name);
@@ -1636,6 +1833,15 @@ impl App {
             leftovers,
             cue.replace("\r\n", "\\r\\n\n").replace('\t', "\\t"),
         );
+        if name.contains("third") {
+            // Separated in two at the split point, then each file's level optimized: the two
+            // files' frames add up to what was recorded and the level went up.
+            let parts: Vec<u64> = self.rec.last.iter().filter_map(|p| rec::wav_info(p).ok()).map(|(_, ch, bits, _, bytes)| bytes as u64 / (ch.max(1) as u64 * (bits.max(8) / 8) as u64)).collect();
+            let sum: u64 = parts.iter().sum();
+            let ok = parts.len() == 2 && sum == self.rec.last_frames && peak > fed * 1.5;
+            eprintln!("rectest: {name}: files {} frames {:?} (sum {sum}, recorded {}) | level: fed {:.4}, first file's peak after optimizing {:.4} | {}", parts.len(), parts, self.rec.last_frames, fed, peak, if ok { "PASS (separated at the split point and the level optimized)" } else { "FAIL" });
+            return;
+        }
         let ok = rate == 44100 && ch == 2 && bits == 16 && data == rec::WAV_HEADER && frames as u64 == self.rec.last_frames && self.rec.last_dropped == 0 && (peak - fed).abs() < 0.0005 && frames > 44100;
         eprintln!("rectest: {name}: {}", if ok { "PASS (format, length and peak agree with what was recorded)" } else { "FAIL" });
     }

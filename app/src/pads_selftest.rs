@@ -325,6 +325,16 @@ impl App {
             wait("past the region (the effect is off again)"),
             wait("past the region"),
             click("ACT. CENSR previous in point", s120 + vec2(15.0, 9.0)),
+            // (perfrest track) The adjust mode: inside a region IN / OUT read IN ADJ / OUT ADJ;
+            // a press starts the adjust (the playhead goes to that edge, which then follows
+            // it), the next press ends it and saves the region.
+            click("ACT. CENSR IN ADJ (adjust starts at the in point)", cell8(1, 0)),
+            wait("adjusting: the in point follows the playhead"),
+            click("ACT. CENSR IN ADJ (adjust ends, saved)", cell8(1, 0)),
+            click("ACT. CENSR OUT ADJ (adjust starts at the out point)", cell8(1, 1)),
+            wait("adjusting: the out point follows the playhead"),
+            click("ACT. CENSR OUT ADJ (adjust ends, saved)", cell8(1, 1)),
+            click("ACT. CENSR previous in point", s120 + vec2(15.0, 9.0)),
             click("ACT. CENSR CLEAR inside the region (it is removed)", cell8(1, 2)),
             click("ACT. CENSR ON/OFF (off)", cell8(1, 3)),
             // USER 1
@@ -334,6 +344,24 @@ impl App {
             }),
             hold("USER 1 pad 1 (HOT CUE A) held", cell(0, 0).center()),
             click("USER 1 pad 6 (SAMPLER 2)", cell(1, 1).center()),
+            // (perfrest track) Transport and PAD FX items on a USER pad, set through the Pad
+            // Editor's call, then pressed on screen.
+            call("USER 1 pad 1 := TRANSPORT BPM + MEDIUM", |a| {
+                a.user_set_item(0, 0, Some(("Transport", "BPM + MEDIUM")));
+            }),
+            click("USER 1 pad 1 (BPM + MEDIUM: +0.50 %)", cell(0, 0).center()),
+            call("USER 1 pad 1 := PAD FX1 1", |a| {
+                a.user_set_item(0, 0, Some(("PadFx1", "1")));
+            }),
+            hold("USER 1 pad 1 (PAD FX1 pad 1) held", cell(0, 0).center()),
+            call("USER 1 pad 1 back to its template; the Pad Editor opened", |a| {
+                a.user_set_item(0, 0, None);
+                a.pads.editor_open = true;
+            }),
+            call("Pad Editor closed; SP.SCRATCH slot 1 (an empty slot: nothing happens)", |a| {
+                a.pads.editor_open = false;
+                a.sample_scratch_pad(0);
+            }),
             // PAD Display
             call("PAD Display, BEAT JUMP", |a| {
                 a.prefs.pads.layout = 3;

@@ -18,8 +18,13 @@
 //!   it shows the collection or a playlist; the Key cell is filled #00FF00 from 1 pt under the
 //!   row's top to 1 pt above its foot and the key is written in black.
 //!
-//! Not traced: the colours of the switched-on button (drawn here as the app's other lit
-//! buttons are).
+//! - the button's look (`SelectorButton` ctor 0x100f03ad4, `lookAndFeelChanged` 0x100f04100,
+//!   `CustomTextButton::paintButton` 0x1002d0e20): Arial 11 bold white text on #282828 in
+//!   both states (colour ids 0x1000281 / 0x3000012); switched on it gets a 1 pt #1473EB
+//!   outline (colour 0x300001F off = no line, on = the `0x1473EB` constant of
+//!   `__GLOBAL__sub_I_SelectorButton`), round on the left only; the 16 pt pull-down part is
+//!   #282828 with `pullDown.svg` in white (0x3000016). Off draws no outline (the paint style
+//!   switches the line on for the "on" state only).
 
 use crate::app::*;
 use crate::model::*;
@@ -52,6 +57,18 @@ pub const RANGE_NAMES: [&str; 4] = ["Same Key", "Related Key 1", "Related Key 2"
 pub const RANGE_HELP: &str = "The range of keys to be highlighted can be set with the Traffic Light feature.\nFor example, if the KEY of the loaded track is 2A(Alphanumeric), \ntracks with the following keys in the library are highlighted.\nSame Key:\n2A\nRelated Key 1:\n2A/2B\nRelated Key 2:\n2A/2B/1A/3A\nRelated Key 3:\n2A/2B/1A/3A/1B/3B";
 pub const TIP_ENABLE: &str = "Enable/disable Traffic Light feature.\nTraffic Light feature:\nWhen it is enabled, tracks in browser area that match the key of the loaded track are highlighted in green.";
 pub const TIP_TARGET: &str = "Select the target deck for Traffic Light feature.";
+
+/// Paint the header button (see the notes above): fill, then the 1 pt blue outline when on.
+pub fn paint_button(p: &eframe::egui::Painter, left: eframe::egui::Rect, right: eframe::egui::Rect, on: bool) {
+    use crate::theme::{BLUE, BTN};
+    use eframe::egui::{CornerRadius, Stroke, StrokeKind};
+    let lr = CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 };
+    p.rect_filled(left, lr, BTN);
+    p.rect_filled(right, CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, BTN);
+    if on {
+        p.rect_stroke(left, lr, Stroke::new(1.0, BLUE), StrokeKind::Inside);
+    }
+}
 
 /// The keys a range lights up for a target key (model index: 0..11 = 1A..12A, 12..23 =
 /// 1B..12B). Empty when the target key is unknown.

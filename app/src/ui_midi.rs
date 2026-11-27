@@ -28,7 +28,10 @@ const ROW: f32 = 22.0;
 const HEAD: f32 = 28.0;
 
 /// (header, width): the six columns rekordbox shows. CSVNAME, Encoder Mode and Color exist
-/// in its table and are hidden.
+/// in its table and are hidden: `MidiLearnTableComponent` (0x101663738) adds every column with
+/// flags 19 (visible, resizable, sortable; not on a column menu, not draggable), width limits
+/// 50..400, then hides columns 2, 6 and 8, so they cannot be brought back on screen. The
+/// Encoder Mode cell's list (" ", "7F/01", "41/3F") is therefore never seen.
 const COLS: [(&str, f32); 6] = [("Function", 200.0), ("Deck", 100.0), ("MIDI IN", 100.0), ("Type", 150.0), ("MIDI OUT", 100.0), ("Comment", 200.0)];
 
 const TEXT: Color32 = hex(0xEDEDED);
@@ -83,6 +86,8 @@ pub enum Ask {
 /// The window's state (a field of `MidiState`).
 #[derive(Default)]
 pub struct Win {
+    /// Column widths after the user dragged a header edge (None: rekordbox's widths).
+    pub widths: Option<[f32; 6]>,
     pub open: bool,
     /// Top-left of the content on screen.
     pub pos: Option<Pos2>,
@@ -817,7 +822,9 @@ fn table(app: &mut App, ui: &mut Ui, tr: Rect, live: bool) {
     p.rect_filled(head, 0.0, hex(0x242428));
     let mut x = tr.min.x;
     let mut xs = [0.0f32; 7];
-    for (i, (name, w)) in COLS.iter().enumerate() {
+    let mut ws = app.midi.win.widths.unwrap_or(COLS.map(|c| c.1));
+    for (i, (name, _)) in COLS.iter().enumerate() {
+        let w = &ws[i];
         xs[i] = x;
         let hr = Rect::from_min_size(pos2(x, head.min.y), vec2(*w, HEAD));
         let resp = ui.interact(hr, ui.id().with(("head", i)), if live { Sense::click() } else { Sense::hover() });
@@ -833,7 +840,21 @@ fn table(app: &mut App, ui: &mut Ui, tr: Rect, live: bool) {
         if resp.clicked() {
             sort_rows(&mut app.midi.win, i);
         }
+        // Each column's right edge is a resize handle (widths 50..400, as rekordbox sets them).
+        let edge = Rect::from_center_size(pos2(x + w - 0.5, head.center().y), vec2(6.0, HEAD));
+        let er = ui.interact(edge, ui.id().with(("headsize", i)), if live { Sense::drag() } else { Sense::hover() });
+        if er.hovered() || er.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let mut grown = 0.0;
+        if er.dragged() {
+            grown = er.drag_delta().x;
+        }
         x += w;
+        if grown != 0.0 {
+            ws[i] = (ws[i] + grown).clamp(50.0, 400.0);
+            app.midi.win.widths = Some(ws);
+        }
     }
     xs[6] = x;
     let tab = app.midi.win.tab;
@@ -865,7 +886,7 @@ fn table(app: &mut App, ui: &mut Ui, tr: Rect, live: bool) {
             if r < 12 {
                 app.midi.win.at.insert(format!("row:{r}"), pos2(xs[0] + 60.0, rr.center().y));
             }
-            for (c, (_, w)) in COLS.iter().enumerate() {
+            for (c, w) in ws.iter().enumerate() {
                 let cell = Rect::from_min_size(pos2(xs[c], rr.min.y), vec2(*w, ROW));
                 // The column separator: white at 20 %.
                 p.rect_filled(Rect::from_min_size(pos2(cell.max.x - 1.0, cell.min.y), vec2(1.0, ROW)), 0.0, Color32::WHITE.gamma_multiply(0.2));
@@ -1108,7 +1129,7 @@ struct TestCtl {
     leds: std::sync::Arc<parking_lot::Mutex<Vec<[u8; 3]>>>,
 }
 
-const TEST_NAME: &str = "recordbox test controller";
+pub const TEST_NAME: &str = "recordbox test controller";
 
 static TEST: parking_lot::Mutex<Option<TestCtl>> = parking_lot::Mutex::new(None);
 
@@ -1158,6 +1179,14 @@ impl App {
     /// controller. PREPDECK_SHOT_PLAYER=miditest (with PREPDECK_BENCH=<frames> to keep the
     /// window up): the scripted pointer run, which prints what each step did.
     pub fn shot_midi_events(&mut self, frame: u32, raw: &mut egui::RawInput) {
+        // `PREPDECK_SHOT_PLAYER=midiprobe PREPDECK_MIDI_PROBE=<port>`: the read-only
+        // hardware probe (midi.rs `probe`), started once (PREPDECK_MIDI_PROBE_SECS, default 8).
+        if frame == 150 && std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "midiprobe")).unwrap_or(false) {
+            if let Ok(port) = std::env::var("PREPDECK_MIDI_PROBE") {
+                let secs: f64 = std::env::var("PREPDECK_MIDI_PROBE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0);
+                std::thread::spawn(move || crate::midi::probe(&port, secs));
+            }
+        }
         let shot = std::env::var("PREPDECK_SHOT_MIDI").unwrap_or_default();
         let test = std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "miditest")).unwrap_or(false);
         if shot.is_empty() && !test {

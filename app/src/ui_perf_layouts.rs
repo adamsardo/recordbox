@@ -283,6 +283,110 @@ thread_local! {
     static SKIN: std::cell::RefCell<std::collections::HashMap<String, Option<egui::TextureHandle>>> = std::cell::RefCell::new(Default::default());
     /// The deck variant the pieces of `ui_perf.rs` are being drawn for (see `with_dk`).
     static DK: Cell<Option<Dk>> = const { Cell::new(None) };
+    /// The control strip's cut (capture) button is on (`PlayerWaveView::onCaptureButton`).
+    static CAPTURE_MODE: Cell<bool> = const { Cell::new(false) };
+    /// A capture being dragged from a waveform: the deck, slicer (true) or loop, and where it
+    /// was picked up.
+    static CAPTURE_DRAG: Cell<Option<(u8, bool, Pos2)>> = const { Cell::new(None) };
+    /// Where the sampler panel was last drawn (for the scripted run's capture drag).
+    static LAST_SAMPLER: Cell<Option<Rect>> = const { Cell::new(None) };
+}
+
+/// The waveform's capture mode (the control strip's cut button).
+pub(crate) fn capture_mode() -> bool {
+    CAPTURE_MODE.with(|c| c.get())
+}
+
+/// Over a deck's waveform (`lane`; vertical: the time runs down) while capture mode is on:
+/// a press on the running loop or on the slicer's domain picks it up to be dropped on a
+/// sampler slot (`WidgetWaveView::startCaptureDragging`). Called after the waveform has been
+/// drawn, so that this takes the drag before the waveform's own scrubbing.
+pub(crate) fn capture_pick(app: &mut App, ui: &mut Ui, lane: Rect, n: u8, vertical: bool) {
+    if !capture_mode() || app.deck.audio.is_none() {
+        return;
+    }
+    let Some((r, pos, pps)) = (if vertical { None } else { app.deck.detail_map }) .or_else(|| {
+        let span = span(app)?;
+        Some((lane, app.pos(), lane.height() as f64 / span))
+    }) else { return };
+    let along = |t: f64| -> f32 {
+        if vertical { lane.center().y + ((t - pos) * pps) as f32 } else { r.center().x + ((t - pos) * pps) as f32 }
+    };
+    let ni = (n as usize).min(3);
+    let slicer = app.pads.deck[ni].slicer.active;
+    let region = if slicer {
+        let b = app.pads.deck[ni].slicer.b;
+        Some((b[0], b[8]))
+    } else {
+        app.loop_active()
+    };
+    let Some((a, b)) = region else {
+        let resp = ui.interact(lane, ui.id().with(("capnone", n)), Sense::click());
+        if resp.clicked() {
+            app.toast_err("Invalid operation. Capture is available during Loop or Slicer performance.");
+        }
+        return;
+    };
+    let (u0, u1) = (along(a), along(b));
+    let rr = if vertical { Rect::from_min_max(pos2(lane.min.x, u0.min(u1)), pos2(lane.max.x, u0.max(u1))) } else { Rect::from_min_max(pos2(u0.min(u1), lane.min.y), pos2(u0.max(u1), lane.max.y)) }.intersect(lane);
+    if rr.width() <= 0.0 || rr.height() <= 0.0 {
+        return;
+    }
+    // (rekordbox shades the area that would be captured.)
+    ui.painter().rect_filled(rr, 0.0, Color32::from_rgba_unmultiplied(20, 115, 235, 50));
+    let resp = ui.interact(rr, ui.id().with(("cappick", n)), Sense::drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if resp.drag_started() {
+        let pp = ui.input(|i| i.pointer.press_origin()).unwrap_or(rr.center());
+        CAPTURE_DRAG.with(|c| c.set(Some((n, slicer, pp))));
+    }
+}
+
+/// The capture being dragged: drawn under the pointer, and dropped on a sampler slot when the
+/// button is let go there (the sampler panel is the last row; slots as `ui_sampler::panel`
+/// lays them out: 16 of 44 pt height, pads 1-8 on the left, 9-16 on the right).
+pub(crate) fn capture_drop(app: &mut App, ui: &mut Ui, full: Rect) {
+    let sampler = if app.prefs.perf_sampler { Some(Rect::from_min_max(pos2(full.min.x, full.max.y - crate::ui_sampler::SAMPLER_H), full.max)) } else { None };
+    LAST_SAMPLER.with(|c| c.set(sampler));
+    let Some((n, slicer, _)) = CAPTURE_DRAG.with(|c| c.get()) else { return };
+    let ptr = ui.ctx().pointer_latest_pos();
+    let down = ui.input(|i| i.pointer.primary_down());
+    let slot_at = |pp: Pos2| -> Option<usize> {
+        let s = sampler?;
+        let w = s.width();
+        let slot_w = ((w - 80.0) / 8.0).floor().max(146.0);
+        (0..app.sampler_pads()).find(|pad| {
+            let (col, row) = (pad & 3, (pad & 7) >> 2);
+            let x = if *pad < 8 { col as f32 * slot_w + 4.0 } else { w + (col as f32 - 4.0) * slot_w - 4.0 };
+            Rect::from_min_size(pos2(s.min.x + x, s.min.y + 44.0 * row as f32 + 4.0), vec2(slot_w, 44.0)).contains(pp)
+        })
+    };
+    if down {
+        if let Some(pp) = ptr {
+            let g = Rect::from_center_size(pp, vec2(90.0, 22.0));
+            let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("capdrag")));
+            lp.rect_filled(g, 2.0, Color32::from_rgba_unmultiplied(20, 115, 235, 160));
+            lp.text(g.center(), Align2::CENTER_CENTER, if slicer { "SLICER" } else { "LOOP" }, arial_b(11.0), WHITE);
+            if let Some(pad) = slot_at(pp) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+                let _ = pad;
+            }
+        }
+        ui.ctx().request_repaint();
+        return;
+    }
+    CAPTURE_DRAG.with(|c| c.set(None));
+    let Some(pad) = ptr.and_then(slot_at) else { return };
+    let idx = app.prefs.sampler.bank.min(3) as usize * 16 + pad;
+    if slicer {
+        app.with_deck(n, |a| {
+            a.slicer_capture();
+        });
+    } else {
+        app.sampler_capture_loop(n, Some(idx));
+    }
 }
 
 const SKINS: &str = "/Applications/rekordbox 7/rekordbox.app/Contents/Resources/skins";
@@ -832,6 +936,211 @@ pub(crate) fn tab_column(ui: &mut Ui, r: Rect, grid_on: bool) -> Option<bool> {
     out
 }
 
+// ------------------------------------------------------------------ the GRID tab's panel
+
+/// The deck's GRID panel in Performance (`djplay::GridViewPanel`, `resized` 0x102331cc8),
+/// drawn over the area of the pads and the loop box (`MemoryCuePanel::setPanelType(2)`;
+/// JUCE clips it to that area). Positions are rekordbox's, from the panel's top left:
+/// x0 = (16 or 0) - 45 (- 10 in 4Deck Vertical), rows at 256 / 273 / 304 / 335 + y0 with
+/// y0 = -253 in 4Deck Horizontal and -248 elsewhere. Columns: A-GAIN ("Set", the knob, PLAY),
+/// CENTER / BPM / TAP, the four grid moves, the four interval changes, x2 / 1/2 / whole /
+/// from here, then undo / redo, the analysis lock and the metronome; PHRASE EDIT at x0 + 452
+/// (in 2Deck Vertical under the grid, at y0 + 386). The buttons are rekordbox's skin images
+/// (read from the installed app); labels Arial 12 #969696, buttons Arial 14 #969696 on #191919.
+pub(crate) fn grid_panel(app: &mut App, ui: &mut Ui, area: Rect, n: u8, right: bool, d: Dk) {
+    let p = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
+    p.rect_filled(area, 0.0, hex(0x1E1E1E));
+    let loaded = app.deck.track.is_some();
+    let locked = app.deck.track.and_then(|t| app.track(t)).map(|t| t.grid_locked).unwrap_or(false);
+    let has_grid = !app.deck.grid.is_empty();
+    let x0 = if right { 16.0 } else { 0.0 } - 45.0 + if d == Dk::V4 { -10.0 } else { 0.0 };
+    let y0 = if d == Dk::H4 { -253.0 } else { -248.0 };
+    let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(area.min + vec2(x0 + x, y0 + y), vec2(w, h));
+    let grey = hex(0x969696);
+    let label = |p: &Painter, r: Rect, t: &str| {
+        p.text(pos2(r.min.x, r.center().y), Align2::LEFT_CENTER, t, arial(12.0 * 0.87), grey);
+    };
+    label(&p, at(48.0, 256.0, 80.0, 11.0), "GRID EDIT");
+    let enabled = loaded && !locked;
+    // A skin button: the image, dimmed while it cannot be used; returns the click (and true
+    // while the press repeats, after 1 s every 100 ms as rekordbox's `setRepeatSpeed`).
+    let skin_btn = |ui: &mut Ui, app: &App, r: Rect, name: &str, id: &str, tipt: &str, on: bool| -> (bool, bool) {
+        let resp = ui.interact(r, ui.id().with(("gridp", n, id)), Sense::click());
+        let tint = if on { Color32::WHITE } else { Color32::from_white_alpha(77) };
+        if !skin_at(&p, name, r, tint) {
+            p.rect_filled(r, 2.0, hex(0x191919));
+        }
+        if resp.hovered() && on {
+            p.rect_filled(r, 2.0, Color32::from_white_alpha(25));
+        }
+        let held = on && resp.is_pointer_button_down_on() && {
+            let now = ui.input(|i| i.time);
+            let t0 = ui.input(|i| i.pointer.press_start_time()).unwrap_or(now);
+            ui.ctx().request_repaint();
+            let key = resp.id.with("rep");
+            let last = ui.ctx().data(|dd| dd.get_temp::<f64>(key)).unwrap_or(0.0);
+            if now - t0 > 1.0 && now - last >= 0.1 {
+                ui.ctx().data_mut(|dd| dd.insert_temp(key, now));
+                true
+            } else {
+                false
+            }
+        };
+        (tip(resp, app, tipt).clicked() && on, held)
+    };
+    // Column 1: Set (the 1.1 Bars), A-GAIN, PLAY/PAUSE.
+    let tb = |ui: &mut Ui, p: &Painter, r: Rect, id: &str, t: &str, on: bool| -> egui::Response {
+        let resp = ui.interact(r, ui.id().with(("gridt", n, id)), Sense::click());
+        p.rect_filled(r, 2.0, if resp.hovered() && on { lighten(hex(0x191919)) } else { hex(0x191919) });
+        p.text(r.center(), Align2::CENTER_CENTER, t, arial(14.0 * 0.87), if on { grey } else { hex(0x505050) });
+        resp
+    };
+    if tb(ui, &p, at(50.0, 273.0, 50.0, 26.0), "set11", "Set", enabled && has_grid).on_hover_text("Set the 1.1 Bars position to the current position.").clicked() && enabled && has_grid {
+        app.grid_set_downbeat();
+    }
+    let kc = at(63.0, 306.0, 24.0, 24.0).center();
+    let db = app.gain_db();
+    let orange = hex(0xFFA300);
+    if let Some(v) = crate::ui_perf::knob(ui, kc, ("gridagain", n), crate::deck::again_pos(db), crate::deck::again_pos(0.0), orange) {
+        if loaded {
+            let db = crate::deck::again_db(v).max(-crate::player_ext::GAIN_RANGE_DB);
+            app.set_gain_db(db, true);
+        }
+    }
+    p.text(at(50.0, 326.0, 50.0, 9.0).center(), Align2::CENTER_CENTER, "A-GAIN", arial(9.0 * 0.87), grey);
+    let pr = at(62.0, 335.0, 26.0, 26.0);
+    let playing = app.playing();
+    let presp = ui.interact(pr, ui.id().with(("gridplay", n)), Sense::click());
+    if !skin_at(&p, if playing { "pauseBtn.svg" } else if loaded { "playBtn.svg" } else { "playBtn_off.svg" }, pr, Color32::WHITE) {
+        p.circle_stroke(pr.center(), 12.0, Stroke::new(1.0_f32, hex(0x2DD728)));
+    }
+    if tip(presp, app, "Play/Pause").clicked() && loaded {
+        app.play_pause_synced();
+    }
+    // Column 2: CENTER, the BPM, TAP.
+    if skin_btn(ui, app, at(105.0, 273.0, 50.0, 26.0), "Grid_CenterButton.svg", "center", "Set a beat to the current position.", enabled).0 {
+        app.grid_center();
+    }
+    let br = at(105.0, 304.0, 50.0, 26.0);
+    p.rect_filled(br, 2.0, hex(0x0F0F0F));
+    if !app.deck.x.bpm_editing {
+        let b = app.current_bpm();
+        app.deck.bpm_text = if loaded && b > 0.0 { format!("{b:.2}") } else { String::new() };
+    }
+    let mut txt = app.deck.bpm_text.clone();
+    let resp = ui.put(br.shrink2(vec2(2.0, 5.0)), egui::TextEdit::singleline(&mut txt).horizontal_align(egui::Align::Center).frame(false).font(arial(12.0 * 0.87)).text_color(Color32::WHITE).interactive(enabled));
+    app.deck.bpm_text = txt;
+    if resp.has_focus() {
+        app.deck.x.bpm_editing = true;
+    }
+    if resp.lost_focus() {
+        app.deck.x.bpm_editing = false;
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let t = app.deck.bpm_text.clone();
+            app.grid_enter_bpm(&t);
+        }
+    }
+    if tb(ui, &p, at(105.0, 335.0, 50.0, 26.0), "tap", "TAP", enabled).on_hover_text("Set BPM with the tapping interval").clicked() && enabled {
+        app.grid_tap();
+    }
+    // The grid moves (1 ms, fast 3 ms; held 10 / 30) and the interval changes (0.01 BPM, fast
+    // 0.03; held 0.10 / 0.30): `GridViewPanel::buttonClicked`.
+    let moves: [(f32, &str, f64, &str); 4] = [(160.0, "Grid_Button_MoveLeftFast.svg", -3.0, "Shift Beatgrid left (fast)"), (215.0, "Grid_Button_MoveLeft.svg", -1.0, "Shift Beatgrid left"), (270.0, "Grid_Button_MoveRight.svg", 1.0, "Shift Beatgrid right"), (325.0, "Grid_Button_MoveRightFast.svg", 3.0, "Shift Beatgrid right (fast)")];
+    for (x, name, ms, t) in moves {
+        let (c, held) = skin_btn(ui, app, at(x, 273.0, 50.0, 26.0), name, name, t, enabled);
+        if c || held {
+            app.grid_shift(ms * if held { 10.0 } else { 1.0 } / 1000.0);
+        }
+    }
+    let ints: [(f32, &str, f64, &str); 4] = [(160.0, "Grid_Button_ShrinkIntvlFast.svg", 3.0, "Shrink beat intervals (fast)"), (215.0, "Grid_Button_ShrinkIntvl.svg", 1.0, "Shrink beat intervals"), (270.0, "Grid_Button_ExpandIntvl.svg", -1.0, "Expand beat intervals"), (325.0, "Grid_Button_ExpandIntvlFast.svg", -3.0, "Expand beat intervals (fast)")];
+    for (x, name, steps, t) in ints {
+        let (c, held) = skin_btn(ui, app, at(x, 304.0, 50.0, 26.0), name, name, t, enabled);
+        if c || held {
+            let k = steps * if held { 10.0 } else { 1.0 } * 0.01;
+            app.grid_scale_bpm(|v| ((v + k) * 100.0).round() / 100.0);
+        }
+    }
+    if skin_btn(ui, app, at(160.0, 335.0, 50.0, 26.0), "grid_beat2timesBtn.svg", "x2", "Double the BPM value", enabled).0 {
+        app.grid_double_half(true);
+    }
+    if skin_btn(ui, app, at(215.0, 335.0, 50.0, 26.0), "grid_beatHalfBtn.svg", "x05", "Halve the BPM value", enabled).0 {
+        app.grid_double_half(false);
+    }
+    let fc = app.prefs.grid_from_current;
+    if skin_btn(ui, app, at(270.0, 335.0, 50.0, 26.0), "Grid_Button_AdjOnWholeTrack.svg", "whole", "Adjust whole Beatgrid", enabled && fc).0 {
+        app.prefs.grid_from_current = false;
+        app.save_prefs();
+    }
+    if skin_btn(ui, app, at(325.0, 335.0, 50.0, 26.0), "Grid_Button_AdjFromCurPos.svg", "fromcur", "Adjust partial Beatgrid", enabled && !fc).0 {
+        app.prefs.grid_from_current = true;
+        app.save_prefs();
+    }
+    // Undo / redo, the analysis lock, the metronome and its volume.
+    if skin_btn(ui, app, at(381.0, 273.0, 24.0, 26.0), "grid_unDoBtn.svg", "undo", "Undo", loaded && !app.deck.grid_undo.is_empty()).0 {
+        app.grid_undo();
+    }
+    if skin_btn(ui, app, at(407.0, 273.0, 24.0, 26.0), "grid_reDoBtn.svg", "redo", "Redo", loaded && !app.deck.grid_redo.is_empty()).0 {
+        app.grid_redo();
+    }
+    let lr = at(381.0, 304.0, 50.0, 26.0);
+    let lresp = ui.interact(lr, ui.id().with(("gridlock", n)), Sense::click());
+    p.rect_filled(lr, 2.0, hex(0x191919));
+    skin_at(&p, if locked { "grid_key_lockbtn_on.svg" } else { "grid_key_lockbtn_off.svg" }, Rect::from_center_size(lr.center(), vec2(12.0, 16.0)), Color32::WHITE);
+    if tip(lresp, app, if locked { "Track Analysis, Key Analysis, and Beatgrid Adjustment are locked." } else { "Enable/Disable Track Analysis, Key Analysis, and Beatgrid Adjustment." }).clicked() && loaded {
+        if let Some(id) = app.deck.track {
+            if let Some(t) = app.track_mut(id) {
+                t.grid_locked = !t.grid_locked;
+            }
+            app.save_track(id);
+        }
+    }
+    let met = app.deck.metronome;
+    if skin_btn(ui, app, at(381.0, 335.0, 24.0, 26.0), if met { "grid_metroNomeBtn_On.svg" } else { "grid_metroNomeBtn_Off.svg" }, "met", "Metronome On/Off", loaded).0 {
+        app.deck.metronome = !met;
+        app.update_metronome();
+    }
+    let vol = app.prefs.metronome_vol.clamp(1, 3);
+    let vr = at(407.0, 335.0, 24.0, 26.0);
+    let vresp = ui.interact(vr, ui.id().with(("gridmetvol", n)), Sense::click());
+    p.rect_filled(vr, 2.0, hex(0x191919));
+    for k in 0..3u8 {
+        let h = 4.0 + 3.0 * k as f32;
+        p.rect_filled(Rect::from_min_size(pos2(vr.center().x - 6.0 + 4.5 * k as f32, vr.center().y + 6.0 - h), vec2(3.0, h)), 0.0, if k < vol { grey } else { hex(0x3C3C3C) });
+    }
+    if tip(vresp, app, "Metronome Volume").clicked() {
+        app.set_metronome_volume(vol % 3 + 1);
+    }
+    // PHRASE EDIT: CUT, the phrase's type, CLEAR.
+    let (px, py) = if d == Dk::V2 { (48.0, 386.0) } else { (452.0, 256.0) };
+    label(&p, at(px, py, 80.0, 11.0), "PHRASE EDIT");
+    let cur = app.current_phrase();
+    let has = cur.is_some();
+    let (cut_r, list_r, clear_r) = if d == Dk::V2 { (at(50.0, 403.0, 50.0, 26.0), at(105.0, 403.0, 64.0, 26.0), at(174.0, 403.0, 50.0, 26.0)) } else { (at(454.0, 273.0, 50.0, 26.0), at(454.0, 304.0, 64.0, 26.0), at(454.0, 335.0, 50.0, 26.0)) };
+    if tb(ui, &p, cut_r, "phcut", "CUT", has).on_hover_text("Cut phrases.").clicked() && has {
+        app.phrase_cut();
+    }
+    let lresp = ui.interact(list_r, ui.id().with(("gridphkind", n)), Sense::click());
+    p.rect_filled(list_r, 2.0, hex(0x191919));
+    if let Some((mood, kind)) = cur {
+        p.with_clip_rect(list_r.shrink(2.0)).text(pos2(list_r.min.x + 5.0, list_r.center().y), Align2::LEFT_CENTER, crate::phrase::label(mood, kind), arial(12.0 * 0.87), grey);
+    }
+    skin_at(&p, "pullDown.svg", Rect::from_center_size(pos2(list_r.max.x - 9.0, list_r.center().y), vec2(11.0, 10.0)), if has { grey } else { hex(0x505050) });
+    if let Some((mood, kind)) = cur {
+        crate::ui_browser::dropdown(ui, &lresp, "gridphkindpop", |ui: &mut Ui| {
+            for (k, name) in crate::phrase::kinds(mood) {
+                if ui.selectable_label(crate::phrase::label(mood, kind) == *name, *name).clicked() {
+                    app.phrase_set_kind(*k);
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            }
+        });
+    }
+    let edited = app.deck.x.phrases_edited;
+    if tb(ui, &p, clear_r, "phclear", "CLEAR", edited).on_hover_text("Clear all the analyzed phrases. ").clicked() && edited {
+        app.phrase_clear();
+    }
+}
+
 // ------------------------------------------------------------------ the control strip (zoom)
 
 /// rekordbox's `WaveViewArea::ControlView`: the strip along the left of the horizontal
@@ -914,10 +1223,36 @@ pub(crate) fn control_strip(app: &mut App, ui: &mut Ui, area: Rect, vertical: bo
             let two = layout(app).decks() == 2;
             let cut = if vertical { at(if two { (w - 48.0) / 2.0 + 34.0 } else { (w - 14.0) / 2.0 }, 2.0, 14.0, 14.0) } else { at(4.0, if two { ((h - 44.0) / 2.0).floor() + 30.0 } else { ((h - 14.0) / 2.0).floor() }, 14.0, 14.0) };
             if two {
+                // Matching (`UiPlayer::eventLikeButton`): the tracks on decks 1 and 2 are
+                // registered as a good match of each other (Related Tracks' Matching), or no
+                // longer; lit while they are one.
                 let m = if vertical { at((w - 48.0) / 2.0, 2.0, 14.0, 14.0) } else { at(4.0, ((h - 44.0) / 2.0).floor(), 14.0, 14.0) };
-                let _ = icon(ui, m, "match", "wave_matching.svg", "Matching: not built in recordbox yet.");
+                let (a, b) = (app.deck_of(0).track, app.deck_of(1).track);
+                let lit = matches!((a, b), (Some(a), Some(b)) if app.is_match(a, b));
+                if lit {
+                    p.rect_filled(m.expand(2.0), 2.0, BLUE);
+                }
+                if icon(ui, m, "match", "wave_matching.svg", "Matching").clicked() {
+                    match (a, b) {
+                        (Some(a), Some(b)) => app.matching_set(a, b, !lit),
+                        _ => app.toast_err("Invalid operation. Matching can be set when tracks are loaded to Deck 1 and 2."),
+                    }
+                }
             }
-            let _ = icon(ui, cut, "cut", "wave_cut.svg", "Not built in recordbox yet.");
+            // Cut: capture mode, where a loop or the slicer's domain is dragged from the
+            // waveform onto a sampler slot; switching it on shows the sampler panel
+            // (`MainComponent::notifyCaptureButtonEvent`).
+            let on = capture_mode();
+            if on {
+                p.rect_filled(cut.expand(2.0), 2.0, BLUE);
+            }
+            if icon(ui, cut, "cut", "wave_cut.svg", "Capture").clicked() {
+                CAPTURE_MODE.with(|c| c.set(!on));
+                if !on && !app.prefs.perf_sampler {
+                    app.prefs.perf_sampler = true;
+                    app.save_prefs();
+                }
+            }
         }
         _ => {
             // DRUM CAPTURE (Groove Circuit, ui_groove.rs): a button per deck and the length.
@@ -1180,17 +1515,59 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
         let t = app.deck.x.menu_time.unwrap_or(pos);
         resp.context_menu(|ui| crate::ui_player2::wave_menu(app, ui, t));
     }
+    // Cue markers can be dragged along the lane as on the horizontal waveforms (hot cues by
+    // their letter box at the left, memory cues by the triangle at the right; quantized,
+    // Escape cancels): the same rule as `ui_player::draw_detail_at`, turned upright.
+    let hit = |cues: &[Cue], pp: Pos2| -> Option<i64> {
+        let mut best: Option<(f32, i64)> = None;
+        for c in cues {
+            let y = y_of(c.start);
+            let (ok, d) = match c.kind {
+                CueKind::Hot => (pp.x >= xl && pp.x <= xl + 12.0 && (pp.y - y).abs() <= 6.0, (pp.y - y).abs()),
+                _ => (pp.x >= xr - 9.0 && pp.x <= xr + 1.0 && (pp.y - y).abs() <= 7.0, (pp.y - y).abs()),
+            };
+            if ok && best.map(|b| d < b.0).unwrap_or(true) {
+                best = Some((d, c.id));
+            }
+        }
+        best.map(|b| b.1)
+    };
+    if app.deck.cue_drag.is_none() {
+        if let Some(hp) = resp.hover_pos() {
+            if hit(&app.deck.cues, hp).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+        }
+    }
     if resp.drag_started() {
         let pp = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
         let adj = app.deck.x.loop_adjust;
         if adj != 0 && app.loop_active().is_some() {
             let (a, b) = app.loop_active().unwrap_or((0.0, 0.0));
             app.deck.x.adjust_drag = Some((pp.map(|p| p.y).unwrap_or(cy), if adj == 1 { a } else { b }));
+        } else if let Some((id, pp)) = pp.and_then(|pp| hit(&app.deck.cues, pp).map(|id| (id, pp))) {
+            let start = app.deck.cues.iter().find(|c| c.id == id).map(|c| c.start).unwrap_or(0.0);
+            app.deck.cue_drag = Some((id, app.deck.cues.clone(), t_of(pp.y) - start));
         } else {
             app.deck.drag_origin = Some((pp.map(|p| p.y).unwrap_or(cy), pos));
         }
     }
-    if let Some((y0, t0)) = app.deck.x.adjust_drag {
+    if let Some((id, _, grab)) = app.deck.cue_drag.clone() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.commit_cue_drag(true);
+        } else if resp.dragged() {
+            if let Some(pp) = resp.interact_pointer_pos() {
+                let t = app.quantized(t_of(pp.y) - grab);
+                if let Some(c) = app.deck.cues.iter_mut().find(|c| c.id == id) {
+                    *c = crate::ui_player::moved_cue(c, t, dur);
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            app.commit_cue_drag(false);
+        }
+    } else if let Some((y0, t0)) = app.deck.x.adjust_drag {
         if let (true, Some(pp)) = (resp.dragged(), resp.interact_pointer_pos()) {
             app.loop_adjust_to(t0 + (pp.y - y0) as f64 / pps);
         }
@@ -1245,10 +1622,27 @@ pub(crate) fn h_lane(app: &mut App, ui: &mut Ui, lane: Rect, n: u8) {
         // (Cmd / Ctrl + wheel changes `prefs.zoom` in there: taken as a Performance zoom step.)
         let z = app.prefs.zoom;
         crate::ui_player::draw_detail_at(app, &mut child, r, pos, 0.0, crate::ui_player::DetailMode::Full);
+        capture_pick(app, &mut child, r, n, false);
         if app.prefs.zoom != z {
             let dir = if app.prefs.zoom < z { -1 } else { 1 };
             app.prefs.zoom = z;
             zoom_step(app, dir);
+        }
+        // Hot cue letters: the waveform draws them in a row above its beats, which a lane does
+        // not have (it is clipped to the lane), so they are drawn again inside the lane's top
+        // edge, centred on the cue line.
+        if let Some((dr, dpos, pps)) = app.deck.detail_map {
+            let cx = dr.center().x;
+            let p = child.painter().clone();
+            for c in app.deck.cues.iter().filter(|c| c.kind == CueKind::Hot) {
+                let x = cx + ((c.start - dpos) * pps) as f32;
+                if x < lane.min.x - 6.0 || x > lane.max.x + 6.0 {
+                    continue;
+                }
+                let lr = Rect::from_min_size(pos2(x - 5.5, lane.min.y + 1.0), vec2(11.0, 11.0));
+                p.rect_filled(lr, 0.0, hotcue_color(c.color));
+                p.text(lr.center(), Align2::CENTER_CENTER, ((b'A' + c.slot as u8) as char).to_string(), FontId::proportional(10.0), Color32::BLACK);
+            }
         }
         // The beat count: ends 2 pt left of the playhead, at the top of the lane.
         let label = beat_count_text(app, pos);
@@ -1289,6 +1683,7 @@ pub(crate) fn finish(app: &mut App, ui: &mut Ui, full: Rect, rects: &[Rect], lan
             app.activate_deck(*n);
         }
     }
+    capture_drop(app, ui, full);
     crate::ui_perf::read_meters(app, ui);
     let any = app.player.decks.iter().any(|s| s.lock().playing) || app.px.parked.iter().any(|d| d.loading.is_some()) || app.deck.loading.is_some() || app.searching() != 0;
     if any {
@@ -1360,6 +1755,7 @@ fn vertical(app: &mut App, ui: &mut Ui) {
         let label = app.with_deck(*n, |app| {
             let pos = app.pos();
             draw_detail_vertical(app, &mut child, lane, pos);
+            capture_pick(app, &mut child, lane, *n, true);
             beat_count_text(app, pos)
         });
         // The beat count under the lane: rekordbox's labels are 64 pt wide at 31 and 153 pt
@@ -1853,6 +2249,12 @@ pub(crate) fn shot_tick(app: &mut App) {
             }
         });
     }
+    // (`PREPDECK_SHOT_GRID=1`: every deck shows its GRID panel.)
+    if std::env::var("PREPDECK_SHOT_GRID").is_ok() {
+        for n in 0..4u8 {
+            app.deck_of_mut(n).x.dk.grid_tab = true;
+        }
+    }
 }
 
 /// `PREPDECK_SHOT_PLAYER=laytest` (with `--screenshot`, a layout's `PREPDECK_SHOT_VIEW` and
@@ -1949,6 +2351,53 @@ fn layout_steps(app: &App) -> Vec<(String, Pos2, Pos2)> {
         click(&mut v, "control strip: show".into(), if l.vertical() { pos2(wa.center().x, wa.min.y + 5.0) } else { pos2(wa.min.x + 5.0, wa.center().y) });
         click(&mut v, "control strip: next page".into(), next);
         click(&mut v, "control strip: previous page".into(), prev);
+        // (perfrest track) Page 1 of the strip: Matching (2-deck layouts) and Cut (capture
+        // mode, which shows the sampler panel); a running loop of deck 1 dragged from its
+        // waveform onto sampler slot 1; capture mode off; back to page 0.
+        let two = fr.count == 2;
+        let (m_at, cut_at) = if l.vertical() {
+            let x0 = wa.min.x + (wa.width() - 48.0) / 2.0;
+            (pos2(x0 + 7.0, wa.min.y + 9.0), pos2(if two { x0 + 41.0 } else { wa.center().x }, wa.min.y + 9.0))
+        } else {
+            let y0 = wa.min.y + ((wa.height() - 44.0) / 2.0).floor();
+            (pos2(wa.min.x + 11.0, y0 + 7.0), pos2(wa.min.x + 11.0, if two { y0 + 37.0 } else { wa.min.y + ((wa.height() - 14.0) / 2.0).floor() + 7.0 }))
+        };
+        click(&mut v, "control strip: next page (matching and cut)".into(), next);
+        if two {
+            click(&mut v, "strip: Matching (decks 1 and 2 become a match)".into(), m_at);
+            click(&mut v, "strip: Matching again (no longer a match)".into(), m_at);
+        }
+        click(&mut v, "strip: Cut (capture mode on, sampler panel shown)".into(), cut_at);
+        if let Some(dr) = fr.decks.first() {
+            if fr.dk.has_lower() {
+                let lo = lower_geo(fr.dk, dr.width(), false);
+                let o = pos2(dr.min.x, dr.min.y + g.info_h + 3.0 + extra);
+                click(&mut v, "deck 1 loop size (start a loop to capture)".into(), o + lo.loop_o.to_vec2() + vec2(34.0, 16.0));
+            }
+        }
+        let lane_pt = if l.vertical() { pos2(wa.min.x + if fr.count == 4 { 93.0 } else { 62.0 }, wa.center().y + 6.0) } else { pos2(wa.center().x + 8.0, wa.min.y + if fr.count == 4 { 25.0 } else { 30.0 }) };
+        if let Some(s) = LAST_SAMPLER.with(|c| c.get()).or(Some(Rect::from_min_max(pos2(0.0, 917.0 - crate::ui_sampler::SAMPLER_H), pos2(1512.0, 917.0)))) {
+            let slot_w = ((s.width() - 80.0) / 8.0).floor().max(146.0);
+            v.push(("capture drag: deck 1's loop onto sampler slot 1".into(), lane_pt, pos2(s.min.x + 4.0 + slot_w / 2.0, s.min.y + 4.0 + 22.0)));
+        }
+        click(&mut v, "strip: Cut (capture mode off)".into(), cut_at);
+        click(&mut v, "control strip: previous page".into(), prev);
+        // A cue marker of deck 1 dragged along the vertical waveform: hot cue pad A first (the
+        // deck goes to the cue, so its letter box is at the playhead), then its box dragged
+        // 20 pt down.
+        if l.vertical() {
+            if let Some(dr) = fr.decks.first() {
+                let lo = lower_geo(fr.dk, dr.width(), false);
+                let o = pos2(dr.min.x, dr.min.y + g.info_h + 3.0 + extra);
+                click(&mut v, "deck 1 hot cue pad A (to the cue)".into(), o + lo.pads.min.to_vec2() + vec2(40.0, lo.pad_h / 2.0));
+            }
+            let lane_w = wa.width() / fr.count as f32;
+            let i = if fr.count == 4 { 1.0 } else { 0.0 };
+            let (top, bot) = (wa.min.y + if fr.count == 4 { 18.0 } else { 0.0 }, wa.max.y - 14.0);
+            let x = wa.min.x + lane_w * i + 6.5;
+            let cy = (top + bot) / 2.0;
+            v.push(("deck 1 hot cue marker dragged down the vertical waveform".into(), pos2(x, cy), pos2(x, cy + 20.0)));
+        }
         // Scrub the first waveform: drag along its time axis.
         let (a, b) = if l.vertical() { (pos2(wa.min.x + if fr.count == 4 { 93.0 } else { 62.0 }, wa.center().y + 10.0), pos2(wa.min.x + if fr.count == 4 { 93.0 } else { 62.0 }, wa.center().y + 40.0)) } else { (pos2(wa.center().x + 200.0, wa.min.y + 30.0), pos2(wa.center().x + 260.0, wa.min.y + 30.0)) };
         v.push(("waveform of deck 1 dragged back".into(), a, b));
@@ -1968,7 +2417,10 @@ fn layout_state(app: &App) -> String {
             format!("{}:{}{} {:.2}s loop {} slip {} Q {} MT {} sync {} key {:+} range {} hot {}", i + 1, if d.track.is_some() { "" } else { "empty " }, if s.playing { "playing" } else { "paused" }, secs, s.loop_range.is_some(), d.x.slip, q, d.x.master_tempo, d.x.beat_sync, d.x.key_shift, d.x.tempo_range, d.cues.iter().filter(|c| c.kind == CueKind::Hot).count())
         })
         .collect();
-    format!("master {} active {} | zoom {:?} strip open {} page {} | fader1 {:.2} high1 {:.2} cue{} {} | {}", app.px.master + 1, app.px.active + 1, lp.zoom, lp.ctl_open, lp.ctl_page, app.px.mix[0].fader, app.px.mix[0].eq[2], n, app.px.mix[n - 1].cue, decks.join(" | "))
+    let matched = matches!((app.deck_of(0).track, app.deck_of(1).track), (Some(a), Some(b)) if app.is_match(a, b));
+    let slot1 = app.prefs.sampler.slots.get(app.prefs.sampler.bank.min(3) as usize * 16).and_then(|x| x.as_ref()).map(|x| x.name.clone());
+    let hot_a = app.deck_of(0).cues.iter().filter(|c| c.kind == CueKind::Hot).map(|c| (c.start * 1000.0).round() / 1000.0).next();
+    format!("master {} active {} | zoom {:?} strip open {} page {} | fader1 {:.2} high1 {:.2} cue{} {} | matching {} capture {} sampler panel {} slot 1 {:?} deck 1 first hot cue {:?} | last message {:?} | {}", app.px.master + 1, app.px.active + 1, lp.zoom, lp.ctl_open, lp.ctl_page, app.px.mix[0].fader, app.px.mix[0].eq[2], n, app.px.mix[n - 1].cue, matched, capture_mode(), app.prefs.perf_sampler, slot1, hot_a, app.toasts.last().map(|t| t.text.as_str()), decks.join(" | "))
 }
 
 #[cfg(test)]

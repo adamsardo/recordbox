@@ -591,7 +591,10 @@ mod tests {
             eprintln!("factory_files_round_trip: skipped, {} not found", dir.display());
             return;
         };
-        let (mut files, mut rows, mut canonical, mut entries_n, mut bare_lf) = (0, 0, 0, 0, 0);
+        let (mut files, mut rows, mut canonical, mut entries_n, mut bare_lf) = (0usize, 0usize, 0, 0, 0);
+        // Mapping files rekordbox added after 7.2.19 (the version the counts were taken from).
+        const NEWER_FILES: [&str; 1] = ["DJM-A7"];
+        let mut newer: Vec<(String, usize)> = vec![];
         let mut kinds: std::collections::HashMap<&'static str, usize> = Default::default();
         for ent in rd.flatten() {
             let p = ent.path();
@@ -600,6 +603,9 @@ mod tests {
             let bytes = std::fs::read(&p).unwrap();
             let f = CsvFile::parse(&bytes).unwrap_or_else(|e| panic!("{fname}: {e:?}"));
             files += 1;
+            if NEWER_FILES.contains(&port) {
+                newer.push((port.to_string(), f.rows().count()));
+            }
             assert_eq!(f.to_bytes(), bytes, "{fname} does not write back unchanged");
             assert!(f.device.eq_ignore_ascii_case(port), "{fname}: @file names {}", f.device);
             bare_lf += f.lines.iter().filter(|l| l.end == "\n").count();
@@ -645,8 +651,12 @@ mod tests {
             assert_eq!(norm(&o2), norm(&outs), "{fname}: outputs after a save");
         }
         eprintln!("factory_files_round_trip: {files} files, {rows} rows ({canonical} with options already in rekordbox's order), {entries_n} codes, {bare_lf} lines ending in a bare LF; kinds {kinds:?}");
-        assert_eq!(files, 69, "rekordbox 7.2.19 ships 69 mapping files");
-        assert_eq!(rows, 13505);
+        // rekordbox 7.2.19 shipped 69 files with 13,505 rows; 7.2.20 (installed on this machine
+        // on 2026-11-27) adds DJM-A7.midi.csv (12 rows). Every file found was checked above;
+        // the 7.2.19 set must still be there unchanged in size.
+        assert!(files >= 69, "{files} mapping files: fewer than rekordbox 7.2.19 shipped");
+        assert_eq!(files - newer.len(), 69, "files added after 7.2.19 other than {NEWER_FILES:?}");
+        assert_eq!(rows - newer.iter().map(|x| x.1).sum::<usize>(), 13505, "rows of the 7.2.19 files");
     }
 
     #[test]

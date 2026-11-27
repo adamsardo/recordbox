@@ -303,11 +303,13 @@ pub struct Engine {
     pub cut: bool,
     /// The last buffer held sound of the slots or of the release FX.
     pub sounding: bool,
+    /// The deck was playing in the last buffer (clips stop when it leaves PLAY).
+    was_playing: bool,
 }
 
 impl Engine {
     pub fn new(deck: usize) -> Engine {
-        Engine { rows: std::array::from_fn(|_| Row::new()), deck: deck.min(DECKS - 1), gain: 1.0, single: true, hold_drums: true, release: None, bpm: 120.0, silent: false, mix: vec![0.0; 16384], bus: vec![0.0; 16384], dry: vec![0.0; 16384], rfx: None, wet: 0.0, cut: false, sounding: false }
+        Engine { rows: std::array::from_fn(|_| Row::new()), deck: deck.min(DECKS - 1), gain: 1.0, single: true, hold_drums: true, release: None, bpm: 120.0, silent: false, mix: vec![0.0; 16384], bus: vec![0.0; 16384], dry: vec![0.0; 16384], rfx: None, wet: 0.0, cut: false, sounding: false, was_playing: false }
     }
 
     /// Make the release FX unit (not on the audio thread: it allocates).
@@ -362,6 +364,7 @@ impl Engine {
             }
         }
         self.rows[row].pending = Some((bank, f64::INFINITY));
+        WANTS[self.deck].store(true, Relaxed);
         true
     }
 
@@ -439,10 +442,14 @@ impl Engine {
             None => (f64::NAN, 0.0),
         };
         let synced = bpf > 0.0;
-        if !d.playing {
-            // The deck left PLAY: every clip stops.
+        // The deck left PLAY: every clip stops (`GrooveCircuit::onPlayModeChanged`). A slot
+        // launched while the deck stands plays at once and unsynced, at its own tempo
+        // (`launchWithQuantize` with the master not playing); only a change to a mode other
+        // than PLAY stops it, so it goes on (unsynced) when the deck starts.
+        if self.was_playing && !d.playing {
             self.stop_all();
         }
+        self.was_playing = d.playing;
         // Launches whose beat falls inside this buffer: (frame, bank, beat).
         let mut starts: [Option<(usize, usize, f64)>; ROWS] = [None; ROWS];
         for (i, r) in self.rows.iter_mut().enumerate() {
@@ -615,6 +622,7 @@ impl Engine {
             mix.iter_mut().for_each(|v| *v = 0.0);
         }
         self.sounding = any || wet_out;
+        WANTS[self.deck].store(self.sounding || self.rows.iter().any(|r| r.playing || r.pending.is_some()), Relaxed);
         self.sounding
     }
 
@@ -639,6 +647,17 @@ pub fn phase_error(have: f64, want: f64) -> f64 {
 pub static ENGINES: [Mutex<Option<Box<Engine>>>; DECKS] = [Mutex::new(None), Mutex::new(None), Mutex::new(None), Mutex::new(None)];
 /// An engine exists and has something to do (else the audio callback does not even lock).
 pub static ACTIVE: [AtomicBool; DECKS] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+
+/// A slot of the deck plays or waits to start: the deck has to render while it stands
+/// (set by the engine after each buffer and by a launch).
+pub static WANTS: [AtomicBool; DECKS] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+
+/// The audio callback asks whether a standing deck still has Groove Circuit sound to make.
+#[inline]
+pub fn wants_render(s: &crate::audio::PlayState) -> bool {
+    let d = (s.deck_no as usize).min(DECKS - 1);
+    ACTIVE[d].load(Relaxed) && WANTS[d].load(Relaxed)
+}
 
 /// One buffer of a deck's Groove Circuit, held by the audio callback while it mixes it in.
 pub struct Block {
@@ -1075,6 +1094,9 @@ pub struct GrooveUi {
     /// The panel is hidden and something is still fading out or being read.
     winding: bool,
     pub textures: std::collections::HashMap<&'static str, Option<egui::TextureHandle>>,
+    /// The DRUM CAPTURE area is being dragged from this deck's waveform onto a slot
+    /// (`DrumSwapSlot::itemDroppedFromWave` 0x1008508c8: the slot captures that range).
+    pub drag_capture: Option<u8>,
 }
 
 impl Default for GrooveUi {
@@ -1098,6 +1120,7 @@ impl Default for GrooveUi {
             confirm_delete: None,
             dropped: None,
             slot_rects: [[egui::Rect::NOTHING; ROWS]; DECKS],
+            drag_capture: None,
             panel_rects: [egui::Rect::NOTHING; DECKS],
             frames: 0,
             was_visible: false,
@@ -1249,14 +1272,12 @@ impl App {
         if !self.groove_visible() || !self.groove_ready(deck, idx) {
             return;
         }
-        let deck_playing = {
-            let s = self.player.decks[deck].lock();
-            s.playing && s.search == 0.0
-        };
+        // (A deck that stands plays the slot at once and unsynced: `launchWithQuantize` with
+        // the master not playing; see `Engine::render`.)
         with_engine(deck, |e| {
             if e.is_played(idx % ROWS, idx / ROWS) {
                 e.stop(idx % ROWS);
-            } else if deck_playing {
+            } else {
                 e.launch(idx % ROWS, idx / ROWS);
             }
         });
@@ -1513,6 +1534,40 @@ impl App {
             });
             self.gc.factory = Some(rx);
         }
+    }
+
+    /// File > Additional contents > GROOVE CIRCUIT FACTORY SAMPLES PACK > Import (command
+    /// 8219; `app_hooks::pack_import` id `pack_gc_import`): a pack file chosen in a file
+    /// panel (the installed rekordbox's `GROOVE_CIRCUIT_FACTORY_SAMPLES.spp` when `path` is
+    /// None and the panel is cancelled nothing happens) is unpacked into the factory folder
+    /// and its kit goes onto the decks' slots, as the first showing of the panel does.
+    pub fn groove_import_pack(&mut self, path: Option<std::path::PathBuf>) {
+        let pack = match path {
+            Some(p) => p,
+            None => {
+                let start = std::path::Path::new(FACTORY_PACK).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let mut d = rfd::FileDialog::new().set_title("GROOVE CIRCUIT FACTORY SAMPLES PACK").add_filter("GROOVE CIRCUIT pack", &["spp", "zip"]);
+                if start.is_dir() {
+                    d = d.set_directory(&start);
+                }
+                match d.pick_file() {
+                    Some(p) => p,
+                    None => return,
+                }
+            }
+        };
+        let decks: Vec<usize> = (0..self.deck_count() as usize).collect();
+        for d in &decks {
+            if !self.gc.factory_for.contains(d) {
+                self.gc.factory_for.push(*d);
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = factory_dir();
+        std::thread::spawn(move || {
+            let _ = tx.send(import_factory(&pack, &dir));
+        });
+        self.gc.factory = Some(rx);
     }
 
     // -------------------------------------------------------------------------- per frame
@@ -1905,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn clips_stop_when_the_deck_leaves_play_and_a_stopped_deck_starts_nothing() {
+    fn clips_stop_when_the_deck_leaves_play_and_a_stopped_deck_plays_them_unsynced() {
         let g = grid(120.0, 60.0);
         let mut e = Engine::new(0);
         e.set_clip(0, 0, Some(drum_loop(120.0, 4, 44100)));
@@ -1916,9 +1971,20 @@ mod tests {
         let out = run(&mut e, &g, &mut pos, 1.0, 2048, false);
         assert!(!e.any_played() && e.row_state(0).playing.is_none());
         assert_eq!(out[2 * 2000], 0.0, "silent after the 3 ms fade");
+        // rekordbox (`launchWithQuantize` with the deck not playing): a launch on a stopped
+        // deck starts at once and plays at the clip's own speed, from its first frame.
+        let clip = drum_loop(120.0, 4, 44100);
         e.launch(0, 0);
+        let out = run(&mut e, &g, &mut pos, 1.0, 4096, false);
+        assert!(e.any_sounding() && e.row_state(0).playing == Some(0), "plays while the deck stands");
+        for i in [10usize, 500, 3000] {
+            assert!((out[i * 2] - clip.audio.samples[i * 2]).abs() < 0.02, "frame {i}: {} vs {}", out[i * 2], clip.audio.samples[i * 2]);
+        }
+        // The deck starts: the slot goes on; it stops only when the deck leaves PLAY again.
+        run(&mut e, &g, &mut pos, 1.0, 4096, true);
+        assert!(e.any_sounding(), "still playing after the deck started");
         run(&mut e, &g, &mut pos, 1.0, 2048, false);
-        assert!(!e.any_played(), "a launch on a stopped deck is dropped");
+        assert!(!e.any_played(), "stopped when the deck left PLAY");
     }
 
     #[test]

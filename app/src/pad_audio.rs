@@ -95,10 +95,15 @@ pub struct CensorSpan {
 const RING_SECS: usize = 6;
 const RING_RATE: usize = 48000;
 const RING_FRAMES: usize = RING_SECS * RING_RATE;
-/// ECHO: how much of each repeat is left in the next.
-const ECHO_FEEDBACK: f32 = 0.6;
-/// Fade at the edges of a region and of TRANS's gate (seconds).
-const EDGE_SECS: f32 = 0.002;
+/// The censor's effects are rekordbox's PAD FX and RELEASE FX layers at level 0.5
+/// (`ActiveCensorView::prepareFxUnit`, `onActiveCensorEffectChanged`: REV ROLL = Beat FX 11,
+/// TRANS = Beat FX 4, ECHO = RELEASE FX 1, V.BRAKE = RELEASE FX 0). Their laws are the FX
+/// track's (`fx.rs`); the processors here follow `fx.rs`'s, which are private to it.
+const LAYER_LEVEL: f32 = 0.5;
+/// RELEASE FX ECHO: each repeat at 0.7 of the one before (`fx.rs` `Channel::process`).
+const ECHO_FEEDBACK: f32 = 0.7;
+/// The effects' gate and edge smoothing (`fx.rs` `SMOOTH_SECS`, rekordbox's 3.33 ms).
+const EDGE_SECS: f32 = 0.003_333_3;
 
 /// ACT. CENSR on one deck.
 pub struct CensorAudio {
@@ -117,15 +122,17 @@ pub struct CensorAudio {
     /// Output frames since the region was entered, and the ring position at that moment.
     k: usize,
     entry: usize,
-    /// V.BRAKE: where it reads (frames after `entry`).
+    /// V.BRAKE: where it reads (frames after `entry`) and its speed; TRANS's gate.
     brake_pos: f64,
+    brake_speed: f32,
+    gate: f32,
     /// 0 = dry, 1 = effect (fades over `EDGE_SECS`).
     mix: f32,
 }
 
 impl Default for CensorAudio {
     fn default() -> CensorAudio {
-        CensorAudio { on: false, kind: 0, regions: Arc::new(Vec::new()), active: None, ring: None, w: 0, filled: 0, k: 0, entry: 0, brake_pos: 0.0, mix: 0.0 }
+        CensorAudio { on: false, kind: 0, regions: Arc::new(Vec::new()), active: None, ring: None, w: 0, filled: 0, k: 0, entry: 0, brake_pos: 0.0, brake_speed: 1.0, gate: 0.0, mix: 0.0 }
     }
 }
 
@@ -172,6 +179,8 @@ impl CensorAudio {
                     self.k = 0;
                     self.entry = self.w;
                     self.brake_pos = 0.0;
+                    self.brake_speed = 1.0;
+                    self.gate = 0.0;
                 }
                 self.mix = (self.mix + edge).min(1.0);
             }
@@ -193,39 +202,48 @@ impl CensorAudio {
         let k = self.k;
         let at = |ring: &[f32], idx: usize| (ring[(idx % n) * 2], ring[(idx % n) * 2 + 1]);
         let (wl, wr) = match self.kind {
-            // REV ROLL: what was heard before the region, backwards; it starts over after
-            // its beat (32 beats) or when the remembered sound runs out.
+            // REV ROLL (ROLL family, `roll_mix` at 0.5 = the roll alone): the beat value
+            // before the region played backwards and over again (32 beats by default, as much
+            // as is remembered), with 3.33 ms fades at the splice.
             0 => {
                 let span = beat.min(self.filled.saturating_sub(1)).max(1);
-                let back = k % span + 1;
-                at(ring, self.entry + n - back.min(n))
+                let i = k % span;
+                let back = i + 1;
+                let edge = (i.min(span - 1 - i) as f32 / (EDGE_SECS * rate as f32)).min(1.0);
+                let (wet_dry, wet) = crate::fx::roll_mix(LAYER_LEVEL);
+                let (a, b) = at(ring, self.entry + n - back.min(n));
+                (dl * wet_dry + a * edge * wet, dr * wet_dry + b * edge * wet)
             }
-            // TRANS: the sound is cut on and off, one beat value per cycle.
+            // TRANS: a square gate once per beat value, open for `trans_duty` of it (never
+            // under 5 ms), its edges moving at 1 / 3.33 ms (`fx.rs`).
             1 => {
                 let period = beat.max(2);
-                let ph = k % period;
-                let half = period / 2;
-                let ramp = ((EDGE_SECS * rate as f32) as usize).clamp(1, (half / 2).max(1));
-                let g = if ph < half { (ph as f32 / ramp as f32).min(1.0).min((half - ph) as f32 / ramp as f32) } else { 0.0 };
-                (dl * g, dr * g)
+                let duty = crate::fx::trans_duty(LAYER_LEVEL).clamp((0.005 * rate as f32 / period as f32).min(0.5), 1.0);
+                let open = if ((k % period) as f32) < duty * period as f32 { 1.0 } else { 0.0 };
+                let gk = 1.0 / (EDGE_SECS * rate as f32);
+                self.gate += (open - self.gate).clamp(-gk, gk);
+                (dl * self.gate, dr * self.gate)
             }
-            // ECHO: the last beat value before the region repeats, fading; the track itself
-            // is silent.
+            // ECHO (RELEASE FX): the track is cut and the last beat value before the region
+            // repeats, each repeat at 0.7 of the one before (at most 4 s long).
             2 => {
-                let d = beat.min(self.filled.saturating_sub(1)).max(1);
+                let d = beat.min((4 * rate) as usize).min(self.filled.saturating_sub(1)).max(1);
                 let rep = (k / d) as i32 + 1;
                 let g = ECHO_FEEDBACK.powi(rep);
                 let (el, er) = at(ring, self.entry + n - d.min(n) + k % d);
                 (el * g, er * g)
             }
-            // V.BRAKE: the sound slows to a stop over its beat value, then silence.
+            // V.BRAKE (RELEASE FX): `brake_step` slows the sound in a straight line to a stop
+            // over the beat value (under 1/8 at 0.20559 per second), the level following the
+            // speed (x 8, at most 1); then silence.
             _ => {
                 // (The region's own sound is kept, so that it can be read slower than it comes.)
                 let wi = (self.entry + k) % n;
                 ring[wi * 2] = dl;
                 ring[wi * 2 + 1] = dr;
-                let speed = (1.0 - k as f64 / beat.max(1) as f64).max(0.0);
-                if speed <= 0.0 || k + 2 >= n {
+                let secs = (beat as f32 / rate as f32).clamp(0.010, 12.0);
+                self.brake_speed = crate::fx::brake_step(self.brake_speed, secs, rate as f32);
+                if self.brake_speed <= 0.0 || k + 2 >= n {
                     (0.0, 0.0)
                 } else {
                     let p = self.brake_pos.min(k as f64);
@@ -233,8 +251,8 @@ impl CensorAudio {
                     let f = (p - i0 as f64) as f32;
                     let (a0, a1) = at(ring, self.entry + i0);
                     let (b0, b1) = at(ring, self.entry + (i0 + 1).min(k));
-                    self.brake_pos += speed;
-                    let g = (speed as f32).sqrt();
+                    self.brake_pos += self.brake_speed as f64;
+                    let g = (self.brake_speed * 8.0).min(1.0);
                     ((a0 + (b0 - a0) * f) * g, (a1 + (b1 - a1) * f) * g)
                 }
             }
@@ -402,31 +420,36 @@ mod tests {
 
     #[test]
     fn censor_trans_echo_and_brake() {
-        // TRANS with a cycle of 0.01 s (441 frames): on for the first half, off for the second.
+        // TRANS at layer level 0.5 (`trans_duty(0.5)` = half), a cycle of 0.01 s (441
+        // frames): open for 220.5 frames, its gate moving at 1 / 3.33 ms (147 frames).
         let mut s = censor_deck(1, 10000.0, 14410.0, 0.01);
         run(&mut s, 10000);
         let out = run(&mut s, 4410);
-        assert!((out[2 * (441 + 110)] - 0.10551).abs() < 2e-5, "{}", out[2 * 551]);
-        assert_eq!(out[2 * (441 + 330)], 0.0);
-        assert_eq!(out[2 * (882 + 300)], 0.0);
-        // ECHO with a beat of 0.01 s: the 441 frames before the region repeat, each time
-        // quieter, and the track's own sound is gone.
+        assert!((out[2 * (441 + 200)] - 0.10641).abs() < 2e-5, "{}", out[2 * 641]);
+        assert!((out[2 * (441 + 73)] - 0.10514 * 74.0 / 147.0).abs() < 2e-3, "{}", out[2 * 514]);
+        assert_eq!(out[2 * (441 + 400)], 0.0);
+        assert_eq!(out[2 * (882 + 400)], 0.0);
+        // ECHO (RELEASE FX) with a beat of 0.01 s: the 441 frames before the region repeat,
+        // each time at 0.7 of the last, and the track's own sound is gone.
         let mut s = censor_deck(2, 10000.0, 14410.0, 0.01);
         run(&mut s, 10000);
         let out = run(&mut s, 4410);
         let first = out[2 * 300];
         let second = out[2 * (441 + 300)];
-        assert!((first - 0.09859 * 0.6).abs() < 2e-4, "{first}");
-        assert!((second - 0.09859 * 0.36).abs() < 2e-4, "{second}");
-        // V.BRAKE over 0.02 s (882 frames): it starts as the track, slows, and is silent after.
+        assert!((first - 0.09859 * 0.7).abs() < 2e-4, "{first}");
+        assert!((second - 0.09859 * 0.49).abs() < 2e-4, "{second}");
+        // V.BRAKE over 0.02 s (882 frames): rekordbox's `brake_step` takes the speed down in
+        // a straight line to 1/8 (frame 772), then at 0.20559 per second; the level is the
+        // speed x 8 (at most 1).
         let mut s = censor_deck(3, 10000.0, 14410.0, 0.02);
         run(&mut s, 10000);
         let out = run(&mut s, 4410);
-        assert!(out[2 * 200] > 0.05 && out[2 * 200] < 0.1002, "{}", out[2 * 200]);
+        // (By frame 200 it has read 200 - 200^2 / 1764 = 177 frames: 0.10177; the track 0.102.)
+        assert!((out[2 * 200] - 0.10177).abs() < 2e-5, "{}", out[2 * 200]);
         // (Slower than the track: by frame 800 it has read less than 800 frames of it.)
         assert!(out[2 * 800] < 0.105, "{}", out[2 * 800]);
-        assert_eq!(out[2 * 900], 0.0);
-        assert_eq!(out[2 * 4000], 0.0);
+        let sp = s.pads.censor.brake_speed;
+        assert!((sp - (0.125 - (4410.0 - 772.0) * 0.20559 / 44100.0)).abs() < 2e-3, "{sp}");
         // The position is never touched by any of them.
         assert!((s.pos - 14410.0).abs() < 1e-6);
     }

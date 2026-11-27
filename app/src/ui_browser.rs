@@ -1662,8 +1662,7 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
         let (label, tip_target) = crate::traffic::target_label(target);
         let left = Rect::from_min_max(pa.min, pos2(pa.max.x - 16.5, pa.max.y));
         let right = Rect::from_min_max(pos2(pa.max.x - 16.0, pa.min.y), pa.max);
-        p.rect_filled(left, egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, if on { BLUE } else { BTN });
-        p.rect_filled(right, egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, BTN);
+        crate::traffic::paint_button(&p, left, right, on);
         p.text(pos2(pa.min.x + 7.0, pa.center().y), Align2::LEFT_CENTER, label, rb_bold(9.75), WHITE);
         {
             let c = pos2(pa.max.x - 8.0, pa.center().y + 0.5);
@@ -1884,6 +1883,10 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                     app.filter_tags.clear();
                 }
                 app.list_dirty = true;
+                x += cw;
+                continue;
+            }
+            if *c == Col::Status && crate::ui_edit::attribute_header(app, ui, &resp, Rect::from_min_max(pos2(cr.min.x + 60.0, cr.min.y), cr.max)) {
                 x += cw;
                 continue;
             }
@@ -2306,7 +2309,7 @@ thread_local! {
     static PREVIEW_MESHES: std::cell::RefCell<HashMap<(i64, usize, u32, u8), (u64, egui::Mesh)>> = std::cell::RefCell::new(HashMap::new());
 }
 
-fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize) {
+pub(crate) fn draw_cell(app: &mut App, ui: &mut Ui, c: Col, t: &Track, r: Rect, row: usize) {
     let p = ui.painter().with_clip_rect(r.shrink2(vec2(3.0, 0.0)));
     let text_pos = |right: bool| if right { pos2(r.max.x - 4.5, r.center().y) } else { pos2(r.min.x + 5.0, r.center().y) };
     let font = list_font(app);

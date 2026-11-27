@@ -240,11 +240,17 @@ pub struct PadsPrefs {
     pub user: Vec<Vec<Option<String>>>,
     /// USER modes listed in the pull-down (the Pad Editor's `mode` flag).
     pub user_shown: [bool; 8],
+    /// The Pad Editor: the mode each of a controller's eight pad mode buttons selects, for
+    /// ASSIGN 1 and ASSIGN 2 (`select` of `Mode.pad.csv`; empty = rekordbox's default), the
+    /// assign shown (`PadEditor Assign`) and the mode button picked.
+    pub editor_modes: Vec<Vec<String>>,
+    pub editor_assign: u8,
+    pub editor_slot: u8,
 }
 
 impl Default for PadsPrefs {
     fn default() -> PadsPrefs {
-        PadsPrefs { layout: 1, beat_jump_page: [5; 4], hot_cue_color: 4, slicer_length: [2; 4], slicer_roll: [4; 4], keyboard_page: [2; 4], key_shift_page: [2; 4], user: vec![vec![None; 16]; 8], user_shown: [false; 8] }
+        PadsPrefs { layout: 1, beat_jump_page: [5; 4], hot_cue_color: 4, slicer_length: [2; 4], slicer_roll: [4; 4], keyboard_page: [2; 4], key_shift_page: [2; 4], user: vec![vec![None; 16]; 8], user_shown: [false; 8], editor_modes: Vec::new(), editor_assign: 0, editor_slot: 0 }
     }
 }
 
@@ -376,6 +382,51 @@ pub fn key_at(pos: usize) -> i32 {
     }
 }
 
+/// Scale 1 of `KeyPositioner` (0x1037ea66c), used when a DDJ-GRV6 or XDJ-AN is connected
+/// (`KeyboardView::updateScale`): -12 .. +12 in a row over pages 1-4, then KEY SYNC, KEY
+/// RESET, SEMITONE DOWN, SEMITONE UP, -12, -5, +7, +12. Its first page is 3.
+pub fn key_at_scale1(pos: usize) -> i32 {
+    match pos {
+        4..=28 => pos as i32 - 16,
+        32 => KEY_SYNC,
+        33 => KEY_RESET,
+        34 => KEY_SEMI_DOWN,
+        35 => KEY_SEMI_UP,
+        36 => 1007,
+        37 => 1006,
+        38 => 1004,
+        39 => 1005,
+        _ => KEY_NONE,
+    }
+}
+
+/// `key_at` for scale 0 or 1.
+pub fn key_at_in(pos: usize, scale1: bool) -> i32 {
+    if scale1 { key_at_scale1(pos) } else { key_at(pos) }
+}
+
+/// LIST Display's place of position `pos` in scale 1 (0x1037ea864): -12 .. +12, then the
+/// last page's +7, -5, -12, SEMITONE UP, SEMITONE DOWN, KEY SYNC, KEY RESET (+12 unlisted).
+pub fn key_list_pos_scale1(pos: usize) -> Option<usize> {
+    Some(match pos {
+        4..=28 => pos - 4,
+        32 => 30,
+        33 => 31,
+        34 => 29,
+        35 => 28,
+        36 => 27,
+        37 => 26,
+        38 => 25,
+        _ => return None,
+    })
+}
+
+/// The controllers that switch KEYBOARD / KEY SHIFT to scale 1.
+pub fn key_scale1_device(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.contains("DDJ-GRV6") || n.contains("XDJ-AN")
+}
+
 /// The semitones of a key item (None for the function items and blanks).
 pub fn key_semis(key: i32) -> Option<i32> {
     match key {
@@ -439,6 +490,36 @@ pub fn key_list() -> Vec<usize> {
     let mut v: Vec<(usize, usize)> = (0..40).filter_map(|p| key_list_pos(p).map(|l| (l, p))).collect();
     v.sort();
     v.into_iter().map(|x| x.1).collect()
+}
+
+/// `key_list` for scale 0 or 1.
+pub fn key_list_in(scale1: bool) -> Vec<usize> {
+    if !scale1 {
+        return key_list();
+    }
+    let mut v: Vec<(usize, usize)> = (0..40).filter_map(|p| key_list_pos_scale1(p).map(|l| (l, p))).collect();
+    v.sort();
+    v.into_iter().map(|x| x.1).collect()
+}
+
+/// `key_label` for scale 0 or 1.
+pub fn key_label_in(pos: usize, list: bool, scale1: bool) -> String {
+    if !scale1 {
+        return key_label(pos, list);
+    }
+    let s = match key_at_scale1(pos) {
+        KEY_NONE => String::new(),
+        KEY_SYNC => "KEY\nSYNC".into(),
+        KEY_RESET => "KEY\nRESET".into(),
+        KEY_SEMI_UP => "SEMITONE\nUP".into(),
+        KEY_SEMI_DOWN => "SEMITONE\nDOWN".into(),
+        0 => "0".into(),
+        k => {
+            let n = key_semis(k).unwrap_or(0);
+            if n > 0 { format!("+{n}") } else { format!("{n}") }
+        }
+    };
+    if list { s.replace('\n', " ") } else { s }
 }
 
 /// The position a controller's pad `p` (0..15) plays on `page` (1..5): the page's eight, the
@@ -620,9 +701,16 @@ pub const CENSOR_FX: [&str; 4] = ["REV ROLL", "TRANS", "ECHO", "V.BRAKE"];
 pub const CENSOR_DEFAULT_BEATS: [(u16, u16); 4] = [(32, 1), (1, 4), (1, 8), (3, 4)];
 /// V.BRAKE's beats, longest first (`onBeatLeft` 0x101085054 steps towards the shorter).
 pub const CENSOR_BRAKE_BEATS: [(u16, u16); 11] = [(32, 1), (16, 1), (8, 1), (4, 1), (2, 1), (1, 1), (3, 4), (1, 2), (1, 4), (1, 8), (1, 16)];
-/// Shortest region. rekordbox: a millisecond value of the player's configuration times the
-/// sample rate; the value was not read. This is recordbox's shortest loop.
-pub const CENSOR_MIN_SECS: f64 = crate::player_ext::MIN_LOOP;
+/// Shortest region: `sampleRate * 0.001 * DjPlayerConfig[+40]` (`addRange`, `setInPoint`),
+/// the same 6.667 ms as the shortest loop.
+pub const CENSOR_MIN_SECS: f64 = crate::deck::MIN_LOOP_SECS;
+
+/// Moving the edge of region `i` while adjusting (`ActiveCensorBehavior::setInPoint` /
+/// `setOutPoint`): the region keeps the minimum length, stays at or after 0 and does not
+/// reach into its neighbours.
+pub fn censor_edge_ok(regions: &[CensorRegion], i: usize, a: f64, b: f64) -> bool {
+    a >= 0.0 && b - a >= CENSOR_MIN_SECS && !regions.iter().enumerate().any(|(j, r)| j != i && a < r.b && r.a < b)
+}
 
 /// A censored region of a track.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -754,7 +842,89 @@ pub fn pad_functions() -> Vec<(&'static str, &'static str, Vec<String>)> {
         ("UserKeyShift", "KEY SHIFT", key),
         ("Sampler", "SAMPLER", (1..=16).map(|n| format!("{n}")).collect()),
         ("SequenceCall", "SEQ. CALL", (1..=8).map(|n| format!("{n}")).collect()),
+        ("PadFx1", "PAD FX1", (1..=16).map(|n| format!("{n}")).collect()),
+        ("PadFx2", "PAD FX2", (1..=16).map(|n| format!("{n}")).collect()),
+        ("Transport", "TRANSPORT", TRANSPORT_VALUES.iter().map(|s| s.to_string()).collect()),
+        ("SampleScratch", "SP.SCRATCH", (1..=16).map(|n| format!("{n}")).collect()),
     ]
+}
+
+/// The transport items in `PadMenu::transportMenu2` order, with the BPM steps of
+/// `transportMenu3`.
+pub const TRANSPORT_VALUES: [&str; 17] = ["PLAY/PAUSE", "CUE", "PITCH BEND -", "PITCH BEND +", "BPM - SMALL", "BPM - MEDIUM", "BPM - LARGE", "BPM + SMALL", "BPM + MEDIUM", "BPM + LARGE", "CUE/LOOP CALL <", "CUE/LOOP CALL >", "TEMPO RESET", "SLIP", "PREVIOUS TRACK", "NEXT TRACK", "ACTIVE LOOP"];
+
+/// One row of rekordbox's `Mode.pad.csv` (read from the installed app at run time).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModeEntry {
+    pub function: String,
+    /// separator / preset / user / combination.
+    pub kind: String,
+    /// Listed as a pad mode (`mode`), as a template (`template`), its items as pad items (`pad`).
+    pub mode: bool,
+    pub template: bool,
+    pub pad: bool,
+    pub text: String,
+    /// The controller's pad mode button it is assigned to (1..8).
+    pub select: Option<u8>,
+}
+
+/// `Mode.pad.csv` (`PadEditorData::read`): booleans are on / yes / true.
+pub fn read_mode_csv() -> Vec<ModeEntry> {
+    let Ok(t) = std::fs::read_to_string(format!("{PAD_DIR}/Mode.pad.csv")) else { return Vec::new() };
+    let yes = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "yes" | "true");
+    t.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| {
+            let mut e = ModeEntry { function: String::new(), kind: String::new(), mode: false, template: false, pad: false, text: String::new(), select: None };
+            for part in l.trim().split(',') {
+                let Some((k, v)) = part.split_once('=') else { continue };
+                match k.trim() {
+                    "function" => e.function = v.trim().into(),
+                    "type" => e.kind = v.trim().into(),
+                    "mode" => e.mode = yes(v),
+                    "template" => e.template = yes(v),
+                    "pad" => e.pad = yes(v),
+                    "text" => e.text = v.trim().into(),
+                    "select" => e.select = v.trim().parse().ok(),
+                    _ => {}
+                }
+            }
+            e
+        })
+        .collect()
+}
+
+/// The sixteen items of a preset or combination mode (`<function>.pad.csv`).
+pub fn mode_items(function: &str) -> Vec<PadItem> {
+    std::fs::read_to_string(format!("{PAD_DIR}/{function}.pad.csv")).map(|t| parse_pad_csv(&t)).unwrap_or_default()
+}
+
+/// The Pad Editor's window (`PadEditorComponent::show` / `resized` / `resizedPadItem`): 640 x 578;
+/// a 30 pt black tab strip (ASSIGN 1, ASSIGN 2) on #323232; "PERFORMANCE MODE" at (25, 54);
+/// eight mode buttons 140 x 25 at x 25 + 150 i, y 86 / 121; "PERFORMANCE PADS" at (25, 171);
+/// TEMPLATES 140 x 30 at (25, 203); sixteen pads 140 x 70 at (25 + 150 c, 243 + 80 r).
+pub mod editor_geo {
+    pub const W: f32 = 640.0;
+    pub const H: f32 = 578.0;
+    pub const TAB_H: f32 = 30.0;
+    pub const MODE_LABEL_Y: f32 = 54.0;
+    pub const PADS_LABEL_Y: f32 = 171.0;
+    pub const LABEL_H: f32 = 15.0;
+    pub fn mode_button(i: usize) -> (f32, f32, f32, f32) {
+        (25.0 + 150.0 * (i % 4) as f32, 86.0 + 35.0 * (i / 4) as f32, 140.0, 25.0)
+    }
+    pub const TEMPLATES: (f32, f32, f32, f32) = (25.0, 203.0, 140.0, 30.0);
+    pub fn pad(i: usize) -> (f32, f32, f32, f32) {
+        (25.0 + 150.0 * (i % 4) as f32, 243.0 + 80.0 * (i / 4) as f32, 140.0, 70.0)
+    }
+    /// Colours (`__GLOBAL__sub_I_PadEditorComponent`, `createComponent`): background, tab
+    /// strip, button fill, outline (normal / on), text (normal / on).
+    pub const BG: u32 = 0x323232;
+    pub const STRIP: u32 = 0x000000;
+    pub const FILL: u32 = 0x191919;
+    pub const OUTLINE: u32 = 0x969696;
+    pub const TEXT: u32 = 0xC8C8C8;
+    pub const ON: u32 = 0x1473EB;
 }
 
 /// What a USER pad does, from its item.
@@ -767,8 +937,57 @@ pub enum UserAct {
     Key(i32),
     Sampler(usize),
     SeqCall(usize),
-    /// A function recordbox does not have on a pad (PAD FX combinations, transport, lighting).
+    /// PAD FX: bank 0 = PAD FX1, 1 = PAD FX2, 2 = the combination bank; pad 0..15
+    /// (devices `PAD%d_PadFx1`, `PAD%d_PadFx2`, `PAD%d_PadFxCombination`).
+    PadFx(u8, u8),
+    /// A transport item (`function=Transport`), by rekordbox's device name.
+    Transport(Transport),
+    /// SP.SCRATCH slot 0..15 (`@SampleScratchSlot%d`).
+    SampleScratch(usize),
+    /// A function recordbox does not have on a pad (lighting).
     Other,
+}
+
+/// The Pad Editor's transport items (`PadMenu::transportMenu2/3`) and the devices they press
+/// (the `function=Transport,value=...,name=...` table in the binary).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transport {
+    PlayPause,
+    Cue,
+    PitchBend(i8),
+    /// BPM - / + by SMALL, MEDIUM or LARGE: `TempoDec*` / `TempoInc*` move the tempo slider
+    /// by 10, 50 or 200 hundredths of a percent (`WidgetPlayerDJ::operate` switch ids 92 /
+    /// 93: `slider +- n * 0.01 / range`).
+    Bpm(i8, u16),
+    CueLoopCall(i8),
+    TempoReset,
+    Slip,
+    Track(i8),
+    ActiveLoop,
+}
+
+/// The transport item of a value text.
+pub fn transport_of(v: &str) -> Option<Transport> {
+    Some(match v {
+        "PLAY/PAUSE" => Transport::PlayPause,
+        "CUE" => Transport::Cue,
+        "PITCH BEND -" => Transport::PitchBend(-1),
+        "PITCH BEND +" => Transport::PitchBend(1),
+        "BPM - SMALL" => Transport::Bpm(-1, 10),
+        "BPM - MEDIUM" => Transport::Bpm(-1, 50),
+        "BPM - LARGE" => Transport::Bpm(-1, 200),
+        "BPM + SMALL" => Transport::Bpm(1, 10),
+        "BPM + MEDIUM" => Transport::Bpm(1, 50),
+        "BPM + LARGE" => Transport::Bpm(1, 200),
+        "CUE/LOOP CALL <" => Transport::CueLoopCall(-1),
+        "CUE/LOOP CALL >" => Transport::CueLoopCall(1),
+        "TEMPO RESET" => Transport::TempoReset,
+        "SLIP" => Transport::Slip,
+        "PREVIOUS TRACK" => Transport::Track(-1),
+        "NEXT TRACK" => Transport::Track(1),
+        "ACTIVE LOOP" => Transport::ActiveLoop,
+        _ => return None,
+    })
 }
 
 fn parse_fraction(s: &str) -> Option<f64> {
@@ -804,6 +1023,16 @@ pub fn user_act(item: &PadItem) -> UserAct {
         },
         "Sampler" => v.parse::<usize>().ok().filter(|n| (1..=16).contains(n)).map(|n| UserAct::Sampler(n - 1)).unwrap_or(UserAct::Other),
         "SequenceCall" => v.parse::<usize>().ok().filter(|n| (1..=8).contains(n)).map(|n| UserAct::SeqCall(n - 1)).unwrap_or(UserAct::Other),
+        "PadFx1" | "PadFx2" | "PadFxCombination" => {
+            let bank = match item.function.as_str() {
+                "PadFx1" => 0,
+                "PadFx2" => 1,
+                _ => 2,
+            };
+            v.parse::<u8>().ok().filter(|n| (1..=16).contains(n)).map(|n| UserAct::PadFx(bank, n - 1)).unwrap_or(UserAct::Other)
+        }
+        "Transport" => transport_of(v).map(UserAct::Transport).unwrap_or(UserAct::Other),
+        "SampleScratch" => v.parse::<usize>().ok().filter(|n| (1..=16).contains(n)).map(|n| UserAct::SampleScratch(n - 1)).unwrap_or(UserAct::Other),
         _ => UserAct::Other,
     }
 }
@@ -824,6 +1053,12 @@ pub fn user_label(item: &PadItem) -> String {
         },
         UserAct::Sampler(n) => format!("SAMPLER {}", n + 1),
         UserAct::SeqCall(n) => format!("PATTERN {}", n + 1),
+        // (`PadMenu`'s texts: "PAD FX1: %d", "PAD FX2: %d"; the transport value as it is.)
+        UserAct::PadFx(0, n) => format!("PAD FX1: {}", n + 1),
+        UserAct::PadFx(1, n) => format!("PAD FX2: {}", n + 1),
+        UserAct::PadFx(_, n) => format!("PAD FX {}", n + 1),
+        UserAct::Transport(_) => item.value.trim().to_string(),
+        UserAct::SampleScratch(n) => format!("SP.SCR {}", n + 1),
         UserAct::Other => match item.function.as_str() {
             "PadFxCombination" => format!("PAD FX {}", item.value),
             "PadFx1" => format!("PAD FX1: {}", item.value),
@@ -857,6 +1092,26 @@ mod tests {
         let labels: Vec<String> = MENU.iter().map(|m| m.label()).collect();
         assert_eq!(labels, ["HOT CUE", "PAD FX", "SLICER", "BEAT JUMP", "BEAT LOOP", "KEYBOARD", "KEY SHIFT", "SEQ. CALL", "ACT. CENSR", "STEMS", "MEMORY CUE"]);
         assert_eq!(PadMode::User(2).label(), "USER 3");
+    }
+
+    #[test]
+    fn scale1_keys_transport_and_pad_fx_items() {
+        let keys: Vec<i32> = (0..40).map(key_at_scale1).collect();
+        assert_eq!(&keys[4..12], &[-12, -11, -10, -9, -8, -7, -6, -5]);
+        assert_eq!(keys[20], 4);
+        assert_eq!(&keys[24..29], &[8, 9, 10, 11, 12]);
+        assert_eq!(&keys[32..40], &[KEY_SYNC, KEY_RESET, KEY_SEMI_DOWN, KEY_SEMI_UP, 1007, 1006, 1004, 1005]);
+        assert_eq!(key_semis(keys[38]), Some(7));
+        assert_eq!(key_list_pos_scale1(16), Some(12));
+        assert_eq!(key_list_pos_scale1(39), None);
+        assert!(key_scale1_device("DDJ-GRV6") && !key_scale1_device("DDJ-FLX4"));
+        let item = |f: &str, v: &str| parse_pad_line(&format!("function={f},value={v}")).unwrap();
+        assert_eq!(user_act(&item("Transport", "BPM - MEDIUM")), UserAct::Transport(Transport::Bpm(-1, 50)));
+        assert_eq!(user_act(&item("Transport", "NEXT TRACK")), UserAct::Transport(Transport::Track(1)));
+        assert_eq!(user_act(&item("PadFx2", "3")), UserAct::PadFx(1, 2));
+        assert_eq!(user_act(&item("PadFxCombination", "16")), UserAct::PadFx(2, 15));
+        assert_eq!(user_label(&item("PadFx1", "4")), "PAD FX1: 4");
+        assert_eq!(user_act(&item("SampleScratch", "2")), UserAct::SampleScratch(1));
     }
 
     #[test]
@@ -1068,6 +1323,14 @@ mod tests {
         assert_eq!(censor_at(&regions, 10.0), Some(0));
         assert_eq!(censor_at(&regions, 12.0), None);
         assert_eq!(censor_at(&regions, 20.99), Some(1));
+        // Adjusting region 0 (10..11): its out may not reach region 1, nor shrink under
+        // 6.667 ms; its in may not go before 0.
+        assert!(censor_edge_ok(&regions, 0, 10.0, 19.9));
+        assert!(!censor_edge_ok(&regions, 0, 10.0, 20.5));
+        assert!(!censor_edge_ok(&regions, 0, 10.0, 10.005));
+        assert!(censor_edge_ok(&regions, 0, 10.0, 10.007));
+        assert!(!censor_edge_ok(&regions, 0, -0.1, 11.0));
+        assert!(!censor_can_add(&regions, 30.0, 30.006));
         assert_eq!(censor_neighbour(&regions, 11.0, true), Some(20.0));
         assert_eq!(censor_neighbour(&regions, 11.0, false), Some(10.0));
         assert_eq!(censor_neighbour(&regions, 25.0, true), None);
@@ -1102,7 +1365,7 @@ mod tests {
         assert_eq!(user_act(&parse_pad_line("function=UserKeyShift,value=KEY SYNC").unwrap()), UserAct::Key(KEY_SYNC));
         assert_eq!(user_act(&parse_pad_line("function=UserKeyShift,value=-3").unwrap()), UserAct::Key(-3));
         assert_eq!(user_act(&parse_pad_line("function=Sampler,value=4").unwrap()), UserAct::Sampler(3));
-        assert_eq!(user_act(&parse_pad_line("function=PadFxCombination,value=2").unwrap()), UserAct::Other);
+        assert_eq!(user_act(&parse_pad_line("function=PadFxCombination,value=2").unwrap()), UserAct::PadFx(2, 1));
         assert!(parse_pad_line("# a comment").is_none());
         assert!(parse_pad_line("").is_none());
         assert_eq!(parse_pad_line("function=HotCue,value=A,key=-2").unwrap().key, Some(-2));

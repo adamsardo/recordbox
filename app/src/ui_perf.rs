@@ -32,6 +32,8 @@ const PAD: Color32 = hex(0x141414);
 const PART: [(&str, usize, Color32); 4] = [("VOCAL", 3, Color32::from_rgb(0x02, 0xDA, 0x0C)), ("INST", 2, Color32::from_rgb(0xDA, 0x1B, 0x02)), ("BASS", 1, Color32::from_rgb(0xD2, 0x00, 0x90)), ("DRUMS", 0, Color32::from_rgb(0x46, 0x55, 0xFF))];
 
 pub fn performance(app: &mut App, ui: &mut Ui) {
+    // (Once: the per-deck Q and BEAT SYNC rekordbox keeps, deck.rs.)
+    app.restore_player_settings();
     lay::shot_tick(app);
     // The vertical layouts, Browse and the layouts without pad and platter.
     if lay::performance_alt(app, ui) {
@@ -186,16 +188,20 @@ pub(crate) fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, 
     let (b2, s2) = split_time(if loaded { pos } else { 0.0 });
     let tcol = if loaded { WHITE } else { dim };
     let time_font = lay::arial(g.time_f);
-    p.text(pos2(x0 + w - g.elapsed_r, y0 + g.time_y), Align2::RIGHT_CENTER, format!("{b2}.{s2}"), time_font.clone(), if loaded { hex(0x8C8C8C) } else { dim });
+    // (Elapsed in colour id 0x3000076 = #878787, remaining 0x3000074 = white: `TimeView::
+    // setSongTime`.)
+    p.text(pos2(x0 + w - g.elapsed_r, y0 + g.time_y), Align2::RIGHT_CENTER, format!("{b2}.{s2}"), time_font.clone(), if loaded { hex(0x878787) } else { dim });
     let (b1, s1) = split_time(if loaded { remain } else { 0.0 });
     p.text(pos2(x0 + w - g.remain_r, y0 + g.time_y), Align2::RIGHT_CENTER, format!("-{b1}.{s1}"), time_font.clone(), tcol);
     if dk == lay::Dk::Browse && loaded {
         // Browse has no platter: the BPM and the tempo stand above the times.
         let pct = (app.deck_speed() - 1.0) * 100.0;
+        // (Dimmed while Automix brings the tempo back: automix.rs `tempo_dimmed`.)
+        let tdim = if crate::automix::tempo_dimmed(app, n) { 0.3 } else { 1.0 };
         let shown = ((pct.abs() + 0.005) * 10.0).floor() / 10.0;
         let sign = if pct < -0.05 { "-" } else if pct > 0.05 { "+" } else { "" };
         p.text(pos2(x0 + w - 248.0, y0 + 18.25), Align2::RIGHT_CENTER, format!("{:.2}", app.effective_bpm()), lay::arial(14.0), hex(0x8C8C8C));
-        p.text(pos2(x0 + w - 190.5, y0 + 18.25), Align2::RIGHT_CENTER, format!("{sign}{shown:.1}%"), lay::arial(14.0), hex(0x8C8C8C));
+        p.text(pos2(x0 + w - 190.5, y0 + 18.25), Align2::RIGHT_CENTER, format!("{sign}{shown:.1}%"), lay::arial(14.0), hex(0x8C8C8C).gamma_multiply(tdim));
     }
 
     // KEY SYNC, key shift, BEAT SYNC and MASTER at the right (rekordbox's TrackInfoView:
@@ -284,11 +290,20 @@ pub(crate) fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, 
     let lo = lay::lower_geo(dk, w, right);
     let o = pos2(x0, ly);
     // Tab column: the pad view's mark and the grid view's.
-    if lay::tab_column(ui, Rect::from_min_size(pos2(x0 + lo.tabs_x, ly), vec2(28.0, g.lower_h)), false) == Some(true) {
-        app.toast("GRID panel of the Performance decks: not built in recordbox yet (the grid can be edited in EXPORT mode).");
+    let grid_on = app.deck.x.dk.grid_tab;
+    if let Some(g) = lay::tab_column(ui, Rect::from_min_size(pos2(x0 + lo.tabs_x, ly), vec2(28.0, g.lower_h)), grid_on) {
+        app.deck.x.dk.grid_tab = g;
     }
-    pads(app, ui, lo.pads.translate(o.to_vec2()), n, c4);
-    loop_box(app, ui, o + lo.loop_o.to_vec2(), n, c4);
+    if grid_on {
+        // The GRID panel takes the place of the pads and the loop box (`MemoryCuePanel`).
+        let pr = lo.pads.translate(o.to_vec2());
+        let (x_a, x_b) = if right { (o.x + lo.loop_o.x, pr.max.x + 10.0) } else { (pr.min.x - 10.0, o.x + lo.loop_o.x + 78.0) };
+        let mcp = Rect::from_min_max(pos2(x_a, ly), pos2(x_b, ly + g.lower_h));
+        lay::grid_panel(app, ui, mcp, n, right, dk);
+    } else {
+        pads(app, ui, lo.pads.translate(o.to_vec2()), n, c4);
+        loop_box(app, ui, o + lo.loop_o.to_vec2(), n, c4);
+    }
     platter_panel(app, ui, o + lo.panel_o.to_vec2(), n, is_active, c4);
 }
 
@@ -699,19 +714,43 @@ pub(crate) fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_activ
     // the red marker.)
     p.circle_filled(c, d / 2.0, if loaded { WHITE } else { hex(0x2A2A2A) });
     p.circle_filled(c, 0.93636 * d / 2.0, PANEL);
-    let turn = (pos * (100.0 / 3.0 / 60.0) * std::f64::consts::TAU) as f32 - std::f32::consts::FRAC_PI_2;
+    // The turn as rekordbox draws it (`VirtualDeckComp::drawCurrentCuePosition` /
+    // `drawTextures`): frac(ms x rpm / 60000) x 360 degrees, less 44.041, from 3 o'clock
+    // clockwise; the outer ring has a 15 degree gap there and the red mark sits on it; the
+    // cue point is an 8 degree mark on the ring (measured on reference 01: gap 25.5-40.5
+    // degrees at 0.3 s, red mark centred at 33 degrees, 0.855 of the ring's radius).
+    let rpm = app.platter_rps() * 60.0;
+    let deg = crate::deck::platter_angle_deg(pos, rpm);
+    // (One mesh per wedge: separate anti-aliased slices left see-through seams.)
+    let wedge = |a0: f32, a1: f32, r0: f32, r1: f32, col: Color32| {
+        let n = ((a1 - a0) / 1.0).ceil().max(1.0) as u32;
+        let mut mesh = egui::Mesh::default();
+        for i in 0..=n {
+            let b = (a0 + (a1 - a0) * i as f32 / n as f32).to_radians();
+            mesh.colored_vertex(c + vec2(b.cos(), b.sin()) * r0, col);
+            mesh.colored_vertex(c + vec2(b.cos(), b.sin()) * r1, col);
+            if i > 0 {
+                let k = 2 * i;
+                mesh.add_triangle(k - 2, k - 1, k);
+                mesh.add_triangle(k - 1, k + 1, k);
+            }
+        }
+        p.add(egui::Shape::mesh(mesh));
+    };
     if loaded {
-        let (r0, r1) = (0.925 * d / 2.0, d / 2.0 + 1.0);
-        let pts: Vec<Pos2> = [(0.03f32, r0), (0.03, r1), (0.2, r1), (0.2, r0)].iter().map(|(a, rr)| c + vec2((turn + a).cos(), (turn + a).sin()) * *rr).collect();
-        p.add(egui::Shape::convex_polygon(pts, PANEL, Stroke::NONE));
+        let (r0, r1) = (0.93 * d / 2.0, d / 2.0 + 1.0);
+        let cue_deg = crate::deck::platter_angle_deg(app.deck.cue_point, rpm);
+        wedge(cue_deg - 4.0, cue_deg + 4.0, r0, r1, hex(0xEB870F));
+        wedge(deg - 7.5, deg + 7.5, r0, r1, PANEL);
     }
     p.circle_filled(c, 0.8 * d / 2.0, if loaded { BLUE } else { hex(0x143C6E) });
     p.circle_filled(c, 0.76364 * d / 2.0, if loaded { BG } else { hex(0x0F0F0F) });
     if loaded {
-        // The position marker turns at 33 1/3 rpm.
-        let a = turn;
-        let m = c + vec2(a.cos(), a.sin()) * (0.968 * d / 2.0);
-        let (u, v) = (vec2(a.cos(), a.sin()) * 0.032 * d, vec2(-a.sin(), a.cos()) * 0.032 * d);
+        // The red mark of the turning platter image, on the band between the blue ring and
+        // the outer ring.
+        let a = deg.to_radians();
+        let m = c + vec2(a.cos(), a.sin()) * (0.855 * d / 2.0);
+        let (u, v) = (vec2(a.cos(), a.sin()) * 0.027 * d, vec2(-a.sin(), a.cos()) * 0.027 * d);
         p.add(egui::Shape::convex_polygon(vec![m - u - v, m + u - v, m + u + v, m - u + v], hex(0xE61E1E), Stroke::NONE));
     }
     // (The jog: touch, scratch, drag to another deck, the hot cue countdown; `deck.rs`.)
@@ -731,19 +770,39 @@ pub(crate) fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_activ
     let by = bb.center().y - h1 / 2.0;
     p.galley(pos2(bx, by), g.clone(), tcol);
     p.galley(pos2(bx + g.size().x, by + (h1 - h2) * 0.82), g2, tcol);
+    // BPM drag (`BpmLabel`): up is faster, 250 pixels for the whole tempo range, 0.02 BPM
+    // steps; not on a sync follower (`updateTempoAndTakeOverVisible`).
+    if loaded && !app.sync_follower() {
+        let dr = ui.interact(bb, ui.id().with(("bpmdrag", n)), Sense::drag());
+        if dr.drag_started() {
+            let y = ui.input(|i| i.pointer.press_origin().map(|p| p.y)).unwrap_or(bb.center().y);
+            app.deck.x.dk.bpm_drag = Some((y, app.effective_bpm()));
+        }
+        if let (true, Some((y0, start)), Some(pp)) = (dr.dragged(), app.deck.x.dk.bpm_drag, ui.input(|i| i.pointer.latest_pos())) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            let own = app.current_bpm();
+            let v = crate::deck::bpm_drag_value(start, own, app.tempo_range(), pp.y - y0);
+            app.bpm_drag_to(v);
+        }
+        if dr.drag_stopped() {
+            app.deck.x.dk.bpm_drag = None;
+        }
+    }
     // Tempo in percent (one decimal, half away from zero) and the range; a click on the
     // range steps it (±6, ±10, ±16, WIDE).
     let pct = (app.deck_speed() - 1.0) * 100.0;
+    // (Dimmed while Automix brings the tempo back: automix.rs `tempo_dimmed`.)
+    let tdim = if crate::automix::tempo_dimmed(app, n) { 0.3 } else { 1.0 };
     let shown = ((pct.abs() + 0.005) * 10.0).floor() / 10.0;
     let sign = if pct < -0.05 { "-" } else if pct > 0.05 { "+" } else { "" };
     let tr = pg.tempo.translate(pq.to_vec2());
     let small = lay::arial_b(pg.small_f + if pg.small_f > 12.0 { 1.5 } else { 0.5 });
-    p.text(pos2(tr.max.x + pg.pct_w, tr.center().y), Align2::RIGHT_CENTER, format!("{sign}{shown:.1}%"), small.clone(), if loaded { hex(0x969696) } else { hex(0x3C3C3C) });
+    p.text(pos2(tr.max.x + pg.pct_w, tr.center().y), Align2::RIGHT_CENTER, format!("{sign}{shown:.1}%"), small.clone(), if loaded { hex(0x969696).gamma_multiply(tdim) } else { hex(0x3C3C3C) });
     let range = app.tempo_range() * 100.0;
     let rl = if !loaded { "± 0".to_string() } else if range >= 100.0 { "WIDE".to_string() } else { format!("±{range:.0}") };
     let rr = Rect::from_min_size(pos2(tr.max.x + pg.pct_w + 4.0, tr.min.y - 1.0), vec2(pg.range_w, tr.height() + 2.0));
     let rresp = ui.interact(rr, ui.id().with("temporange"), Sense::click());
-    p.text(pos2(rr.min.x + 1.0, tr.center().y), Align2::LEFT_CENTER, rl, small, if loaded { hex(0xE6461E) } else { hex(0x3C3C3C) });
+    p.text(pos2(rr.min.x + 1.0, tr.center().y), Align2::LEFT_CENTER, rl, small, if loaded { hex(0xE6461E).gamma_multiply(tdim) } else { hex(0x3C3C3C) });
     if tip(rresp, app, "Tempo Range").clicked() {
         app.tempo_range_next();
     }
@@ -753,13 +812,13 @@ pub(crate) fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_activ
         let plus = pg.plus.translate(pq.to_vec2());
         let reset = Rect::from_min_max(pos2(minus.max.x, minus.min.y), pos2(plus.min.x, plus.max.y));
         let mr = ui.interact(minus, ui.id().with("tminus"), Sense::click());
-        crate::icons_player::tempo_sign(&p, minus.center(), false, WHITE);
+        crate::icons_player::tempo_sign(&p, minus.center(), false, WHITE.gamma_multiply(tdim));
         let held = mr.is_pointer_button_down_on() && repeat(ui, &mr);
         if tip(mr, app, "Tempo -").clicked() || held {
             app.tempo_step(-1);
         }
         let pr = ui.interact(plus, ui.id().with("tplus"), Sense::click());
-        crate::icons_player::tempo_sign(&p, plus.center(), true, WHITE);
+        crate::icons_player::tempo_sign(&p, plus.center(), true, WHITE.gamma_multiply(tdim));
         let held = pr.is_pointer_button_down_on() && repeat(ui, &pr);
         if tip(pr, app, "Tempo +").clicked() || held {
             app.tempo_step(1);
@@ -1135,7 +1194,10 @@ pub(crate) fn bottom_row(app: &mut App, ui: &mut Ui, r: Rect, cx: f32) {
     let (fl, fr) = (x(711.0), x(801.0));
     let cy = cy + 1.0;
     let rr = Rect::from_min_max(pos2(fl - 6.0, cy - 12.0), pos2(fr + 6.0, cy + 12.0));
-    let resp = ui.interact(rr, ui.id().with("xfader"), Sense::click_and_drag());
+    // (Disabled while Automix crossfades: automix.rs `crossfader_locked`.)
+    let xf_locked = crate::automix::crossfader_locked(app);
+    app.mixx.automix.ui.xfader = Some(rr);
+    let resp = ui.interact(rr, ui.id().with("xfader"), if xf_locked { Sense::hover() } else { Sense::click_and_drag() });
     let mut xf = app.px.crossfader;
     if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.any())) {
         xf = 0.5;
@@ -1148,7 +1210,7 @@ pub(crate) fn bottom_row(app: &mut App, ui: &mut Ui, r: Rect, cx: f32) {
     p.rect_filled(Rect::from_min_max(pos2(fl, cy - 10.0), pos2(fl + 1.0, cy + 10.0)), 0.0, hex(0x323232));
     p.rect_filled(Rect::from_min_max(pos2(fr - 1.0, cy - 10.0), pos2(fr, cy + 10.0)), 0.0, hex(0x323232));
     let hx = fl + xf * (fr - fl);
-    p.rect_filled(Rect::from_center_size(pos2(hx, cy), vec2(2.0, 24.0)), 0.0, if resp.hovered() || resp.dragged() { WHITE } else { hex(0x646464) });
+    p.rect_filled(Rect::from_center_size(pos2(hx, cy), vec2(2.0, 24.0)), 0.0, if xf_locked { hex(0x646464).gamma_multiply(0.3) } else if resp.hovered() || resp.dragged() { WHITE } else { hex(0x646464) });
     if changed {
         app.px.crossfader = xf;
         app.poll_decks();

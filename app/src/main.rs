@@ -72,6 +72,7 @@ mod recorder;
 mod stems;
 mod smart;
 mod split;
+mod playlist_art;
 mod theme;
 mod traffic;
 mod ui_automix;
@@ -145,6 +146,7 @@ impl eframe::App for Gui {
         self.app.shot_mix_events(frame, raw);
         self.app.shot_prefs_events(frame, raw);
         self.app.shot_key_events(frame, raw);
+        crate::dupes::shot_events(&mut self.app, frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }

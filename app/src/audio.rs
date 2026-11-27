@@ -1249,7 +1249,7 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     let jog = s.dk.jog;
     let top = (FADE_N - 1) as u8;
     // Nothing sounds and nothing moves: the deck rests where it is.
-    if !s.playing && !searching && !matches!(jog, Jog::Speed(_)) && (!smooth || (s.dsp.att == 0 && s.dsp.ramp == 0)) {
+    if !s.playing && !searching && !matches!(jog, Jog::Speed(_)) && (!smooth || (s.dsp.att == 0 && s.dsp.ramp == 0)) && !crate::groove::wants_render(s) {
         s.search_count = 0;
         s.dsp.st.active = false;
         s.dsp.expect = s.pos;
@@ -1310,16 +1310,26 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     // The channel strip: none (Export), the equalizer (1: DJM-900NXS2 type, 3: DJM-900NXS
     // type), or the isolator (rekordbox's band gains: kill at the left end, flat at the
     // centre, +6 dB at the right, the same curve as STEM ISO).
-    let strip = s.strip;
-    let eq_on = s.eq_on || strip == 2;
+    // A change of type fades the old one out and the new one in, 3.3 ms each (`EqIso`); the
+    // DJM-900NXS type follows its knobs in filter steps (deck.rs).
+    let want_strip = s.strip;
+    let mut strip = s.dk.eqsw.begin(want_strip, rate);
+    let mut eq_on = s.eq_on || strip == 2;
     if eq_on {
         s.dsp.eq.prepare(rate);
     }
+    let eq_knobs = if strip == 3 {
+        s.dk.nxs.advance(s.eq_pos, n_out, rate)
+    } else {
+        s.dk.nxs.ready = false;
+        s.eq_pos
+    };
     if strip == 1 || strip == 3 {
         s.dsp.eq3.nxs = strip == 3;
-        s.dsp.eq3.prepare(rate, s.eq_pos, n_out);
+        s.dsp.eq3.prepare(rate, eq_knobs, n_out);
     }
-    let iso_gain = if strip == 2 { [stem_iso_gain(s.eq_pos[0]), stem_iso_gain(s.eq_pos[1]), stem_iso_gain(s.eq_pos[2])] } else { s.eq_gain };
+    let iso_of = |strip: u8, pos: [f32; 3], gain: [f32; 3]| if strip == 2 { [stem_iso_gain(pos[0]), stem_iso_gain(pos[1]), stem_iso_gain(pos[2])] } else { gain };
+    let mut iso_gain = iso_of(strip, s.eq_pos, s.eq_gain);
     let mut peak = s.peak;
     let cfx_on = strip != 0;
     if !stretch {
@@ -1420,8 +1430,8 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     };
     // The loop as whole source frames, so that every pass is the same samples. Its wrap is
     // smoothed (fade out before, fade in after) unless the loop is 2 ms or shorter.
-    let lp = s.loop_range.map(|(a, b)| ((a * audio.sr as f64).round(), (b * audio.sr as f64).round())).filter(|(a, b)| b > a);
-    let lp_smooth = smooth && lp.map(|(a, b)| (b - a) / audio.sr as f64 > crate::deck::LOOP_SMOOTH_SECS).unwrap_or(false);
+    let mut lp = s.loop_range.map(|(a, b)| ((a * audio.sr as f64).round(), (b * audio.sr as f64).round())).filter(|(a, b)| b > a);
+    let mut lp_smooth = smooth && lp.map(|(a, b)| (b - a) / audio.sr as f64 > crate::deck::LOOP_SMOOTH_SECS).unwrap_or(false);
     let cue_gain = if cue.len() * channels.max(1) >= out.len() * 2 { s.cue_gain * s.gain } else { 0.0 };
     // Groove Circuit: this deck's DRUM SWAP slots (and its drums under DRUM RELEASE FX).
     let gc = crate::groove::deck_block(s, &audio, speed, &mut stem_target, out.len() / channels.max(1), rate);
@@ -1497,6 +1507,12 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
                     if (d.vel > 0.0 && d.snd >= exit) || (d.vel < 0.0 && d.snd <= exit) {
                         d.snd = (enter + (d.snd - exit)).clamp(0.0, last);
                         s.dk.warp = None;
+                        // (An auto beat loop entered on its lattice starts now; deck.rs.)
+                        if let Some((a, b)) = s.dk.arm_loop.take() {
+                            s.loop_range = Some((a, b));
+                            lp = Some(((a * audio.sr as f64).round(), (b * audio.sr as f64).round())).filter(|(a, b)| b > a);
+                            lp_smooth = smooth && (b - a) > crate::deck::LOOP_SMOOTH_SECS;
+                        }
                         if smooth {
                             d.since = 0;
                         }
@@ -1572,16 +1588,18 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
         } else {
             d.st.frame(&src, p, pitch * step * dir, hop)
         };
-        if let Some(g) = gc.as_ref() {
-            let (gl, gr) = g.at(fi);
-            l += gl;
-            r += gr;
-        }
         if smooth {
             // The fade curve of rekordbox's `Attenuator`: a raised cosine over 44 frames.
             let g = fade_curve(d.att as usize) * dip * g_stop;
             l *= g;
             r *= g;
+        }
+        // (Groove Circuit's slots after the deck's own fades: a slot also sounds while the
+        // deck stands.)
+        if let Some(g) = gc.as_ref() {
+            let (gl, gr) = g.at(fi);
+            l += gl;
+            r += gr;
         }
         if eq_on {
             for k in 0..3 {
@@ -1598,6 +1616,22 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
                 l = d.eq3.run(0, l);
                 r = d.eq3.run(1, r);
             }
+            let (eg, switched) = s.dk.eqsw.next(want_strip, rate);
+            if let Some(m) = switched {
+                // The new type starts from a clean state (`initialize`).
+                strip = m;
+                eq_on = s.eq_on || strip == 2;
+                d.eq = Iso3::new();
+                d.eq.prepare(rate);
+                d.eq3 = crate::mixer::Eq3::new();
+                d.eq3.nxs = strip == 3;
+                s.dk.nxs.ready = false;
+                let k = if strip == 3 { s.dk.nxs.advance(s.eq_pos, 0, rate) } else { s.eq_pos };
+                d.eq3.prepare(rate, k, n_out);
+                iso_gain = iso_of(strip, s.eq_pos, s.eq_gain);
+            }
+            l *= eg;
+            r *= eg;
             // Sound Color FX: after the EQ, before the meter, the CUE feed and the faders.
             if cfx_on {
                 let mut fr = [l, r];

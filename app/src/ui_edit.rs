@@ -143,11 +143,17 @@ pub struct EditState {
     pub(crate) menu: Option<MenuItems>,
     /// Last state pushed to the menu items.
     menu_shown: Vec<bool>,
+    /// Tracks made by a render (their `edit_of_<id>` link), read once and kept current.
+    pub edited: Option<std::collections::HashSet<i64>>,
+    /// The Attribute column's filter list: None = "Select all"; else (Edited Tracks, No
+    /// Attribute) ticked.
+    pub attr_filter: Option<(bool, bool)>,
+    pub attr_popup: bool,
 }
 
 impl Default for EditState {
     fn default() -> Self {
-        EditState { project: None, loading: None, zoom: ZOOM_DEFAULT, view_start: 0.0, gesture: Gesture::None, modal: None, palette_delete: false, renaming: None, zoom_ctrl_open: true, job: None, quit_ok: false, map: Default::default(), queue: vec![], menu: None, menu_shown: vec![] }
+        EditState { project: None, loading: None, zoom: ZOOM_DEFAULT, view_start: 0.0, gesture: Gesture::None, modal: None, palette_delete: false, renaming: None, zoom_ctrl_open: true, job: None, quit_ok: false, map: Default::default(), queue: vec![], menu: None, menu_shown: vec![], edited: None, attr_filter: None, attr_popup: false }
     }
 }
 
@@ -325,7 +331,9 @@ fn finish_load(app: &mut App, id: i64, audio: Arc<Decoded>, project: Option<(Pat
         e.main.playing = false;
         e.main.loop_on = app.prefs.edit.loop_mode;
         e.main.loop_range = None;
-        e.pal.audio = Some(audio.clone());
+        for v in e.pals.iter_mut() {
+            v.audio = Some(audio.clone());
+        }
         e.gain = if t.gain_db.is_finite() { 10f32.powf(t.gain_db / 20.0).min(4.0) } else { 1.0 };
     }
     app.edit.project = Some(Project { session, wave: app.db.wave(id).map(Arc::new), track: t, audio, file, song });
@@ -344,8 +352,9 @@ fn finish_load(app: &mut App, id: i64, audio: Arc<Decoded>, project: Option<(Pat
 pub fn unload(app: &mut App) {
     let freed = {
         let mut e = EDIT.lock();
-        e.pal_id = 0;
-        (e.main.clear(), e.pal.clear())
+        e.pal_ids = [0; crate::edit_audio::PAL_VOICES];
+        let pals: Vec<_> = e.pals.iter_mut().map(|v| v.clear()).collect();
+        (e.main.clear(), pals)
     };
     drop(freed);
     app.edit.project = None;
@@ -793,16 +802,20 @@ pub fn palette_play(app: &mut App, id: u32, from: Option<f64>) {
     let Some(clip) = p.session.palettes.iter().find(|c| c.id == id).map(|c| c.clip.clone()) else { return };
     let old = {
         let mut e = EDIT.lock();
-        if e.pal_id == id && e.pal.playing && from.is_none() {
-            e.pal.playing = false;
+        if e.pal_playing(id) && from.is_none() {
+            if let Some(k) = e.pal_of(id) {
+                e.pals[k].playing = false;
+            }
             None
         } else {
-            let old = e.pal.score.replace(clip.clone());
-            e.pal.keep_pitch = clip.song_grid.is_dynamic();
-            e.pal.audio = Some(p.audio.clone());
-            e.pal.pos = from.unwrap_or(0.0).clamp(0.0, clip.len());
-            e.pal.playing = true;
-            e.pal_id = id;
+            // Each palette clip has a player of its own: others keep sounding.
+            let k = e.pal_slot(id);
+            let v = &mut e.pals[k];
+            let old = v.score.replace(clip.clone());
+            v.keep_pitch = clip.song_grid.is_dynamic();
+            v.audio = Some(p.audio.clone());
+            v.pos = from.unwrap_or(0.0).clamp(0.0, clip.len());
+            v.playing = true;
             old
         }
     };
@@ -812,12 +825,13 @@ pub fn palette_play(app: &mut App, id: u32, from: Option<f64>) {
 pub fn palette_remove(app: &mut App, id: u32) {
     let old = {
         let mut e = EDIT.lock();
-        if e.pal_id == id {
-            e.pal.playing = false;
-            e.pal_id = 0;
-            e.pal.score.take()
-        } else {
-            None
+        match e.pal_of(id) {
+            Some(k) => {
+                e.pals[k].playing = false;
+                e.pal_ids[k] = 0;
+                e.pals[k].score.take()
+            }
+            None => None,
         }
     };
     drop(old);
@@ -902,6 +916,138 @@ fn poll_render(app: &mut App) {
     }
 }
 
+// ------------------------------------------------------------ the browser's EDIT attribute
+//
+// rekordbox marks a rendered track as edited (`DatabaseIF::setTrackEdited`): the browser's
+// Attribute cell shows `edit/attribute.svg` (`ListViewer::paintAttributeColumn` 0x1003f07b0)
+// with the tooltip "Tracks created in EDIT mode." (`getAttributeCellTooltip` 0x1003ebc2c),
+// and the Attribute column's filter list (`AttributeFilterList`, `db::AttributeFilter::
+// execFilter` 0x1014d8380, opened from the column's header) has "Edited Tracks" beside
+// "Select all", the cloud items, "LINK file", "Karaoke file" and "No Attribute". The same cell
+// shows `sampler.svg` / `samplerLoop.svg` for a track whose Track Type is Oneshot / Loop.
+// recordbox lists the items that can apply to its library: Select all, Edited Tracks, No
+// Attribute (no cloud, no video LINK or karaoke files).
+
+/// The rendered tracks (read from the settings the first time).
+pub fn edited_set(app: &mut App) -> &std::collections::HashSet<i64> {
+    if app.edit.edited.is_none() {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(mut st) = app.db.conn.prepare("SELECT key FROM settings WHERE substr(key, 1, 8) = 'edit_of_'") {
+            if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+                for k in rows.flatten() {
+                    if let Some(id) = k.strip_prefix("edit_of_").and_then(|v| v.parse::<i64>().ok()) {
+                        set.insert(id);
+                    }
+                }
+            }
+        }
+        app.edit.edited = Some(set);
+    }
+    app.edit.edited.as_ref().unwrap()
+}
+
+/// The Attribute filter lets this track through (call `edited_set` once before filtering).
+pub fn attribute_pass(app: &App, id: i64) -> bool {
+    let Some((edited, none)) = app.edit.attr_filter else { return true };
+    let is_edited = app.edit.edited.as_ref().map(|s| s.contains(&id)).unwrap_or(false);
+    attr_ok(Some((edited, none)), is_edited, app.cue_tools.has_type(id))
+}
+
+/// The filter list's rule: a ticked item lets its tracks through; "No Attribute" is a track
+/// with no attribute icon at all.
+pub fn attr_ok(filter: Option<(bool, bool)>, is_edited: bool, has_type: bool) -> bool {
+    match filter {
+        None => true,
+        Some((edited, none)) => (edited && is_edited) || (none && !is_edited && !has_type),
+    }
+}
+
+/// rekordbox's `edit/attribute.svg` (19 x 16, grey 149) drawn with its top left at `o`,
+/// scaled by `k`.
+pub fn attribute_icon(p: &egui::Painter, o: egui::Pos2, k: f32, col: egui::Color32) {
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    for (x0, y0, x1, y1) in [(0.0, 0.0, 2.0, 16.0), (4.0, 4.0, 6.0, 12.0)] {
+        p.rect_filled(egui::Rect::from_min_max(at(x0, y0), at(x1, y1)), 0.0, col);
+    }
+    for pts in [vec![(13.0, 15.0), (9.0, 11.0), (15.0, 5.0), (19.0, 9.0)], vec![(12.0, 3.0), (14.0, 3.0), (14.0, 4.029), (12.0, 5.979)], vec![(8.0, 1.0), (10.0, 1.0), (10.0, 8.0), (8.0, 10.0)], vec![(12.0, 16.0), (8.0, 16.0), (8.0, 12.0)]] {
+        p.add(egui::Shape::convex_polygon(pts.into_iter().map(|(x, y)| at(x, y)).collect(), col, egui::Stroke::NONE));
+    }
+}
+
+/// The attribute icons of a row (EDIT, Track Type) in `cell`, with their tooltips.
+pub fn attribute_icons(app: &mut App, p: &egui::Painter, cell: egui::Rect, id: i64, tips: &mut Vec<&'static str>) {
+    use egui::vec2;
+    let edited = edited_set(app).contains(&id);
+    app.track_types_ready();
+    let ty = app.cue_tools.cached_type(id);
+    let col = crate::theme::hex(0x959595);
+    let mut x = cell.min.x + 4.0;
+    let cy = cell.center().y;
+    if edited {
+        // (At 75 %: 14 x 12 pt in the 30 pt cell.)
+        attribute_icon(p, egui::pos2(x, cy - 6.0), 0.75, col);
+        tips.push("Tracks created in EDIT mode.");
+        x += 16.0;
+    }
+    match ty {
+        Some(1) => {
+            // sampler.svg: an arrow, 10 x 9.
+            let o = egui::pos2(x, cy - 4.5);
+            p.add(egui::Shape::convex_polygon(vec![o + vec2(5.195, 0.0), o + vec2(9.996, 4.5), o + vec2(5.195, 8.996)], col, egui::Stroke::NONE));
+            p.rect_filled(egui::Rect::from_min_max(o + vec2(0.0, 4.0), o + vec2(5.2, 5.0)), 0.0, col);
+        }
+        Some(2) => {
+            // samplerLoop.svg: a loop with an arrow, 12 x 8.
+            let o = egui::pos2(x, cy - 4.0);
+            p.rect_stroke(egui::Rect::from_min_max(o + vec2(3.0, 1.5), o + vec2(10.8, 6.4)), 1.4, egui::Stroke::new(1.4, col), egui::StrokeKind::Middle);
+            p.add(egui::Shape::convex_polygon(vec![o + vec2(3.05, 0.87), o + vec2(5.7, 4.93), o + vec2(0.4, 4.93)], col, egui::Stroke::NONE));
+        }
+        _ => {}
+    }
+}
+
+/// The Attribute cell of the list header: a click opens the filter list. Returns true when
+/// the click was taken. `cell`: the header's attribute cell.
+pub fn attribute_header(app: &mut App, ui: &mut egui::Ui, resp: &egui::Response, cell: egui::Rect) -> bool {
+    use egui::{vec2, Align2, RichText};
+    let on = app.edit.attr_filter.is_some();
+    crate::icons_src::funnel(ui.painter(), egui::pos2(cell.center().x, cell.center().y - 1.0), if on { crate::theme::TILE_ON } else { crate::theme::DIM });
+    let hit = resp.clicked() && resp.interact_pointer_pos().map(|pp| cell.contains(pp)).unwrap_or(false);
+    if hit {
+        app.edit.attr_popup = !app.edit.attr_popup;
+        edited_set(app);
+    }
+    if app.edit.attr_popup {
+        let mut close = false;
+        let area = egui::Area::new(egui::Id::new("attr_filter_list")).order(egui::Order::Foreground).fixed_pos(cell.left_bottom() + vec2(0.0, 2.0)).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).fill(crate::theme::hex(0x202020)).show(ui, |ui| {
+                ui.set_min_width(170.0);
+                let (mut all, (mut ed, mut none)) = (app.edit.attr_filter.is_none(), app.edit.attr_filter.unwrap_or((true, true)));
+                let mut changed = false;
+                changed |= ui.checkbox(&mut all, RichText::new("Select all").size(11.5)).changed();
+                if changed {
+                    ed = all;
+                    none = all;
+                }
+                let c1 = ui.checkbox(&mut ed, RichText::new("Edited Tracks").size(11.5)).changed();
+                let c2 = ui.checkbox(&mut none, RichText::new("No Attribute").size(11.5)).changed();
+                if changed || c1 || c2 {
+                    app.edit.attr_filter = if ed && none { None } else { Some((ed, none)) };
+                    app.list_dirty = true;
+                }
+            });
+        });
+        let _ = Align2::LEFT_TOP;
+        if !hit && ui.input(|i| i.pointer.any_pressed()) && !area.response.rect.contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default())) {
+            close = true;
+        }
+        if close {
+            app.edit.attr_popup = false;
+        }
+    }
+    hit
+}
+
 /// Key of the setting that links a rendered track to the track it was edited from.
 pub fn edited_key(id: i64) -> String {
     format!("edit_of_{id}")
@@ -946,6 +1092,7 @@ pub fn import_render(app: &mut App, path: &Path, dlg: &RenderDlg, show: bool) ->
     let _ = app.db.save_grid(id, &BeatGrid::constant(0.0, score.bpm, first_beat_no));
     let _ = app.db.replace_cues(id, &cues_for_render(&score, id));
     app.db.set_setting(&edited_key(id), &src.id.to_string());
+    app.edit.edited.get_or_insert_with(Default::default).insert(id);
     if let Some(mut t) = app.db.track(id) {
         t.title = dlg.track.clone();
         t.artist = dlg.artist.clone();
@@ -1132,6 +1279,19 @@ fn sync_menu(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attribute_filter_lets_edited_tracks_and_plain_ones_through() {
+        assert!(attr_ok(None, false, false) && attr_ok(None, true, true));
+        // Edited Tracks only.
+        assert!(attr_ok(Some((true, false)), true, false));
+        assert!(!attr_ok(Some((true, false)), false, false));
+        // No Attribute only: neither edited nor a sampler type.
+        assert!(attr_ok(Some((false, true)), false, false));
+        assert!(!attr_ok(Some((false, true)), true, false) && !attr_ok(Some((false, true)), false, true));
+        // Nothing ticked: nothing passes.
+        assert!(!attr_ok(Some((false, false)), true, false));
+    }
+
     use super::*;
 
     fn track() -> Track {

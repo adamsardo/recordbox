@@ -382,6 +382,14 @@ fn slot(app: &mut App, ui: &mut Ui, r: Rect, deck: usize, idx: usize, st: groove
     let body = Rect::from_min_max(r.min, pos2(r.max.x - 2.0, r.max.y));
     p.rect_filled(r, 0.0, BG);
     let resp = ui.interact(r, ui.id().with(("slot", idx)), Sense::click());
+    // The capture area dropped here: this slot captures it.
+    if app.gc.drag_capture.is_some() && ui.rect_contains_pointer(r) {
+        p.rect_stroke(r, 0.0, egui::Stroke::new(2.0, hex(0x8214EB)), egui::StrokeKind::Inside);
+        if ui.input(|i| i.pointer.any_released()) {
+            app.gc.drag_capture = None;
+            app.groove_capture(deck, idx);
+        }
+    }
     let over = ui.rect_contains_pointer(r) && app.drag.is_none();
     let controls = over && !capture;
 
@@ -640,6 +648,21 @@ fn capture_area(app: &mut App, ui: &mut Ui) {
     let area = Rect::from_min_max(pos2(x(a), r.min.y), pos2(x(b), r.max.y)).intersect(clip);
     if area.width() > 0.0 {
         ui.painter().with_clip_rect(clip).rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(0x82, 0x14, 0xEB, 102));
+        // The area can be dragged onto a DRUM SWAP slot, which captures it
+        // (`DrumSwapSlot::itemDroppedFromWave`).
+        let resp = ui.interact(area, ui.id().with(("gc_capture_drag", deck)), Sense::drag());
+        if resp.drag_started() {
+            app.gc.drag_capture = Some(deck);
+        }
+    }
+    if app.gc.drag_capture.is_some() {
+        if let Some(pp) = ui.ctx().pointer_latest_pos() {
+            let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("gc_capture_ghost")));
+            lp.rect_filled(Rect::from_min_size(pp + vec2(10.0, 4.0), vec2(40.0, 14.0)), 2.0, Color32::from_rgba_unmultiplied(0x82, 0x14, 0xEB, 160));
+        }
+        if !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+            app.gc.drag_capture = None;
+        }
     }
 }
 
@@ -797,6 +820,16 @@ pub fn frame_hook(app: &mut App, raw: &mut egui::RawInput) {
     app.groove_poll();
 }
 
+/// The middle of deck 1's DRUM CAPTURE area on its waveform (for the scripted run).
+fn cap_c(app: &App) -> Pos2 {
+    let Some((a, b)) = app.groove_capture_span(0) else { return Pos2::ZERO };
+    let Some((r, pos, pps)) = app.deck_of(0).detail_map else { return Pos2::ZERO };
+    let x = |t: f64| r.center().x + ((t - pos) * pps) as f32;
+    let xa = x(a).max(r.min.x + 30.0);
+    let xb = x(b).min(r.max.x);
+    pos2((xa + xb) / 2.0, r.center().y)
+}
+
 fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
     let view = std::env::var("PREPDECK_SHOT_VIEW").unwrap_or_default();
     if !view.starts_with("perfgroove") {
@@ -909,6 +942,9 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
         ('c', "slot B1: Eject while it plays (Eject Lock)", eject(app, 0), Pos2::ZERO),
         ('c', "slot B1: Play again (stops it)", play(app, 0), Pos2::ZERO),
         ('c', "slot B1: Eject", eject(app, 0), Pos2::ZERO),
+        ('x', "CALL capture on: DRUM CAPTURE on for deck 1 (for the drag)", Pos2::ZERO, Pos2::ZERO),
+        ('d', "drag the DRUM CAPTURE area from deck 1's waveform onto slot B3 (it captures there)", cap_c(app), slot_c(app, 2)),
+        ('w', "wait (the captured file is read)", Pos2::ZERO, Pos2::ZERO),
         ('x', "CALL capture: Original track, 8 beats, into slot B2", Pos2::ZERO, Pos2::ZERO),
         ('c', "BANK A", pp(19.0, 13.0), Pos2::ZERO),
         ('x', "CALL preset: Save as New Preset \"Set one\", then eject A2 and load the preset back", Pos2::ZERO, Pos2::ZERO),
@@ -917,7 +953,10 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
         ('c', "slot A1: Play", play(app, 0), Pos2::ZERO),
         ('w', "wait", Pos2::ZERO, Pos2::ZERO),
         ('x', "CALL deck: pause deck 1 (its clips stop)", Pos2::ZERO, Pos2::ZERO),
+        ('c', "slot A1: Play on the stopped deck (rekordbox: plays at once, unsynced)", play(app, 0), Pos2::ZERO),
+        ('w', "wait (A1 sounds while the deck stands)", Pos2::ZERO, Pos2::ZERO),
         ('x', "CALL deck: play deck 1", Pos2::ZERO, Pos2::ZERO),
+        ('w', "wait (A1 goes on when the deck starts)", Pos2::ZERO, Pos2::ZERO),
         ('c', "slot A1: Play", play(app, 0), Pos2::ZERO),
         ('w', "wait", Pos2::ZERO, Pos2::ZERO),
         ('c', "top bar: GROOVE CIRCUIT button (hide the panel: everything stops)", pos2(195.0 + 37.0 * 1.0 + 10.0, 14.0), Pos2::ZERO),
@@ -939,6 +978,8 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
                     if let Some(id) = app.deck_of(0).track {
                         app.groove_load_track(0, 3, id);
                     }
+                } else if name.starts_with("CALL capture on") {
+                    app.gc.capture_on = Some(0);
                 } else if name.starts_with("CALL capture") {
                     app.prefs.groove.capture_stem = 2;
                     app.gc.capture_len = 8;

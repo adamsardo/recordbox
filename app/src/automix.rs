@@ -1154,6 +1154,33 @@ pub fn poll(app: &mut App, ctx: &eframe::egui::Context) {
     app.smplib_poll();
     crate::ui_automix::windows(app, ctx);
     crate::ui_sampler_lib::windows(app, ctx);
+    crate::ui_sampler_lib::drag_frame(app, ctx);
+}
+
+/// While Automix crossfades (`AutoMixCrossfader::startCrossfade` 0x1023592b4 to
+/// `completeCrossfade` 0x102359f7c), rekordbox disables the on-screen crossfader
+/// (`CrossFaderComp::setAutomixCrossfaderEnabled` 0x1000d9cd8: the slider's
+/// `setEnabled(false)`) and sets the crossfader curve to value 0 (the smoothest of the 33:
+/// the two sides blend over the whole travel); at the end of the crossfade, or when Automix
+/// stops (`finishAutoMix` 0x102359598), the crossfader is enabled again and the curve set in
+/// Preferences comes back. No message goes with it (none exists in the binary).
+pub fn crossfader_locked(app: &App) -> bool {
+    app.mixx.automix.engine.processing && app.mixx.automix.engine.crossfade.is_some()
+}
+
+/// The crossfader curve Automix holds while it crossfades (see `crossfader_locked`).
+pub fn curve_override(app: &App) -> Option<u8> {
+    if crossfader_locked(app) { Some(0) } else { None }
+}
+
+/// While Automix brings a deck's tempo back to 0 % (`AutoMixTempoController::start`
+/// 0x1008fb048 to its last `timerCallback` step), rekordbox dims that deck's tempo controls
+/// to 30 % opacity (`AutoMixPlayerWrapper::setManualTempoSliderEnabled(false)` 0x100107c40:
+/// `setAlpha(0.3)` on two of `VirtualDeckPanel`'s components); they are not disabled and no
+/// message is shown. Decks 1 and 2 only (Automix uses no others).
+pub fn tempo_dimmed(app: &App, deck: u8) -> bool {
+    let e = &app.mixx.automix.engine;
+    e.processing && (deck as usize) < 2 && e.players[deck as usize].tempo_ramp.is_some()
 }
 
 impl App {

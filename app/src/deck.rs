@@ -106,11 +106,173 @@ pub struct Engine {
     pub xf: [f32; 2],
     /// The speed in use (1.0 = the track's own speed), for the interface.
     pub vel: f64,
+    /// A loop that starts with the quantized `warp` above (an auto beat loop that lies
+    /// behind the playhead is entered on its own lattice, `QuantizedCueBehavior::
+    /// doShortAutoBeatLoop`): it becomes `loop_range` when the warp is taken.
+    pub arm_loop: Option<(f64, f64)>,
+    /// The channel's EQ / ISOLATOR switch as it sounds (rekordbox's `EqIso`).
+    pub eqsw: EqSwitch,
+    /// DJM-900NXS EQ: the filter steps in use per band (rekordbox's `Equalizer`).
+    pub nxs: NxsSteps,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Engine { reverse: false, slip_reverse: false, slip_return: false, jog: Jog::None, start_ms: 1.0, stop_ms: 1.0, bend_slope: 0.0, bend_acc: 0.0, warp: None, scan_grain: 0.0, sync_rate: 1.0, route: 255, xf: [1.0; 2], vel: 0.0 }
+        Engine { reverse: false, slip_reverse: false, slip_return: false, jog: Jog::None, start_ms: 1.0, stop_ms: 1.0, bend_slope: 0.0, bend_acc: 0.0, warp: None, scan_grain: 0.0, sync_rate: 1.0, route: 255, xf: [1.0; 2], vel: 0.0, arm_loop: None, eqsw: EqSwitch::default(), nxs: NxsSteps::default() }
+    }
+}
+
+// ---------------------------------------------------------------------- EQ type switch
+
+/// rekordbox's `EqIso::processBlock`: when the channel's EQ type changes (EQ / ISOLATOR, or
+/// the EQ model), the old one fades out over a 3.3 ms `GainSmoother`, the new one is set up
+/// from scratch (`initialize`) and fades in over another 3.3 ms.
+#[derive(Clone, Copy, Debug)]
+pub struct EqSwitch {
+    /// The strip that sounds (0 none, 1 NXS2 EQ, 2 isolator, 3 NXS EQ; 255 = not yet set).
+    pub mode: u8,
+    /// 0 steady, 1 fading out, 2 fading in.
+    pub phase: u8,
+    pub gain: Ramp,
+}
+
+impl Default for EqSwitch {
+    fn default() -> Self {
+        EqSwitch { mode: 255, phase: 0, gain: Ramp::at(1.0) }
+    }
+}
+
+/// Length of the EQ type switch's fades (`GainSmoother(rate, 3.3 ms, 1.0)` in `EqIso`).
+pub const EQ_SWITCH_SECS: f32 = 0.0033;
+
+impl EqSwitch {
+    /// Before a block: the strip to start it with. A first call takes `want` at once.
+    pub fn begin(&mut self, want: u8, rate: u32) -> u8 {
+        if self.mode == 255 || (self.mode == 0) != (want == 0) {
+            // (A strip switched on or off with the mode is not a type change.)
+            self.mode = want;
+            self.phase = 0;
+            self.gain = Ramp::at(1.0);
+        } else if self.phase == 0 && want != self.mode {
+            self.phase = 1;
+            self.gain.set(0.0, EQ_SWITCH_SECS * rate as f32);
+        }
+        self.mode
+    }
+
+    /// One frame's gain; `Some(new mode)` on the frame where the old type has faded out and
+    /// the new one takes over (the caller resets that one's filters).
+    #[inline]
+    pub fn next(&mut self, want: u8, rate: u32) -> (f32, Option<u8>) {
+        if self.phase == 0 {
+            return (1.0, None);
+        }
+        let g = self.gain.next();
+        if self.gain.idle() {
+            if self.phase == 1 {
+                self.phase = 2;
+                self.mode = want;
+                self.gain.set(1.0, EQ_SWITCH_SECS * rate as f32);
+                return (g, Some(want));
+            }
+            self.phase = 0;
+        }
+        (g, None)
+    }
+}
+
+// ---------------------------------------------------------------------- DJM-900NXS EQ steps
+
+/// rekordbox's DJM-900NXS `Equalizer` does not follow its knob directly: the knob (rounded to
+/// 256 positions) picks one of 488 filter steps through a table (`mp_s_vr_eqtbl`, with a flat
+/// zone around the centre), and every 1/3 ms (`sampleRate * 0.000333` frames) the filter moves
+/// one step toward it. This keeps the step in use per band (low, mid, high).
+#[derive(Clone, Copy, Debug)]
+pub struct NxsSteps {
+    pub cur: [f32; 3],
+    pub ready: bool,
+}
+
+impl Default for NxsSteps {
+    fn default() -> Self {
+        NxsSteps { cur: [0.0; 3], ready: false }
+    }
+}
+
+/// The last filter step.
+pub const NXS_STEPS: u16 = 487;
+
+static NXS_TABLE: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
+
+/// The knob-to-step table, read once from the installed rekordbox 7.2.19 (it is not copied
+/// into recordbox); a straight line when that is not there.
+pub fn nxs_table() -> &'static [u16; 256] {
+    NXS_TABLE.get_or_init(|| read_nxs_table().unwrap_or_else(|| std::array::from_fn(|k| ((k as f32 * NXS_STEPS as f32 / 255.0).round()) as u16)))
+}
+
+/// Read `Equalizer::mp_s_vr_eqtbl` from the arm64 slice of the installed binary (7.2.19:
+/// slice offset 0x38E17F0, 256 little-endian u16, rising from 0 to 487).
+fn read_nxs_table() -> Option<[u16; 256]> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open("/Applications/rekordbox 7/rekordbox.app/Contents/MacOS/rekordbox").ok()?;
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head).ok()?;
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    // A universal binary: find the arm64 slice (cputype 0x0100000C).
+    let base = if be(&head[0..4]) == 0xCAFE_BABE {
+        let n = be(&head[4..8]) as usize;
+        let mut arch = vec![0u8; 20 * n.min(8)];
+        f.read_exact(&mut arch).ok()?;
+        (0..n.min(8)).find(|i| be(&arch[i * 20..]) == 0x0100_000C).map(|i| be(&arch[i * 20 + 8..]) as u64)?
+    } else {
+        0
+    };
+    f.seek(SeekFrom::Start(base + 0x38E_17F0)).ok()?;
+    let mut raw = [0u8; 512];
+    f.read_exact(&mut raw).ok()?;
+    let t: [u16; 256] = std::array::from_fn(|i| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]));
+    (t[0] == 0 && t[255] == NXS_STEPS && t.windows(2).all(|w| w[0] <= w[1] && w[1] - w[0] <= 4)).then_some(t)
+}
+
+/// The filter step a knob position (0..1) asks for.
+pub fn nxs_step_of(knob: f32) -> u16 {
+    nxs_table()[(knob.clamp(0.0, 1.0) * 255.0).round() as usize]
+}
+
+/// The knob position (0..1) whose gain law gives filter step `step`: the middle of the knob
+/// positions that map to it, or a point between its neighbours.
+pub fn nxs_knob_of(step: f32) -> f32 {
+    let t = nxs_table();
+    let s = step.clamp(0.0, NXS_STEPS as f32);
+    let i = t.partition_point(|v| (*v as f32) < s);
+    if i < 256 && t[i] as f32 == s {
+        let j = t.partition_point(|v| (*v as f32) <= s);
+        return (i + j - 1) as f32 / 2.0 / 255.0;
+    }
+    let (a, b) = (i.saturating_sub(1), i.min(255));
+    let (va, vb) = (t[a] as f32, t[b] as f32);
+    let k = if vb > va { a as f32 + (s - va) / (vb - va) } else { a as f32 };
+    k / 255.0
+}
+
+impl NxsSteps {
+    /// Move the steps toward the knobs for a block of `frames` and give the knob positions
+    /// that the equalizer's gain law is to use for it.
+    pub fn advance(&mut self, knobs: [f32; 3], frames: usize, rate: u32) -> [f32; 3] {
+        let target = knobs.map(|k| nxs_step_of(k) as f32);
+        if !self.ready {
+            self.cur = target;
+            self.ready = true;
+        } else {
+            let n = (frames as f32 / (rate as f32 * 0.000_333_333_3)).max(0.0);
+            for (c, t) in self.cur.iter_mut().zip(target) {
+                *c += (t - *c).clamp(-n, n);
+                if (t - *c).abs() < 1e-3 {
+                    *c = t;
+                }
+            }
+        }
+        self.cur.map(nxs_knob_of)
     }
 }
 
@@ -191,6 +353,80 @@ pub fn sync_speed(master_bpm: f64, own_bpm: f64, rate: f64) -> Option<f64> {
     let v = master_bpm * rate / own_bpm;
     (v <= SYNC_MAX_SPEED).then_some(v)
 }
+
+/// Limited sync rate (`SlaveDjPlayerStateReqirements` +32 / +40, switched by +69): a follower
+/// may then play only between half and one and a half times its own speed.
+pub const SYNC_LIMITED_MIN: f64 = 0.5;
+pub const SYNC_LIMITED_MAX: f64 = 1.5;
+
+/// `sync_speed` with rekordbox's limited sync rate (`isBpmWithinRange`): with `limited` the
+/// speed must lie in 0.5 ..= 1.5, otherwise up to 2.0.
+pub fn sync_speed_limited(master_bpm: f64, own_bpm: f64, rate: f64, limited: bool) -> Option<f64> {
+    if !limited {
+        return sync_speed(master_bpm, own_bpm, rate);
+    }
+    if master_bpm < SYNC_MIN_BPM || own_bpm < SYNC_MIN_BPM {
+        return None;
+    }
+    let v = master_bpm * rate / own_bpm;
+    (SYNC_LIMITED_MIN..=SYNC_LIMITED_MAX).contains(&v).then_some(v)
+}
+
+/// The x1/2, x1, x2 button with the limited sync rate (`getToggleSyncRate`, the branch on
+/// +69): x1 goes to x2 if that is at most 1.5 times the speed, else to x1/2 if that is at
+/// least half, else stays; x2 goes to x1/2 if that is in range, else to x1 if that is, else
+/// stays; x1/2 goes to x1, unless x1 is out of range, when it is x2 if that fits, else x1/2.
+pub fn sync_rate_toggle_limited(current: f64, master_bpm: f64, own_bpm: f64, limited: bool) -> f64 {
+    if !limited {
+        return sync_rate_toggle(current, master_bpm, own_bpm);
+    }
+    if own_bpm <= 0.0 {
+        return 1.0;
+    }
+    let r = master_bpm / own_bpm;
+    let (lo, hi) = (SYNC_LIMITED_MIN, SYNC_LIMITED_MAX);
+    if current == 1.0 {
+        if 2.0 * r <= hi {
+            2.0
+        } else if 0.5 * r >= lo {
+            0.5
+        } else {
+            1.0
+        }
+    } else if current == 2.0 {
+        if 0.5 * r >= lo {
+            0.5
+        } else if r >= lo && r <= hi {
+            1.0
+        } else {
+            2.0
+        }
+    } else if r > hi || r < lo {
+        if 2.0 * r <= hi { 2.0 } else { 0.5 }
+    } else {
+        1.0
+    }
+}
+
+/// Controllers with a motorised platter switch every deck to the limited sync rate while they
+/// are connected (`MainComponent::initializeDevice` / `finalizeDevice`, which call
+/// `setLimitedSyncRate(true / false)` on each deck when `DeviceDefs::isMotorizedJogDevice`).
+/// rekordbox 7.2.19 lists one such device.
+pub fn motorized_jog_device(name: &str) -> bool {
+    name.to_ascii_uppercase().contains("DDJ-REV7")
+}
+
+/// `PlayHeadInfo::isJumpThresholdDeviation`: whether a phase error of `beats` at `bpm` is a
+/// deviation that asks the follower to jump. The threshold is in ms; a negative threshold
+/// means every error counts. A deck master's play head keeps its constructor's -1.0
+/// (`DjSyncMasterBehavior` never sets it), so for decks only the 0.01 beat rule of
+/// `shouldJumpForSyncBeat` remains.
+pub fn jump_threshold_deviation(beats: f64, bpm: f64, threshold_ms: f64) -> bool {
+    threshold_ms < 0.0 || beats.abs() * 60000.0 / bpm.max(1e-9) > threshold_ms
+}
+
+/// The jump threshold of a deck master's play head (ms; negative: none).
+pub const DECK_MASTER_JUMP_THRESHOLD_MS: f64 = -1.0;
 
 /// How far the follower's beats are from the master's, -0.5 .. 0.5 (positive: ahead), with
 /// both positions in beats of their own grids (`getMinJumpSamplesToSyncBeat`). The unit is
@@ -446,6 +682,10 @@ pub struct DeckPrefs {
     pub eq_nxs: bool,
     /// Hot cue countdown on the platter.
     pub hot_cue_countdown: bool,
+    /// Limited sync rate (0.5 .. 1.5 times the own speed) without a motorised controller.
+    /// rekordbox has no setting for it (only such a controller switches it on); recordbox
+    /// keeps the switch here, off by default, so the rule can be used and tested.
+    pub limited_sync: bool,
     /// Per deck, as rekordbox keeps them (`Player%d_Quantize`, `_Sync`, `_TimeMode`,
     /// `_DvsMode`).
     pub player_quantize: [bool; 4],
@@ -456,7 +696,7 @@ pub struct DeckPrefs {
 
 impl Default for DeckPrefs {
     fn default() -> Self {
-        DeckPrefs { needle_lock: true, vinyl_brake: [0; 2], vinyl_start: [0; 2], jog_45: false, beat_sync: true, multi_bpm_sync: true, show_sync_rate: true, quantize_one_go: false, quantize_units: [6, 4, 6, 6], crossfader_curve: 16, headroom: 4, eq_nxs: false, hot_cue_countdown: true, player_quantize: [true; 4], player_sync: [false; 4], player_time_mode: [0; 4], player_dvs_mode: [1003; 4] }
+        DeckPrefs { needle_lock: true, vinyl_brake: [0; 2], vinyl_start: [0; 2], jog_45: false, beat_sync: true, multi_bpm_sync: true, show_sync_rate: true, quantize_one_go: false, quantize_units: [6, 4, 6, 6], crossfader_curve: 16, headroom: 4, eq_nxs: false, hot_cue_countdown: true, limited_sync: false, player_quantize: [true; 4], player_sync: [false; 4], player_time_mode: [0; 4], player_dvs_mode: [1003; 4] }
     }
 }
 
@@ -489,6 +729,35 @@ pub struct DeckUi {
     /// The track being loaded was dragged over from another deck's platter: it becomes an
     /// instant double whatever the Instant Doubles setting says.
     pub double_pending: bool,
+    /// The deck's tab column shows the GRID panel instead of the pads
+    /// (`MemoryCuePanel::setPanelType(2)`).
+    pub grid_tab: bool,
+}
+
+/// `kPlayerOperateErrorBeforeStart` (status bar text in 7.2.19).
+pub const BEFORE_START: &str = "Invalid operation. Cannot set Cue points before 00m00s.";
+
+/// The platter's turn as rekordbox draws it (`VirtualDeckComp::drawCurrentCuePosition`): the
+/// fraction of a turn at `secs` and `rpm` (33 1/3 or 45) in degrees, 0 = 3 o'clock, clockwise
+/// on screen. The position mark (a 15 degree gap in the outer ring, the panel colour) is
+/// centred 44.041 degrees before it, and so is the cue mark (8 degrees, `#EB870F`).
+pub fn platter_angle_deg(secs: f64, rpm: f64) -> f32 {
+    let turns = (secs * 1000.0) as f32 * (0.000_016_667 * rpm as f32);
+    turns.fract() * 360.0 - 44.041
+}
+
+/// BPM drag on the platter's BPM (`BpmLabel`: a hidden `juce::Slider` in IncDecButtons style,
+/// absolute drag, 250 pixels for the whole range, up is faster): the BPM for a drag of `dy`
+/// pixels (positive = down) from `start`, the range being the tempo range around the track's
+/// own BPM (`setRangeByTempo(range, 0.02)`), in steps of 0.02.
+pub fn bpm_drag_value(start: f64, own: f64, range: f64, dy: f32) -> f64 {
+    let (lo, hi) = (own * (1.0 - range), own * (1.0 + range));
+    if hi <= lo {
+        return start;
+    }
+    let prop = ((start - lo) / (hi - lo) - dy as f64 / 250.0).clamp(0.0, 1.0);
+    let v = lo + prop * (hi - lo);
+    (lo + ((v - lo) / 0.02).round() * 0.02).clamp(lo, hi)
 }
 
 /// UI play status as rekordbox's `ePlayStatus`.
@@ -713,6 +982,131 @@ impl App {
         true
     }
 
+    // ------------------------------------------------------------------ loops with quantize
+    /// The deck stands before the start of the track (`getPlayingTimeFloatMs < 0`): CUE,
+    /// LOOP IN and SLICER refuse with rekordbox's `kPlayerOperateErrorBeforeStart`. (recordbox
+    /// keeps positions at 0 or later, so this is a guard rather than a common case.)
+    pub fn before_start(&mut self) -> bool {
+        if self.deck.audio.is_some() && self.pos() < 0.0 {
+            self.toast_err(BEFORE_START);
+            return true;
+        }
+        false
+    }
+
+    /// LOOP IN in Performance (`UiPlayer::eventLoopIn` → `setCurrentCue`): the in point lands
+    /// on the SNAP value with Q on. Returns false outside Performance (the caller's rule).
+    pub fn perf_loop_in(&mut self) -> bool {
+        if !self.performance() || self.deck.audio.is_none() {
+            return false;
+        }
+        if self.before_start() {
+            return true;
+        }
+        let t = self.quantize_action(self.pos(), QType::Snap);
+        let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
+        self.deck.loop_in = Some(on_frame(t, sr));
+        true
+    }
+
+    /// LOOP OUT in Performance (`setLoopOutPoint`, then `QuantizedCueBehavior::doLoop`): with
+    /// Q on the jump back to the in point waits for the next point of the LOOP value's
+    /// lattice, so the loop ends there; one passed by less than 1/32 beat counts as now (the
+    /// playhead then lands as far past the in point).
+    pub fn perf_loop_out(&mut self) -> bool {
+        if !self.performance() || self.deck.audio.is_none() {
+            return false;
+        }
+        let Some(a) = self.deck.loop_in else { return true };
+        let sr = self.deck.audio.as_ref().map(|x| x.sr).unwrap_or(44100);
+        let p = self.pos();
+        let b = if self.prefs.quantize && self.deck.beats.len() >= 2 { quantize_point(&self.deck.beats, p, QType::Loop, self.quantize_unit(QType::Loop), self.deck.x.dk.reverse) } else { p };
+        let (a, b) = (on_frame(a, sr), on_frame(b, sr));
+        if b <= a + MIN_LOOP_SECS {
+            return true;
+        }
+        self.player.state.lock().loop_range = Some((a, b));
+        self.deck.last_loop = Some((a, b));
+        if b <= p {
+            self.seek(a + (p - b));
+        }
+        true
+    }
+
+    /// An auto beat loop in Performance with Q on (`QuantizedCueBehavior::doAutoBeatLoop` and
+    /// `updateAutoBeatLoopState`): the in point is the SNAP point nearest the playhead and the
+    /// out point that many beats on along the grid. When the loop lies wholly behind a playing
+    /// deck (a short loop started late in its beat), the deck enters it on the loop's own
+    /// lattice: at the next multiple of its length after the in point, where it warps to the
+    /// in point sample exact (`doShortAutoBeatLoop`). Returns false when the caller's rule
+    /// applies (outside Performance, Q off or no grid).
+    pub fn perf_auto_loop(&mut self, beats: f64) -> bool {
+        if !self.performance() || self.deck.audio.is_none() || !self.prefs.quantize || self.deck.beats.len() < 2 {
+            return false;
+        }
+        let sr = self.deck.audio.as_ref().map(|x| x.sr).unwrap_or(44100);
+        let p = self.pos();
+        let a = on_frame(quantize_point(&self.deck.beats, p, QType::Snap, self.quantize_unit(QType::Snap), false), sr);
+        let Some(pa) = grid_pos(&self.deck.beats, a) else { return false };
+        let b = on_frame(grid_time(&self.deck.beats, pa + beats).unwrap_or(a + beats * self.beat_len()).max(a + MIN_LOOP_SECS), sr);
+        self.deck.last_loop = Some((a, b));
+        let playing = self.playing();
+        let mut s = self.player.state.lock();
+        s.dk.arm_loop = None;
+        if !playing || p < b {
+            s.loop_range = Some((a, b));
+            return true;
+        }
+        // Behind the playhead: the next lattice point (the loop's own length, LOOP threshold).
+        let pp = grid_pos(&self.deck.beats, p).unwrap_or(pa);
+        let th = quantize_threshold(beats, raw_threshold(QType::Loop));
+        let k = ((pp - pa - th) / beats + 1e-9).floor() + 1.0;
+        let point = grid_time(&self.deck.beats, pa + k * beats).unwrap_or(p);
+        if point <= p {
+            s.loop_range = Some((a, b));
+            drop(s);
+            self.seek(a + (p - point));
+        } else {
+            s.loop_range = None;
+            s.dk.warp = Some(((point * sr as f64).round(), (a * sr as f64).round()));
+            s.dk.arm_loop = Some((a, b));
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------ per-deck settings
+    /// Per-deck Q and BEAT SYNC as rekordbox keeps them (`Player%d_Quantize`, `Player%d_Sync`),
+    /// put back on the decks once at start.
+    pub fn restore_player_settings(&mut self) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let q = self.prefs.deck.player_quantize;
+        let sync = self.prefs.deck.player_sync;
+        if self.prefs.deck.quantize_one_go {
+            let any = q.iter().any(|v| *v);
+            self.px.parked_quantize = [any; 4];
+            self.prefs.quantize = any;
+        } else {
+            self.px.parked_quantize = q;
+            self.prefs.quantize = q[(self.px.active as usize).min(3)];
+        }
+        for n in 0..4u8 {
+            self.deck_of_mut(n).x.beat_sync = sync[n as usize];
+        }
+        self.push_deck_controls();
+    }
+
+    /// The time display's mode of the active deck (`TimeView::setTimeMode(-1)`, stored as
+    /// `Player%d_TimeMode`, 0 or 1). In Performance both times are always shown; the mode only
+    /// decides whether a time before the start carries its minus sign.
+    pub fn time_mode_toggle(&mut self) {
+        let n = (self.px.active as usize).min(3);
+        self.prefs.deck.player_time_mode[n] = if self.prefs.deck.player_time_mode[n] == 0 { 1 } else { 0 };
+        self.save_prefs();
+    }
+
     // ------------------------------------------------------------------ quantize
     /// The beat value of a quantize type, in beats.
     pub fn quantize_unit(&self, kind: QType) -> f64 {
@@ -745,7 +1139,9 @@ impl App {
             // Just past the point: land the same distance past the cue.
             self.seek(start + (p - exit));
         } else {
-            self.player.state.lock().dk.warp = Some(((exit * a.sr as f64).round(), (start * a.sr as f64).round()));
+            let mut s = self.player.state.lock();
+            s.dk.warp = Some(((exit * a.sr as f64).round(), (start * a.sr as f64).round()));
+            s.dk.arm_loop = None;
         }
         true
     }
@@ -775,7 +1171,8 @@ impl App {
         }
         let (master_bpm, own) = self.sync_bpms();
         let cur = self.deck.x.dk.rate_now.max(0.5);
-        self.deck.x.dk.sync_rate = Some(sync_rate_toggle(if cur == 0.5 || cur == 2.0 { cur } else { 1.0 }, master_bpm, own));
+        let limited = self.limited_sync_rate();
+        self.deck.x.dk.sync_rate = Some(sync_rate_toggle_limited(if cur == 0.5 || cur == 2.0 { cur } else { 1.0 }, master_bpm, own, limited));
         self.push_deck_controls();
         self.sync_align();
     }
@@ -827,6 +1224,12 @@ impl App {
         if let Some(n) = (0..count).find(|n| plays(self, *n)) {
             self.px.master = n;
         }
+    }
+
+    /// The limited sync rate is in force: a motorised-platter controller is connected
+    /// (rekordbox's only switch for it), or recordbox's own setting is on.
+    pub fn limited_sync_rate(&self) -> bool {
+        self.prefs.deck.limited_sync || self.midi.devices.iter().any(|d| motorized_jog_device(d))
     }
 
     // ------------------------------------------------------------------ tempo
@@ -930,11 +1333,17 @@ impl App {
     pub(crate) fn push_deck_engine(&mut self, own_bpm: [f64; 4], master_bpm: f64) {
         let perf = self.performance();
         let count = self.deck_count();
-        let gains = crossfader_curve(self.px.crossfader, self.prefs.deck.crossfader_curve);
+        let gains = crossfader_curve(self.px.crossfader, crate::automix::curve_override(self).unwrap_or(self.prefs.deck.crossfader_curve));
         let head = headroom_gain(self.prefs.deck.headroom);
         let smp_master = self.sampler_is_master();
         let master = self.px.master.min(count.saturating_sub(1));
         let (multi, beat, eq_nxs) = (self.prefs.deck.multi_bpm_sync, self.prefs.deck.beat_sync, self.prefs.deck.eq_nxs);
+        let bpm_only = crate::mpl::bpm_sync_decks(self);
+        let limited = self.limited_sync_rate();
+        if eq_nxs {
+            // (Read here, on the interface thread, before the audio thread needs it.)
+            let _ = nxs_table();
+        }
         for n in 0..count {
             let own = own_bpm[n as usize];
             let (brake, start) = (self.prefs.deck.vinyl_brake[(n % 2) as usize], self.prefs.deck.vinyl_start[(n % 2) as usize]);
@@ -946,7 +1355,7 @@ impl App {
             if follower {
                 let rate = if !multi { 1.0 } else { d.x.dk.sync_rate.unwrap_or_else(|| sync_rate_auto(master_bpm, own)) };
                 d.x.dk.rate_now = rate;
-                speed = sync_speed(master_bpm, own, rate);
+                speed = sync_speed_limited(master_bpm, own, rate, limited);
                 let out = speed.is_none() && master_bpm >= SYNC_MIN_BPM && own >= SYNC_MIN_BPM;
                 went_out = out && !d.x.dk.out_of_range;
                 d.x.dk.out_of_range = out;
@@ -957,7 +1366,8 @@ impl App {
             }
             let (jog_bend, lost, tempo_adj, rate_now) = (d.x.dk.jog_bend, d.x.dk.beat_lost, d.x.tempo_adj, d.x.dk.rate_now);
             if went_out {
-                self.toast_err("Out of range. BPM Sync is not available because Tempo Range exceeds 100%.");
+                // (`PlayCuePanel::updatePlayerComponent` picks the message by the limit.)
+                self.toast_err(if limited { "Out of range.BPM Sync is not available because Tempo Range exceeds +/-50%." } else { "Out of range. BPM Sync is not available because Tempo Range exceeds 100%." });
             }
             let mut s = self.player.decks[n as usize].lock();
             s.dk.start_ms = vinyl_ms(start);
@@ -967,7 +1377,7 @@ impl App {
                 if follower {
                     // The master's tempo at the rate; out of range, the deck's own tempo.
                     s.tempo = speed.unwrap_or(1.0 + tempo_adj);
-                    s.sync_follow = speed.is_some() && beat && !lost && !smp_master;
+                    s.sync_follow = speed.is_some() && beat && !lost && !smp_master && !bpm_only[n as usize];
                     s.dk.sync_rate = rate_now;
                 }
                 s.dk.route = assign.min(2);
@@ -993,7 +1403,8 @@ pub fn platter_hook(app: &mut App, ui: &mut egui::Ui, n: u8, c: egui::Pos2, radi
     use egui::{vec2, Rect, Sense, Stroke};
     // Countdown: an arc ahead of the position marker, as long as the way to the next hot cue.
     if let Some((deg, col)) = app.hot_cue_countdown() {
-        let a0 = (app.pos() * app.platter_rps() * std::f64::consts::TAU) as f32 - std::f32::consts::FRAC_PI_2;
+        // (From the position mark on, `drawHotCueCountDown`.)
+        let a0 = platter_angle_deg(app.pos(), app.platter_rps() * 60.0).to_radians();
         let steps = (deg / 6.0).ceil().max(1.0) as usize;
         let pts: Vec<egui::Pos2> = (0..=steps).map(|i| a0 + (deg.to_radians() * i as f32 / steps as f32)).map(|a| c + vec2(a.cos(), a.sin()) * (radius - 1.5)).collect();
         ui.painter().add(egui::Shape::line(pts, Stroke::new(2.0_f32, col)));
@@ -1260,6 +1671,37 @@ pub fn selftest_call(a: &mut App, what: &str) {
             a.cue_up();
         }
         "play" => a.play_pause_synced(),
+        // (The rules added after the first deck build.)
+        "limited" => {
+            a.prefs.deck.limited_sync = !a.prefs.deck.limited_sync;
+            a.push_deck_controls();
+        }
+        "loopin" => a.loop_in(),
+        "loopout" => a.loop_out(),
+        "autoloop14" => a.auto_loop(0.25),
+        "eqiso" => {
+            a.prefs.eq_isolator = !a.prefs.eq_isolator;
+            a.push_deck_controls();
+        }
+        "eqnxs" => {
+            a.prefs.deck.eq_nxs = !a.prefs.deck.eq_nxs;
+            a.push_deck_controls();
+        }
+        "slicer" => {
+            a.set_pad_mode(crate::pads::PadMode::Slicer);
+        }
+        "hotcue" => {
+            a.set_pad_mode(crate::pads::PadMode::HotCue);
+        }
+        "slip" => a.toggle_slip(),
+        "timemode" => a.time_mode_toggle(),
+        "spscratch" => a.sample_scratch_pad(0),
+        "userbpm" => {
+            let it = crate::pads::PadItem { function: "Transport".into(), value: "BPM + MEDIUM".into(), key: None };
+            a.user_pad_down(&it, false);
+            a.user_pad_up();
+        }
+        "gridtab" => a.deck.x.dk.grid_tab = !a.deck.x.dk.grid_tab,
         _ => {}
     }
 }
@@ -1283,7 +1725,7 @@ pub fn state_line(a: &App, n: u8) -> String {
     };
     let status = if d.cue_preview { CUE_HELD } else if s.playing { PLAYING } else if d.audio.is_some() && (s.pos / sr - d.cue_point).abs() < 0.01 { CUED } else { PAUSED };
     format!(
-        "DECK{} status {status} pos {:.2}s cue {:.2}s speed {:+.3} reverse {} (slip {}) jog {:?} loop {:?} ({} beats) slip-bg {:?} scan {} sync {} rate x{} follow {} out-of-range {} beat-lost {} master {} | last message {:?}",
+        "DECK{} status {status} pos {:.2}s cue {:.2}s speed {:+.3} reverse {} (slip {}) jog {:?} loop {:?} ({} beats) slip-bg {:?} scan {} sync {} rate x{} follow {} out-of-range {} beat-lost {} master {} | limited {} eq-strip {} armed-loop {:?} loop-in {:?} SLIP {} grid-tab {} grid-first-beat {:?} grid-undo {} tempo {:+.2}% time-mode {} | last message {:?}",
         n + 1,
         s.pos / sr,
         d.cue_point,
@@ -1301,6 +1743,16 @@ pub fn state_line(a: &App, n: u8) -> String {
         d.x.dk.out_of_range,
         d.x.dk.beat_lost,
         a.px.master + 1,
+        a.limited_sync_rate(),
+        s.dk.eqsw.mode,
+        s.dk.arm_loop.map(|l| ((l.0 * 1000.0).round() / 1000.0, (l.1 * 1000.0).round() / 1000.0)),
+        d.loop_in.map(|t| (t * 1000.0).round() / 1000.0),
+        d.x.slip,
+        d.x.dk.grid_tab,
+        d.beats.first().map(|b| (b.time * 10000.0).round() / 10000.0),
+        d.grid_undo.len(),
+        d.x.tempo_adj * 100.0,
+        a.prefs.deck.player_time_mode[(n as usize).min(3)],
         a.toasts.last().map(|t| t.text.as_str())
     )
 }
@@ -1798,4 +2250,115 @@ mod tests {
         // The bands are peaks, not shelves: LOW fully left takes far less off 1 kHz than off 70 Hz.
         assert!(level([0.0, 0.5, 0.5], 1000.0) > -6.0, "{}", level([0.0, 0.5, 0.5], 1000.0));
     }
+
+    #[test]
+    fn limited_sync_rate_window_and_toggle() {
+        // Normal: up to double speed; limited: 0.5 ..= 1.5 (`isBpmWithinRange`).
+        assert_eq!(sync_speed_limited(180.0, 100.0, 1.0, false), Some(1.8));
+        assert_eq!(sync_speed_limited(180.0, 100.0, 1.0, true), None);
+        assert_eq!(sync_speed_limited(150.0, 100.0, 1.0, true), Some(1.5));
+        assert_eq!(sync_speed_limited(49.0, 100.0, 1.0, true), None);
+        assert_eq!(sync_speed_limited(50.0, 100.0, 1.0, true), Some(0.5));
+        // `getToggleSyncRate` with +69 set: master 128, own 126 (r = 1.016).
+        assert_eq!(sync_rate_toggle_limited(1.0, 128.0, 126.0, true), 0.5); // 2r > 1.5, r/2 >= 0.5
+        assert_eq!(sync_rate_toggle_limited(0.5, 128.0, 126.0, true), 1.0);
+        assert_eq!(sync_rate_toggle_limited(2.0, 128.0, 126.0, true), 0.5);
+        // master 70, own 140 (r = 0.5): x1 -> x2 (2r = 1.0 fits).
+        assert_eq!(sync_rate_toggle_limited(1.0, 70.0, 140.0, true), 2.0);
+        // x2 with r/2 under 0.5 and r in range -> x1.
+        assert_eq!(sync_rate_toggle_limited(2.0, 70.0, 140.0, true), 1.0);
+        // Unlimited keeps the old rule.
+        assert_eq!(sync_rate_toggle_limited(1.0, 128.0, 126.0, false), sync_rate_toggle(1.0, 128.0, 126.0));
+        assert!(motorized_jog_device("DDJ-REV7") && motorized_jog_device("Pioneer DDJ-REV7 MIDI") && !motorized_jog_device("DDJ-FLX10"));
+        // A deck master's play head has no ms threshold: any error over 0.01 beat jumps.
+        assert!(jump_threshold_deviation(0.011, 128.0, DECK_MASTER_JUMP_THRESHOLD_MS));
+        assert!(!jump_threshold_deviation(0.02, 120.0, 20.0) && jump_threshold_deviation(0.05, 120.0, 20.0));
+    }
+
+    #[test]
+    fn loop_out_and_auto_loop_points_follow_the_loop_value() {
+        let g = grid(64, 64); // 0.5 s beats
+        // LOOP value 1 beat: OUT 0.3 beat after a beat waits for the next beat...
+        assert!((quantize_point(&g, 1.15, QType::Loop, 1.0, false) - 1.5).abs() < 1e-9);
+        // ...but one passed by less than 1/32 beat is taken now.
+        assert!((quantize_point(&g, 1.0 + 0.01 * 0.5, QType::Loop, 1.0, false) - 1.0).abs() < 1e-9);
+        // LOOP IN with SNAP 1 beat: the nearest beat.
+        assert!((quantize_point(&g, 1.2, QType::Snap, 1.0, false) - 1.0).abs() < 1e-9);
+        assert!((quantize_point(&g, 1.3, QType::Snap, 1.0, false) - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_loop_behind_the_playhead_starts_on_its_lattice() {
+        // Loop 1000..1500 frames armed with a warp at 2500 -> 1000: until 2500 the deck plays
+        // on, then it is inside the loop and wraps at 1500 from then on.
+        let mut s = ramp_deck(20000);
+        s.smooth = false;
+        s.pos = 2000.0;
+        s.dk.warp = Some((2500.0, 1000.0));
+        s.dk.arm_loop = Some((1000.0 / SR as f64, 1500.0 / SR as f64));
+        let out = run(&mut s, 1200);
+        let at = |i: usize| (out[i] / 1e-5).round() as i64;
+        assert_eq!(at(0), 2000);
+        assert_eq!(at(499), 2499);
+        assert_eq!(at(500), 1000);
+        assert_eq!(at(999), 1499);
+        assert_eq!(at(1000), 1000);
+        assert!(s.loop_range.is_some() && s.dk.arm_loop.is_none());
+    }
+
+    #[test]
+    fn eq_type_switch_fades_out_and_in_over_3_3_ms() {
+        // A constant through the strip: the change of type dips to silence and comes back,
+        // 3.3 ms down and 3.3 ms up (146 frames each at 44.1 kHz).
+        let mut s = dc_deck(44100);
+        s.strip = 1;
+        s.trim = 1.0;
+        let _ = run(&mut s, 2000);
+        s.strip = 2;
+        let out = run(&mut s, 1000);
+        let n = (EQ_SWITCH_SECS * SR as f32).round() as usize;
+        let min_i = out.iter().enumerate().min_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map(|x| x.0).unwrap();
+        assert!(out[min_i].abs() < 0.01, "dip {}", out[min_i]);
+        assert!((min_i as i64 - n as i64).abs() <= 2, "{min_i} vs {n}");
+        assert!(out[2 * n + 20].abs() > 0.3);
+        assert_eq!(s.dk.eqsw.mode, 2);
+        // No change, no dip.
+        let out = run(&mut s, 400);
+        assert!(out.iter().all(|v| v.abs() > 0.3));
+    }
+
+    #[test]
+    fn nxs_eq_moves_in_filter_steps() {
+        let t = nxs_table();
+        assert_eq!(t[0], 0);
+        assert_eq!(t[255], NXS_STEPS);
+        assert!(t.windows(2).all(|w| w[0] <= w[1]));
+        // The centre of the knob is the middle of its step's knob range: flat.
+        assert!((nxs_knob_of(nxs_step_of(0.5) as f32) - 0.5).abs() < 0.02);
+        // One step per 1/3 ms: from the left end to the right end takes 487 steps.
+        let mut st = NxsSteps::default();
+        st.advance([0.0; 3], 0, 48000);
+        let k = st.advance([1.0; 3], 1600, 48000); // 1600 frames = 33.3 ms = 100 steps
+        assert!((st.cur[0] - 100.0).abs() < 0.5, "{}", st.cur[0]);
+        assert!(k[0] > 0.0 && k[0] < 0.5);
+        let k = st.advance([1.0; 3], 48000, 48000);
+        assert_eq!(st.cur[0], NXS_STEPS as f32);
+        // (The top step is the knob's last few positions; their middle is just under 1.)
+        assert!(k[0] > 0.99, "{}", k[0]);
+    }
+
+    #[test]
+    fn platter_angle_and_bpm_drag() {
+        // 33 1/3 rpm: 1.8 s is one turn; the marks sit 44.041 degrees before the turn.
+        assert!((platter_angle_deg(0.0, RPM_33) + 44.041).abs() < 1e-3);
+        assert!((platter_angle_deg(0.45, RPM_33) - (90.0 - 44.041)).abs() < 0.05);
+        assert!((platter_angle_deg(0.45, 45.0) - (121.5 - 44.041)).abs() < 0.05);
+        // BPM drag: 250 pixels for the whole range, up is faster, steps of 0.02.
+        let v = bpm_drag_value(128.0, 128.0, 0.10, -25.0);
+        assert!((v - 130.56).abs() < 1e-6, "{v}");
+        let v = bpm_drag_value(128.0, 128.0, 0.10, 1.0);
+        assert!(((v - 128.0) / 0.02 - ((v - 128.0) / 0.02).round()).abs() < 1e-6 && v < 128.0);
+        assert!((bpm_drag_value(128.0, 128.0, 0.10, -1000.0) - 140.8).abs() < 1e-9);
+    }
+
 }

@@ -74,6 +74,29 @@ impl App {
             ("DECK:cuedown|CUE held at the cue (cue sampler)", o, o),
             ("DECK:play|PLAY while CUE is held (back-cue: plays on)", o, o),
             ("DECK:cueup|CUE let go (still playing)", o, o),
+            // The rules and controls added by the perfrest track (deck.rs, ui_perf.rs,
+            // ui_perf_layouts.rs, pads_ext.rs), on the playing deck 1.
+            ("DECK:limited|limited sync rate on (as a DDJ-REV7 would)", o, o),
+            ("DECK:limited|limited sync rate off", o, o),
+            ("DECK:loopin|LOOP IN with Q (SNAP point)", o, o),
+            ("DECK:loopout|LOOP OUT with Q (next LOOP-lattice point)", o, o),
+            ("DECK:loopexit|loop exit", o, o),
+            ("DECK:autoloop14|1/4-beat auto loop with Q", o, o),
+            ("DECK:loopexit|loop exit", o, o),
+            ("DECK:eqiso|EQ / ISOLATOR switched (3.3 ms out, 3.3 ms in)", o, o),
+            ("DECK:eqiso|EQ / ISOLATOR back", o, o),
+            ("DECK:eqnxs|EQ type DJM-900NXS (filter steps)", o, o),
+            ("DECK:eqnxs|EQ type back", o, o),
+            ("DECK:timemode|time mode of deck 1 toggled", o, o),
+            ("DECK:userbpm|USER pad BPM + MEDIUM (+0.50 %)", o, o),
+            ("BPM drag up 25 pt on the platter's BPM", o + egui::vec2(100.0, 52.5), o + egui::vec2(100.0, 27.5)),
+            ("DECK:slicer|pad mode SLICER (SLIP was on: switched off with the message)", o, o),
+            ("DECK:slip|SLIP while the slicer is on (refused)", o, o),
+            ("DECK:hotcue|pad mode HOT CUE", o, o),
+            ("GRID tab of deck 1", pos2(14.0, ly + 94.0), pos2(14.0, ly + 94.0)),
+            ("GRID: beat grid right (1 ms)", pos2(28.0 - 45.0 + 295.0, ly + 34.5), pos2(28.0 - 45.0 + 295.0, ly + 34.5)),
+            ("GRID: undo", pos2(28.0 - 45.0 + 381.0 + 12.0, ly + 34.5), pos2(28.0 - 45.0 + 381.0 + 12.0, ly + 34.5)),
+            ("PAD tab of deck 1", pos2(14.0, ly + 30.0), pos2(14.0, ly + 30.0)),
             ("PLAY/PAUSE deck 1 (pause)", o + egui::vec2(20.0, 102.0), o + egui::vec2(20.0, 102.0)),
         ];
         let _ = d2;
@@ -193,6 +216,13 @@ impl App {
                 ("4D channel fader 4 down", pos2(661.0 + 162.5, y1 + 224.5), pos2(661.0 + 162.5, y1 + 284.0)),
                 st("quick click on CUE of channel 3", p(661.0 + 30.0, y1 + 198.0)),
                 st("4D BEAT SYNC deck 2", p(1512.0 - 76.0 + 20.0, y1 + 14.0)),
+                // (perfrest track) Deck 3's GRID tab and a GRID button; its pad mode pull-down,
+                // which opens upwards over the pads on the lower decks.
+                st("4D GRID tab deck 3", p(14.0, ly3 + 84.0)),
+                st("4D GRID beat grid right deck 3", p(28.0 - 45.0 + 295.0, ly3 + 33.0)),
+                st("4D PAD tab deck 3", p(14.0, ly3 + 28.0)),
+                st("4D pad mode pull-down deck 3 (opens upwards)", p(70.0, ly3 + 96.0)),
+                st("4D pad mode pull-down deck 3 (closes)", p(70.0, ly3 + 96.0)),
                 st("4D PLAY deck 4 (pause)", p(855.0 + 10.0 + 20.0, ly3 + 84.0)),
             ]
         } else {
@@ -344,7 +374,7 @@ impl App {
             30 if fxt => eprintln!("perftest: {name}: {} || {}", self.perf_state_fx(), crate::ui_fx::selftest_state(self)),
             // The loop is left running for a while before its state is read.
             30 if smp => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
-            30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),
+            30 if four => eprintln!("perftest: {name}: {} | {}", self.perf_state4(), crate::deck::state_line(self, 2)),
             30 => eprintln!("perftest: {name}: {} | {}", self.perf_state(), crate::deck::state_line(self, 0)),
             _ => {}
         }

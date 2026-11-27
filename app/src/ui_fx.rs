@@ -324,7 +324,9 @@ pub fn sync(app: &mut App) {
     // A deck that left PAD FX (or Performance mode) lets go of everything its pads held.
     for d in 0..4usize {
         let p = &app.px.fxx.pad.decks[d];
-        if (!perf || app.px.pad_mode[d] != crate::ui_padfx::PAD_FX) && (!p.held.is_empty() || p.release.is_some() || p.slip.is_some() || p.edit) {
+        // (A USER pad holding a PAD FX pad is PAD FX too: pads_ext.rs.)
+        let user_fx = matches!(app.pads.deck[d].user_held, Some(crate::pads_ext::UserHeld::PadFx(_)));
+        if (!perf || app.px.pad_mode[d] != crate::ui_padfx::PAD_FX) && !user_fx && (!p.held.is_empty() || p.release.is_some() || p.slip.is_some() || p.edit) {
             app.px.fxx.pad.decks[d].edit = false;
             if (d as u8) < app.deck_count() {
                 app.with_deck(d as u8, |a| crate::ui_padfx::stop_deck(a, d));

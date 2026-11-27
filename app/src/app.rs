@@ -1737,6 +1737,7 @@ impl App {
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
+        crate::analysis::rb_hp::set_mode(self.prefs.high_precision_grid, self.prefs.analysis_mode);
         AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic(), vocal: self.prefs.vocal_analysis }
     }
 
@@ -2070,6 +2071,9 @@ impl App {
                     if !words.iter().all(|w| hay.contains(w)) {
                         return false;
                     }
+                }
+                if !crate::ui_edit::attribute_pass(self, t.id) {
+                    return false;
                 }
                 if self.filter_open {
                     if !crate::library_ext::filter_pass(&self.ext.filter, t) {
@@ -3519,6 +3523,7 @@ impl App {
             let mut s = self.player.state.lock();
             s.loop_range = None;
             s.dk.warp = None;
+            s.dk.arm_loop = None;
         } else {
             let p = self.pos();
             if (p - self.deck.cue_point).abs() < 0.01 {
@@ -3526,6 +3531,7 @@ impl App {
                 self.set_playing(true);
             } else if p >= self.deck.duration - 0.01 {
                 // (At the end of the track CUE does nothing.)
+            } else if self.before_start() {
             } else {
                 let q = self.quantized(p);
                 self.deck.cue_point = q;
@@ -3839,7 +3845,7 @@ impl App {
     }
 
     pub fn auto_loop(&mut self, beats: f64) {
-        if self.deck.audio.is_none() {
+        if self.deck.audio.is_none() || self.perf_auto_loop(beats) {
             return;
         }
         let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
@@ -3866,7 +3872,11 @@ impl App {
         self.player.state.lock().loop_range
     }
     pub fn loop_exit(&mut self) {
-        self.player.state.lock().loop_range = None;
+        let mut s = self.player.state.lock();
+        s.loop_range = None;
+        if s.dk.arm_loop.take().is_some() {
+            s.dk.warp = None;
+        }
     }
     pub fn reloop(&mut self) {
         if let Some((a, b)) = self.deck.last_loop {
@@ -3875,10 +3885,16 @@ impl App {
         }
     }
     pub fn loop_in(&mut self) {
+        if self.perf_loop_in() {
+            return;
+        }
         let q = crate::prefs_bridge::loop_point(self, self.pos());
         self.deck.loop_in = Some(q);
     }
     pub fn loop_out(&mut self) {
+        if self.perf_loop_out() {
+            return;
+        }
         if let Some(a) = self.deck.loop_in {
             let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
             let (a, b) = (crate::deck::on_frame(a, sr), crate::deck::on_frame(crate::prefs_bridge::loop_point(self, self.pos()), sr));

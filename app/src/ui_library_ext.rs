@@ -162,6 +162,8 @@ pub fn status_cell(app: &mut App, ui: &mut Ui, t: &Track, r: Rect) {
         let sc = pos2(b.min.x + if cued { 7.5 } else { 14.5 }, cy - 0.5);
         crate::icons_src::star(&p, sc + vec2(0.0, 0.0), true, WHITE);
     }
+    // The middle cell: EDIT and Track Type attributes (ui_edit.rs).
+    crate::ui_edit::attribute_icons(app, &p, Rect::from_min_max(pos2(a.max.x, r.min.y), pos2(b.min.x, r.max.y)), t.id, &mut tips);
     if !tips.is_empty() && app.prefs.tooltips && ui.rect_contains_pointer(r) {
         let resp = ui.interact(r, ui.id().with(("attr_tip", t.id, r.min.y as i32)), Sense::hover());
         resp.on_hover_text(tips.join("\n"));
@@ -805,7 +807,7 @@ pub fn export_playlist_dialog(app: &mut App, node: i64) {
 /// The right-click menu of a playlist, intelligent playlist or folder in the tree, in the
 /// order rekordbox 7.2.19 builds it (`BrowsePopupMenuManager::showTreeViewPopupMenu`
 /// 0x100118eec; `checks/re-7.2.19/shell-menus-traffic.md`). Left out: cloud, sharing and
-/// Request Catalog items, and playlist artwork (recordbox has none). recordbox's own entries
+/// Request Catalog items. recordbox's own entries
 /// come after the last separator. A name is changed by double-clicking it, as in rekordbox;
 /// Rename is also kept among recordbox's own entries.
 pub fn node_menu(app: &mut App, ui: &mut Ui, n: &PlaylistNode) {
@@ -840,6 +842,10 @@ pub fn node_menu(app: &mut App, ui: &mut Ui, n: &PlaylistNode) {
         }
     }
     ui.separator();
+    // Playlist artwork (playlist_art.rs): between the Create items and Delete Playlist.
+    if n.kind == NodeKind::Playlist {
+        crate::playlist_art::menu(app, ui, n.id);
+    }
     if ui.button(if folder { "Delete Folder" } else { "Delete Playlist" }).clicked() {
         app.dialogs.confirm_delete_node = Some((n.id, n.name.clone(), folder));
         ui.close_menu();
