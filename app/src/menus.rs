@@ -1,6 +1,11 @@
-//! Native macOS menu bar, laid out as rekordbox's EXPORT mode: File / View / Track / Playlist /
-//! Help (plus the macOS app menu and Edit). Items are enabled and ticked from the app's state
-//! every frame (`sync`), and their accelerators follow Preferences > Keyboard.
+//! Native macOS menu bar, laid out as rekordbox 7.2.19 builds it for the current mode
+//! (`MainComponent::getMenuBarNames` 0x1009643d8 and `getMenuForIndex` 0x100964638; notes in
+//! `checks/re-7.2.19/shell-menus-traffic.md`): File / View / Track / Playlist / Help in EXPORT
+//! and PERFORMANCE, File / Edit / View / Help in EDIT. recordbox's own commands, which rekordbox
+//! has no item for, come after a separator at the end of the menu they belong to; the macOS app
+//! menu and an Edit menu (Undo, Redo and the clipboard commands) are recordbox's too.
+//! Items are enabled and ticked from the app's state every frame (`sync`), and their
+//! accelerators follow Preferences > Keyboard.
 
 use crate::app::*;
 use crate::model::*;
@@ -17,18 +22,33 @@ enum Entry {
 #[derive(Default)]
 struct Handles {
     items: HashMap<&'static str, Entry>,
+    subs: HashMap<&'static str, Submenu>,
+    /// The macOS app menu (always first).
+    app_menu: Option<Submenu>,
     /// What each item was last set to: (enabled, ticked).
     shown: HashMap<&'static str, (bool, bool)>,
+    /// What each submenu was last set to.
+    subs_shown: HashMap<&'static str, bool>,
     /// The keymap the accelerators were last built from.
     keys: String,
+    /// The mode the menus were last laid out for (`MODE_NONE` before the first time).
+    mode: u8,
+    /// Signatures of what the filled-in submenus were last built from.
+    playlists_sig: u64,
+    devices_sig: u64,
+    /// Text of "Remove from Collection" / "Remove from Playlist".
+    remove_label: &'static str,
 }
+
+const MODE_NONE: u8 = 255;
 
 thread_local! {
-    static HANDLES: RefCell<Handles> = RefCell::new(Handles::default());
+    static HANDLES: RefCell<Handles> = RefCell::new(Handles { mode: MODE_NONE, ..Handles::default() });
 }
 
-/// Every menu command: (id, label, ticked item). The order here is not the menu order.
-pub const COMMANDS: [(&str, &str, bool); 65] = [
+/// Every menu command: (id, label, ticked item). The order here is not the menu order. Some
+/// commands are in no menu (they are reached from Preferences > Keyboard or a context menu).
+pub const COMMANDS: [(&str, &str, bool); 91] = [
     ("edit_cut", "Cut", false),
     ("edit_copy", "Copy", false),
     ("edit_paste", "Paste", false),
@@ -41,6 +61,13 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("backup", "Backup Library", false),
     ("restore", "Restore Library", false),
     ("missing", "Display All Missing Files", false),
+    ("dupes", "Display All Duplicated Files", false),
+    ("device_backup_mgmt", "Backed up device library management", false),
+    ("import_v5", "Import your library from ver. 5 (or earlier)", false),
+    ("pack_sample_dl", "Download", false),
+    ("pack_sample_import", "Import", false),
+    ("pack_gc_dl", "Download", false),
+    ("pack_gc_import", "Import", false),
     ("export_xml", "Export Collection in xml format", false),
     ("export_playlists_info", "Export Playlists Information", false),
     ("sync_rekordbox", "Sync rekordbox Library Now", false),
@@ -50,24 +77,40 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("undo", "Undo", false),
     ("redo", "Redo", false),
     ("fullscreen", "Full screen", true),
+    ("appearance_dark", "Dark", true),
+    ("appearance_light", "Light", true),
     ("layout_player", "1 Player", true),
     ("layout_2players", "2 Players", true),
     ("layout_dual", "Dual Player", true),
     ("layout_simple", "Simple Player", true),
     ("layout_browser", "Full Browser", true),
+    ("perf_2h", "2 Deck Horizontal", true),
+    ("perf_2v", "2 Deck Vertical", true),
+    ("perf_4h", "4 Deck Horizontal", true),
+    ("perf_4v", "4 Deck Vertical", true),
+    ("perf_browse", "Browse", true),
+    ("pad_platter", "Show / Hide Pad and Platter", false),
+    ("split_screen", "Show Split Screen", true),
     ("mytag_window", "My Tag Configuration Window", true),
-    ("related_window", "Related Track List Window", true),
+    ("related_subpanel", "\"Related tracks\" on Subpanel", true),
+    ("suggest_subpanel", "\"Track Suggestion\" on Subpanel", true),
     ("info_window", "Information Window", true),
-    ("sub_browser", "Sub-Browser Window", true),
+    ("sub_browser", "Vertical sub-browser", true),
+    ("sub_browser_h", "Horizontal sub-browser", true),
+    ("automix", "Automix", true),
+    ("related_window", "Related Track List Window", true),
     ("filter", "Filter", true),
     ("wave_blue", "Waveform: BLUE", true),
     ("wave_rgb", "Waveform: RGB", true),
     ("wave_3band", "Waveform: 3Band", true),
     ("t_import_track", "Import Track", false),
+    ("import_to_collection", "Import To Collection", false),
     ("analyze", "Analyze Track", false),
     ("analyze_missing", "Analyze Missing Data", false),
     ("analyze_key", "Analyze Key", false),
     ("analysis_lock", "Analysis Lock", true),
+    ("lock_on", "On", false),
+    ("lock_off", "Off", false),
     ("auto_on", "Enable", true),
     ("auto_off", "Disable", true),
     ("stop_analysis", "Stop Analyzing", false),
@@ -90,11 +133,138 @@ pub const COMMANDS: [(&str, &str, bool); 65] = [
     ("sort_items", "Sort Items", false),
     ("renumber", "Renumber Track Order", false),
     ("save_playlist_info", "Save Playlist Info", false),
+    ("save_info_txt", "Export a playlist to a file (*.txt)", false),
+    ("save_info_m3u8", "Export a playlist to a file for music apps (*.m3u8)", false),
     ("export_device", "Export to USB Device…", false),
-    ("manual", "Online Manual", false),
+    ("manual", "User's Manual", false),
     ("shortcuts", "Keyboard Shortcuts", false),
     ("h_about", "About recordbox", false),
+    ("copy_to_playlists", "Copy to Playlists", false),
 ];
+
+/// One entry of a menu's layout: a command, a separator or a submenu (by key).
+#[derive(Clone, Copy)]
+enum It {
+    C(&'static str),
+    Sep,
+    Sub(&'static str),
+}
+use It::{Sep, Sub, C};
+
+/// Submenus: (key, title). "add_to_playlist", "export_track" and "export_playlist" are filled
+/// in from the playlist tree and the connected devices (`fill_playlists`, `fill_devices`).
+const SUBMENUS: [(&str, &str); 16] = [
+    ("file", "File"),
+    ("import", "Import"),
+    ("additional", "Additional contents"),
+    ("sample_pack", "Sample Pack"),
+    ("gc_pack", "GROOVE CIRCUIT FACTORY SAMPLES PACK"),
+    ("library", "Library"),
+    ("edit", "Edit"),
+    ("view", "View"),
+    ("appearance", "Appearance"),
+    ("track", "Track"),
+    ("analysis_lock", "Analysis Lock"),
+    ("add_to_playlist", "Add To Playlist"),
+    ("export_track", "Export Track"),
+    ("playlist", "Playlist"),
+    ("export_playlist", "Export Playlist"),
+    ("save_info", "Save Playlist Info"),
+];
+const HELP: (&str, &str) = ("help", "Help");
+
+/// The menu-bar mode for an application mode: 0 EXPORT, 1 PERFORMANCE, 2 EDIT.
+fn menu_mode(app: &App) -> u8 {
+    app.prefs.app_mode.min(2)
+}
+
+/// Top-level menus of a mode, in order (rekordbox's `getMenuBarNames`; "edit" outside EDIT
+/// mode is recordbox's own).
+fn top_level(mode: u8) -> &'static [&'static str] {
+    match mode {
+        2 => &["file", "edit", "view", "help"],
+        _ => &["file", "edit", "view", "track", "playlist", "help"],
+    }
+}
+
+/// What each menu and submenu holds in a mode, as rekordbox's `getMenuForIndex` builds it.
+/// Items that depend on a plan, an account, a streaming service or the cloud are left out
+/// (Cloud Library Sync, Mobile Library Sync, Liked Songs, Collaborative playlists, Show in
+/// Spotify, the lighting settings in Library).
+fn layout(mode: u8) -> Vec<(&'static str, Vec<It>)> {
+    let perf = mode == 1;
+    let mut file = vec![Sub("import")];
+    if perf {
+        file.extend([Sep, Sub("additional")]);
+    }
+    file.extend([Sep, C("missing"), C("dupes"), Sep, Sub("library"), Sep, C("export_xml")]);
+    // recordbox's own.
+    file.extend([Sep, C("sync_rekordbox"), C("import_xml"), C("relocate_missing"), C("library_folder")]);
+
+    let mut view = vec![C("fullscreen"), Sep, Sub("appearance"), Sep];
+    match mode {
+        0 => view.extend([C("layout_player"), C("layout_2players"), C("layout_dual"), C("layout_simple"), C("layout_browser"), Sep]),
+        1 => view.extend([C("perf_2h"), C("perf_2v"), C("perf_4h"), C("perf_4v"), C("perf_browse"), Sep, C("pad_platter"), Sep, C("split_screen"), Sep]),
+        _ => {}
+    }
+    view.extend([C("mytag_window"), C("related_subpanel"), C("suggest_subpanel"), C("info_window"), C("sub_browser"), C("sub_browser_h")]);
+    if perf {
+        view.push(C("automix"));
+    }
+
+    let track = vec![
+        C("import_to_collection"),
+        C("analyze"),
+        Sub("analysis_lock"),
+        Sep,
+        Sub("add_to_playlist"),
+        C("reload_tags"),
+        Sub("export_track"),
+        Sep,
+        C("remove_collection"),
+        Sep,
+        C("show_finder"),
+        C("auto_relocate"),
+        C("relocate"),
+        // recordbox's own.
+        Sep,
+        C("trash"),
+    ];
+    let playlist = vec![
+        Sub("export_playlist"),
+        C("p_import_playlist"),
+        C("copy_to_playlists"),
+        Sep,
+        C("new_playlist"),
+        C("new_smart"),
+        C("new_folder"),
+        Sep,
+        C("delete_playlist"),
+        Sep,
+        C("sort_items"),
+        C("renumber"),
+        Sub("save_info"),
+        // recordbox's own.
+        Sep,
+        C("export_device"),
+    ];
+    vec![
+        ("file", file),
+        ("import", vec![C("import_track"), C("import_folder"), C("import_playlist")]),
+        ("additional", vec![Sub("sample_pack"), Sub("gc_pack")]),
+        ("sample_pack", vec![C("pack_sample_dl"), C("pack_sample_import")]),
+        ("gc_pack", vec![C("pack_gc_dl"), C("pack_gc_import")]),
+        ("library", vec![C("backup"), C("restore"), C("device_backup_mgmt"), C("import_v5")]),
+        ("edit", vec![C("undo"), C("redo"), Sep, C("edit_cut"), C("edit_copy"), C("edit_paste"), C("edit_select_all")]),
+        ("view", view),
+        ("appearance", vec![C("appearance_dark"), C("appearance_light")]),
+        ("track", track),
+        ("analysis_lock", vec![C("lock_on"), C("lock_off")]),
+        ("playlist", playlist),
+        ("save_info", vec![C("save_info_txt"), C("save_info_m3u8")]),
+        ("help", vec![C("manual"), C("shortcuts"), Sep, C("h_about")]),
+    ]
+}
 
 fn it<'a>(h: &'a Handles, id: &str) -> &'a dyn IsMenuItem {
     match h.items.get(id).unwrap_or_else(|| panic!("menu item {id}")) {
@@ -109,7 +279,9 @@ fn fixed_accelerator(id: &str) -> Option<Accelerator> {
     let (m, c) = match id {
         "new_playlist" => (cmd, Code::KeyN),
         "export_device" => (cmd, Code::KeyE),
-        "property" => (cmd, Code::KeyI),
+        // rekordbox: Information Window is Cmd+I, Show in Finder Cmd+R.
+        "info_window" => (cmd, Code::KeyI),
+        "show_finder" => (cmd, Code::KeyR),
         // Edit commands carry their own shortcuts and are passed on to the focused text field
         // or the track list (the system's predefined items never reach the egui view).
         "edit_cut" => (cmd, Code::KeyX),
@@ -137,103 +309,102 @@ pub fn wake_on_menu(ctx: &eframe::egui::Context) {
     }));
 }
 
+fn clear(sub: &Submenu) {
+    while sub.remove_at(0).is_some() {}
+}
+
+/// Lay the menus out for a mode: the top-level menus and what each one holds.
+fn fill(menu: &Menu, h: &Handles, mode: u8) {
+    while menu.items().len() > 1 {
+        if menu.remove_at(1).is_none() {
+            break;
+        }
+    }
+    for (key, items) in layout(mode) {
+        let Some(sub) = h.subs.get(key) else { continue };
+        clear(sub);
+        for i in items {
+            let _ = match i {
+                C(id) => sub.append(it(h, id)),
+                Sep => sub.append(&PredefinedMenuItem::separator()),
+                Sub(k) => match h.subs.get(k) {
+                    Some(s) => sub.append(s),
+                    None => Ok(()),
+                },
+            };
+        }
+    }
+    for key in top_level(mode) {
+        if let Some(s) = h.subs.get(key) {
+            let _ = menu.append(s);
+        }
+    }
+}
+
 pub fn build() -> Option<Menu> {
-    let mut h = Handles::default();
+    let mut h = Handles { mode: MODE_NONE, remove_label: "Remove from Collection", ..Handles::default() };
     for (id, label, check) in COMMANDS {
-        let e = if check { Entry::Check(CheckMenuItem::with_id(id, label, true, false, None)) } else { Entry::Plain(MenuItem::with_id(id, label, true, fixed_accelerator(id))) };
+        let e = if check { Entry::Check(CheckMenuItem::with_id(id, label, true, false, fixed_accelerator(id))) } else { Entry::Plain(MenuItem::with_id(id, label, true, fixed_accelerator(id))) };
         h.items.insert(id, e);
+    }
+    for (key, title) in SUBMENUS.iter().chain(std::iter::once(&HELP)) {
+        h.subs.insert(key, Submenu::new(title, true));
     }
     let sep = PredefinedMenuItem::separator;
     let menu = Menu::new();
-    {
-        let app_menu = Submenu::new("recordbox", true);
-        app_menu
-            .append_items(&[it(&h, "about"), &sep(), it(&h, "prefs"), &sep(), &PredefinedMenuItem::hide(None), &PredefinedMenuItem::hide_others(None), &PredefinedMenuItem::show_all(None), &sep(), &PredefinedMenuItem::quit(None)])
-            .ok()?;
-        let import = Submenu::new("Import", true);
-        import.append_items(&[it(&h, "import_track"), it(&h, "import_folder"), it(&h, "import_playlist")]).ok()?;
-        let library = Submenu::new("Library", true);
-        library.append_items(&[it(&h, "backup"), it(&h, "restore")]).ok()?;
-        let file = Submenu::new("File", true);
-        file.append_items(&[&import, &library, &sep(), it(&h, "missing"), &sep(), it(&h, "export_xml"), it(&h, "export_playlists_info"), &sep(), it(&h, "sync_rekordbox"), it(&h, "import_xml"), it(&h, "relocate_missing"), it(&h, "library_folder")]).ok()?;
-        let edit = Submenu::new("Edit", true);
-        edit.append_items(&[it(&h, "undo"), it(&h, "redo"), &sep(), it(&h, "edit_cut"), it(&h, "edit_copy"), it(&h, "edit_paste"), it(&h, "edit_select_all")]).ok()?;
-        let view = Submenu::new("View", true);
-        view.append_items(&[
-            it(&h, "fullscreen"),
-            &sep(),
-            it(&h, "layout_player"),
-            it(&h, "layout_2players"),
-            it(&h, "layout_dual"),
-            it(&h, "layout_simple"),
-            it(&h, "layout_browser"),
-            &sep(),
-            it(&h, "mytag_window"),
-            it(&h, "related_window"),
-            it(&h, "info_window"),
-            it(&h, "sub_browser"),
-            &sep(),
-            it(&h, "filter"),
-            it(&h, "wave_blue"),
-            it(&h, "wave_rgb"),
-            it(&h, "wave_3band"),
-        ])
+    let app_menu = Submenu::new("recordbox", true);
+    app_menu
+        .append_items(&[it(&h, "about"), &sep(), it(&h, "prefs"), &sep(), &PredefinedMenuItem::hide(None), &PredefinedMenuItem::hide_others(None), &PredefinedMenuItem::show_all(None), &sep(), &PredefinedMenuItem::quit(None)])
         .ok()?;
-        let auto = Submenu::new("Auto Analysis", true);
-        auto.append_items(&[it(&h, "auto_on"), it(&h, "auto_off")]).ok()?;
-        let relocate = Submenu::new("Relocate", true);
-        relocate.append_items(&[it(&h, "relocate"), it(&h, "auto_relocate")]).ok()?;
-        let track = Submenu::new("Track", true);
-        track
-            .append_items(&[
-                it(&h, "t_import_track"),
-                &sep(),
-                it(&h, "analyze"),
-                it(&h, "analyze_missing"),
-                it(&h, "analyze_key"),
-                it(&h, "analysis_lock"),
-                &auto,
-                it(&h, "stop_analysis"),
-                &sep(),
-                it(&h, "export_tracks"),
-                it(&h, "reload_tags"),
-                &relocate,
-                it(&h, "show_finder"),
-                it(&h, "remove_collection"),
-                &sep(),
-                it(&h, "property"),
-                &sep(),
-                it(&h, "load"),
-                it(&h, "trash"),
-            ])
-            .ok()?;
-        let playlist = Submenu::new("Playlist", true);
-        playlist
-            .append_items(&[
-                it(&h, "p_import_playlist"),
-                &sep(),
-                it(&h, "new_playlist"),
-                it(&h, "new_smart"),
-                it(&h, "new_folder"),
-                it(&h, "delete_playlist"),
-                it(&h, "rename_playlist"),
-                &sep(),
-                it(&h, "export_playlist"),
-                it(&h, "sort_items"),
-                it(&h, "renumber"),
-                it(&h, "save_playlist_info"),
-                &sep(),
-                it(&h, "export_device"),
-            ])
-            .ok()?;
-        let help = Submenu::new("Help", true);
-        help.append_items(&[it(&h, "manual"), it(&h, "shortcuts"), &sep(), it(&h, "h_about")]).ok()?;
-        menu.append_items(&[&app_menu, &file, &edit, &view, &track, &playlist, &help]).ok()?;
-    }
+    menu.append(&app_menu).ok()?;
+    fill(&menu, &h, 0);
+    h.mode = 0;
+    h.app_menu = Some(app_menu);
     #[cfg(target_os = "macos")]
     menu.init_for_nsapp();
     HANDLES.with(|x| *x.borrow_mut() = h);
     Some(menu)
+}
+
+/// "Add To Playlist": the playlist tree with its folders (intelligent playlists left out).
+fn fill_playlists(h: &Handles, app: &App) {
+    fn level(sub: &Submenu, app: &App, parent: i64, depth: usize) {
+        if depth > 32 {
+            return;
+        }
+        for n in app.nodes.iter().filter(|n| n.parent == parent && n.kind != NodeKind::Smart) {
+            if n.kind == NodeKind::Folder {
+                let s = Submenu::new(&n.name, true);
+                level(&s, app, n.id, depth + 1);
+                let _ = sub.append(&s);
+            } else {
+                let _ = sub.append(&MenuItem::with_id(format!("addpl:{}", n.id), &n.name, true, None));
+            }
+        }
+    }
+    if let Some(sub) = h.subs.get("add_to_playlist") {
+        clear(sub);
+        level(sub, app, 0, 0);
+    }
+}
+
+/// "Export Track" and "Export Playlist": one item per connected device.
+fn fill_devices(h: &Handles, app: &App) {
+    for (key, prefix) in [("export_track", "exptrk"), ("export_playlist", "exppl")] {
+        if let Some(sub) = h.subs.get(key) {
+            clear(sub);
+            for (i, d) in app.devices.iter().enumerate() {
+                let _ = sub.append(&MenuItem::with_id(format!("{prefix}:{i}"), &d.name, true, None));
+            }
+        }
+    }
+}
+
+fn sig<T: std::hash::Hash>(v: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut s);
+    s.finish() | 1
 }
 
 pub fn poll(app: &mut App) {
