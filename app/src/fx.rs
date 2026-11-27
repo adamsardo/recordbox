@@ -809,6 +809,13 @@ pub fn stretch_speed(level: f32) -> f32 {
     if level >= 0.5 { 0.75 - 0.5 * level } else { 1.0 - level }
 }
 
+/// fx9: STRETCH's pitch shift (`StretchCore::updatePitchSpeed` 0x102a4780c, every block):
+/// REPITCH 0 (the pitch falls with the speed), else 1 / speed - 1 within -2 .. 3
+/// (`PitchShifter::setPitchParameterDirect` 0x1028ceb34).
+pub fn stretch_shift(speed: f32, repitch: bool) -> f32 {
+    if repitch { 0.0 } else { (1.0 / speed - 1.0).clamp(-2.0, 3.0) }
+}
+
 /// PHASER's all-pass stages (left, right) for single mode's second knob
 /// (`SingleBeatFxPhaser::updateParameter` 0x102a0d14c, KnobPara2Assign 0 as the single-mode
 /// layer makes it): 6 and 6 at the centre; turned left the left channel's count rises to 60
@@ -932,9 +939,6 @@ const PART_LEN: usize = DELAY_LEN / 4;
 const AUX_LEN: usize = MAX_RATE;
 /// On/off and gate smoothing, as rekordbox's 3.3333 ms.
 const SMOOTH_SECS: f32 = 0.0033333;
-/// The band split of LOW CUT / HI CUT (`ThreeBandSeparate`: the isolator's crossovers).
-const CUT_LOW_HZ: f32 = 284.0;
-const CUT_HIGH_HZ: f32 = 4649.0;
 const PI: f32 = std::f32::consts::PI;
 const TAU: f32 = std::f32::consts::TAU;
 
@@ -1014,24 +1018,6 @@ fn svf_g(fc: f32, rate: f32) -> f32 {
     (PI * (fc / rate).clamp(0.0002, 0.45)).tan()
 }
 
-/// A second-order Butterworth section (low-pass, or high-pass with `hp`): b0, b1, b2, a1, a2.
-fn butter(fc: f32, rate: f32, hp: bool) -> [f32; 5] {
-    let w = TAU * (fc / rate).min(0.45);
-    let (s, c) = w.sin_cos();
-    let alpha = s / std::f32::consts::SQRT_2;
-    let a0 = 1.0 + alpha;
-    let b = if hp { [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0] } else { [(1.0 - c) / 2.0 / a0, (1.0 - c) / a0, (1.0 - c) / 2.0 / a0] };
-    [b[0], b[1], b[2], -2.0 * c / a0, (1.0 - alpha) / a0]
-}
-
-#[inline]
-fn biquad(z: &mut [f32], c: &[f32; 5], x: f32) -> f32 {
-    let y = c[0] * x + z[0];
-    z[0] = c[1] * x + z[1] - c[3] * y;
-    z[1] = c[2] * x - c[4] * y;
-    y
-}
-
 /// First-order sections as rekordbox's `IirFilter::calcCoef*1stOrder` (bilinear): b0, b1, a1.
 #[inline]
 fn one_pole(fc: f32, rate: f32, hp: bool) -> [f32; 3] {
@@ -1093,11 +1079,22 @@ pub(crate) struct Slot {
     vb_k: (usize, usize),
     vlp: [[f32; 2]; 2],
     vxf: crate::fx_lfo::Sf,
+    /// fx9: `VinylBrakeCore`'s own history (`RingBufferForbiddenOverwriting`, written once from
+    /// the brake's start with what the core is given: the module's fx bands), 6 s, made with
+    /// the other cores (`rev_needs` bit 64); and how many frames it holds.
+    vbh: Option<Box<[f32]>>,
+    vbh_n: usize,
     /// STRETCH: `StretchCore`'s `SlowPlaybackFilter` and read gain (3.3 ms), and the frames
     /// since a restart while that gain shuts (-1: none pending).
     stf: crate::fx_spin::SlowPlay,
     stg: crate::fx_lfo::Sf,
     st_cnt: f64,
+    /// fx9: STRETCH's read sound for the shifter's block (`StretchCore::processEffectInternal`
+    /// runs the read and `SlowPlaybackFilter` over the block before `processPitchShift`), and
+    /// how far it is used.
+    st_pre: [[f32; 2]; crate::fx_core::PitchShifter::BLOCK],
+    st_i: usize,
+    st_len: usize,
     kind: Kind,
     /// Stereo delay line (interleaved) and its write position (frames).
     delay: Vec<f32>,
@@ -1109,9 +1106,6 @@ pub(crate) struct Slot {
     /// Wet gain in use (0 off .. 1 on).
     gate: f32,
     lfo: f32,
-    /// LOW CUT / HI CUT band split (per channel: the cut bands, then the rest; two
-    /// Butterworth sections each, as rekordbox's `ThreeBandSeparate`).
-    bands: [[f32; 16]; 2],
     f1: [[f32; 2]; 2],
     f2: [[f32; 2]; 2],
     f3: [[f32; 2]; 2],
@@ -1330,6 +1324,14 @@ impl RackParts {
     }
 }
 
+/// fx9: VINYL BRAKE's history, stereo frames (`VinylBrakeCore`'s ring: 6 s; the core reads
+/// at most 6 s from the start, and one frame past it).
+const VB_HIST: usize = 6 * MAX_RATE + 2;
+
+fn new_vb_history() -> Box<[f32]> {
+    vec![0.0f32; VB_HIST * 2].into_boxed_slice()
+}
+
 /// Effect cores made by the interface outside the rack's lock (`Rack::rev_needs`,
 /// `NewCores::make`, `Rack::rev_install`).
 #[derive(Default)]
@@ -1340,6 +1342,7 @@ pub struct NewCores {
     mt: Option<Box<crate::fx_echo::MtCore>>,
     fxp: Option<Box<crate::fx_echo_plus::FxPlusEcho>>,
     nz: Option<crate::fx_noise::NoiseFx>,
+    vbh: Option<Box<[f32]>>,
 }
 
 impl NewCores {
@@ -1352,6 +1355,7 @@ impl NewCores {
             mt: (bits & 8 != 0).then(crate::fx_echo::MtCore::new),
             fxp: (bits & 16 != 0).then(|| crate::fx_echo_plus::FxPlusEcho::new(single)),
             nz: (bits & 32 != 0).then(|| crate::fx_noise::NoiseFx::new(48000.0)),
+            vbh: (bits & 64 != 0).then(new_vb_history),
         }
     }
 }
@@ -1375,9 +1379,14 @@ impl Slot {
             vb_k: (0, 0),
             vlp: [[0.0; 2]; 2],
             vxf: crate::fx_rev::new_gate(48000.0),
+            vbh: None,
+            vbh_n: 0,
             stf: crate::fx_spin::SlowPlay::new(48000.0),
             stg: { let mut g = crate::fx_lfo::Sf::new(48000.0); g.set_time(3.3); g.reset(1.0); g },
             st_cnt: -1.0,
+            st_pre: [[0.0; 2]; crate::fx_core::PitchShifter::BLOCK],
+            st_i: 0,
+            st_len: 0,
             delay: vec![0.0; DELAY_LEN * 2], ps: crate::fx_core::PitchShifter::new(48000.0), ej: crate::fx_core::EnigmaJet::new(), mob: crate::fx_core::Mobius::new(), aux: vec![0.0; AUX_LEN * 2], ..Slot::empty() }
     }
 
@@ -1400,10 +1409,15 @@ impl Slot {
             vb_k: (0, 0),
             vlp: [[0.0; 2]; 2],
             vxf: crate::fx_rev::new_gate(48000.0),
+            vbh: None,
+            vbh_n: 0,
             stf: crate::fx_spin::SlowPlay::new(48000.0),
             stg: { let mut g = crate::fx_lfo::Sf::new(48000.0); g.set_time(3.3); g.reset(1.0); g },
             st_cnt: -1.0,
-            kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, aux: Vec::new(), aux_w: 0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0,
+            st_pre: [[0.0; 2]; crate::fx_core::PitchShifter::BLOCK],
+            st_i: 0,
+            st_len: 0,
+            kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), gate: 0.0, lfo: 0.0, f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, aux: Vec::new(), aux_w: 0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0,
             // fx7a
             ec: None,
             b3: crate::fx_echo::Bands3::new(),
@@ -1440,7 +1454,6 @@ impl Slot {
         self.ga = [0.75, 0.75];
         self.vb_state = 0;
         self.vb = [0.0; 6];
-        self.bands = [[0.0; 16]; 2];
         self.f1 = [[0.0; 2]; 2];
         self.f2 = [[0.0; 2]; 2];
         self.f3 = [[0.0; 2]; 2];
@@ -1544,10 +1557,13 @@ impl Slot {
         if matches!(k, Kind::BpfEcho | Kind::HpfEcho | Kind::LpfEcho | Kind::CrushEcho) && self.fxp.as_ref().is_none_or(|f| f.single() != single) && !self.delay.is_empty() {
             self.fxp = Some(crate::fx_echo_plus::FxPlusEcho::new(single));
         }
+        if k == Kind::VinylBrake && self.vbh.is_none() && !self.delay.is_empty() {
+            self.vbh = Some(new_vb_history());
+        }
     }
 
     /// The cores `ensure_rev` would make for this kind and mode, as bits (1 reverse, 2 echo,
-    /// 4 pitch echo, 8 multi tap, 16 FX+). Cheap: for the interface to ask under the rack's
+    /// 4 pitch echo, 8 multi tap, 16 FX+, 32 NOISE's echo, 64 VINYL BRAKE's history). Cheap: for the interface to ask under the rack's
     /// lock, so that the cores themselves (up to 25 MB) can be made without holding it: the
     /// audio thread waits only a quarter of a millisecond for that lock.
     pub(crate) fn rev_needs(&self, k: Kind, single: bool) -> u8 {
@@ -1579,6 +1595,10 @@ impl Slot {
         if k == Kind::Noise && !self.nzf.ready() {
             m |= 32;
         }
+        // (fx9: VINYL BRAKE's history.)
+        if k == Kind::VinylBrake && self.vbh.is_none() {
+            m |= 64;
+        }
         m
     }
 
@@ -1606,6 +1626,9 @@ impl Slot {
                 std::mem::swap(&mut self.nzf, nz);
             }
         }
+        if m & 64 != 0 && c.vbh.is_some() {
+            std::mem::swap(&mut self.vbh, &mut c.vbh);
+        }
         c
     }
 
@@ -1625,6 +1648,39 @@ impl Slot {
         if k == Kind::Noise && !self.nzf.ready() && !self.delay.is_empty() {
             self.nzf = crate::fx_noise::NoiseFx::new(48000.0);
         }
+    }
+
+    /// fx9: STRETCH's `StretchCore::processEffectInternal` 0x102a47408 up to the pitch shifter
+    /// for the `len` frames of `buf` from `n`: a restart every `total` frames takes the live
+    /// place (the read gain shut over 3.3 ms, the jump, the gain opened again), the fx bands
+    /// into its ring (the slot's delay line), read back by Lagrange at the speed, through the
+    /// read gain and `SlowPlaybackFilter`. Into `st_pre`.
+    fn stretch_pre(&mut self, buf: &[f32], n: usize, len: usize, total: f32, speed: f32) {
+        for k in 0..len {
+            if self.t >= total {
+                self.t = 0.0;
+                self.st_cnt = 0.0;
+                self.stg.set_target(0.0);
+            }
+            if self.st_cnt >= 0.0 && !self.stg.on && self.stg.cur.abs() < 1.1920929e-7 {
+                self.lag = self.st_cnt;
+                self.st_cnt = -1.0;
+                self.stg.set_target(1.0);
+            }
+            if self.st_cnt >= 0.0 {
+                self.st_cnt += 1.0;
+            }
+            let (f, _) = self.b3.next([buf[(n + k) * 2], buf[(n + k) * 2 + 1]]);
+            self.push(f[0], f[1]);
+            let back = 1.0 + self.lag;
+            let (wl, wr) = (self.lagrange(back, 0), self.lagrange(back, 1));
+            self.lag += (1.0 - speed) as f64;
+            let sg = self.stg.take();
+            self.st_pre[k] = self.stf.frame([wl * sg, wr * sg], speed);
+            self.t += 1.0;
+        }
+        self.st_i = 0;
+        self.st_len = len;
     }
 
     /// fx7b: `RingBuffer::readByLagrangeInterpolation` (forward): four-point Lagrange through
@@ -2242,15 +2298,44 @@ impl Slot {
         // LOW CUT takes band 2 out, HI CUT band 0, each gain fading over 3.3 ms.
         // VINYL BRAKE's BPF (`BeatFxVinylBrake::updateStateAndParameter` 0x102a552c4): while
         // the brake runs, bands 0 and 2 go to thru (fading over 3.3 ms) and pass live beside it.
-        let b3_mine = !multi && matches!(kind, Spiral | SpiralUp | SpiralDown | Reverb | ReverbUp | ReverbDown | Robot | Pitch | VinylBrake);
+        // (fx9: VINYL BRAKE makes its module in both modes, `BeatFxVinylBrake` 0x102a543b0.)
+        let b3_mine = !multi && matches!(kind, Spiral | SpiralUp | SpiralDown | Reverb | ReverbUp | ReverbDown | Robot | Pitch) || kind == VinylBrake;
         if b3_mine {
             if made || (self.b3.rate() - r).abs() > 0.5 {
                 self.b3.setup(r);
             }
-            let (lo, hi) = if kind == VinylBrake { let bp = b2 && self.vb_state != 0; (bp, bp) } else { (b1, b2) };
+            let (lo, hi) = if kind == VinylBrake { let bp = b2 && !multi && self.vb_state != 0; (bp, bp) } else { (b1, b2) };
             self.b3.set_gains([if hi { 0.0 } else { 1.0 }, 1.0, if lo { 0.0 } else { 1.0 }]);
         }
         let b3_on = b3_on || b3_mine;
+        // fx9: TRANS and PAN (`BeatFxTrans` made with its `EffectFrequencyModule`, 0x102a5084c;
+        // `processEffectConcrete` 0x102a512c8: the gate runs on the module's fx bands and each
+        // side's thru is added after it). `SingleBeatFxTrans::updateParameter` 0x102a51ac0:
+        // LOW CUT takes band 2 out, HI CUT band 0. `SingleBeatFxPan::updateParameter`
+        // 0x102a4f0a8 sets the bands otherwise: button 1 takes band 1 (the middle) out, button 2
+        // bands 0 and 2 (its parameters are rekordbox's "Mid Band Removal" / "High & Low Band
+        // Removal").
+        // The ROLL family (`SingleBeatFxRollBase::processEffectConcrete` 0x102a2ffac) and HELIX
+        // (`SingleBeatFxHelix::pre/postProcessEffectHook` 0x1029f62d0 / 0x1029f62d8) run on the
+        // whole sound and split twice: the live sound's cut bands (module 1 thru) plus the
+        // effect output's kept bands (ROLL: module 2's thru with the buttons the other way
+        // round, `updateAndSetParameter` 0x102a2fca0; HELIX: module 2's fx, `updateParameter`
+        // 0x1029f6400). `b3` is module 1, `b3t` module 2.
+        let b3_post = !multi && matches!(kind, Roll | RevRoll | SlipRoll | Helix);
+        let b3_fx9 = !multi && matches!(kind, Trans | Pan) || b3_post;
+        if b3_fx9 {
+            if made || (self.b3.rate() - r).abs() > 0.5 || (self.b3t.rate() - r).abs() > 0.5 {
+                self.b3.setup(r);
+                self.b3t.setup(r);
+            }
+            let f = |b: bool| if b { 0.0 } else { 1.0 };
+            self.b3.set_gains(if kind == Pan { [f(b2), f(b1), f(b2)] } else { [f(b2), 1.0, f(b1)] });
+            if kind == Helix {
+                self.b3t.set_gains([f(b2), 1.0, f(b1)]);
+            } else if b3_post {
+                self.b3t.set_gains([1.0 - f(b2), 0.0, 1.0 - f(b1)]);
+            }
+        }
         // STRETCH (`BeatFxStretch::processEffectConcrete` 0x102a454b4): the split is in front of
         // the stretch, which takes the bands at their fx gains; the thru gains pass them live.
         if kind == Stretch {
@@ -2275,17 +2360,6 @@ impl Slot {
         let mut si = 0usize;
         let mut dsi = 0usize;
         let (dry, wet) = mix;
-        // LOW CUT / HI CUT: the effect is not given those bands (LOW CUT ECHO never gets the
-        // lows). The echoes simply do not repeat them; the others pass them through.
-        let has_cuts = info_of(kind).labels[2] == "LOW CUT";
-        // VINYL BRAKE's BPF (`BeatFxVinylBrake::updateStateAndParameter` 0x102a552c4): while the
-        // brake runs, the low and high bands pass live (`EffectFrequencyModule` bands 2 and 0 at
-        // fx 0, thru 1) and only the middle band is braked.
-        let vb_bpf = kind == VinylBrake && !multi && b2 && self.vb_state != 0;
-        let (cut_lo, cut_hi) = (kind == LowCutEcho || has_cuts && !multi && b1 || vb_bpf, has_cuts && !multi && b2 || vb_bpf);
-        let cuts = cut_lo || cut_hi;
-        let (lo_c, hi_c) = (butter(CUT_LOW_HZ, r, false), butter(CUT_HIGH_HZ, r, true));
-        let (lo_hp, hi_lp) = (butter(CUT_LOW_HZ, r, true), butter(CUT_HIGH_HZ, r, false));
         let echo_type = matches!(kind, Delay | RevDelay | Echo | PitchEcho | UpEcho | DownEcho | LowCutEcho | PingPong | Spiral | SpiralUp | SpiralDown | MtDelay | Reverb | ReverbUp | ReverbDown);
         // Per-effect settings that do not change inside the block.
         let dir = if down != (b1 && matches!(kind, EnigmaJet | MobiusSaw | MobiusTri)) { -1.0f32 } else { 1.0 };
@@ -2302,10 +2376,13 @@ impl Slot {
         // keeps its default 0.267 (`RobotCore::createParameter`).
         let (rob_a, rob_b, rob_mod) = if multi { robot_law(level) } else { (robot_law(k2).0, k2, 0.267) };
         let speed = stretch_speed(level);
+        // (fx9: STRETCH's turn in frames, `BeatFxStretch::updateAndSetParameter` 0x102a4558c:
+        // the beat value x LEVEL/DEPTH, at most 16 s; its shifter's shift.)
+        let st_total = ((secs * level).min(16.0) * r).max(1.0);
+        let st_shift = stretch_shift(speed, !multi && b1);
         let stages = if multi { (6, 6) } else { phaser_stages(k2) };
         let (helix_keep, helix_in) = helix_law(level);
         let env_k = (1.0 - (-1.0 / (0.002 * r)).exp(), 1.0 - (-1.0 / (0.12 * r)).exp());
-        let base = (ring.w + 2 * RING_LEN - frames) as f64;
         // The FX+ reverbs: the main knob and TIME in 8-bit steps, REVERB UP's band-pass and
         // the FILTER knob's filter on the reverb (single mode).
         let fxp_v = (level * 255.9).floor().min(255.0);
@@ -2428,7 +2505,8 @@ impl Slot {
             // (fx7b: single SPIRAL / SPIRAL UP / DOWN run the shifter on every block, also at 0 %.)
             Spiral | SpiralUp | SpiralDown => !multi,
             Robot | Pitch => true,
-            Stretch => !b1 && speed < 0.999,
+            // (fx9: `StretchCore` runs the shifter on every block: `updatePitchSpeed` 0x102a4780c.)
+            Stretch => true,
             VinylBrake => self.vb_state == 2,
             _ => false,
         };
@@ -2527,13 +2605,18 @@ impl Slot {
                 // Off and faded out: the rest of the buffer is the dry sound, untouched.
                 break;
             }
-            if ps_on && self.ps.block_left() == 0 {
+            if ps_on && (self.ps.block_left() == 0 || kind == Stretch && n == 0) {
                 // rekordbox's shifter works a block at a time (`processPitchShift` over the
                 // buffer it is given, 512 frames here at most): its zero-crossing search sees
                 // the block's input before the block's frames run. The input ahead is the
                 // buffer itself (PITCH, ROBOT) or what the line will give (the echoes, SPIRAL,
                 // HELIX: written at least a delay time ago; STRETCH: the history).
                 let len = (frames - n).min(crate::fx_core::PitchShifter::BLOCK);
+                if kind == Stretch {
+                    self.stf.set_rate(r);
+                    self.stg.set_rate(r);
+                    self.stretch_pre(buf, n, len, st_total, speed);
+                }
                 let mut ps = std::mem::replace(&mut self.ps, crate::fx_core::PitchShifter::empty());
                 {
                     let me = &*self;
@@ -2542,10 +2625,11 @@ impl Slot {
                     // (fx7b: single ROBOT / PITCH are given the band split's effect bands.)
                     let mut cb = me.b3;
                     ps.begin_block((0..len).map(|k| match kind {
-                        Robot | Pitch if b3_on => { let f = cb.next([bb[(n + k) * 2], bb[(n + k) * 2 + 1]]).0; (f[0], f[1]) }
+                        // (fx9: VINYL BRAKE's shifter is given the module's fx bands too.)
+                        Robot | Pitch | VinylBrake if b3_on => { let f = cb.next([bb[(n + k) * 2], bb[(n + k) * 2 + 1]]).0; (f[0], f[1]) }
                         Robot | Pitch | VinylBrake => (bb[(n + k) * 2], bb[(n + k) * 2 + 1]),
                         SpiralUp | SpiralDown => (me.aux_tap(t - k as f32, 0), me.aux_tap(t - k as f32, 1)),
-                        Stretch => ring.at(base + (n + k) as f64 - me.lag - k as f64 * (1.0 - speed) as f64),
+                        Stretch => (me.st_pre[k][0], me.st_pre[k][1]),
                         _ => (me.tap(t - k as f32, 0), me.tap(t - k as f32, 1)),
                     }));
                 }
@@ -2554,42 +2638,21 @@ impl Slot {
             let (xl, xr) = (buf[n * 2], buf[n * 2 + 1]);
             // What the effect is given (`dl`, `dr`) and the bands kept from it (`tl`, `tr`).
             let (mut dl, mut dr, mut tl, mut tr) = (xl, xr, 0.0, 0.0);
-            if b3_on {
+            // (fx9: the live sound's thru bands, added inside the wet sound.)
+            let mut th9 = [0.0f32; 2];
+            if b3_fx9 {
+                let (f, t) = self.b3.next([xl, xr]);
+                if !b3_post {
+                    [dl, dr] = f;
+                }
+                th9 = t;
+            } else if b3_on {
                 let (f, t) = self.b3.next([xl, xr]);
                 [dl, dr] = f;
                 b3_thru = t[0];
                 // (fx7b: VINYL BRAKE adds each side's thru live.)
                 if kind == VinylBrake {
                     (tl, tr) = (t[0], t[1]);
-                }
-            } else if cuts {
-                for (c, x) in [xl, xr].into_iter().enumerate() {
-                    let z = &mut self.bands[c];
-                    let (mut thru, mut y) = (0.0, x);
-                    if cut_lo {
-                        let a = biquad(&mut z[0..2], &lo_c, x);
-                        thru += biquad(&mut z[2..4], &lo_c, a);
-                        let b = biquad(&mut z[8..10], &lo_hp, y);
-                        y = biquad(&mut z[10..12], &lo_hp, b);
-                    }
-                    if cut_hi {
-                        let a = biquad(&mut z[4..6], &hi_c, x);
-                        thru += biquad(&mut z[6..8], &hi_c, a);
-                        let b = biquad(&mut z[12..14], &hi_lp, y);
-                        y = biquad(&mut z[14..16], &hi_lp, b);
-                    }
-                    if c == 0 {
-                        tl = thru;
-                        dl = y;
-                    } else {
-                        tr = thru;
-                        dr = y;
-                    }
-                }
-                if echo_type {
-                    // (The dry side of an echo is the whole sound.)
-                    tl = 0.0;
-                    tr = 0.0;
                 }
             }
             if spiral_kind {
@@ -2640,7 +2703,7 @@ impl Slot {
             let (il, ir) = (dl * target, dr * target);
             // The dry sound (whole for the echoes) and the wet sound, mixed by the effect's
             // law; the on/off gate moves both gains over 3.33 ms.
-            let (fdl, fdr) = if echo_type || b3_mine { (xl, xr) } else { (dl, dr) };
+            let (fdl, fdr) = if echo_type || b3_mine || b3_fx9 { (xl, xr) } else { (dl, dr) };
             let mixed = |wl: f32, wr: f32| (fdl * (1.0 + (dry - 1.0) * g) + wl * wet * g, fdr * (1.0 + (dry - 1.0) * g) + wr * wet * g);
             let (ol, or) = match kind {
                 Delay | RevDelay | Echo | PitchEcho | UpEcho | DownEcho | LowCutEcho | PingPong => {
@@ -2830,7 +2893,7 @@ impl Slot {
                     // square between 0 and 1 (open for the duty, edges a 3.3333 ms line ending on
                     // the jump). PAN: a triangle between 0 and 1.4125, the sides half a turn apart.
                     let i = n % LFO_PIECE;
-                    mixed(dl * lgain[i], dr * rgain[i])
+                    mixed(dl * lgain[i] + th9[0], dr * rgain[i] + th9[1])
                 }
                 Filter => {
                     // `BeatFxFilter::processEffectConcrete` 0x1029cf584 (`crate::fx_sweep`): the
@@ -2932,8 +2995,14 @@ impl Slot {
                     let sq = |d: f32, h: f32| if d >= 1.0 || (ph + h).fract() < d { 1.0f32 } else { 0.0 };
                     self.fb[0] += (sq(rd, rh) - self.fb[0]).clamp(-gate_k, gate_k);
                     self.fb[1] += (sq(dd, dh) - self.fb[1]).clamp(-gate_k, gate_k);
-                    let ol = lgain[i] * self.fb[0] + dl * self.fb[1];
-                    let or = rgain[i] * self.fb[0] + dr * self.fb[1];
+                    // (fx9: single mode, the roll's kept bands beside the live cut bands.)
+                    let mut rl = [lgain[i], rgain[i]];
+                    if b3_post {
+                        let k = self.b3t.next(rl).1;
+                        rl = [k[0] + th9[0], k[1] + th9[1]];
+                    }
+                    let ol = rl[0] * self.fb[0] + dl * self.fb[1];
+                    let or = rl[1] * self.fb[0] + dr * self.fb[1];
                     mixed(ol, or)
                 }
                 Robot => {
@@ -2987,7 +3056,12 @@ impl Slot {
                     // fx7b: `HelixCore` (crate::fx_helix): records the beat value, then lays
                     // the input over the loop (IN, KEEP); a new TIME plays the loop faster or
                     // slower in steps and records the new length from it.
-                    let y = self.hxc.frame(&mut self.delay, DELAY_LEN / 2, [dl, dr], n + 1 == frames);
+                    let mut y = self.hxc.frame(&mut self.delay, DELAY_LEN / 2, [dl, dr], n + 1 == frames);
+                    // (fx9: single mode, the helix's kept bands beside the live cut bands.)
+                    if b3_post {
+                        let k = self.b3t.next(y).0;
+                        y = [k[0] + th9[0], k[1] + th9[1]];
+                    }
                     mixed(y[0], y[1])
                 }
                 VinylBrake => {
@@ -3012,6 +3086,7 @@ impl Slot {
                         self.vbc.start(r);
                         self.vb_start = (ring.w + RING_LEN - frames + n) % RING_LEN;
                         self.vb_k = (0, 0);
+                        self.vbh_n = 0;
                     }
                     let mut out = (dl, dr);
                     let mut wet_g = 0.0;
@@ -3030,10 +3105,27 @@ impl Slot {
                         self.vb_k.0 += 1;
                         self.speed = v;
                         let h0 = self.vb_start;
-                        let (wl, wr) = self.vbc.frame(v, |k| {
-                            let i = (h0 + k) % RING_LEN;
-                            (ring.buf[i * 2], ring.buf[i * 2 + 1])
-                        });
+                        // fx9: the core's own history: this frame's fx bands are written
+                        // before it reads (`processBlock` writes the block first), and it reads
+                        // at most one frame past the one before.
+                        let (wl, wr) = if let Some(h) = self.vbh.as_deref_mut() {
+                            let k = self.vbh_n;
+                            if k < VB_HIST {
+                                h[k * 2] = dl;
+                                h[k * 2 + 1] = dr;
+                                self.vbh_n = k + 1;
+                            }
+                            let h = &*h;
+                            self.vbc.frame(v, |k| {
+                                let i = k.min(VB_HIST - 1);
+                                (h[i * 2], h[i * 2 + 1])
+                            })
+                        } else {
+                            self.vbc.frame(v, |k| {
+                                let i = (h0 + k) % RING_LEN;
+                                (ring.buf[i * 2], ring.buf[i * 2 + 1])
+                            })
+                        };
                         out = (wl, wr);
                         wet_g = 1.0;
                         self.t += 1.0;
@@ -3044,6 +3136,7 @@ impl Slot {
                             self.vbc.start(r);
                             self.vb_start = (ring.w + RING_LEN - frames + n + 1) % RING_LEN;
                             self.vb_k = (0, 0);
+                            self.vbh_n = 0;
                         }
                         if lv < self.vb[0] - 0.03125 && !(b1 && !multi) {
                             // Into the release state from here.
@@ -3095,7 +3188,10 @@ impl Slot {
                     let (el, er) = if vb_echo { self.echo(wl * target, wr * target, &e, r) } else { (0.0, 0.0) };
                     self.ga[0] += (wet_g - self.ga[0]).clamp(-gate_k, gate_k);
                     let w = self.ga[0] * g;
-                    (dl * (1.0 - w) + (wl + el) * w, dr * (1.0 - w) + (wr + er) * w)
+                    // (fx9: the dry side is the whole sound, `updateMixRatio` 0x102a5568c: the
+                    // EffectBase dry gain 1 only before the brake starts, the wet sound the
+                    // module's bands.)
+                    (xl * (1.0 - w) + (wl + el) * w, xr * (1.0 - w) + (wr + er) * w)
                 }
                 Stretch => {
                     // Every beat value x LEVEL/DEPTH playback starts again at the live sound and runs at
@@ -3109,38 +3205,15 @@ impl Slot {
                     // place, shuts the read gain over 3.3 ms, jumps there and opens it again;
                     // the read sound goes through `SlowPlaybackFilter` at the speed, then the
                     // pitch shifter.)
-                    let total = ((secs * level).min(16.0) * r).max(1.0);
-                    self.stf.set_rate(r);
-                    self.stg.set_rate(r);
-                    if self.t >= total {
-                        self.t = 0.0;
-                        self.st_cnt = 0.0;
-                        self.stg.set_target(0.0);
-                    }
-                    if self.st_cnt >= 0.0 && !self.stg.on && self.stg.cur.abs() < 1.1920929e-7 {
-                        self.lag = self.st_cnt;
-                        self.st_cnt = -1.0;
-                        self.stg.set_target(1.0);
-                    }
-                    if self.st_cnt >= 0.0 {
-                        self.st_cnt += 1.0;
-                    }
-                    // fx7b: the bands into `StretchCore`'s own ring (the slot's delay line) and
-                    // read back by `RingBuffer::readByLagrangeInterpolation` 0x102989008.
-                    let (f, _) = self.b3.next([xl, xr]);
+                    // fx9: the read sound from `stretch_pre` (the block's, made before the
+                    // shifter's block began), then the shifter: `updatePitchSpeed` 0x102a4780c,
+                    // REPITCH (single mode) shift 0, else 1 / speed - 1 within -2 .. 3.
+                    let y = if self.st_i < self.st_len { self.st_pre[self.st_i] } else { [0.0; 2] };
+                    self.st_i += 1;
                     let (_, th) = self.b3t.next([xl, xr]);
-                    self.push(f[0], f[1]);
-                    let back = 1.0 + self.lag;
-                    let (wl, wr) = (self.lagrange(back, 0), self.lagrange(back, 1));
-                    self.lag += (1.0 - speed) as f64;
-                    let sg = self.stg.take();
-                    let y = self.stf.frame([wl * sg, wr * sg], speed);
-                    let (mut wl, mut wr) = (y[0], y[1]);
-                    if !b1 && speed < 0.999 {
-                        (wl, wr) = self.shift(wl, wr, 1.0 / speed);
-                    }
+                    self.ps.set_shift(st_shift);
+                    let (wl, wr) = self.ps.process(y[0], y[1]);
                     let edge = 1.0;
-                    self.t += 1.0;
                     // (LOW / HI CUT and BPF, `SingleBeatFxStretch::updateParameter` 0x102a459c0:
                     // the gains of the split in front, set above.)
                     let thru = th;
@@ -3659,13 +3732,17 @@ impl Rack {
     /// `ch`: 0..3 = decks 1 to 4, 4 = the master, 5 = the sampler. A deck's order: MERGE FX,
     /// its PAD FX unit, then FX1 and FX2.
     pub fn process(&mut self, ch: usize, buf: &mut [f32], rate: u32) {
+        // fx9: the order of the units on one place is rekordbox's `FxUnitProcessor` slots
+        // (`FxUnitProcessor::processBlock` 0x102aa1388 runs slots 0 .. 6 in turn; the slot is
+        // the last argument of `DjSystem::setChannelFx / setMasterFx / setAuxFx`): on the master
+        // the RELEASE FX panel's unit in slot 0 (`RbxReleaseFxPanel` 0x1009396d0), the Beat FX
+        // units in slot 2 (`RekordboxMulti/SingleFxUnitContainer`), CFX in slot 4
+        // (`RekordboxDjColorFxUnitContainer` 0x102a668c8); on the sampler Beat FX (2) then
+        // CFX (4). MERGE FX's sampler joins the mix before the master's effects (its own
+        // channel, `MergeFxSamplerChannelGraph`).
         if ch == MASTER {
             if let Some(m) = self.merge.as_deref_mut() {
                 m.master(buf, rate);
-            }
-            if self.enabled {
-                let (k, c, p) = self.master_cfx_set;
-                self.master_cfx.process(k, c, p, buf, rate);
             }
             if let Some(c) = self.master_rel.as_deref_mut() {
                 c.remember(buf);
@@ -3675,10 +3752,6 @@ impl Rack {
                 up.bpm = [self.master_bpm; CHANNELS];
                 c.process(&up, MASTER, buf, rate, None);
             }
-        }
-        if ch == SAMPLER && self.enabled && (self.sampler_cfx_set.1 - 0.5).abs() > 0.011 {
-            let (k, c, p) = self.sampler_cfx_set;
-            self.sampler_cfx.process(k, c, p, buf, rate);
         }
         if ch < 4 {
             if let Some(m) = self.merge.as_deref_mut() {
@@ -3729,6 +3802,15 @@ impl Rack {
                     c.process(&p, ch, buf, rate, beat);
                 }
             }
+        }
+        // (fx9: CFX after the Beat FX, slot 4.)
+        if ch == MASTER {
+            let (k, c, p) = self.master_cfx_set;
+            self.master_cfx.process(k, c, p, buf, rate);
+        }
+        if ch == SAMPLER && (self.sampler_cfx_set.1 - 0.5).abs() > 0.011 {
+            let (k, c, p) = self.sampler_cfx_set;
+            self.sampler_cfx.process(k, c, p, buf, rate);
         }
     }
 }
@@ -3803,7 +3885,7 @@ mod tests {
                 let bits = b.rev_needs(k, single);
                 let _old = b.rev_install(k, single, NewCores::make(bits, single));
                 assert_eq!(b.rev_needs(k, single), 0, "{k:?} single {single}: the installed cores do not cover the need");
-                let has = |s: &Slot| (s.rv.is_some(), s.ec.is_some(), s.pe.is_some(), s.mt.is_some(), s.fxp.as_ref().map(|f| f.single()), s.nzf.ready());
+                let has = |s: &Slot| (s.rv.is_some(), s.ec.is_some(), s.pe.is_some(), s.mt.is_some(), s.fxp.as_ref().map(|f| f.single()), s.nzf.ready(), s.vbh.is_some());
                 assert_eq!(has(&a), has(&b), "{k:?} single {single}: the two ways make different cores");
             }
         }

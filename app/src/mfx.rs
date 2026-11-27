@@ -303,6 +303,20 @@ pub fn factory_dir() -> std::path::PathBuf {
 /// Read the factory sounds where rekordbox's presets point (only read); a sound missing there
 /// is taken from rekordbox's own archive (compressed, so the system's `unzip` unpacks each
 /// file to memory). Missing rekordbox or files: those sounds are silent.
+/// fx9: the engine's sample table (one place a file of `FILES`).
+pub type SampleTable = [Option<Arc<Sample>>; 18];
+
+/// fx9: the table for `Engine::swap_samples`, made from `load_samples`' list (on the worker).
+pub fn sample_table(list: &[(u16, Arc<Sample>)]) -> SampleTable {
+    let mut t: SampleTable = Default::default();
+    for (no, s) in list {
+        if let Some(i) = FILES.iter().position(|f| f == no) {
+            t[i] = Some(s.clone());
+        }
+    }
+    t
+}
+
 pub fn load_samples() -> Vec<(u16, Arc<Sample>)> {
     let zip = "/Applications/rekordbox 7/rekordbox.app/Contents/Resources/MERGE FX.zip";
     let dir = factory_dir();
@@ -332,16 +346,6 @@ pub fn load_user(path: &str) -> Option<Arc<Sample>> {
     let mut data = d.samples;
     data.truncate(d.sr as usize * 120 * 2);
     (data.len() >= 4).then(|| Arc::new(Sample { data, rate: d.sr as f32 }))
-}
-
-/// The clip player's fade length (`Attenuator(rate, 1.0 ms)`: (1.0 x 0.001) x rate, rounded).
-fn restart_fade_frames(rate: f32) -> i32 {
-    (((1.0f32 * 0.001) * rate) as f64).round().max(2.0) as i32
-}
-
-/// `Attenuator::createCurve`: 0.5 + 0.5 sin(i pi / (n - 1) - pi / 2), from 0 to 1 over n frames.
-fn restart_curve(i: i32, n: i32) -> f32 {
-    (((i.clamp(0, n - 1)) as f64 * 3.14159265 / (n - 1) as f64 - 1.57079633).sin() * 0.5 + 0.5) as f32
 }
 
 /// A sample being played: its place (frames of the file) or `None`.
@@ -384,8 +388,10 @@ struct UnitEng {
     /// starts from.
     npb: u32,
     grid0: f64,
-    /// Frames since the build sample last restarted (its fade-in; `i32::MAX`: none).
-    rfade: i32,
+    /// fx9: the build sample's clip player fade (`crate::mfx_att`, rekordbox's `Attenuator`)
+    /// and the rate it was made at.
+    att: crate::mfx_att::Attenuator,
+    att_rate: f32,
     /// REPEAT UP: CFX PITCH on the build sample, and the buffer it is made in.
     pitch: Cfx,
     sbuf: Vec<f32>,
@@ -398,7 +404,7 @@ struct UnitEng {
 
 impl UnitEng {
     fn new() -> UnitEng {
-        let mut e = UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, rfade: i32::MAX, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2], pe_line: vec![0.0; PE_LEN * 2], pe_w: 0, pe_ps: crate::fx_core::PitchShifter::new(48000.0) };
+        let mut e = UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, att: crate::mfx_att::Attenuator::new(48000.0, 1.0), att_rate: 48000.0, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2], pe_line: vec![0.0; PE_LEN * 2], pe_w: 0, pe_ps: crate::fx_core::PitchShifter::new(48000.0) };
         // (Made by the interface: the echo cores of the slots, so that MERGE FX runs rekordbox's
         // echo and not the old shared line.)
         for s in e.slots.iter_mut() {
@@ -417,7 +423,7 @@ const PE_LEN: usize = 4 * 48000 + 1024;
 pub struct Engine {
     pub cmd: [Cmd; 2],
     units: [UnitEng; 2],
-    samples: [Option<Arc<Sample>>; 18],
+    samples: SampleTable,
     /// Per unit, the files chosen for the BUILD SAMPLE and DROP SAMPLE columns (decoded on
     /// the interface's side and handed over).
     user: [[Option<Arc<Sample>>; 2]; 2],
@@ -438,12 +444,20 @@ impl Engine {
         std::mem::replace(&mut self.user[u][col], s)
     }
 
+    /// (Tests: the samples of `list` in their places.)
+    #[cfg(test)]
     pub fn set_samples(&mut self, list: &[(u16, Arc<Sample>)]) {
         for (no, s) in list {
             if let Some(i) = FILES.iter().position(|f| f == no) {
                 self.samples[i] = Some(s.clone());
             }
         }
+    }
+
+    /// fx9: put a table made by `sample_table` in place (the old one comes back in `t`). Only
+    /// pointers move: for the interface thread with the rack locked.
+    pub fn swap_samples(&mut self, t: &mut SampleTable) {
+        std::mem::swap(&mut self.samples, t);
     }
 
     pub fn phase(&self, u: usize) -> Phase {
@@ -655,6 +669,32 @@ impl Engine {
                 let len = (frames - done).min(SBUF);
                 let sb = &mut e.sbuf[..len * 2];
                 sb.iter_mut().for_each(|v| *v = 0.0);
+                // fx9: the clip player's fade for this block (`AudioPlayerCore`: the block's
+                // discontinuous points through `Attenuator::letSmoothDiscontinuousPoints`, then
+                // `apply`): the restarts the grid test below makes, found ahead over the block
+                // and one fade more.
+                let use_att = building && repeat && e.npb > 0;
+                let mut att_g = [1.0f32; SBUF];
+                if use_att {
+                    if (e.att_rate - r).abs() > 0.5 {
+                        e.att = crate::mfx_att::Attenuator::new(r, 1.0);
+                        e.att_rate = r;
+                    }
+                    let mut pts = [0i32; 64];
+                    let mut np = 0;
+                    let mut c = e.clock;
+                    for k in 0..len as i32 + e.att.len() {
+                        let before = c;
+                        c += bpm as f64 / 60.0 / r as f64;
+                        let (a, b) = ((before - e.grid0) * e.npb as f64, (c - e.grid0) * e.npb as f64);
+                        if b >= 0.0 && (a < 0.0 || a.floor() != b.floor() || before == e.grid0) && np < pts.len() {
+                            pts[np] = k;
+                            np += 1;
+                        }
+                    }
+                    e.att.smooth(&pts[..np], len as i32);
+                    e.att.apply(&mut att_g[..len]);
+                }
                 for k in 0..len {
                     let n = done + k;
                     let mut s = (0.0f32, 0.0f32);
@@ -665,7 +705,6 @@ impl Engine {
                             let (a, b) = ((before - e.grid0) * e.npb as f64, (e.clock - e.grid0) * e.npb as f64);
                             if b >= 0.0 && (a < 0.0 || a.floor() != b.floor() || before == e.grid0) {
                                 e.build.pos = Some(0.0);
-                                e.rfade = 0;
                             }
                         }
                         match id {
@@ -706,20 +745,9 @@ impl Engine {
                     // `rbxfrm::f2dsp::Attenuator::createCurve` 0x102887b84, made by
                     // `AudioPlayerCore`'s constructor 0x1028f3668): a sample still playing fades out
                     // into the restart point and the restart fades in (`AudioClipPlayer::
-                    // launchAudioClip` 0x10294c620, `doMovePlayingPosWithDelay` /
-                    // `letSmoothDiscontinuousPoints`); a finished one only fades in.
-                    let fade_g = if building && repeat && e.npb > 0 {
-                        let nf = restart_fade_frames(r);
-                        let step = e.npb as f64 * bpm as f64 / 60.0 / r as f64;
-                        let b = (e.clock - e.grid0) * e.npb as f64;
-                        let to_next = if b >= 0.0 { ((b.floor() + 1.0 - b) / step).floor() as i32 } else { i32::MAX };
-                        let g_out = if e.build.pos.is_some() && to_next < nf { restart_curve(to_next, nf) } else { 1.0 };
-                        let g_in = if e.rfade < nf { restart_curve(e.rfade, nf) } else { 1.0 };
-                        e.rfade = e.rfade.saturating_add(1);
-                        g_out * g_in
-                    } else {
-                        1.0
-                    };
+                    // launchAudioClip` 0x10294c620, `doMovePlayingPosWithDelay`; fx9: the gains
+                    // worked out for the block above, `crate::mfx_att`).
+                    let fade_g = att_g[k];
                     if let Some(pos) = e.build.pos {
                         match find(e.build.no) {
                             Some(smp) if (pos as usize + 1) * 2 + 1 < smp.data.len() => {
@@ -785,7 +813,7 @@ pub struct UnitUi {
 pub struct MfxState {
     pub units: [UnitUi; 2],
     /// The samples are being (or have been) read.
-    loading: Option<std::sync::mpsc::Receiver<Vec<(u16, Arc<Sample>)>>>,
+    loading: Option<std::sync::mpsc::Receiver<SampleTable>>,
     loaded: bool,
     /// The bottom row of the FX panel shows MERGE FX instead of CFX.
     pub show: bool,
@@ -867,15 +895,18 @@ pub fn sync(app: &mut crate::app::App, rack: &mut crate::fx::Rack, bpm: &[f32; c
     if !st.loaded && st.loading.is_none() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(load_samples());
+            // (fx9: the engine's table is made here, off the interface thread and its lock.)
+            let _ = tx.send(sample_table(&load_samples()));
         });
         st.loading = Some(rx);
     }
     let m = rack.merge.as_deref_mut().unwrap();
-    if let Some(Ok(list)) = st.loading.as_ref().map(|rx| rx.try_recv()) {
-        m.set_samples(&list);
+    if let Some(Ok(mut table)) = st.loading.as_ref().map(|rx| rx.try_recv()) {
+        // (fx9: under the rack's lock only the table's pointers are swapped.)
+        m.swap_samples(&mut table);
         st.loaded = true;
         st.loading = None;
+        drop(table);
     }
     for u in 0..2 {
         let deck = p.deck(u);
@@ -1127,12 +1158,13 @@ mod tests {
     /// raised-sine): a held tone fades out into each restart and in after it.
     #[test]
     fn repeat_restarts_fade_through_the_clip_players_attenuator() {
-        assert_eq!(restart_fade_frames(48000.0), 48);
-        assert!(restart_curve(0, 48) == 0.0 && (restart_curve(47, 48) - 1.0).abs() < 1e-6 && (restart_curve(24, 48) - 0.5).abs() < 0.04);
         let mut e = Engine::new();
         e.cmd[0].comps = [44, 15, 23, 44];
-        // A long constant "sample": the repeats restart it while it still plays.
-        e.set_samples(&[(101, Arc::new(Sample { data: vec![0.5f32; 48000 * 2 * 2], rate: 48000.0 }))]);
+        // A long constant "sample": the repeats restart it while it still plays. (fx9: handed
+        // over as the app does, a table made beforehand and swapped in.)
+        let mut t = sample_table(&[(101, Arc::new(Sample { data: vec![0.5f32; 48000 * 2 * 2], rate: 48000.0 }))]);
+        e.swap_samples(&mut t);
+        assert!(t.iter().all(|s| s.is_none()) && e.samples[0].is_some());
         e.cmd[0].on = true;
         e.cmd[0].knob = 0.0;
         let mut out = Vec::new();
@@ -1150,6 +1182,11 @@ mod tests {
         let mid = dips[0] + 12000;
         assert!(l[mid].abs() > 0.1 && (l[dips[0] + 24] / l[mid] - 0.5).abs() < 0.1, "{} {}", l[dips[0] + 24], l[mid]);
         assert!((dips[1] - dips[0]).abs_diff(24000) <= 1, "{dips:?}");
+        // fx9: steady before it, the fade-out runs from the curve's top to its place 1 on the
+        // frame before the restart (`Attenuator::letSmoothDiscontinuousPoints`: from `p - pos`).
+        let c = crate::mfx_att::Attenuator::new(48000.0, 1.0);
+        let k = l[dips[1] - 1] / l[mid];
+        assert!((k - c.curve(1)).abs() < 2e-4 && (l[dips[1] - 2] / l[mid] - c.curve(2)).abs() < 2e-4, "{k} vs {}", c.curve(1));
     }
 
     #[test]

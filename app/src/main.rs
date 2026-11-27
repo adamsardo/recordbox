@@ -33,12 +33,15 @@ mod fx_helix;
 mod fx_noise;
 #[cfg(test)]
 mod fx7b_tests;
+#[cfg(test)]
+mod fx9_tests;
 mod fx_roll;
 mod fx_sweep;
 mod fx_rev;
 mod fx_echo;
 mod fx_echo_plus;
 mod mfx;
+mod mfx_att;
 mod icons;
 mod icons_player;
 mod icons_src;

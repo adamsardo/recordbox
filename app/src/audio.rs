@@ -1222,9 +1222,17 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     crate::recorder::restore_master(&mut guards, rec_lift);
     drop(guards);
     crate::edit_audio::mix(out, channels, rate);
-    // The master section (Performance mixer): peak limiter, then the master level meter.
+    // The master section (Performance mixer): the master level meter, then the peak limiter.
     use std::sync::atomic::Ordering::Relaxed;
     crate::recorder::tap(out, channels, rate, rec_lift);
+    // (fx9: the master level meter reads before the limiter, `OutputChannelGraph::connectUnit`
+    // 0x102a9d298: MasterVolume -> LevelMeter -> Limitter.)
+    for (c, m) in MASTER_PEAK.iter().enumerate().take(channels.min(2)) {
+        let p = out.iter().skip(c).step_by(channels.max(1)).fold(0.0f32, |a, v| a.max(v.abs()));
+        if p > f32::from_bits(m.load(Relaxed)) {
+            m.store(p.to_bits(), Relaxed);
+        }
+    }
     if let Some(mut lim) = MASTER_LIMITER.try_lock() {
         lim.process(out, channels, rate, LIMITER_ON.load(Relaxed));
     }
@@ -1233,12 +1241,6 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     if hp_master > 0.0 && channels == 2 && cue.len() >= out.len() {
         for (c, o) in cue.iter_mut().zip(out.iter()) {
             *c += *o * hp_master;
-        }
-    }
-    for (c, m) in MASTER_PEAK.iter().enumerate().take(channels.min(2)) {
-        let p = out.iter().skip(c).step_by(channels.max(1)).fold(0.0f32, |a, v| a.max(v.abs()));
-        if p > f32::from_bits(m.load(Relaxed)) {
-            m.store(p.to_bits(), Relaxed);
         }
     }
 }
