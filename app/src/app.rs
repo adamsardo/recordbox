@@ -2178,13 +2178,9 @@ impl App {
                 Col::Bpm => fc(ta.bpm, tb.bpm),
                 Col::Rating => ta.rating.cmp(&tb.rating),
                 Col::Time => fc(ta.duration, tb.duration),
-                Col::Key => {
-                    if alnum {
-                        (ta.key % 12, ta.key / 12).cmp(&(tb.key % 12, tb.key / 12))
-                    } else {
-                        key_name(ta.key, false).cmp(&key_name(tb.key, false))
-                    }
-                }
+                // By the label on screen (an imported spelling such as "1A" is shown whatever
+                // notation is chosen here, and used to be sorted by the note name under it).
+                Col::Key => crate::model::key_sort_key(&ta.key_label(alnum)).cmp(&crate::model::key_sort_key(&tb.key_label(alnum))),
                 Col::DateAdded => ta.date_added.cmp(&tb.date_added).then(ta.id.cmp(&tb.id)),
                 Col::Color => ta.color.cmp(&tb.color),
                 Col::Comments => tc(&ta.comment, &tb.comment),
