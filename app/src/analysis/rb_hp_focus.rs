@@ -170,7 +170,6 @@ fn half_beat_conflict(starts: &[i32; 128], ends: &[i32; 128], count: usize, list
 }
 
 /// Why the port gives no result where rekordbox would have one.
-pub const NOT_4_4: &str = "the network numbered the bars other than 4/4, which takes rekordbox's tempo-change branch (not built yet)";
 pub const NO_INPUT: &str = "no beats to work from";
 pub const OUT_OF_RANGE: &str = "rekordbox reads past its beat list here; recordbox stops instead";
 
@@ -296,8 +295,11 @@ pub fn analyze_focus(env: &Uba, inp: &FocusInput) -> Result<FocusOutput, &'stati
         list.push(BeatInfo { pos, zero: 0, interval: v87 as f32, num, minus1: -1, flag: false });
     }
     if inp.hendou || v81 != 4 {
-        // The tempo-change / non 4-4 path of the original is not ported.
-        return Err(NOT_4_4);
+        // the tempo-change / non 4-4 half of the original (`focus2.rs`)
+        let out = super::focus2::analyze(list, inp.sr, a7, bpm72, inp.total)?;
+        let bpm100 = ((out.bpm72 * 100.0) + 0.5) as i32;
+        let beats = out.list.iter().map(|b| (b.pos, b.num, ((6000000.0f32 / b.interval) + 0.5) as i32)).collect();
+        return Ok(FocusOutput { beats, bpm100, flag, csv, before_uba: vec![], after_uba: out.list, vote: Default::default() });
     }
     let n = a6 as usize;
     let sr = inp.sr as f64;

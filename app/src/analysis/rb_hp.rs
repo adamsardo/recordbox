@@ -12,8 +12,10 @@
 //!    (`grid_from_list`).
 //!
 //! The legacy analysis is `legacy` (BeatAnalyzer_2_0, with its tempo-change verdict that Auto
-//! follows). Not ported: the tempo-change path (Dynamic, and Auto when 2_0 judges the tempo
-//! varied); it keeps the standard grid and says why (`take_notes`). Other rates than 44.1 / 48
+//! follows). The tempo-change path (Dynamic, and Auto when 2_0 judges the tempo varied) is
+//! `tempo` (network over the whole track, seam repair) and `focus2` (analyzeFocus' second
+//! half); where it reaches a branch not built yet the standard Dynamic grid is kept and the
+//! reason is reported (`take_notes`). Other rates than 44.1 / 48
 //! kHz go through rekordbox's converter (`rb_reader::for_analysis`) first, as in rekordbox.
 
 #[path = "rb_hp_net.rs"]
@@ -29,6 +31,10 @@ pub mod focus;
 pub mod vote;
 #[path = "rb_hp_legacy.rs"]
 pub mod legacy;
+#[path = "rb_hp_tempo.rs"]
+pub mod tempo;
+#[path = "rb_hp_focus2.rs"]
+pub mod focus2;
 
 use crate::model::BeatGrid;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -322,15 +328,21 @@ pub struct HpOutcome {
     pub beats: Vec<(i32, i32, i32)>,
     pub offset: i32,
     pub window: (usize, usize),
+    /// The tempo-change path was taken (convertToMicrosec then keeps the grid as it is).
+    pub hendou: bool,
 }
 
 /// Why the high precision analysis gave no result (the caller then keeps the standard one).
 pub const NOT_44_48: &str = "the audio's sample rate could not be converted to 44.1 or 48 kHz";
 pub const NO_MODELS: &str = "rekordbox's beat models were not found";
-pub const NO_TEMPO_CHANGE: &str = "the tempo-change analysis (Dynamic) of high precision is not built yet";
-pub const NO_TEMPO_CHANGE_AUTO: &str = "Auto judged the tempo to change, and the tempo-change analysis of high precision is not built yet";
 pub const NO_GRID: &str = "the standard analysis found no beats to start from";
+pub const NO_LEGACY_BEATS: &str = "rekordbox's first analysis (BeatAnalyzer_2_0) found no beats, so its high precision analysis gives no grid";
 pub const NO_NET_BEATS: &str = "the network found no beats";
+
+/// The reasons the tempo-change path gives up in a branch that is not built yet.
+pub fn is_tempo_fallback(why: &str) -> bool {
+    why == focus2::UNPORTED_CLASS || why == focus2::UNPORTED_HALFBEAT || why == focus2::UNPORTED_SHORT
+}
 
 /// rekordbox's high precision analysis of decoded audio. `legacy` is the standard analysis'
 /// tempo and first beat, used only when `legacy::analyze` gives nothing. The error says
@@ -369,6 +381,9 @@ pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) ->
     let auto_hendou = leg2.as_ref().map(|l| l.hendou).unwrap_or(false);
     let (legacy, bpm100) = match leg2 {
         Some(l) => (Legacy { bpm: l.bpm, beats: l.beats.iter().map(|b| b.pos).collect() }, l.bpm100()),
+        // BeatAnalyzer_2_0 found no beats: analyzeFocus then gets a count of 0 and returns
+        // nothing (BA_GetBeatNum_Focus 0), as for short loops in Dynamic
+        None if std::env::var("PREPDECK_HP_LEGACY").as_deref() != Ok("standard") => return Err(NO_LEGACY_BEATS),
         None => {
             let l = legacy_from_grid(legacy.0, legacy.1, sr, total).ok_or(NO_GRID)?;
             let b = (l.bpm as f64 * 100.0).round() as i32;
@@ -382,13 +397,18 @@ pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) ->
         MODE_AUTO => auto_hendou,
         _ => false,
     };
-    if hendou {
-        // The tempo-change path (model7 over the whole track in chunks, the gap filling after
-        // it and analyzeFocus' second half) is not ported: the caller keeps its own grid.
-        return Err(if mode == MODE_AUTO { NO_TEMPO_CHANGE_AUTO } else { NO_TEMPO_CHANGE });
-    }
     let (start, len) = madmom_window(total as i64, sr as i64, offset as i64, hendou);
-    let (list, mbpm, _) = madmom_stage(&dec.samples, sr, start as usize, len as usize, hendou).ok_or(NO_MODELS)?;
+    let (list, mbpm) = if hendou {
+        // the tempo-change path: model7 over the whole track in pieces, the seam repair
+        // (`tempo.rs`), then analyzeFocus' second half (`focus2.rs`)
+        let m = load_models();
+        let net = m.net7.as_ref().ok_or(NO_MODELS)?;
+        let (_, list, b) = tempo::madmom_tempo(net, &m.dbn, &dec.samples, sr, total);
+        (list, b as f64)
+    } else {
+        let (list, mbpm, _) = madmom_stage(&dec.samples, sr, start as usize, len as usize, hendou).ok_or(NO_MODELS)?;
+        (list, mbpm)
+    };
     tt.push(("network+dbn", thread_cpu()));
     let ml: Vec<(i32, i32, i32)> = list.iter().map(|b| (b.pos as i32, b.num_bar, b.bpm)).collect();
     let input = focus::FocusInput { sr: sr as i32, total: ana as i32, offset, hendou, legacy_bpm100: bpm100, legacy_count: legacy.beats.len() as i32, madmom: &ml, madmom_bpm: mbpm as i32 };
@@ -404,7 +424,7 @@ pub fn analyze(dec: &crate::audio::Decoded, mode: u8, legacy: (f64, f64, u8)) ->
     let beats = out.beats;
     let bpm = out.bpm100 as f64 / 100.0;
     let grid = grid_from_list(&beats, sr);
-    Ok(HpOutcome { bpm, grid, beats, offset, window: (start as usize, len as usize) })
+    Ok(HpOutcome { bpm, grid, beats, offset, window: (start as usize, len as usize), hendou })
 }
 
 /// CPU seconds of the calling thread (for PREPDECK_HP_TIMES; worker threads of a stage are
@@ -440,6 +460,7 @@ pub fn grid_from_list(beats: &[(i32, i32, i32)], sr: u32) -> BeatGrid {
     let ms_of = |t: f64| ((t.max(0.0) * 1e6).round() as i64) / 1000;
     // `pt`: where `BeatGrid::beats` puts this beat (it adds the period beat by beat)
     let (mut pt, mut a_bpm100, mut pn) = (0f64, 0i32, 0i32);
+    let mut force = false;
     for (j, &(pos, num, bpm100)) in beats.iter().enumerate() {
         let us = beat_us(pos, sr);
         let t = us as f64 / 1e6;
@@ -448,11 +469,31 @@ pub fn grid_from_list(beats: &[(i32, i32, i32)], sr: u32) -> BeatGrid {
             pt += 60.0 / (a_bpm100 as f64 / 100.0).max(1.0);
             pn = pn % 4 + 1;
         }
-        let fits = j > 0 && bpm100 == a_bpm100 && bpm100 > 0 && num == pn && ms_of(pt) == us / 1000;
-        if !fits {
-            let bpm = if bpm100 > 0 { bpm100 as f64 / 100.0 } else { anchors.last().map(|a| a.bpm).unwrap_or(120.0) };
+        let fits = !force && j > 0 && bpm100 == a_bpm100 && bpm100 > 0 && num == pn && ms_of(pt) == us / 1000;
+        force = false;
+        let mut bpm = if bpm100 > 0 { bpm100 as f64 / 100.0 } else { anchors.last().map(|a| a.bpm).unwrap_or(120.0) };
+        // `BeatGrid::beats` lays a beat every period from an anchor until half a period before
+        // the next one: with the tempo changing per beat (the tempo-change path) a gap to the
+        // next listed beat of 1.5 periods or more would add a beat, one of half a period or
+        // less would drop this one. Such a beat gets its own anchor at the nearest tempo that
+        // keeps the list (its written tempo then differs from rekordbox's).
+        let gap = beats.get(j + 1).map(|b| beat_us(b.0, sr) as f64 / 1e6 - t);
+        let p = 60.0 / bpm.max(1.0);
+        let bad = match gap {
+            Some(g) if g > 0.0 && g >= 1.5 * p - 1e-9 => {
+                bpm = (9000.0 / g).floor() / 100.0;
+                true
+            }
+            Some(g) if g > 0.0 && g <= 0.5 * p + 1e-9 => {
+                bpm = ((3000.0 / g).floor() + 1.0) / 100.0;
+                true
+            }
+            _ => false,
+        };
+        if !fits || bad {
             anchors.push(crate::model::GridAnchor { time: t, bpm, beat: num as u8 });
-            (pt, a_bpm100, pn) = (t, if bpm100 > 0 { bpm100 } else { (bpm * 100.0).round() as i32 }, num);
+            (pt, a_bpm100, pn) = (t, (bpm * 100.0).round() as i32, num);
+            force = bad;
         }
     }
     BeatGrid { anchors }
@@ -568,13 +609,14 @@ pub fn dispatch(dec: &crate::audio::Decoded, s: &super::AnalysisSettings, bpm: f
         Ok(o) => {
             let mut g = o.grid;
             let mut b = o.bpm;
-            // convertToMicrosec: halve or double into the BPM range (constant tempo only)
+            // convertToMicrosec (0x102328b20): halve or double into the BPM range, only when the
+            // tempo-change path was not taken (Analyzer +48 clear)
             let dur = dec.duration();
-            while b < s.bpm_min && b > 0.0 {
+            while !o.hendou && b < s.bpm_min && b > 0.0 {
                 g = g.doubled(dur);
                 b *= 2.0;
             }
-            while b > s.bpm_max {
+            while !o.hendou && b > s.bpm_max {
                 g = g.halved(dur);
                 b *= 0.5;
             }
@@ -582,8 +624,8 @@ pub fn dispatch(dec: &crate::audio::Decoded, s: &super::AnalysisSettings, bpm: f
         }
         Err(why) => {
             note(why);
-            if why == NO_TEMPO_CHANGE_AUTO {
-                // Auto chose the tempo-change path, which is not built: the standard analysis in
+            if is_tempo_fallback(why) {
+                // the tempo-change path hit a branch that is not built: the standard analysis in
                 // Dynamic mode is the nearest grid (recordbox's choice, not traced)
                 if let Some((b, Some(g))) = super::rb_beat1::tempo_and_grid(&dec.samples, dec.sr, true, s.bpm_min, s.bpm_max) {
                     return (b, Some(g));
@@ -643,8 +685,20 @@ mod oracle_tests {
             sum / feats.len() as f64
         );
         let mut worst_a = 0f32;
-        for (a, b) in act.iter().flatten().zip(&want_a) {
-            worst_a = worst_a.max((a - b).abs());
+        let mut worst_at = 0usize;
+        let mut over = 0usize;
+        for (i, (a, b)) in act.iter().flatten().zip(&want_a).enumerate() {
+            let d = (a - b).abs();
+            over += (d > 1e-4) as usize;
+            if d > worst_a {
+                worst_a = d;
+                worst_at = i;
+            }
+        }
+        eprintln!("activations: worst at frame {} col {}, {over} values differ by more than 1e-4", worst_at / 2, worst_at % 2);
+        if let Ok(p) = std::env::var("PREPDECK_HP_ACTOUT") {
+            let b: Vec<u8> = act.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(p, b).unwrap();
         }
         // The same network on TensorFlow's own features isolates the LSTM part.
         let act_tf = net.activations(&want_f);
