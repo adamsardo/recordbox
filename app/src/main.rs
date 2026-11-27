@@ -23,6 +23,7 @@ mod edit_render;
 mod edit_selftest;
 mod export;
 mod fx;
+mod fx_core;
 mod mfx;
 mod icons;
 mod icons_player;
@@ -99,6 +100,9 @@ mod ui_perf;
 mod ui_perf_layouts;
 mod ui_player2;
 mod xmlexport;
+mod vocal_rb;
+mod vocal_rb_mp3;
+mod vocal_rb_net;
 
 use app::App;
 

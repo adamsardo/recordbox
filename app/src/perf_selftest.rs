@@ -13,7 +13,7 @@ impl App {
         if !std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "perftest")).unwrap_or(false) {
             return;
         }
-        let fxh = if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 };
+        let fxh = if self.prefs.perf_fx { crate::ui_fx::fx_h(self) } else { 0.0 };
         let t = 28.0 + fxh;
         let extra = if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 };
         let ly = t + 143.0 + 99.5 + extra;

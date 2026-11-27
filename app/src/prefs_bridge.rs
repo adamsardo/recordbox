@@ -440,12 +440,7 @@ pub fn hide_deck_info(app: &App) -> bool {
 /// View > Layout > Effect Panel: the FX panel's height with the rows it shows (the Beat FX row
 /// is 1 + 49 pt and 3 pt of black before the Sound Color FX row of 24 pt; 1 pt closes it).
 pub fn fx_panel_height(app: &App) -> f32 {
-    let (beat, color) = app.prefs.rb.fx_rows();
-    match (beat, color) {
-        (true, true) => crate::ui_fx::FX_H,
-        (true, false) => crate::ui_fx::FX_H - 27.0,
-        _ => crate::ui_fx::FX_H - 53.0,
-    }
+    crate::ui_fx::fx_h(app)
 }
 
 // ------------------------------------------------------------------ Advanced

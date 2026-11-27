@@ -2013,10 +2013,11 @@ mod tests {
         assert!((out[0] - 0.0).abs() < 0.01 && out[..300].windows(2).all(|w| (w[1] - w[0]).abs() < 0.02), "{:?}", &out[..8]);
         e.release = None;
         step(&mut e, &mut pos, 44100);
-        // ECHO: the last beat of the drums repeats, each time at 0.7.
+        // ECHO (rekordbox's `ReleaseEcho`): the beat after the press plays on and is taken in,
+        // then it repeats at 0.7, 0.49, ...
         e.release = Some((1, 1.0));
         let (out, _) = step(&mut e, &mut pos, 44100);
-        assert!((out[2000] - 0.35).abs() < 0.01 && (out[22050 + 2000] - 0.245).abs() < 0.01, "{} {}", out[2000], out[24050]);
+        assert!((out[2000] - 0.5).abs() < 0.01 && (out[22050 + 2000] - 0.35).abs() < 0.01, "{} {}", out[2000], out[24050]);
         // Let go: the deck's drums are back, and after the fade nothing is added.
         e.release = None;
         let (out, cut) = step(&mut e, &mut pos, 4096);

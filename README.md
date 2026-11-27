@@ -8,7 +8,7 @@ An unofficial, open-source macOS app for getting ready for a DJ set: organise yo
 
 **A first version is ready to try**
 
-So far: 120 source files, 104,023 lines of Rust.
+So far: 124 source files, 108,143 lines of Rust.
 
 This is being built in the open. An AI coding agent (Claude Code, run through Craft Anything) is writing the code, and this repo syncs from its build folder about every 15 minutes, so you're watching it come together in real time. Expect gaps and the occasional broken build until a first release. Star or watch the repo to follow along.
 

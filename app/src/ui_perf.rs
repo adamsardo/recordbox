@@ -43,8 +43,8 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     let (l, mut t) = (full.min.x, full.min.y);
     // The FX panel, when shown, sits above the waveforms.
     if app.prefs.perf_fx {
-        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), crate::prefs_bridge::fx_panel_height(app) - 1.0)));
-        t += crate::prefs_bridge::fx_panel_height(app);
+        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), crate::ui_fx::fx_h(app) - 1.0)));
+        t += crate::ui_fx::fx_h(app);
     }
     // Two decks (2Deck Horizontal) or four (4Deck Horizontal: decks 1 and 3 on the left, 2 and
     // 4 on the right, the mixer's four strips between, in rekordbox's order 3, 1, 2, 4).

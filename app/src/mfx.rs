@@ -10,9 +10,10 @@
 //! `MergeFX::parameters`; written here as rules). The sample sounds are read from the
 //! installed rekordbox's `MERGE FX.zip` when MERGE FX is first enabled; nothing is copied.
 //! recordbox's own: the effect bodies (see `fx.rs` / `cfx.rs`), the release echoes' pitch as
-//! a change of speed, the beat steps of ROLL, the repeat rates of the REPEAT samples
-//! (rekordbox's notes-per-beat table was not read), and REPEAT SAMPLE / SAMPLER (the user's
-//! own sampler slot), which are listed but silent.
+//! a change of speed, the repeat rates of the REPEAT samples (not in `MergeFX::parameters`;
+//! their pattern codes are -1 / 201, which only drive the pitch), and REPEAT SAMPLE / SAMPLER
+//! (a file path stored in the preset), which are listed but silent. ROLL's beat steps are the
+//! echoes' step table, as the parameter table says.
 
 use crate::cfx::Cfx;
 use crate::fx::{Kind, Ring, Slot, SlotParams};
@@ -128,7 +129,9 @@ fn step(pct: f32, table: &[f32]) -> f32 {
 
 const ECHO_BEATS: [f32; 4] = [0.125, 0.25, 0.5, 0.75];
 const RISE_BEATS: [f32; 8] = [1.0 / 8.0, 1.0 / 10.0, 1.0 / 12.0, 1.0 / 16.0, 1.0 / 24.0, 1.0 / 32.0, 1.0 / 48.0, 1.0 / 64.0];
-const ROLL_BEATS: [f32; 4] = [0.5, 0.25, 0.125, 0.0625];
+/// ROLL and ROLL UP read their beat from the same step table as the echoes (table 4 in
+/// `MergeFX::parameters`, rows of patterns 106 / 107, param 1: curve 2, sub-type 3).
+const ROLL_BEATS: [f32; 4] = ECHO_BEATS;
 
 /// What a BUILD FX does at a knob position: up to three effect slots (with the mode their
 /// settings are read in), two colour effects (kind, COLOR, PARAM) and the dry sound's gain.

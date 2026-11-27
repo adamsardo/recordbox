@@ -284,7 +284,7 @@ pub struct Prefs {
     pub center_selected: bool,
     /// Vocal positions above the overview waveform.
     pub show_vocal: bool,
-    /// Detect vocals (with the stem model) for loaded tracks rekordbox never analysed.
+    /// Detect vocals when analysing (rekordbox's detector, `vocal_rb`; the stem model without rekordbox).
     pub vocal_analysis: bool,
     /// The column set and sort not in use: playlists and the collection each keep their own
     /// (rekordbox shows # and fewer columns in playlists). `columns_for_playlist` says which
@@ -1180,6 +1180,8 @@ pub struct App {
     pub key_requested: HashSet<i64>,
     /// Tracks whose vocal detection failed this session (not retried on every load).
     pub vocal_failed: HashSet<i64>,
+    /// Vocal levels for already analysed tracks, filled in in the background (`vocal_rb`).
+    pub vocal_backfill: crate::vocal_rb::Backfill,
     pub dialogs: Dialogs,
     pub toasts: Vec<Toast>,
     pub drag: Option<Vec<i64>>,
@@ -1305,6 +1307,7 @@ impl App {
             edits_checked: HashSet::new(),
             key_job: None,
             vocal_failed: HashSet::new(),
+            vocal_backfill: Default::default(),
             key_requested: HashSet::new(),
             relocate_rx: None,
             audio_retry: None,
@@ -1734,7 +1737,7 @@ impl App {
     }
     pub fn analysis_settings(&self) -> AnalysisSettings {
         let (lo, hi) = BPM_RANGES[self.prefs.bpm_range.min(BPM_RANGES.len() - 1)];
-        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic() }
+        AnalysisSettings { bpm_min: lo, bpm_max: hi, do_grid: self.prefs.analyze_grid, do_key: self.prefs.analyze_key, target_lufs: self.prefs.target_lufs, dynamic: self.analysis_dynamic(), vocal: self.prefs.vocal_analysis }
     }
 
     // ------------------------------------------------------------------ loading
@@ -2255,19 +2258,23 @@ impl App {
         if !self.prefs.vocal_analysis || self.deck.vocal.is_some() || self.screenshot.is_some() {
             return;
         }
-        // Only with a downloaded model and a GPU (about a minute per track there; much slower on
-        // the CPU).
-        if !crate::stems::CATALOG.iter().any(crate::stems::model_ready) || !self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false) {
+        // rekordbox's detector (CPU, about a second per track) unless PREPDECK_VOCAL=stems or
+        // rekordbox is not installed.
+        let rb = !crate::vocal_rb::use_stems();
+        // The stem model only when downloaded and with a GPU (about a minute per track there;
+        // much slower on the CPU).
+        if !rb && (!crate::stems::CATALOG.iter().any(crate::stems::model_ready) || !self.stem.hw.as_ref().map(|h| h.gpu).unwrap_or(false)) {
             return;
         }
         let Some(id) = self.deck.track else { return };
         if self.vocal_failed.contains(&id) {
             return;
         }
+        let path = self.track(id).map(|t| t.path.clone()).unwrap_or_default();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let r = crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr)));
+            let r = if rb { crate::vocal_rb::analyse_file(&path, Some(&a)) } else { crate::stems::separate_vocals(&a.samples, a.sr, &mut |_| true).ok().map(|v| crate::stems::vocal_levels(&v, &crate::stems::mono_44k(&a.samples, a.sr))) };
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });
@@ -2371,6 +2378,7 @@ impl App {
     }
 
     pub fn poll_vocal(&mut self) {
+        crate::vocal_rb::backfill_poll(self);
         let Some(rx) = &self.deck.vocal_rx else { return };
         if let Ok((id, r)) = rx.try_recv() {
             self.deck.vocal_rx = None;
@@ -2733,7 +2741,7 @@ impl App {
                     match r {
                         Ok(st) => {
                             // Separated stems give vocal detection for free.
-                            if self.db.vocal(id).is_none() && st.len > 0 {
+                            if self.db.vocal(id).is_none() && st.len > 0 && crate::vocal_rb::use_stems() {
                                 let (l, r) = (&st.data[6 * st.len..7 * st.len], &st.data[7 * st.len..8 * st.len]);
                                 let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
                                 // The mix is the sum of the four stems.
@@ -3229,6 +3237,12 @@ impl App {
                 let preview: Vec<u8> = res.wave.columns(400).iter().flat_map(|c| c.iter().copied()).collect();
                 let _ = self.db.save_wave(id, &res.wave, &preview);
                 self.previews.insert(id, preview);
+                if let Some(v) = &res.vocal {
+                    let _ = self.db.save_vocal(id, v);
+                    if self.deck.track == Some(id) && self.deck.vocal.is_none() {
+                        self.deck.vocal = Some(std::sync::Arc::new((crate::vocal_rb::hop_seconds(), v.clone())));
+                    }
+                }
                 let new_grid = save_grid.clone();
                 if let Some(g) = save_grid {
                     let _ = self.db.save_grid(id, &g);

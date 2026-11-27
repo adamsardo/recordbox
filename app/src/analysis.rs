@@ -16,6 +16,8 @@ pub struct AnalysisSettings {
     pub target_lufs: f64,
     /// Analysis Mode "Dynamic": the grid follows tempo changes (several anchors).
     pub dynamic: bool,
+    /// Vocal detection (rekordbox's, `vocal_rb`), Preferences > Analysis > Vocal.
+    pub vocal: bool,
 }
 
 pub mod dynamic;
@@ -23,7 +25,7 @@ pub mod mp3_timebase;
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
-        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, do_key: true, target_lufs: -10.0, dynamic: false }
+        AnalysisSettings { bpm_min: 70.0, bpm_max: 180.0, do_grid: true, do_key: true, target_lufs: -10.0, dynamic: false, vocal: true }
     }
 }
 
@@ -53,11 +55,17 @@ pub struct AnalysisResult {
     pub gain_db: f32,
     /// Linear sample peak of the measured audio (0 when unavailable).
     pub peak: f32,
+    /// Vocal levels 0–4 per 1024 samples at 22,050 Hz (`vocal_rb`), when detected.
+    pub vocal: Option<Vec<u8>>,
 }
 
 pub fn analyze_file(path: &str, s: &AnalysisSettings) -> Result<AnalysisResult> {
     let dec = decode_file(path)?;
-    Ok(analyze_decoded(&dec, s))
+    let mut r = analyze_decoded(&dec, &AnalysisSettings { vocal: false, ..s.clone() });
+    if s.vocal {
+        r.vocal = crate::vocal_rb::analyse_file(path, Some(&dec));
+    }
+    Ok(r)
 }
 
 pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
@@ -73,7 +81,8 @@ pub fn analyze_decoded(dec: &Decoded, s: &AnalysisSettings) -> AnalysisResult {
     let (lufs, peak) = loudness_and_peak(dec);
     // No measurement stays unavailable (NaN), never a usable 0 dB or an infinite gain.
     let gain_db = if lufs.is_finite() { (s.target_lufs - lufs).clamp(-24.0, 24.0) as f32 } else { f32::NAN };
-    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak }
+    let vocal = if s.vocal { crate::vocal_rb::analyse(dec) } else { None };
+    AnalysisResult { duration: dec.duration(), raw_samples: dec.raw_frames as u64, sample_rate: dec.sr, bpm, grid, key, wave, gain_db, peak, vocal }
 }
 
 // ------------------------------------------------------------------------------------------

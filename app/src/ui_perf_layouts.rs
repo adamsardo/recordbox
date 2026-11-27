@@ -228,7 +228,7 @@ pub(crate) fn player_height(app: &App) -> f32 {
 /// `getPlayerHeight` in every layout: 1 pt above the decks and a 3 pt gutter above the browser.
 pub(crate) fn height(app: &App) -> f32 {
     let l = layout(app);
-    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::prefs_bridge::fx_panel_height(app) } else { 0.0 };
+    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::ui_fx::fx_h(app) } else { 0.0 };
     let smp = if app.prefs.perf_sampler && panel_enabled(app, 2) { crate::ui_sampler::SAMPLER_H } else { 0.0 };
     let _ = l;
     player_height(app) + 4.0 + fx + smp
@@ -1313,8 +1313,8 @@ pub(crate) fn panels(app: &mut App, ui: &mut Ui) -> Rect {
     ui.painter().rect_filled(full, 0.0, BG);
     let mut t = full.min.y;
     if app.prefs.perf_fx && panel_enabled(app, 0) {
-        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(full.min.x, t), vec2(full.width(), crate::prefs_bridge::fx_panel_height(app) - 1.0)));
-        t += crate::prefs_bridge::fx_panel_height(app);
+        crate::ui_fx::panel(app, ui, Rect::from_min_size(pos2(full.min.x, t), vec2(full.width(), crate::ui_fx::fx_h(app) - 1.0)));
+        t += crate::ui_fx::fx_h(app);
     }
     let sampler_h = if app.prefs.perf_sampler && panel_enabled(app, 2) { crate::ui_sampler::SAMPLER_H } else { 0.0 };
     app.sampler_poll();
@@ -1886,7 +1886,7 @@ pub(crate) fn shot_layout_events(app: &mut App, frame: u32, raw: &mut egui::RawI
 /// The steps of the scripted run for the layout showing: (what, press at, release at).
 fn layout_steps(app: &App) -> Vec<(String, Pos2, Pos2)> {
     let l = layout(app);
-    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::prefs_bridge::fx_panel_height(app) } else { 0.0 };
+    let fx = if app.prefs.perf_fx && panel_enabled(app, 0) { crate::ui_fx::fx_h(app) } else { 0.0 };
     let area = Rect::from_min_size(pos2(0.0, 28.0 + fx), vec2(1512.0, player_height(app) + 4.0));
     let fr = frame(app, area);
     let mut v: Vec<(String, Pos2, Pos2)> = vec![];

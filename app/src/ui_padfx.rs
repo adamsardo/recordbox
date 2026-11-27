@@ -35,6 +35,32 @@ const COLOR_CODE: [u8; 41] = [5, 5, 22, 22, 9, 14, 14, 14, 56, 9, 9, 9, 5, 5, 5,
 
 pub const SLIP_LOOP: u8 = 28;
 
+/// The key Preferences > View > PAD FX color stores an effect's colour under (its name there,
+/// with "(RFX)" for the release effects and "(SFX)" for the Scene FX).
+pub fn color_key(fx: u8) -> String {
+    let name = match fx {
+        29 => "VINYL BRAKE",
+        31 => "BACK SPIN",
+        _ => NAMES[fx.min(40) as usize],
+    };
+    match group(fx) {
+        3 => format!("{name}(RFX)"),
+        4 => format!("{name}(SFX)"),
+        _ => name.to_string(),
+    }
+}
+
+/// A pad's colour: the one chosen in Preferences (PAD FX color, 1..9: Pink, Red, Orange,
+/// Yellow, Green, Aqua, Blue, Purple, Teal, the page's dot colours), else rekordbox's default
+/// controller colour code for the effect.
+pub fn pad_fx_color(chosen: &std::collections::BTreeMap<String, u8>, fx: u8) -> egui::Color32 {
+    const DOTS: [u32; 9] = [0xFF5AA5, 0xF03C3C, 0xFF8C19, 0xF8E330, 0x24E01F, 0x00DFFE, 0x56B2FB, 0xB133FF, 0x28A092];
+    match chosen.get(&color_key(fx)) {
+        Some(&c) => hex(DOTS[(c.clamp(1, 9) - 1) as usize]),
+        None => crate::sampler_ext::pad_color(COLOR_CODE[fx.min(40) as usize]),
+    }
+}
+
 /// rekordbox's fxGroup: 0 Beat FX, 1 Sound Color FX, 2 SLIP LOOP, 3 Release FX, 4 Scene FX.
 pub fn group(fx: u8) -> u8 {
     match fx {
@@ -498,7 +524,7 @@ pub fn pads(app: &mut App, ui: &mut Ui, n: u8, pad: &dyn Fn(usize, usize) -> Rec
             p.rect_stroke(pr, 0.0, Stroke::new(1.0_f32, BLUE), egui::StrokeKind::Inside);
         }
         // The effect's colour: an 8 x 8 square, 6 in from the left.
-        let col = crate::sampler_ext::pad_color(COLOR_CODE[info.fx.min(40) as usize]);
+        let col = pad_fx_color(&app.prefs.rb.pad_fx_colors, info.fx);
         p.rect_filled(Rect::from_min_size(pos2(pr.min.x + 6.0, (pr.center().y - 4.0).round()), vec2(8.0, 8.0)), 0.0, if lit { lighten(col) } else { col });
         let text = hex(0xF4F4F4);
         let mut x = pr.min.x + 20.0;

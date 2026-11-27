@@ -20,6 +20,21 @@ use serde::{Deserialize, Serialize};
 
 /// Height of the FX panel: the Beat FX row (52 pt) and the CFX row (26 pt).
 pub const FX_H: f32 = 78.0;
+/// MERGE FX's row under the CFX row (rekordbox shows it as a further row; its own height was
+/// not traced, so it takes the CFX row's 24 pt and the 3 pt gap above it).
+pub const MFX_ROW_H: f32 = 27.0;
+
+/// The FX panel's height as laid out now: with MERGE FX enabled its row is added.
+pub fn fx_h(app: &App) -> f32 {
+    // (View > Layout > Effect Panel chooses the rows; MERGE FX hangs under the CFX row.)
+    let (beat, color) = app.prefs.rb.fx_rows();
+    let base = match (beat, color) {
+        (true, true) => FX_H,
+        (true, false) => FX_H - 27.0,
+        _ => FX_H - 53.0,
+    };
+    if app.prefs.fx.mfx.enabled && color { base + MFX_ROW_H } else { base }
+}
 const BEAT_H: f32 = 52.0;
 
 /// A single-mode snapshot: knob 1, knob 2, button 1, button 2.
@@ -595,7 +610,7 @@ fn single_controls(app: &mut App, ui: &mut Ui, u: usize, l: Lay) {
                 app.px.fx[u].params.one.knob[k] = v;
             }
             let shown = v.unwrap_or(sp.knob[k]);
-            p.text(lr.center(), Align2::CENTER_CENTER, if active { knob_text(label, shown) } else { label.to_string() }, caps(8.0), WHITE);
+            p.text(lr.center(), Align2::CENTER_CENTER, if active { fx::single_knob_text(sp.kind, k, shown) } else { label.to_string() }, caps(8.0), WHITE);
         }
         let label = labels[2 + k];
         if label.is_empty() {
@@ -628,8 +643,8 @@ fn single_controls(app: &mut App, ui: &mut Ui, u: usize, l: Lay) {
     let _ = resp.on_hover_text("Snapshot: saves the positions of the knobs and buttons for this effect.");
 }
 
-/// The FX row: FX1 in the left half of `r`, FX2 in the right half; under it the CFX row (or
-/// MERGE FX's, when that is enabled and chosen).
+/// The FX row: FX1 in the left half of `r`, FX2 in the right half; under it the CFX row and,
+/// when MERGE FX is enabled (and `r` is `fx_h` tall), MERGE FX's row.
 pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let p = ui.painter().clone();
     let full = r;
@@ -643,10 +658,11 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
     let top = if beat_row { 53.0 } else { 0.0 };
     let bottom = Rect::from_min_max(pos2(full.min.x, full.min.y + top), pos2(full.max.x, full.min.y + top + 24.0));
     if color_row {
-        if app.prefs.fx.mfx.enabled && app.px.fxx.mfx.show {
-            mfx_row(app, ui, bottom);
-        } else {
-            cfx_row(app, ui, bottom);
+        cfx_row(app, ui, bottom);
+        if app.prefs.fx.mfx.enabled {
+            // MERGE FX's own row under the CFX row.
+            let mrow = Rect::from_min_max(pos2(full.min.x, bottom.max.y + 3.0), pos2(full.max.x, bottom.max.y + 3.0 + 24.0));
+            mfx_row(app, ui, mrow);
         }
     }
     if !beat_row {
@@ -790,19 +806,6 @@ fn color_knob(app: &mut App, ui: &mut Ui, kc: egui::Pos2, c: usize) {
     }
 }
 
-/// With MERGE FX enabled, the bottom row is the CFX row or MERGE FX's: this button swaps them.
-fn row_swap(app: &mut App, ui: &mut Ui, l: Lay) {
-    if !app.prefs.fx.mfx.enabled {
-        return;
-    }
-    let show = app.px.fxx.mfx.show;
-    let lit = app.px.fxx.mfx.units.iter().any(|u| u.on || u.phase_on);
-    let resp = small(ui, l.r(1040.0, 3.0, 40.0, 18.0), "mfxswap", if show { "CFX" } else { "MFX" }, lit && !show, true);
-    if resp.on_hover_text(if show { "Show the CFX row" } else { "Show MERGE FX" }).clicked() {
-        app.px.fxx.mfx.show = !show;
-    }
-}
-
 /// The CFX row at rekordbox's places. Single mode: DEFAULT / USER, the effect, PARAM, and a
 /// COLOR knob per channel in the order S, 3, 1, 2, 4, M. Multi mode: PARAM, then per channel
 /// its label, its effect (name = on/off, list) and its COLOR knob.
@@ -822,7 +825,6 @@ fn cfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
     if mode_button(ui, m2.shrink2(vec2(0.5, 0.0)), "cfxsingle", 1, !multi, "CFX single-mode: one effect for all channels.") {
         app.px.fxx.cfx_multi = false;
     }
-    row_swap(app, ui, l);
     // S (the sampler deck) is live when "Apply CFX to Sampler" is ticked in Preferences >
     // Controller > Effect; decks 3 and 4 in the 4-deck layout.
     let four = app.deck_count() == 4;
@@ -936,7 +938,6 @@ fn mfx_row(app: &mut App, ui: &mut Ui, r: Rect) {
     p.rect_filled(r, 0.0, hex(0x1E1E1E));
     let l = Lay { x0: r.min.x, y0: r.center().y - 12.0, k: r.width() / 1280.0 };
     p.text(pos2(r.min.x + 10.5, r.center().y - 0.5), Align2::LEFT_CENTER, "MFX", bold(12.5), hex(0x8C8C8C));
-    row_swap(app, ui, l);
     let four = app.deck_count() == 4;
     for u in 0..2usize {
         let h = Lay { x0: l.x0 + u as f32 * 400.0 * l.k, ..l };
@@ -1091,6 +1092,8 @@ pub fn selftest_steps(app: &App) -> Vec<(&'static str, egui::Pos2, egui::Pos2)> 
     let k = 1512.0 / 1280.0;
     let top = 28.0 + 3.0;
     let (y1, y2, ya, cy) = (top + 11.0, top + 37.0, top + 16.0, 28.0 + 66.0);
+    // (MERGE FX's row sits under the CFX row.)
+    let my = cy + MFX_ROW_H;
     let p = |x: f32, y: f32| (pos2(x * k, y), pos2(x * k, y));
     let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
     let pad = |i: usize| { let c = app.px.fxx.pad.rects[0][i].center(); (c, c) };
@@ -1131,18 +1134,18 @@ pub fn selftest_steps(app: &App) -> Vec<(&'static str, egui::Pos2, egui::Pos2)> 
         // MERGE FX: enabled in Preferences, its row shown; unit 1 (deck 1, MERGE FX 1 = SNARE
         // RISER) on, the knob up, off again: release (2.5 s), drop, deck 1 stops.
         st("FXCALL:mfx enabled and its row shown", p(0.0, 0.0)),
-        st("MERGE FX unit 1 ON", p(234.0, cy)),
-        ("MERGE FX unit 1 knob to the right", pos2(277.0 * k, cy), pos2(277.0 * k, cy - 50.0)),
+        st("MERGE FX unit 1 ON", p(234.0, my)),
+        ("MERGE FX unit 1 knob to the right", pos2(277.0 * k, my), pos2(277.0 * k, my - 50.0)),
         st("FXCALL:wait while it builds", p(0.0, 0.0)),
         st("PAD FX pad 5 while MERGE FX is on (refused)", pad(4)),
-        st("MERGE FX unit 1 OFF (release starts)", p(234.0, cy)),
+        st("MERGE FX unit 1 OFF (release starts)", p(234.0, my)),
         st("FXCALL:wait 1 (release)", p(0.0, 0.0)),
         st("FXCALL:wait 2 (release)", p(0.0, 0.0)),
         st("FXCALL:wait 3 (release)", p(0.0, 0.0)),
         st("FXCALL:wait 4 (drop: deck 1 stopped)", p(0.0, 0.0)),
         st("FXCALL:wait 5 (at rest)", p(0.0, 0.0)),
         st("FXCALL:play deck 1 again", p(0.0, 0.0)),
-        st("MERGE FX unit 1 ON again", p(234.0, cy)),
+        st("MERGE FX unit 1 ON again", p(234.0, my)),
         st("FXCALL:cancel unit 1 (Shift + ON)", p(0.0, 0.0)),
         st("FXCALL:wait 6 (cancelled: no drop)", p(0.0, 0.0)),
     ]
@@ -1283,6 +1286,20 @@ mod tests {
 
     #[test]
     fn single_mode_read_outs() {
+        // rekordbox's read-outs (`convertSingleParamString`).
+        use fx::{single_knob_text as t, Kind as K};
+        assert_eq!(t(K::Echo, 0, 0.5), "0.5");
+        assert_eq!(t(K::Echo, 1, 1.0), "HPF 100");
+        assert_eq!(t(K::Echo, 1, 0.5), "0");
+        assert_eq!(t(K::Delay, 1, 0.0), "L:100%");
+        assert_eq!(t(K::Spiral, 1, 0.0), "-50%");
+        assert_eq!(t(K::Spiral, 1, 1.0), "+100%");
+        assert_eq!(t(K::Phaser, 1, 1.0), "R STAGE:60");
+        assert_eq!(t(K::Trans, 0, 1.0), "99%");
+        assert_eq!(t(K::MtDelay, 1, 0.5), "4");
+        assert_eq!(t(K::VinylBrake, 1, 0.5), "NONE");
+        assert_eq!(t(K::VinylBrake, 0, 1.0), "4");
+        assert_eq!(t(K::Stretch, 0, 0.0), "L:100%");
         assert_eq!(knob_text("FEEDBACK", 0.5), "50");
         assert_eq!(knob_text("PITCH", 0.5), "0");
         assert_eq!(knob_text("PITCH", 0.505), "0");

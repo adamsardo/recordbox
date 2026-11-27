@@ -1014,7 +1014,7 @@ fn page_analysis(app: &mut App, ui: &mut Ui, tab: usize) {
         });
         kit::checkbox(ui, &mut app.prefs.analyze_key, "KEY");
         kit::checkbox(ui, &mut app.prefs.phrase_analysis, "Phrase").on_hover_text("Phrases (Intro, Up, Down, Chorus, Outro) are shown under the overview and written to USB exports. rekordbox's own phrases are used for tracks it analysed.");
-        kit::checkbox(ui, &mut app.prefs.vocal_analysis, "Vocal").on_hover_text("Vocal positions for loaded tracks rekordbox never analysed, found with the stem separation model once it is downloaded (about a minute per track on this Mac's GPU, in the background). rekordbox's own vocal detection is used for tracks it analysed.");
+        kit::checkbox(ui, &mut app.prefs.vocal_analysis, "Vocal").on_hover_text("Vocal positions, detected when tracks are analysed, the way rekordbox does it (its own detection network, read from the installed rekordbox; about a second per track). rekordbox's stored results are used for tracks it analysed. Without rekordbox installed, the stem separation model is used once it is downloaded (about a minute per track on this Mac's GPU, for loaded tracks).");
         separator(ui);
         sub(ui, "Auto Analysis");
         toggle(ui, &mut app.prefs.auto_analysis, "Enable");
