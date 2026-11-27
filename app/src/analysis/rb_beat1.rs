@@ -111,6 +111,7 @@ fn pipeline(samples: &[f32], scale: f32, reader: bool, sr: u32, varied: bool, ke
     }
     let bia = info::Bia { sr: sr as i32 };
     let mut list = std::mem::take(&mut sensor.list);
+    FRONT.with(|f| *f.borrow_mut() = Some(Front { key: front_key(samples, sr), list: list.clone(), uem: uem.clone(), total }));
     if keep {
         st.sensor = list.clone();
         st.log = sensor.log.take();
@@ -131,6 +132,84 @@ fn pipeline(samples: &[f32], scale: f32, reader: bool, sr: u32, varied: bool, ke
     st.fin = grid;
     st.bpm = bpm;
     st
+}
+
+/// The stages `BeatAnalyzer_1_0` and `BeatAnalyzer_2_0` share (the same functions in both
+/// libraries, fed the same samples): the sensor's candidate list and the `UnitEnvelopeMaker`
+/// that has seen the samples. With high precision on, rekordbox runs both libraries on a track;
+/// recordbox runs these stages once (`front`, one entry kept per thread by `pipeline`).
+pub(crate) struct Front {
+    key: (usize, usize, u32),
+    pub(crate) list: Vec<BeatInfo>,
+    uem: env::Uem,
+    pub(crate) total: i32,
+}
+
+thread_local! {
+    static FRONT: std::cell::RefCell<Option<Front>> = const { std::cell::RefCell::new(None) };
+}
+
+fn front_key(samples: &[f32], sr: u32) -> (usize, usize, u32) {
+    (samples.as_ptr() as usize, samples.len(), sr)
+}
+
+impl Front {
+    /// `UnitEnvelopeMaker::analyze` on a beat list (consumes this front's envelope state).
+    pub(crate) fn uem_analyze(&mut self, bpm: f32, v: &mut Vec<BeatInfo>, varied: bool) {
+        self.uem.analyze(bpm, v, varied);
+    }
+}
+
+/// The shared stages for interleaved stereo at 44.1 / 48 kHz as `pipeline` feeds them (the reader's
+/// 16-bit values, blocks of sr / 75 frames): taken from the last `pipeline` run on this thread when
+/// that saw the same samples, computed otherwise. `samples` must already be the analysed frames.
+pub(crate) fn front(samples: &[f32], sr: u32) -> Option<Front> {
+    let total = (samples.len() / 2) as i32;
+    if !(sr == 44100 || sr == 48000) || total < 1 {
+        return None;
+    }
+    let key = front_key(samples, sr);
+    // PREPDECK_HP_NOSHARE=1 recomputes (for timing the shared stages)
+    if let Some(f) = FRONT.with(|f| f.borrow_mut().take()).filter(|f| f.key == key && std::env::var("PREPDECK_HP_NOSHARE").is_err()) {
+        return Some(f);
+    }
+    let block = (sr / 75) as usize;
+    let mut sensor = sensor::Sensor::new(sr as i32, total);
+    let mut uem = env::Uem::new(sr as i32, total);
+    let mut pcm16 = vec![0i16; 2 * block];
+    let mut mono = vec![0f32; block];
+    let frames = total as usize;
+    let mut done = 0usize;
+    while done < frames {
+        let n = block.min(frames - done);
+        for i in 0..n {
+            let l = reader_sample(samples[2 * (done + i)]);
+            let r = reader_sample(samples[2 * (done + i) + 1]);
+            mono[i] = (r + l) * (1.0 / 65536.0);
+            pcm16[2 * i] = (l as i32) as i16;
+            pcm16[2 * i + 1] = (r as i32) as i16;
+        }
+        sensor.put(&mono[..n]);
+        uem.put(&pcm16[..2 * n]);
+        done += n;
+    }
+    Some(Front { key, list: std::mem::take(&mut sensor.list), uem, total })
+}
+
+/// `BeatInfoAnalyzer::analyze` of 1_0 with the candidate list `segAdjust` searches given apart
+/// (see `info::Bia::analyze_with`); for `BeatAnalyzer_2_0`'s two passes.
+pub(crate) fn bia_analyze(sr: i32, list: &mut Vec<BeatInfo>, out: &mut Vec<BeatInfo>, total: i32, varied: bool, seg_list: Option<&[BeatInfo]>) -> f32 {
+    info::Bia { sr }.analyze_with(list, out, total, 4, 16, 12, varied, seg_list)
+}
+
+/// Stage trace of `BeatInfoAnalyzer` for the oracle tests (`info::trace`).
+#[cfg(test)]
+pub(crate) fn trace_on() {
+    info::trace_on();
+}
+#[cfg(test)]
+pub(crate) fn trace_take() -> Vec<(&'static str, Vec<BeatInfo>, f32)> {
+    info::trace_take()
 }
 
 /// `BA_GetBpm` (0x101156344 → `Analyzer::getBpm` 0x101136a00): BPM × 100, rounded.
@@ -306,7 +385,7 @@ fn grid_from(st: &Stages, sr: u32, dynamic: bool, duration: f64, bpm_min: f64, b
 }
 
 #[cfg(test)]
-mod oracle {
+pub(crate) mod oracle {
     //! `PREPDECK_RBBEAT=<dir with rbbeat and fixups.txt> PREPDECK_RBSLICE=<arm64 slice>
     //! PREPDECK_GT=<tsv: path TAB ...> cargo test --release -- --ignored rb_beat1_oracle --nocapture`
     use super::*;
@@ -458,9 +537,9 @@ mod oracle {
         (0..a.len().max(b.len())).find(|&i| a.get(i).map(|x| (x.pos, x.f1.to_bits(), x.iv.to_bits(), x.stat, x.band)) != b.get(i).map(|x| (x.pos, x.f1.to_bits(), x.iv.to_bits(), x.stat, x.band)))
     }
 
-    type Program = (f64, fn(f64) -> f64, u64, Option<(f64, f64)>);
+    pub(crate) type Program = (f64, fn(f64) -> f64, u64, Option<(f64, f64)>);
     /// Tempo programs: constant, steps, ramps, jitter, a silent break, slow and fast tempi.
-    pub(super) const SYNTH: [Program; 10] = [
+    pub(crate) const SYNTH: [Program; 10] = [
         (150.0, |_| 124.0, 1, None),
         (180.0, |t| if t < 60.0 { 120.0 } else { 126.0 }, 2, None),
         (200.0, |t| 118.0 + 14.0 * (t / 200.0), 3, None),
@@ -547,7 +626,7 @@ mod oracle {
     /// Synthetic drum loops with a tempo program (beats per minute as a function of time), for
     /// checking the multi-segment (Dynamic) paths: kick on every beat, snare on 2 and 4, hats
     /// on the off-beats, a little noise. Returns interleaved stereo in [-1, 1] at 44.1 kHz.
-    pub(super) fn synth(secs: f64, tempo: &dyn Fn(f64) -> f64, seed: u64, gap: Option<(f64, f64)>) -> Vec<f32> {
+    pub(crate) fn synth(secs: f64, tempo: &dyn Fn(f64) -> f64, seed: u64, gap: Option<(f64, f64)>) -> Vec<f32> {
         let sr = 44100.0;
         let n = (secs * sr) as usize;
         let mut v = vec![0f32; n];

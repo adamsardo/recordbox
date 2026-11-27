@@ -1565,21 +1565,34 @@ impl App {
                         }
                     }
                     "relocate" => {
-                        // Check of Relocate Missing Files: move one track's file into a subfolder of
-                        // PREPDECK_SHOT_MOVED, then search that folder.
-                        let dest = std::path::PathBuf::from(std::env::var("PREPDECK_SHOT_MOVED").unwrap_or_default());
-                        if let Some(t) = app.tracks.iter().find(|t| !t.missing).cloned() {
-                            let to = dest.join("nested").join(std::path::Path::new(&t.path).file_name().unwrap());
-                            let _ = std::fs::create_dir_all(to.parent().unwrap());
-                            if std::fs::rename(&t.path, &to).is_ok() {
-                                app.reload_tracks();
-                                app.relocate_missing(&dest);
-                                let t0 = std::time::Instant::now();
-                                while app.relocate_rx.is_some() && t0.elapsed() < std::time::Duration::from_secs(30) {
-                                    app.poll_relocate();
-                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                        // Check of Relocate Missing Files. This never touches the track's real
+                        // file (an earlier form of this switch MOVED it, which took audio files
+                        // out of the user's folders): a copy goes into a subfolder of
+                        // PREPDECK_SHOT_MOVED, the track of the throwaway library is pointed at a
+                        // path that does not exist, and that folder is searched. Without
+                        // PREPDECK_SHOT_MOVED, or with a library that is not a throwaway copy
+                        // (PREPDECK_DATA), nothing is done.
+                        let moved = std::env::var("PREPDECK_SHOT_MOVED").unwrap_or_default();
+                        let throwaway = std::env::var_os("PREPDECK_DATA").is_some();
+                        if !moved.trim().is_empty() && throwaway {
+                            let dest = std::path::PathBuf::from(moved);
+                            if let Some(t) = app.tracks.iter().find(|t| !t.missing).cloned() {
+                                let name = std::path::Path::new(&t.path).file_name().unwrap().to_owned();
+                                let to = dest.join("nested").join(&name);
+                                let _ = std::fs::create_dir_all(to.parent().unwrap());
+                                let gone = dest.join("was-here").join(&name);
+                                if std::fs::copy(&t.path, &to).is_ok() && app.relocate_track(t.id, &gone.to_string_lossy()) {
+                                    app.reload_tracks();
+                                    app.relocate_missing(&dest);
+                                    let t0 = std::time::Instant::now();
+                                    while app.relocate_rx.is_some() && t0.elapsed() < std::time::Duration::from_secs(30) {
+                                        app.poll_relocate();
+                                        std::thread::sleep(std::time::Duration::from_millis(20));
+                                    }
                                 }
                             }
+                        } else {
+                            eprintln!("relocate: skipped (needs PREPDECK_SHOT_MOVED and a throwaway PREPDECK_DATA; it works on a copy)");
                         }
                     }
                     "subbrowser" => {

@@ -10,6 +10,28 @@
 use super::sensor::tol;
 use super::BeatInfo;
 
+/// Stage trace for the oracle tests (the sections `BeatInfoAnalyzer` writes to its debug file
+/// in rekordbox's `BeatAnalyzer_2_0`): off unless a test turns it on with [`trace_on`].
+pub(super) type Trace = Vec<(&'static str, Vec<BeatInfo>, f32)>;
+thread_local! {
+    static TRACE: std::cell::RefCell<Option<Trace>> = const { std::cell::RefCell::new(None) };
+}
+#[allow(dead_code)]
+pub(super) fn trace_on() {
+    TRACE.with(|t| *t.borrow_mut() = Some(vec![]));
+}
+#[allow(dead_code)]
+pub(super) fn trace_take() -> Trace {
+    TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default()
+}
+pub(super) fn trace(name: &'static str, list: &[BeatInfo], bpm: f32) {
+    TRACE.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push((name, list.to_vec(), bpm));
+        }
+    });
+}
+
 /// Band latency offsets in ms (`strBandOffset`, 0x1037c86a0): the same for every segment.
 pub(super) const BAND_OFFSET_MS: [f64; 6] = [-30.0, -20.0, -3.0, -3.0, -20.0, -3.0];
 
@@ -110,6 +132,14 @@ impl Bia {
     /// `BeatInfoAnalyzer::analyze(info, out, total, 4, 16, 12, varied)`. Returns the BPM; the
     /// candidate `list` is consumed (the original works on a copy).
     pub(super) fn analyze(&self, list: &mut Vec<BeatInfo>, out: &mut Vec<BeatInfo>, total: i32, a5: i32, a6: i32, a7: i32, varied: bool) -> f32 {
+        self.analyze_with(list, out, total, a5, a6, a7, varied, None)
+    }
+
+    /// `analyze` with the candidate list `segAdjust` searches given apart (`seg_list`; the
+    /// working list when `None`): 2_0's varied pass hands its `segAdjust` the list the constant
+    /// pass left behind (`BeatAnalyzer_2_0`, 0x10119d.. call with the caller's `info`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn analyze_with(&self, list: &mut Vec<BeatInfo>, out: &mut Vec<BeatInfo>, total: i32, a5: i32, a6: i32, a7: i32, varied: bool, seg_list: Option<&[BeatInfo]>) -> f32 {
         out.clear();
         if list.is_empty() {
             return 0.0;
@@ -174,6 +204,7 @@ impl Bia {
             kept.extend_from_slice(&src[i..]);
             *list = kept;
         }
+        trace("near values adjusted", list, 0.0);
         // --- P5: BPM of the longest segment.
         let nseg = segs.len();
         if nseg == 0 {
@@ -197,8 +228,11 @@ impl Bia {
                 }
             }
         }
+        trace("representative BPM", &[], bpm);
+        trace("segments before adjust", &segs, 0.0);
         // --- P6: phase and tempo fine search per segment.
-        self.seg_adjust(list, &mut segs, total);
+        self.seg_adjust(seg_list.unwrap_or(list), &mut segs, total);
+        trace("segments after adjust", &segs, 0.0);
         // --- P7: beat tracking per segment.
         let v335 = a6 + a5 + a7;
         let mut buf = vec![0i32; (4 * v335 + 1) as usize];
@@ -518,6 +552,7 @@ impl Bia {
         if let Some(l) = out.last_mut() {
             l.iv = (v354 / v340) as f32;
         }
+        trace("split by BPM", out, 0.0);
         // --- P8: regular grid through the first and last tracked beats, then bar numbers.
         if out.is_empty() {
             return 0.0; // the original reads out of bounds here
@@ -542,6 +577,7 @@ impl Bia {
             }
         }
         out.retain(|b| !(b.pos < 0 || b.pos > total));
+        trace("position corrected", out, 0.0);
         bpm
     }
 
@@ -620,6 +656,7 @@ impl Bia {
                 inr(iv, l2, h2) || inr(iv + iv, l2, h2) || inr(iv * 0.5, l2, h2)
             }
         });
+        trace("BPM mismatch removed", list, 0.0);
         if list.is_empty() {
             return None;
         }
@@ -1053,6 +1090,7 @@ impl Bia {
                 }
             }
         }
+        trace("non-continuous BPM runs removed", list, 0.0);
         // V3: runs of consecutive candidates with one tempo.
         if list.is_empty() {
             return None;
@@ -1104,6 +1142,7 @@ impl Bia {
                 list.truncate(i19);
             }
         }
+        trace("runs under 8 removed", list, 0.0);
         // V4: segments where the 8-second tempo mode changes.
         let k1 = 600000.0f64;
         let n = list.len() as i32;
