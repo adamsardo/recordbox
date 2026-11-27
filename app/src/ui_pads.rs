@@ -1135,7 +1135,10 @@ fn pad_editor(app: &mut App, ui: &mut Ui) {
     let text_of = |f: &str| modes.iter().find(|m| m.function == f).map(|m| m.text.clone()).unwrap_or_else(|| f.to_string());
     let mut open = true;
     let mut changed = false;
-    egui::Window::new("PAD EDITOR").id(egui::Id::new("pad_editor")).open(&mut open).resizable(false).collapsible(false).frame(egui::Frame::window(&ui.ctx().style()).inner_margin(0.0).fill(hex(eg::BG))).show(ui.ctx(), |ui| {
+    // (The PAD EDITOR window keeps its fixed dark colours, so it is drawn Dark in Light: its
+    // colours in rekordbox's Light appearance were not traced.)
+    let _pe_dark = crate::theme::dark_scope(true);
+    egui::Window::new(egui::RichText::new("PAD EDITOR").color(TEXT.0)).id(egui::Id::new("pad_editor")).open(&mut open).resizable(false).collapsible(false).frame(egui::Frame::window(&ui.ctx().style()).inner_margin(0.0).fill(hex(eg::BG))).show(ui.ctx(), |ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(eg::W, eg::H), Sense::hover());
         let o = rect.min;
         let at = |g: (f32, f32, f32, f32)| Rect::from_min_size(o + vec2(g.0, g.1), vec2(g.2, g.3));

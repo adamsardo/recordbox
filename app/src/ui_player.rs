@@ -1109,7 +1109,9 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     }
     // Status and actions.
     let model = app.stem.model.as_deref().and_then(crate::stems::spec).map(|m| m.name).unwrap_or("checking this computer…");
-    let status = if let Some((d, t)) = app.stem.downloading {
+    let status = if let Some(s) = crate::ui_stem_export::strip_status(app) {
+        s
+    } else if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
     } else if let Some((_, pr)) = app.stem.separating {
         // (rekordbox's wording while its engine starts.)
@@ -1131,9 +1133,12 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
         let sr = Rect::from_min_size(pos2(sx(main, 700.0), y - 9.0), vec2(360.0, 18.0));
         ui.interact(sr, ui.id().with("stem_model_info"), Sense::hover()).on_hover_text(format!("{} — {}. Licence: {}. Checked against its published checksum after download.", m.name, m.source, m.licence));
     }
-    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some();
+    let busy = app.stem.separating.is_some() || app.stem.downloading.is_some() || crate::stem_export::busy_for(app, app.deck.track);
     if busy {
         if tip(bold_button(ui, at(1165.0, 54.0), "stem_stop", "STOP"), app, "Stop").clicked() {
+            if crate::stem_export::busy_for(app, app.deck.track) {
+                crate::stem_export::stop(app);
+            }
             app.stop_separation();
         }
     } else if !have && loaded {
@@ -1141,6 +1146,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             app.separate_loaded();
         }
     }
+    // recordbox's stem export: left of the part buttons, where the strip is empty.
+    crate::ui_stem_export::strip_control(app, ui, at(370.0, 64.0).shrink2(vec2(0.0, 3.0)));
     if tip(seg_button(ui, at(1222.5, 40.0), "stems_back", "BACK", false), app, "Back to the cue and loop controls").clicked() {
         app.deck.ctrl_tab = 0;
     }

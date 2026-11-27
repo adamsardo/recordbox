@@ -605,6 +605,9 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     if !app.midi.win.open {
         return;
     }
+    // rekordbox's MIDI LEARN window has a LookAndFeel of its own (`MidiLearnLookAndFeel`, JUCE
+    // V3 colours; of the theme table it sets only 0x01002800), so it is drawn as in Dark.
+    let _midi_dark = crate::theme::dark_scope(true);
     if app.midi.win.rows.len() != TABS.len() {
         rebuild_rows(app);
     }

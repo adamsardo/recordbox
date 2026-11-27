@@ -9,7 +9,7 @@ fn esc(s: &str) -> String {
 }
 
 /// (anchor, title, body as HTML).
-const CHAPTERS: [(&str, &str, &str); 14] = [
+const CHAPTERS: [(&str, &str, &str); 15] = [
     ("start", "Getting started", r#"
 <p>recordbox is a local DJ library: it analyses your tracks, lets you prepare cues, loops, beat grids and playlists, and exports USB drives that Pioneer DJ / AlphaTheta players (CDJ, XDJ) read.</p>
 <ul>
@@ -102,6 +102,11 @@ const CHAPTERS: [(&str, &str, &str); 14] = [
 "#),
     ("stems", "Stems", r#"
 <p>recordbox can split the loaded track into vocal, instrument, bass and drum parts with an open separation model that runs on this computer. The first time, the model is downloaded (Preferences &gt; Extensions &gt; STEMS). Separated stems are kept so each track is only split once. A track is separated when it is loaded, and the original plays until its parts are ready. The part buttons mute and unmute parts (or solo them); Preferences &gt; Extensions &gt; STEMS chooses 4 or 3 parts, sound quality or speed, and whether muted parts come back when a track is loaded. The same model detects vocal positions, shown above the overview.</p>
+"#),
+    ("stemexport", "Exporting vocals or the instrumental", r#"
+<p>EXPORT in the deck's STEMS strip (or Track &gt; Export Stems, or Export Stems in a track's menu, for several tracks at once) saves the track's <b>Vocals</b> or its <b>Instrumental</b> (everything except the vocals: the original less the vocal part) as a new audio file and adds it to the collection. A track that is not separated yet is separated first; the strip's status line or the line at the bottom of the window shows how far it is, and STOP or Stop Exporting cancels without leaving a file behind.</p>
+<p>The new track is called "Title (Vocals)" or "Title (Instrumental)" and gets the original's artist, album, genre, artwork, BPM, key, beat grid, hot cues, memory cues and phrases; its waveform is analysed from the new audio. The file is as long as the original and starts on the same beat, so the grid and cues stay right. Exporting the same part again makes a second, numbered file. The browser's Attribute column marks the track, and "Edited Tracks" in its filter includes it.</p>
+<p>When you export while a playlist is open, the new track also goes into that playlist, right after the original. The first export explains this and lets you turn it off. Preferences &gt; Advanced &gt; Others (EXPORT) and Extensions &gt; STEMS (PERFORMANCE) have the settings: the playlist rule, the file format (by default the original's: an MP3 stays an MP3 at its bitrate, a 24-bit FLAC stays 24-bit FLAC; or WAV, FLAC, AIFF, M4A or MP3), the folder (recordbox/Stems in your Music folder) and bringing the explanation back.</p>
 "#),
     ("export", "Exporting to USB", r#"
 <ol>

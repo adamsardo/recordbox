@@ -4,6 +4,7 @@ use eframe::egui;
 mod analysis;
 mod app;
 mod app_hooks;
+mod contrast;
 mod audio;
 mod automix;
 mod backup;
@@ -111,6 +112,8 @@ mod prefs_shell;
 mod rbimport;
 mod recorder;
 mod stems;
+mod stem_export;
+mod stem_export_selftest;
 mod smart;
 mod split;
 mod playlist_art;
@@ -130,6 +133,7 @@ mod ui_sampler_lib;
 mod ui_player;
 mod ui_prefs;
 mod ui_rec;
+mod ui_stem_export;
 mod ui_prefs_adv;
 mod ui_prefs_item;
 mod ui_prefs_keys;
@@ -188,6 +192,7 @@ impl eframe::App for Gui {
         self.app.shot_prefs_events(frame, raw);
         self.app.shot_key_events(frame, raw);
         crate::dupes::shot_events(&mut self.app, frame, raw);
+        crate::stem_export_selftest::shot_events(&mut self.app, frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
@@ -331,6 +336,7 @@ impl eframe::App for Gui {
             }
         });
         step!(ui_dialogs::dialogs(app, ctx));
+        step!(ui_stem_export::frame(app, ctx));
         // Preferences rows of other files' features take effect (prefs_bridge.rs).
         if app.dialogs.prefs_open || app.ctx.cumulative_pass_nr() < 3 {
             app.prefs_bridge();
@@ -402,6 +408,10 @@ impl eframe::App for Gui {
             // synced library (up to ~20 s).
             static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if frames >= 120 + bench && (app.rb_job.is_none() || frames >= 1200 + bench) && !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // PREPDECK_CONTRAST=<file>: the text runs of this frame, for the legibility check.
+                if let Ok(p) = std::env::var("PREPDECK_CONTRAST") {
+                    contrast::dump(ctx, &p);
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             if frames > 1500 + bench {

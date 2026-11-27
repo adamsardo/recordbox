@@ -289,7 +289,7 @@ pub fn paint_pill(p: &egui::Painter, min: egui::Pos2, h: f32, on: bool, enabled:
     let track = Rect::from_min_size(min, vec2(2.0 * t, t));
     p.rect_filled(track, t / 2.0, faded(if on { PBLUE } else { GREY.c() }, enabled, 0.3));
     let kx = if on { 1.1 * t } else { 0.1 * t };
-    p.circle_filled(pos2(min.x + kx + 0.4 * t, min.y + 0.5 * t), 0.4 * t, faded(WHITE.c(), enabled, 0.3));
+    p.circle_filled(pos2(min.x + kx + 0.4 * t, min.y + 0.5 * t), 0.4 * t, faded(ON_ACCENT.c(), enabled, 0.3));
     if enabled && hovered {
         p.rect_filled(track, t / 2.0, Color32::from_white_alpha(26));
     }
@@ -302,7 +302,7 @@ pub fn paint_radio_at(p: &egui::Painter, min: egui::Pos2, h: f32, on: bool, enab
     let c = pos2(min.x + t / 2.0, min.y + t / 2.0);
     p.circle_filled(c, t / 2.0, faded(if on { PBLUE } else { GREY.c() }, enabled, 0.5));
     if on {
-        p.circle_filled(pos2(min.x + 0.425 * h, min.y + 0.425 * h), 0.2125 * h, faded(WHITE.c(), enabled, 0.5));
+        p.circle_filled(pos2(min.x + 0.425 * h, min.y + 0.425 * h), 0.2125 * h, faded(ON_ACCENT.c(), enabled, 0.5));
     }
 }
 
@@ -693,7 +693,7 @@ pub fn message_note(ui: &mut Ui, s: &str) {
 /// A dialog window in the kit's look: bold 13 pt title, #1E1E1E panel, not collapsible.
 /// Call `apply_style(ui)` first thing inside it.
 pub fn dialog<'a>(ctx: &egui::Context, title: impl Into<String>) -> egui::Window<'a> {
-    egui::Window::new(RichText::new(title).font(inter_bold(13.0)).color(gy(0xB3B3B4))).collapsible(false).frame(dialog_frame(ctx))
+    egui::Window::new(RichText::new(title).font(inter_bold(13.0)).color(Tc(hex(0xB3B3B4), hex(0x000000)))).collapsible(false).frame(dialog_frame(ctx))
 }
 
 /// A dropdown with the kit's arrow and the regular face for its value.

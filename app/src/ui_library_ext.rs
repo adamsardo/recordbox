@@ -740,6 +740,7 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         app.analyze_key_tracks(sel);
         ui.close_menu();
     }
+    crate::ui_stem_export::track_menu(app, ui, sel);
     if app.analysis_total > 0 && ui.button("Stop Analyzing").clicked() {
         app.pool.stop();
         ui.close_menu();
@@ -1575,6 +1576,8 @@ pub fn source_list(app: &mut App, ui: &mut Ui, kind: u8, node: &str) {
             let t = &lib.tracks[ti];
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let sel = app.ext.sources[k].sel.contains(&ti);
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel);
             ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
             let have = present[ri];
             if have {
@@ -2189,6 +2192,8 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
                     let t = &missing[i];
                     let (rr, resp) = ui.allocate_exact_size(vec2(content_w, 25.0), Sense::click());
                     let on = app.ext.missing_sel.contains(&t.id);
+                    // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+                    let _sel_dark = crate::theme::dark_scope(on);
                     if on {
                         ui.painter().rect_filled(Rect::from_min_max(pos2(rr.min.x, rr.min.y + 0.5), rr.max), 0.0, ROW_SEL);
                     } else if resp.hovered() {

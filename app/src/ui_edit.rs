@@ -932,10 +932,11 @@ fn poll_render(app: &mut App) {
 pub fn edited_set(app: &mut App) -> &std::collections::HashSet<i64> {
     if app.edit.edited.is_none() {
         let mut set = std::collections::HashSet::new();
-        if let Ok(mut st) = app.db.conn.prepare("SELECT key FROM settings WHERE substr(key, 1, 8) = 'edit_of_'") {
+        // (Stem exports, `stem_of_<id>`, count as tracks recordbox made from another: stem_export.rs.)
+        if let Ok(mut st) = app.db.conn.prepare("SELECT key FROM settings WHERE substr(key, 1, 8) IN ('edit_of_', 'stem_of_')") {
             if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
                 for k in rows.flatten() {
-                    if let Some(id) = k.strip_prefix("edit_of_").and_then(|v| v.parse::<i64>().ok()) {
+                    if let Some(id) = k.strip_prefix("edit_of_").or_else(|| k.strip_prefix("stem_of_")).and_then(|v| v.parse::<i64>().ok()) {
                         set.insert(id);
                     }
                 }
@@ -986,7 +987,7 @@ pub fn attribute_icons(app: &mut App, p: &egui::Painter, cell: egui::Rect, id: i
     if edited {
         // (At 75 %: 14 x 12 pt in the 30 pt cell.)
         attribute_icon(p, egui::pos2(x, cy - 6.0), 0.75, col);
-        tips.push("Tracks created in EDIT mode.");
+        tips.push(if crate::stem_export::is_stem_track(app, id) { "Stem track exported from another track." } else { "Tracks created in EDIT mode." });
         x += 16.0;
     }
     match ty {

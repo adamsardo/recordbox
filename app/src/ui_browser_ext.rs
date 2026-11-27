@@ -494,6 +494,8 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
             let Some(tr) = app.track(id).cloned() else { continue };
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click_and_drag());
             let sel = app.ext.panel_sel[which] == Some(id);
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel);
             let pt = ui.painter().with_clip_rect(rr.intersect(ui.clip_rect()));
             pt.rect_filled(rr, 0.0, if sel { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 });
             let ar = Rect::from_min_size(rr.min, vec2(30.0, 30.0));
@@ -614,6 +616,8 @@ pub fn node_row_extras(app: &mut App, ui: &mut Ui, n: &PlaylistNode, rr: Rect, s
         if br.min.x > rr.min.x + 60.0 {
             let resp = ui.interact(br, ui.id().with(("cue_start", n.id)), Sense::click());
             let busy = app.ext.cue_wait;
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel);
             let col = if busy { BLUE } else if resp.hovered() { WHITE } else { DIM };
             ui.painter().rect_filled(br, 0.0, if sel { ROW_SEL } else { BG2 });
             ui.painter().rect_stroke(br, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
@@ -794,6 +798,8 @@ fn cv_row(ui: &mut Ui, text: &str, icon: TreeIcon, count: Option<usize>, folder:
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 15.0), Sense::click());
     let p = ui.painter().with_clip_rect(rr.intersect(ui.clip_rect()));
     let bg = if selected { ROW_SEL.c() } else if resp.hovered() { gy(0x262626) } else { BG2.c() };
+    // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+    let _sel_dark = crate::theme::dark_scope(selected);
     if selected || resp.hovered() {
         p.rect_filled(rr, 0.0, bg);
     }
@@ -975,6 +981,8 @@ pub fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect, drop: &mut Vec<(Rect, i6
         let rr = Rect::from_center_size(pos2(r.min.x + 14.5, r.min.y + 12.0 + i as f32 * 20.0), vec2(18.0, 18.0));
         let on = *mode == Some(app.side);
         let resp = ui.interact(rr, ui.id().with(("sub_side", i)), Sense::click());
+        // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+        let _sel_dark = crate::theme::dark_scope(on);
         let bg = if on {
             p.rect_filled(Rect::from_min_max(pos2(r.min.x, rr.min.y), pos2(r.min.x + 2.0, rr.max.y)), 0.0, ROW_SEL);
             p.rect_filled(rr, 1.5, ROW_SEL);

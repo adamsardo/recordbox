@@ -383,6 +383,10 @@ fn others(app: &mut App, ui: &mut Ui, mode: Mode) {
         it.button(508.0, 90.0, 100.0, 22.0, "Browse");
     });
     own(app, ui, &mut dirty);
+    // (EXPORT's Preferences have no Extensions page: the stem export's settings are here too.)
+    if export {
+        crate::ui_stem_export::prefs_group(app, ui);
+    }
     if dirty {
         app.save_prefs();
     }
@@ -669,6 +673,7 @@ pub fn page_stems(app: &mut App, ui: &mut Ui) {
         it.pill(52.0, 56.0, &mut p.drum_auto_import, "Automatically import audio files");
     });
     stem_model_card(app, ui);
+    crate::ui_stem_export::prefs_group(app, ui);
     let after = (app.prefs.rb.clone(), app.prefs.show_stems, app.prefs.stem_parts, app.prefs.stem_waveform, app.prefs.stem_reset_on_load);
     if after != before {
         app.save_prefs();

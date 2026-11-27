@@ -268,6 +268,8 @@ pub fn pane(app: &mut App, ui: &mut Ui, list: Rect) -> Rect {
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             rects.push(rr);
             let sel = app.mixx.automix.selected.contains(&ri);
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel);
             let deck = (0..2).find(|d| on_deck[*d].is_some_and(|(row, _)| row == ri));
             ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
             let t = app.track(ids[ri]);

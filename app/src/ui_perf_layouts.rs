@@ -1506,7 +1506,7 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
             cap(&p, xl, y, 1.0, BAR_RED, true);
             cap(&p, xr, y, -1.0, BAR_RED, true);
             if app.deck.wave.is_some() {
-                p.rect_filled(Rect::from_min_max(pos2(xl + 5.0, y - 0.5), pos2(xr - 5.0, y + 0.5)), 0.0, WHITE);
+                p.rect_filled(Rect::from_min_max(pos2(xl + 5.0, y - 0.5), pos2(xr - 5.0, y + 0.5)), 0.0, ON_ACCENT);
             }
         } else {
             cap(&p, xl, y, 1.0, gy(0x7C7C7C), false);

@@ -48,7 +48,7 @@ thread_local! {
 
 /// Every menu command: (id, label, ticked item). The order here is not the menu order. Some
 /// commands are in no menu (they are reached from Preferences > Keyboard or a context menu).
-pub const COMMANDS: [(&str, &str, bool); 91] = [
+pub const COMMANDS: [(&str, &str, bool); 94] = [
     ("edit_cut", "Cut", false),
     ("edit_copy", "Copy", false),
     ("edit_paste", "Paste", false),
@@ -123,6 +123,9 @@ pub const COMMANDS: [(&str, &str, bool); 91] = [
     ("property", "Property", false),
     ("load", "Load to Player", false),
     ("trash", "Restore Removed Tracks…", false),
+    ("stem_vocals", "Vocals", false),
+    ("stem_inst", "Instrumental", false),
+    ("stem_stop", "Stop Exporting Stems", false),
     ("p_import_playlist", "Import Playlist", false),
     ("new_playlist", "Create New Playlist", false),
     ("new_smart", "Create New Intelligent Playlist", false),
@@ -153,7 +156,7 @@ use It::{Sep, Sub, C};
 
 /// Submenus: (key, title). "add_to_playlist", "export_track" and "export_playlist" are filled
 /// in from the playlist tree and the connected devices (`fill_playlists`, `fill_devices`).
-const SUBMENUS: [(&str, &str); 16] = [
+const SUBMENUS: [(&str, &str); 17] = [
     ("file", "File"),
     ("import", "Import"),
     ("additional", "Additional contents"),
@@ -167,6 +170,7 @@ const SUBMENUS: [(&str, &str); 16] = [
     ("analysis_lock", "Analysis Lock"),
     ("add_to_playlist", "Add To Playlist"),
     ("export_track", "Export Track"),
+    ("export_stems", "Export Stems"),
     ("playlist", "Playlist"),
     ("export_playlist", "Export Playlist"),
     ("save_info", "Save Playlist Info"),
@@ -229,6 +233,7 @@ fn layout(mode: u8) -> Vec<(&'static str, Vec<It>)> {
         // recordbox's own.
         Sep,
         C("trash"),
+        Sub("export_stems"),
     ];
     let playlist = vec![
         Sub("export_playlist"),
@@ -260,6 +265,7 @@ fn layout(mode: u8) -> Vec<(&'static str, Vec<It>)> {
         ("appearance", vec![C("appearance_dark"), C("appearance_light")]),
         ("track", track),
         ("analysis_lock", vec![C("lock_on"), C("lock_off")]),
+        ("export_stems", vec![C("stem_vocals"), C("stem_inst"), Sep, C("stem_stop")]),
         ("playlist", playlist),
         ("save_info", vec![C("save_info_txt"), C("save_info_m3u8")]),
         ("help", vec![C("manual"), C("shortcuts"), Sep, C("h_about")]),
@@ -510,6 +516,8 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
             "copy_to_playlists" => (copyable_list(app), false),
             "sort_items" => (!app.nodes.is_empty(), false),
             "renumber" => (manual, false),
+            "stem_vocals" | "stem_inst" => (has_sel && app.prefs.show_stems, false),
+            "stem_stop" => (crate::stem_export::busy(app), false),
             _ => (true, false),
         };
         m.insert(id, v);
@@ -978,6 +986,9 @@ pub fn handle(app: &mut App, id: &str) {
             }
         }
         "export_device" => crate::ui_browser::open_export(app, vec![], vec![]),
+        "stem_vocals" => crate::stem_export::request(app, &sel, crate::stem_export::Part::Vocals, false),
+        "stem_inst" => crate::stem_export::request(app, &sel, crate::stem_export::Part::Instrumental, false),
+        "stem_stop" => crate::stem_export::stop(app),
         _ => {}
     }
 }

@@ -114,6 +114,23 @@ impl PartialEq<Tc> for Color32 {
     }
 }
 
+/// While alive, tokens resolve to their Dark values (when `on`). rekordbox fills a selected row
+/// with fixed blues (#1473EB focused, #294C69 not: `ListViewer::paintRowBackground`
+/// 0x1003f24c0, `CustomItemComponent::paint` 0x100a21534) and draws its text white in both
+/// appearances (`ListViewer::findTextColour` 0x1003efb70, `CustomItemComponent::findItemTextColour`
+/// 0x100a21374), so a selected row is drawn as in Dark.
+pub struct DarkScope(bool);
+
+pub fn dark_scope(on: bool) -> DarkScope {
+    DarkScope(if on { LIGHT.swap(false, Relaxed) } else { is_light() })
+}
+
+impl Drop for DarkScope {
+    fn drop(&mut self) {
+        LIGHT.store(self.0, Relaxed);
+    }
+}
+
 /// Sets the appearance for this frame (`ColorThemeMode` 2 = Light). rekordbox draws EDIT mode
 /// in Dark whatever the setting (`MainComponent::changeModeToEdit` 0x10098865c), and applies a
 /// change at once, without a restart (`MainComponent::replaceCustomColorTheme` 0x100975dbc).
@@ -185,6 +202,13 @@ pub fn gy(v: u32) -> Color32 {
 /// Panel background: id 0x03000008 (`PlayerPanelL::paint`, `BrowseBasicView::paint`, 83
 /// users) D #000000 L #FFFFFF.
 pub const BG: Tc = tc(0x000000, 0xFFFFFF);
+/// Preferences' category and tab labels (not selected): `PreferenceCategoryComponent::
+/// lookAndFeelChanged` 0x10136e690 sets 0x0300011A, L #000000 (D: recordbox's measured #AAAAAA;
+/// the table has #646464); selected labels are 0x03000119, white in both (ON_ACCENT).
+pub const PREF_CAT: Tc = tc(0xAAAAAA, 0x000000);
+/// Labels of the information window: `browse::InfoComponent::InfoComponent` sets 0x01000284,
+/// L #000000 (D: recordbox's #AAAAAA).
+pub const INFO_LBL: Tc = tc(0xAAAAAA, 0x000000);
 /// The header bar (mode, layout, panel toggles, clock): 0x0300002D, the colour
 /// `MainComponent::paint` 0x100961ef0 sets last, D #0F0F0F L #F0F0F0.
 pub const HEADER: Tc = tc(0x0F0F0F, 0xF0F0F0);
@@ -365,29 +389,37 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Hovered widget face and window outline of egui's own widgets. L: not in rekordbox's table
-/// (egui widgets have no rekordbox counterpart); #BEBEBE, the table's light value for the
-/// #323232 frames next to it (0x03000030).
-pub const HOVER: Tc = tc(0x3A3A3A, 0xBEBEBE);
+/// Hovered item of egui's own widgets (menu and list items): `PopupMenu::highlightedBackground`
+/// 0x01000900, L #FFFFFF.
+pub const HOVER: Tc = tc(0x3A3A3A, 0xFFFFFF);
+/// egui's window outline. L: no JUCE id; #BEBEBE, the table's light value for the #323232
+/// frames (0x03000030).
+pub const WIN_EDGE: Tc = tc(0x3A3A3A, 0xBEBEBE);
+/// egui's scroll bar track and text field: `ScrollBar::backgroundColourId` 0x01000300 (and the
+/// browser's search field 0x030000D4), L #E1E1E1.
+pub const EXTREME: Tc = tc(0x000000, 0xE1E1E1);
+/// egui's scroll bar thumb and plain button face: `ScrollBar::thumbColourId` 0x01000400,
+/// L #969696.
+pub const THUMB: Tc = tc(0x282828, 0x969696);
 
 /// egui's own widget colours for the appearance drawn now.
 fn visuals(v: &mut egui::Visuals) {
     *v = if is_light() { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = BG2.c();
     v.window_fill = BG2.c();
-    v.extreme_bg_color = BG.c();
+    v.extreme_bg_color = EXTREME.c();
     v.faint_bg_color = BG1.c();
     v.override_text_color = Some(TEXT.c());
     v.selection.bg_fill = BLUE.c();
     v.selection.stroke = egui::Stroke::new(1.0, ON_ACCENT);
     v.widgets.noninteractive.bg_fill = BG2.c();
-    v.widgets.inactive.bg_fill = BTN.c();
+    v.widgets.inactive.bg_fill = THUMB.c();
     v.widgets.inactive.weak_bg_fill = BTN.c();
     v.widgets.hovered.bg_fill = HOVER.c();
     v.widgets.hovered.weak_bg_fill = HOVER.c();
     v.widgets.active.bg_fill = BLUE.c();
     v.widgets.active.weak_bg_fill = BLUE.c();
-    v.window_stroke = egui::Stroke::new(1.0, HOVER);
+    v.window_stroke = egui::Stroke::new(1.0, WIN_EDGE);
 }
 
 #[cfg(test)]

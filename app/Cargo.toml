@@ -43,6 +43,9 @@ arboard = { version = "3", default-features = false }
 # are compressed already).
 zip = { version = "7", default-features = false }
 egui_extras = { version = "0.31.1", default-features = false, features = ["svg"] }
+# MP3 encoding for stem exports (LAME, built from source by mp3lame-sys; LGPL, linked
+# statically: the app's source is public, so it can be rebuilt against a changed LAME).
+mp3lame-encoder = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.9", features = ["metal"] }

@@ -398,6 +398,8 @@ pub struct Prefs {
     pub stem_reset_on_load: bool,
     /// STEMS > STEM Waveform Display: the waveform shows only the parts that sound.
     pub stem_waveform: bool,
+    /// Stem export (Extensions > STEMS > Stem Export; stem_export.rs).
+    pub stemx: crate::stem_export::StemExportPrefs,
     /// The settings of rekordbox's Preferences that came with the full window (prefs_rb.rs).
     pub rb: crate::prefs_rb::RbPrefs,
 }
@@ -837,6 +839,7 @@ impl Default for Prefs {
             stem_solo: false,
             stem_reset_on_load: true,
             stem_waveform: true,
+            stemx: Default::default(),
             delete_device_tracks: false,
             // rekordbox's standard: gain = -10 - integrated loudness.
             target_lufs: -10.0,
@@ -1212,6 +1215,8 @@ pub struct App {
     pub midi: crate::midi::MidiState,
     /// EDIT mode: the open project and the editor's state (ui_edit.rs).
     pub edit: crate::ui_edit::EditState,
+    /// Stem export: the exports in progress and the first-export pop-up (stem_export.rs).
+    pub stemx: crate::stem_export::StemExport,
 }
 
 impl App {
@@ -1333,6 +1338,7 @@ impl App {
             ext: Default::default(),
             midi: Default::default(),
             edit: Default::default(),
+            stemx: Default::default(),
         };
         app.menu = crate::menus::build();
         crate::ui_edit::attach_menu(&mut app);
@@ -1385,6 +1391,11 @@ impl App {
                 match v.as_str() {
                     // The Light appearance (Preferences > View > Color > Appearance).
                     "light" => app.prefs.rb.color_theme = 2,
+                    // Windows the reference states do not show (appearance checks).
+                    "padeditor" => app.pads.editor_open = true,
+                    "automix" => crate::ui_automix::toggle_pane(&mut app),
+                    "automixset" => app.mixx.automix.settings_open = true,
+                    "toast" => app.toast("Appearance check: a message in the status line."),
                     "playlists" | "smart" => {
                         app.side = SideMode::Playlists;
                         if app.nodes.is_empty() {

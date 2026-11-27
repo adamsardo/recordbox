@@ -61,6 +61,8 @@ fn row(ui: &mut Ui, depth: usize, text: &str, count: Option<usize>, selected: bo
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 15.0), Sense::click());
     let p = ui.painter();
     let bg = if selected { ROW_SEL.c() } else if resp.hovered() { gy(0x262626) } else { BG2.c() };
+    // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+    let _sel_dark = crate::theme::dark_scope(selected);
     if selected || resp.hovered() {
         p.rect_filled(rr, 0.0, bg);
     }
@@ -384,6 +386,8 @@ pub fn list(app: &mut App, ui: &mut Ui, id: i64) {
                 start_drag(app, picked);
             }
             let sel = app.mixx.lib.selected.contains(&ri);
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel);
             ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
             let vals = [format!("{}", ri + 1), String::new(), s.name.clone(), if s.bpm100 > 0 { format!("{:.2}", s.bpm100 as f64 / 100.0) } else { String::new() }, if s.duration > 0.0 { fmt_time(s.duration, false) } else { String::new() }, s.path.clone()];
             let mut x = rr.min.x;

@@ -78,22 +78,36 @@ pub fn to_i16(x: &[f32]) -> Vec<i16> {
 }
 
 pub fn wav_bytes(pcm: &[i16], rate: u32) -> Vec<u8> {
-    let data = pcm.len() as u32 * 2;
+    wav_bytes_n(&widen(pcm), 2, 16, rate)
+}
+
+/// 16-bit samples as the integer samples the encoders below take.
+pub fn widen(pcm: &[i16]) -> Vec<i32> {
+    pcm.iter().map(|s| *s as i32).collect()
+}
+
+/// Interleaved integer samples of `ch` channels at `bits` (16 or 24) as a PCM WAV file.
+pub fn wav_bytes_n(pcm: &[i32], ch: u16, bits: u16, rate: u32) -> Vec<u8> {
+    let bps = bits as u32 / 8;
+    let data = pcm.len() as u32 * bps;
     let mut o = Vec::with_capacity(44 + data as usize);
     o.extend_from_slice(b"RIFF");
-    o.extend_from_slice(&(36 + data).to_le_bytes());
+    o.extend_from_slice(&(36 + data + (data & 1)).to_le_bytes());
     o.extend_from_slice(b"WAVEfmt ");
     o.extend_from_slice(&16u32.to_le_bytes());
     o.extend_from_slice(&1u16.to_le_bytes());
-    o.extend_from_slice(&2u16.to_le_bytes());
+    o.extend_from_slice(&ch.to_le_bytes());
     o.extend_from_slice(&rate.to_le_bytes());
-    o.extend_from_slice(&(rate * 4).to_le_bytes());
-    o.extend_from_slice(&4u16.to_le_bytes());
-    o.extend_from_slice(&16u16.to_le_bytes());
+    o.extend_from_slice(&(rate * ch as u32 * bps).to_le_bytes());
+    o.extend_from_slice(&(ch * bits / 8).to_le_bytes());
+    o.extend_from_slice(&bits.to_le_bytes());
     o.extend_from_slice(b"data");
     o.extend_from_slice(&data.to_le_bytes());
     for s in pcm {
-        o.extend_from_slice(&s.to_le_bytes());
+        o.extend_from_slice(&s.to_le_bytes()[..bps as usize]);
+    }
+    if data & 1 == 1 {
+        o.push(0);
     }
     o
 }
@@ -112,21 +126,30 @@ fn extended(rate: u32) -> [u8; 10] {
 }
 
 pub fn aiff_bytes(pcm: &[i16], rate: u32) -> Vec<u8> {
-    let data = pcm.len() as u32 * 2;
+    aiff_bytes_n(&widen(pcm), 2, 16, rate)
+}
+
+/// Interleaved integer samples of `ch` channels at `bits` (16 or 24) as an AIFF file.
+pub fn aiff_bytes_n(pcm: &[i32], ch: u16, bits: u16, rate: u32) -> Vec<u8> {
+    let bps = bits as usize / 8;
+    let data = (pcm.len() * bps) as u32;
     let mut o = Vec::with_capacity(54 + data as usize);
     o.extend_from_slice(b"FORM");
-    o.extend_from_slice(&(4 + 26 + 16 + data).to_be_bytes());
+    o.extend_from_slice(&(4 + 26 + 16 + data + (data & 1)).to_be_bytes());
     o.extend_from_slice(b"AIFFCOMM");
     o.extend_from_slice(&18u32.to_be_bytes());
-    o.extend_from_slice(&2u16.to_be_bytes());
-    o.extend_from_slice(&(pcm.len() as u32 / 2).to_be_bytes());
-    o.extend_from_slice(&16u16.to_be_bytes());
+    o.extend_from_slice(&ch.to_be_bytes());
+    o.extend_from_slice(&(pcm.len() as u32 / ch.max(1) as u32).to_be_bytes());
+    o.extend_from_slice(&bits.to_be_bytes());
     o.extend_from_slice(&extended(rate));
     o.extend_from_slice(b"SSND");
     o.extend_from_slice(&(8 + data).to_be_bytes());
     o.extend_from_slice(&[0u8; 8]);
     for s in pcm {
-        o.extend_from_slice(&s.to_be_bytes());
+        o.extend_from_slice(&s.to_be_bytes()[4 - bps..]);
+    }
+    if data & 1 == 1 {
+        o.push(0);
     }
     o
 }
@@ -323,12 +346,20 @@ fn utf8_number(w: &mut Bits, v: u64) {
 /// 16-bit stereo FLAC. `level` 0..=8 sets how hard the encoder looks for the smallest form
 /// of each block (predictor order, mid/side, Rice partitions); every level is lossless.
 pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
+    flac_bytes_n(&widen(pcm), 2, 16, rate, level)
+}
+
+/// FLAC of interleaved integer samples: `ch` 1 or 2 channels, `bits` 16 or 24.
+pub fn flac_bytes_n(pcm: &[i32], ch: u16, bits: u16, rate: u32, level: u8) -> Vec<u8> {
     let level = level.min(8) as usize;
     let block = if level < 3 { 1152 } else { 4096 };
     let max_order = [1, 2, 2, 3, 4, 4, 4, 4, 4][level];
     let max_po = [0, 0, 2, 2, 3, 4, 5, 6, 8][level];
-    let try_ms = level >= 3;
-    let frames = pcm.len() / 2;
+    let mono = ch == 1;
+    let bps = bits as u32;
+    let try_ms = level >= 3 && !mono;
+    let chn = if mono { 1 } else { 2 };
+    let frames = pcm.len() / chn;
     let mut out = Vec::with_capacity(pcm.len());
     out.extend_from_slice(b"fLaC");
     let mut si = Bits::new();
@@ -339,8 +370,8 @@ pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
     si.put(0, 24);
     si.put(0, 24);
     si.put(rate as u64, 20);
-    si.put(1, 3);
-    si.put(15, 5);
+    si.put(chn as u64 - 1, 3);
+    si.put(bps as u64 - 1, 5);
     si.put(frames as u64, 36);
     out.extend_from_slice(&si.out);
     out.extend_from_slice(&[0u8; 16]);
@@ -354,7 +385,11 @@ pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
         m.clear();
         s.clear();
         for i in at..at + n {
-            let (a, b) = (pcm[i * 2] as i32, pcm[i * 2 + 1] as i32);
+            if mono {
+                l.push(pcm[i]);
+                continue;
+            }
+            let (a, b) = (pcm[i * 2], pcm[i * 2 + 1]);
             l.push(a);
             r.push(b);
             m.push((a + b) >> 1);
@@ -363,13 +398,14 @@ pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
         // (Partitions must divide the block, so a short last block gets none.)
         let po = if n == block { max_po } else { 0 };
         let cost = |p: &Option<Plan>, bps: u32| p.as_ref().map(|p| p.bits).unwrap_or(n as u64 * bps as u64);
-        let (pl, pr) = (plan_channel(&l, 16, max_order, po), plan_channel(&r, 16, max_order, po));
-        let mut choice = (1u64, [(&l, 16u32, pl), (&r, 16u32, pr)]);
+        let (pl, pr) = (plan_channel(&l, bps, max_order, po), if mono { None } else { plan_channel(&r, bps, max_order, po) });
+        // (Channel assignment: 0 one channel, 1 left/right, 10 mid/side.)
+        let mut choice = (if mono { 0u64 } else { 1u64 }, [(&l, bps, pl), (&r, bps, pr)]);
         if try_ms {
-            let (pm, ps) = (plan_channel(&m, 16, max_order, po), plan_channel(&s, 17, max_order, po));
-            let lr = cost(&choice.1[0].2, 16) + cost(&choice.1[1].2, 16);
-            if cost(&pm, 16) + cost(&ps, 17) < lr {
-                choice = (10, [(&m, 16, pm), (&s, 17, ps)]);
+            let (pm, ps) = (plan_channel(&m, bps, max_order, po), plan_channel(&s, bps + 1, max_order, po));
+            let lr = cost(&choice.1[0].2, bps) + cost(&choice.1[1].2, bps);
+            if cost(&pm, bps) + cost(&ps, bps + 1) < lr {
+                choice = (10, [(&m, bps, pm), (&s, bps + 1, ps)]);
             }
         }
         let mut w = Bits::new();
@@ -381,7 +417,7 @@ pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
             _ => 0,
         }, 4);
         w.put(choice.0, 4);
-        w.put(0b100, 3);
+        w.put(if bps == 24 { 0b110 } else { 0b100 }, 3);
         w.put(0, 1);
         utf8_number(&mut w, number);
         if n != 4096 && n != 1152 {
@@ -389,7 +425,7 @@ pub fn flac_bytes(pcm: &[i16], rate: u32, level: u8) -> Vec<u8> {
         }
         let c = crc8(&w.out);
         w.put(c as u64, 8);
-        for (x, bps, plan) in &choice.1 {
+        for (x, bps, plan) in choice.1.iter().take(chn) {
             write_subframe(&mut w, x, *bps, plan);
         }
         w.align();
@@ -425,12 +461,16 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// AAC in an .m4a file with the system's encoder.
 fn write_m4a(path: &Path, pcm: &[i16], rate: u32, bps: u32) -> Result<(), String> {
+    write_m4a_n(path, &widen(pcm), 2, 16, rate, bps)
+}
+
+fn write_m4a_n(path: &Path, pcm: &[i32], ch: u16, bits: u16, rate: u32, bps: u32) -> Result<(), String> {
     let tool = Path::new("/usr/bin/afconvert");
     if !tool.exists() {
         return Err("M4A cannot be written here: macOS's audio converter (afconvert) was not found.".into());
     }
     let tmp = path.with_extension(format!("render{}.wav", std::process::id()));
-    write_file(&tmp, &wav_bytes(pcm, rate))?;
+    write_file(&tmp, &wav_bytes_n(pcm, ch, bits, rate))?;
     let run = std::process::Command::new(tool).args(["-f", "m4af", "-d", "aac", "-b", &bps.to_string()]).arg(&tmp).arg(path).output();
     let _ = std::fs::remove_file(&tmp);
     match run {
@@ -453,6 +493,124 @@ pub fn write(path: &Path, pcm: &[i16], rate: u32, opt: &Options) -> Result<(), S
         2 => write_file(path, &aiff_bytes(pcm, rate)),
         3 => write_m4a(path, pcm, rate, opt.aac_bps),
         _ => write_file(path, &wav_bytes(pcm, rate)),
+    }
+}
+
+// ---------------------------------------------------------------------------- MP3
+
+/// MP3 bitrate: constant (kbps) or VBR quality (LAME's -V 0..=9, 0 best).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mp3Rate {
+    Cbr(u32),
+    Vbr(u8),
+}
+
+/// The MP3 bitrates LAME can write for MPEG-1 (32 / 44.1 / 48 kHz).
+pub const MP3_RATES: [u32; 14] = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+
+/// MP3 with LAME (high quality, `-q 2`), joint stereo or mono, with the LAME / Info tag in the
+/// first frame so players know the length and the encoder's delay and padding. The input
+/// must be at a rate MP3 has (32, 44.1, 48 kHz or the MPEG-2 / 2.5 halves).
+pub fn mp3_bytes(pcm: &[i16], ch: u16, rate: u32, r: Mp3Rate) -> Result<Vec<u8>, String> {
+    use mp3lame_encoder::{Bitrate, Builder, FlushGap, InterleavedPcm, Mode, MonoPcm, Quality, VbrMode};
+    let err = |e: &dyn std::fmt::Debug| format!("The MP3 encoder failed: {e:?}");
+    let mut b = Builder::new().ok_or_else(|| "The MP3 encoder could not be started.".to_string())?;
+    b.set_num_channels(ch as u8).map_err(|e| err(&e))?;
+    b.set_sample_rate(rate).map_err(|e| err(&e))?;
+    b.set_output_sample_rate(std::num::NonZeroU32::new(rate)).map_err(|e| err(&e))?;
+    b.set_mode(if ch == 1 { Mode::Mono } else { Mode::JointStereo }).map_err(|e| err(&e))?;
+    b.set_quality(Quality::NearBest).map_err(|e| err(&e))?;
+    match r {
+        Mp3Rate::Cbr(k) => {
+            let k = MP3_RATES.iter().copied().filter(|v| *v <= k.max(32)).last().unwrap_or(128);
+            let br = match k {
+                32 => Bitrate::Kbps32,
+                40 => Bitrate::Kbps40,
+                48 | 56 => Bitrate::Kbps48,
+                64 => Bitrate::Kbps64,
+                80 => Bitrate::Kbps80,
+                96 => Bitrate::Kbps96,
+                112 => Bitrate::Kbps112,
+                128 => Bitrate::Kbps128,
+                160 => Bitrate::Kbps160,
+                192 => Bitrate::Kbps192,
+                224 => Bitrate::Kbps224,
+                256 => Bitrate::Kbps256,
+                _ => Bitrate::Kbps320,
+            };
+            b.set_vbr_mode(VbrMode::Off).map_err(|e| err(&e))?;
+            b.set_brate(br).map_err(|e| err(&e))?;
+        }
+        Mp3Rate::Vbr(q) => {
+            let q = match q.min(9) {
+                0 => Quality::Best,
+                1 => Quality::SecondBest,
+                2 => Quality::NearBest,
+                3 => Quality::VeryNice,
+                4 => Quality::Nice,
+                5 => Quality::Good,
+                6 => Quality::Decent,
+                7 => Quality::Ok,
+                8 => Quality::SecondWorst,
+                _ => Quality::Worst,
+            };
+            b.set_vbr_mode(VbrMode::Mtrh).map_err(|e| err(&e))?;
+            b.set_vbr_quality(q).map_err(|e| err(&e))?;
+        }
+    }
+    b.set_to_write_vbr_tag(true).map_err(|e| err(&e))?;
+    let mut enc = b.build().map_err(|e| err(&e))?;
+    let frames = pcm.len() / ch.max(1) as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(frames / 2 + 16384);
+    let chunk = 1152 * 64;
+    let mut at = 0;
+    while at < frames {
+        let n = chunk.min(frames - at);
+        let part = &pcm[at * ch as usize..(at + n) * ch as usize];
+        out.reserve(n * 5 / 4 + 7200);
+        if ch == 1 {
+            enc.encode_to_vec(MonoPcm(part), &mut out).map_err(|e| err(&e))?;
+        } else {
+            enc.encode_to_vec(InterleavedPcm(part), &mut out).map_err(|e| err(&e))?;
+        }
+        at += n;
+    }
+    out.reserve(7200);
+    enc.flush_to_vec::<FlushGap>(&mut out).map_err(|e| err(&e))?;
+    // The Info frame LAME left blank at the start, now with the length, delay and padding.
+    let mut tag = Vec::with_capacity(enc.lame_tag_size().max(1));
+    if enc.lame_tag_encode_to_vec(&mut tag).is_some() && tag.len() <= out.len() {
+        out[..tag.len()].copy_from_slice(&tag);
+    }
+    Ok(out)
+}
+
+/// How a file is written: format (0 FLAC, 1 WAV, 2 AIFF, 3 M4A, 4 MP3), bit depth of the
+/// lossless ones (16 or 24), FLAC level, AAC bitrate (bits per second) and MP3 bitrate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Encode {
+    pub format: u8,
+    pub bits: u16,
+    pub flac_level: u8,
+    pub aac_bps: u32,
+    pub mp3: Mp3Rate,
+}
+
+/// Write interleaved integer samples (`ch` channels, full scale of `bits`) in `enc`'s format.
+/// Lossy formats take 16-bit input (24-bit samples are rounded to it).
+pub fn write_n(path: &Path, pcm: &[i32], ch: u16, rate: u32, enc: &Encode) -> Result<(), String> {
+    match path.parent() {
+        Some(d) if d.is_dir() => {}
+        _ => return Err(MSG_NO_DEST.into()),
+    }
+    let bits = if enc.bits == 24 { 24 } else { 16 };
+    let to16 = || -> Vec<i16> { if bits == 16 { pcm.iter().map(|s| *s as i16).collect() } else { pcm.iter().map(|s| ((*s + 128) >> 8).clamp(-32768, 32767) as i16).collect() } };
+    match enc.format {
+        0 => write_file(path, &flac_bytes_n(pcm, ch, bits, rate, enc.flac_level)),
+        2 => write_file(path, &aiff_bytes_n(pcm, ch, bits, rate)),
+        3 => write_m4a_n(path, &widen(&to16()), ch, 16, rate, enc.aac_bps),
+        4 => write_file(path, &mp3_bytes(&to16(), ch, rate, enc.mp3)?),
+        _ => write_file(path, &wav_bytes_n(pcm, ch, bits, rate)),
     }
 }
 

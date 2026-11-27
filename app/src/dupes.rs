@@ -235,6 +235,7 @@ fn track_table(app: &mut App, ui: &mut egui::Ui, table: Rect, ids: &[i64], salt:
                     Some(one) => **one == Some(t.id),
                     None => app.dupes.sel.contains(&t.id),
                 };
+                let _sel_dark = crate::theme::dark_scope(on);
                 if on {
                     ui.painter().rect_filled(rr, 0.0, ROW_SEL);
                 } else if i % 2 == 1 {

@@ -375,6 +375,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
             p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, &t.text, rb(11.5), TEXT.c());
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    } else if crate::ui_stem_export::footer(app, ui, &p, mid) {
     } else if let Some(job) = &app.export_job {
         let (d, t, txt) = &job.last;
         p.text(pos2(mid.min.x + 8.0, mid.center().y), Align2::LEFT_CENTER, format!("Exporting {}/{} · {}", d, t, txt), rb(11.5), TEXT.c());
@@ -569,6 +570,8 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
             let label = if ids.len() == 1 { app.track(ids[0]).map(|t| t.display_title()).unwrap_or_default() } else { format!("{} tracks", ids.len()) };
             let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dragl")));
             let rr = Rect::from_min_size(pp + vec2(12.0, 6.0), vec2(8.0 + label.len() as f32 * 6.5, 18.0));
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(true);
             lp.rect_filled(rr, 3.0, ROW_SEL);
             lp.text(rr.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, rb(11.0), WHITE.c());
             for (r, _id) in &drop_targets {
@@ -799,6 +802,8 @@ pub(crate) fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usiz
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click_and_drag());
     let p = ui.painter();
     let bg = if selected { ROW_SEL.c() } else if resp.hovered() { gy(0x262626) } else { BG2.c() };
+    // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+    let _sel_dark = crate::theme::dark_scope(selected);
     if selected || resp.hovered() {
         p.rect_filled(rr, 0.0, bg);
     }
@@ -842,6 +847,8 @@ fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, cou
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click());
     let p = ui.painter();
     let bar = Rect::from_min_max(pos2(rr.min.x + 1.0, rr.min.y), pos2(rr.max.x - 1.0, rr.max.y));
+    // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+    let _sel_dark = crate::theme::dark_scope(selected);
     if selected {
         p.rect_filled(bar, 0.0, ROW_SEL);
     } else if resp.hovered() {
@@ -1401,6 +1408,8 @@ fn explorer_list(app: &mut App, ui: &mut Ui, dir: &str) {
             let fs = f.to_string_lossy().to_string();
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let in_col = in_collection.get(&fs).copied();
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel.as_deref() == Some(fs.as_str()));
             if sel.as_deref() == Some(fs.as_str()) {
                 ui.painter().rect_filled(rr, 0.0, ROW_SEL);
             } else if i % 2 == 1 {
@@ -1552,6 +1561,8 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
                 }
             }
             let selected = app.device_ui.sel.contains(&t.id);
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(selected);
             ui.painter().rect_filled(rr, 0.0, if selected { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 });
             let r3 = root.to_string();
             row.context_menu(|ui| {
@@ -1950,6 +1961,8 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                 let Some(t) = app.track(id).cloned() else { continue };
                 let (rr, resp) = ui.allocate_exact_size(vec2(w, rh), Sense::click_and_drag());
                 let sel = app.selected.contains(&id);
+                // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+                let _sel_dark = crate::theme::dark_scope(sel);
                 let loaded = app.deck.track == Some(id);
                 let bg = if sel { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 };
                 ui.painter().rect_filled(rr, 0.0, bg);

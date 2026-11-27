@@ -1216,6 +1216,8 @@ pub fn list(app: &mut App, ui: &mut Ui, dir: &str) {
             let (f, _, _) = &files[i];
             let fs = f.to_string_lossy().to_string();
             let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), crate::ui_browser::ROW_H), Sense::click_and_drag());
+            // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
+            let _sel_dark = crate::theme::dark_scope(sel.as_deref() == Some(fs.as_str()));
             if sel.as_deref() == Some(fs.as_str()) {
                 ui.painter().rect_filled(rr, 0.0, ROW_SEL);
             } else if i % 2 == 1 {
@@ -1384,7 +1386,7 @@ pub fn prefs_page(app: &mut App, ui: &mut Ui) {
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
         let o = row.min;
         let vr = Rect::from_min_size(pos2(o.x + 84.0, o.y), vec2(100.0, 20.0));
-        p.rect_filled(vr, 0.0, WHITE);
+        p.rect_filled(vr, 0.0, ON_ACCENT);
         p.text(vr.center(), Align2::CENTER_CENTER, format!("{}dB", app.prefs.rec.silence_db.round() as i32), inter(13.5), Color32::BLACK);
         let tr = Rect::from_min_size(pos2(o.x + 200.0, o.y), vec2(398.0, 20.0));
         let resp = ui.interact(tr, ui.id().with("rec_silence"), Sense::click_and_drag());

@@ -524,7 +524,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
             ui.painter().rect_filled(r, 0.0, bg);
         }
         crate::ui_prefs_keys::side_icon(ui, r.min, *i, sel, false);
-        crate::prefs_font::draw(ui, Rect::from_min_size(pos2(r.min.x + 40.0, r.min.y), vec2(104.0, 30.0)), name, 15.0, false, if sel { WHITE.c() } else { DIM2.c() }, kit::Just::Left);
+        crate::prefs_font::draw(ui, Rect::from_min_size(pos2(r.min.x + 40.0, r.min.y), vec2(104.0, 30.0)), name, 15.0, false, if sel { ON_ACCENT.c() } else { PREF_CAT.c() }, kit::Just::Left);
         crate::ui_prefs_item::tab_seen(name, r);
         if resp.clicked() {
             app.dialogs.prefs_tab = *i;
@@ -554,7 +554,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
         let r = Rect::from_min_size(at(x, 4.0), vec2(w, 30.0));
         let resp = ui.interact(r, ui.id().with(("prefs_tab", page, i)), egui::Sense::click());
         ui.painter().rect_filled(r, 0.0, if sel { PBLUE } else if resp.hovered() && out.is_none() { gy(0x2A2A2A) } else { BG2.c() });
-        crate::prefs_font::draw(ui, r, t, 14.0, false, if sel { WHITE.c() } else if out.is_some() { OFF.c() } else { DIM2.c() }, kit::Just::Centre);
+        crate::prefs_font::draw(ui, r, t, 14.0, false, if sel { ON_ACCENT.c() } else if out.is_some() { OFF.c() } else { PREF_CAT.c() }, kit::Just::Centre);
         crate::ui_prefs_item::tab_seen(t, r);
         if let Some(why) = out {
             resp.on_hover_text(why);
