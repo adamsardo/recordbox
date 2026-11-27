@@ -1,7 +1,7 @@
 //! Phrase analysis (song structure) for tracks rekordbox has not analysed, and the PSSI section
-//! the players read. Layout and the RB6+ XOR mask follow rekordcrate (src/anlz.rs); the
-//! segmentation and labels are Recordbox's own, tuned against rekordbox's phrases for the
-//! user's library (rekordbox's models are not used).
+//! the players read. Layout and the RB6+ XOR mask follow rekordcrate (src/anlz.rs). The
+//! analysis is the port of rekordbox's own analyser (`phrase_rb*.rs`, all three moods);
+//! `analyze` below is recordbox's earlier algorithm, kept behind `PREPDECK_PHRASE=own`.
 
 use crate::model::Beat;
 
@@ -42,18 +42,30 @@ pub struct RbFields {
 }
 
 /// The phrase structure for a decoded track: the port of rekordbox's own analyser
-/// (`phrase_rb`), or recordbox's earlier algorithm with `PREPDECK_PHRASE=own` and for the tracks
-/// the port does not cover yet (Mid/Low-mood structures).
-/// The key goes in as unknown: on all 94 minor-key library tracks whose key recordbox knows,
-/// rekordbox's stored byte 29 is the "no key" value (see `phrase_rb::analyser_key`).
-pub fn analyze_audio(d: &crate::audio::Decoded, beats: &[Beat]) -> Option<Structure> {
+/// (`phrase_rb`); recordbox's earlier algorithm with `PREPDECK_PHRASE=own`. `None` where
+/// rekordbox's analyser gives no phrases either (no grid it accepts, silence, a failed run).
+/// `bpm` is the track's BPM (its tempo input, as rekordbox passes the library's BPM; 0 = the
+/// first beat's). `key` is the analyser's key input as `key_input` gives it (recordbox's index,
+/// −1 none); only PSSI byte 29 depends on it (see `phrase_rb::analyser_key`).
+pub fn analyze_audio(d: &crate::audio::Decoded, beats: &[Beat], bpm: f64, key: i32) -> Option<Structure> {
     if std::env::var("PREPDECK_PHRASE").map(|v| v == "own").unwrap_or(false) {
         return analyze(&d.mono(), d.sr as f64, beats);
     }
-    if let Some(r) = crate::phrase_rb::analyze(&d.samples, d.sr, beats, crate::phrase_rb::analyser_key(-1)) {
-        return Some(crate::phrase_rb::to_structure(&r));
+    crate::phrase_rb::analyze(&d.samples, d.sr, beats, bpm, crate::phrase_rb::analyser_key(key)).map(|r| crate::phrase_rb::to_structure(&r))
+}
+
+/// The key to give the phrase analyser for a track (recordbox's index, −1 none), following
+/// rekordbox: its analysis thread passes the key already in its library when the run does not
+/// analyse the key, and none when it does (a fresh track gets key and phrases in one run). In
+/// recordbox the phrases come after the track's analysis, so a key recordbox's analysis found
+/// counts as found in that same run; a key the user chose or one imported with the track (from
+/// rekordbox's library or the file's tags, `key_text`) was there before.
+pub fn key_input(t: &crate::model::Track) -> i32 {
+    if t.key_manual || !t.key_text.is_empty() {
+        t.key
+    } else {
+        -1
     }
-    analyze(&d.mono(), d.sr as f64, beats)
 }
 
 /// Per-bar log energies in three bands (low < 200 Hz, mid, high > 2.5 kHz).
@@ -280,12 +292,13 @@ pub fn kind_name(kind: u16) -> &'static str {
 }
 
 /// Suggested memory cues: the start of each phrase after the first, named after the phrase
-/// it starts (provenance: phrase analysis). Times come from the grid's beats.
+/// it starts in the structure's mood (provenance: phrase analysis). Times come from the grid's
+/// beats.
 pub fn cue_proposals(s: &Structure, beats: &[Beat]) -> Vec<(f64, &'static str)> {
     s.phrases
         .iter()
         .filter(|p| p.beat > 1)
-        .filter_map(|p| beats.get(p.beat as usize - 1).map(|b| (b.time, kind_name(p.kind))))
+        .filter_map(|p| beats.get(p.beat as usize - 1).map(|b| (b.time, label(s.mood, p.kind))))
         .collect()
 }
 
@@ -422,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn key_input_follows_where_the_key_came_from() {
+        let mut t = crate::model::Track { key: 5, ..Default::default() };
+        // Found by recordbox's own analysis: rekordbox analyses such a key with the phrases.
+        assert_eq!(key_input(&t), -1);
+        t.key_text = "6A".into();
+        assert_eq!(key_input(&t), 5, "imported with the track");
+        t.key_text.clear();
+        t.key_manual = true;
+        assert_eq!(key_input(&t), 5, "chosen by the user");
+        // Minor keys clear PSSI byte 29, major and unknown ones set it.
+        assert!(crate::phrase_rb::analyser_key(5) >= 12 && crate::phrase_rb::analyser_key(17) < 12 && crate::phrase_rb::analyser_key(-1) < 12);
+    }
+
+    #[test]
     fn pssi_roundtrip_and_mask() {
         let s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }, Phrase { beat: 129, kind: OUTRO }], end_beat: 160, rb: None };
         let mut b = pssi(&s);
@@ -458,10 +485,10 @@ mod tests {
         // touched); rekordbox keeps cues in master.db, not in its analysis files.
         let dest = std::env::temp_dir().join(format!("recordbox_cuebench_{}", std::process::id()));
         let Ok(Some(lib)) = crate::rbimport::load_installed(&dest) else { return };
-        let rows: Vec<(String, String, Vec<f64>)> = lib
+        let rows: Vec<(String, String, Vec<f64>, f64)> = lib
             .tracks
             .iter()
-            .filter_map(|t| Some((t.xt.track.path.clone(), t.anlz_base.as_ref()?.to_string_lossy().to_string(), t.xt.cues.iter().map(|c| c.start).collect::<Vec<f64>>())))
+            .filter_map(|t| Some((t.xt.track.path.clone(), t.anlz_base.as_ref()?.to_string_lossy().to_string(), t.xt.cues.iter().map(|c| c.start).collect::<Vec<f64>>(), t.xt.track.bpm)))
             .filter(|r| !r.2.is_empty())
             .collect();
         let res = std::sync::Mutex::new(vec![]);
@@ -469,7 +496,7 @@ mod tests {
             for ch in rows.chunks((rows.len() / 8).max(1)) {
                 let res = &res;
                 sc.spawn(move || {
-                    for (audio, base, user) in ch {
+                    for (audio, base, user, track_bpm) in ch {
                         let dat = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.DAT")));
                         let Some(q) = dat.get("PQTZ") else { continue };
                         let n = u32::from_be_bytes(q[20..24].try_into().unwrap()) as usize;
@@ -490,7 +517,7 @@ mod tests {
                         }
                         let Ok(d) = crate::audio::decode_file(audio) else { continue };
                         // PREPDECK_PHRASE=own measures the earlier algorithm, the default the port.
-                        let Some(mine) = analyze_audio(&d, &beats) else { continue };
+                        let Some(mine) = analyze_audio(&d, &beats, *track_bpm, -1) else { continue };
                         let ours: Vec<f64> = cue_proposals(&mine, &beats).iter().map(|p| p.0).collect();
                         let rb_ext = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.EXT")));
                         let theirs: Vec<f64> = rb_ext.get("PSSI").and_then(|s| parse(s)).map(|s| cue_proposals(&s, &beats).iter().map(|p| p.0).collect()).unwrap_or_default();
@@ -516,6 +543,10 @@ mod tests {
     fn phrase_benchmark() {
         let Ok(f) = std::env::var("PREPDECK_ANLZ_PAIRS") else { return };
         let rows: Vec<(String, String)> = std::fs::read_to_string(f).unwrap().lines().filter_map(|l| l.split_once('\t').map(|(a, b)| (a.to_string(), b.to_string()))).collect();
+        // The track's BPM from rekordbox's library when PREPDECK_KEYTAB is given (variable-tempo
+        // grids), else the first beat's.
+        let keytab = crate::phrase_rb::oracle::read_keytab();
+        let bpm_of = |base: &str| keytab.iter().find(|(k, _)| !k.is_empty() && base.ends_with(k.as_str())).map(|x| x.1 .2).unwrap_or(0.0);
         let res = std::sync::Mutex::new(vec![]);
         std::thread::scope(|sc| {
             for ch in rows.chunks((rows.len() / 8).max(1)) {
@@ -524,9 +555,6 @@ mod tests {
                     for (audio, base) in ch {
                         let ext = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.EXT")));
                         let Some(rb) = ext.get("PSSI").and_then(|s| parse(s)) else { continue };
-                        if rb.mood != 1 {
-                            continue;
-                        }
                         let dat = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.DAT")));
                         let Some(q) = dat.get("PQTZ") else { continue };
                         let n = u32::from_be_bytes(q[20..24].try_into().unwrap()) as usize;
@@ -536,25 +564,30 @@ mod tests {
                         }).collect();
                         let Ok(d) = crate::audio::decode_file(audio) else { continue };
                         // PREPDECK_PHRASE=own measures the earlier algorithm, the default the port.
-                        let Some(mine) = analyze_audio(&d, &beats) else { continue };
+                        let Some(mine) = analyze_audio(&d, &beats, bpm_of(base), -1) else { continue };
                         // Per-beat label agreement and boundary F1 (exact beat).
                         let label_at = |s: &Structure, b: u16| s.phrases.iter().rev().find(|p| p.beat <= b).map(|p| p.kind).unwrap_or(0);
                         let total = rb.end_beat.max(1);
-                        let same = (1..=total).filter(|b| label_at(&rb, *b) == label_at(&mine, *b)).count();
+                        let same = (1..=total).filter(|b| label_at(&rb, *b) == label_at(&mine, *b) && rb.mood == mine.mood).count();
                         let rb_b: std::collections::HashSet<u16> = rb.phrases.iter().map(|p| p.beat).collect();
                         let my_b: std::collections::HashSet<u16> = mine.phrases.iter().map(|p| p.beat).collect();
                         let hit = rb_b.intersection(&my_b).count();
-                        res.lock().unwrap().push((same as f64 / total as f64, hit, rb_b.len(), my_b.len()));
+                        res.lock().unwrap().push((same as f64 / total as f64, hit, rb_b.len(), my_b.len(), rb.mood));
                     }
                 });
             }
         });
         let r = res.into_inner().unwrap();
-        let n = r.len() as f64;
-        let label = r.iter().map(|x| x.0).sum::<f64>() / n;
-        let (hit, rbn, myn): (usize, usize, usize) = r.iter().fold((0, 0, 0), |a, x| (a.0 + x.1, a.1 + x.2, a.2 + x.3));
-        let p = hit as f64 / myn.max(1) as f64;
-        let rc = hit as f64 / rbn.max(1) as f64;
-        eprintln!("tracks {n}  label agreement {:.1}%  boundary precision {:.1}% recall {:.1}% F1 {:.1}%", label * 100.0, p * 100.0, rc * 100.0, 2.0 * p * rc / (p + rc).max(1e-9) * 100.0);
+        // High-mood tracks only (the set the earlier benchmark used), then every mood (a label
+        // counts as agreeing only when the mood agrees too).
+        for (what, high_only) in [("High mood", true), ("all moods", false)] {
+            let r: Vec<_> = r.iter().filter(|x| !high_only || x.4 == 1).collect();
+            let n = r.len() as f64;
+            let label = r.iter().map(|x| x.0).sum::<f64>() / n.max(1.0);
+            let (hit, rbn, myn): (usize, usize, usize) = r.iter().fold((0, 0, 0), |a, x| (a.0 + x.1, a.1 + x.2, a.2 + x.3));
+            let p = hit as f64 / myn.max(1) as f64;
+            let rc = hit as f64 / rbn.max(1) as f64;
+            eprintln!("{what}: tracks {n}  label agreement {:.1}%  boundary precision {:.1}% recall {:.1}% F1 {:.1}%", label * 100.0, p * 100.0, rc * 100.0, 2.0 * p * rc / (p + rc).max(1e-9) * 100.0);
+        }
     }
 }

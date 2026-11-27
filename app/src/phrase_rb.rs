@@ -53,27 +53,55 @@ pub fn first_bar_index(beat_number: u8) -> i32 {
     }
 }
 
-/// Grid parameters from a beat list, as the caller derives them: tempo of the first beat,
-/// its time in ms, the first downbeat's index. None when the grid does not start within one
-/// beat of the track start (the analyser is then not run).
-pub fn grid_input(beats: &[Beat]) -> Option<(i32, i32, i32)> {
+/// Grid parameters from a beat list and the track's BPM, as rekordbox's analysis thread derives
+/// them (`CBeatAnalyzeThread::analyze`): the tempo is the track's BPM (`track_bpm`; 0 = the
+/// first beat's), the first beat's time in ms, the first downbeat's index. When the track's BPM
+/// differs from the first beat's (a variable-tempo grid) and the first beat lies between one and
+/// two of the track's beat periods into the track, the first beat moves one period earlier and
+/// the downbeat index with it. None when the grid does not start within one beat of the track
+/// start (the analyser is then not run).
+pub fn grid_input(beats: &[Beat], track_bpm: f64) -> Option<(i32, i32, i32)> {
     let b = beats.first()?;
-    let bpm100 = (b.bpm * 100.0).round() as i32;
-    let ms = (b.time * 1000.0).round() as i32;
+    let first_bpm100 = (b.bpm * 100.0).round() as i32;
+    let bpm100 = if track_bpm > 0.0 { (track_bpm * 100.0).round() as i32 } else { first_bpm100 };
+    let mut ms = (b.time * 1000.0).round() as i32;
+    let mut bar = first_bar_index(b.beat);
+    if bpm100 >= 1 && bpm100 != first_bpm100 {
+        let per = 6_000_000.0 / bpm100 as f64;
+        if !(per >= ms as f64 || per + per <= ms as f64) {
+            ms -= per as i64 as i32;
+            bar = if bar == 1 { 4 } else { bar - 1 };
+        }
+    }
     if bpm100 < 1 || ms < 0 || (6_000_000.0 / bpm100 as f64) < (ms as f64) {
         return None;
     }
-    Some((bpm100, ms, first_bar_index(b.beat)))
+    Some((bpm100, ms, bar))
+}
+
+/// The checks rekordbox's analysis thread makes before it runs the analyser at all
+/// (`CBeatAnalyzeThread::analyze` before `Initialize`), besides `grid_input`'s: at least eight
+/// beats after the first one, and no more than two hours of audio.
+pub fn caller_accepts(bpm100: i32, first_ms: i32, frames: i64, sr: i64) -> bool {
+    if frames < 1 || sr < 1 {
+        return false;
+    }
+    let beats = bpm100 as f64 * 0.00016666666666666666 * (frames as f64 + -32.0 + first_ms as f64 * (-0.001 * sr as f64)) / sr as f64;
+    beats as i32 >= 8 && frames / sr <= 7200
 }
 
 /// Interleaved stereo floats (±1) to the analyser's 16-bit scale, rounded as a 16-bit decoder
 /// output would be.
+///
+/// The last frame is left out: rekordbox's analysis thread gives the analyser the reader's
+/// length − 1 as the track length (`CBeatAnalyzeThread::analyze`, `v472 = len − 1`), which moves
+/// the end beat of tracks whose last beat falls on the final sample.
 pub fn s16_channels(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let q = |x: f32| (x * 32768.0).round().clamp(-32768.0, 32767.0);
-    let n = samples.len() / 2;
+    let n = (samples.len() / 2).saturating_sub(1);
     let mut l = Vec::with_capacity(n);
     let mut r = Vec::with_capacity(n);
-    for c in samples.chunks_exact(2) {
+    for c in samples.chunks_exact(2).take(n) {
         l.push(q(c[0]));
         r.push(q(c[1]));
     }
@@ -191,10 +219,18 @@ pub fn analyser_key(key: i32) -> i32 {
 }
 
 /// The whole port of rekordbox's phrase analyser: interleaved stereo samples (±1), the beat
-/// grid and the key index → the result rekordbox stores. `None` where the port does not cover
+/// grid, the track's BPM (0 = the first beat's) and the key index → the result rekordbox stores. `None` where the port does not cover
 /// the track (no usable grid, or a structure path that is not ported yet).
-pub fn analyze(samples: &[f32], sr: u32, beats: &[Beat], key: i32) -> Option<RbResult> {
-    let (bpm100, first_ms, first_bar) = grid_input(beats)?;
+pub fn analyze(samples: &[f32], sr: u32, beats: &[Beat], track_bpm: f64, key: i32) -> Option<RbResult> {
+    analyze_traced(samples, sr, beats, track_bpm, key, &mut crate::phrase_rb_d::Trace::default())
+}
+
+/// `analyze` with stage D's path (and, when `tr.on`, every call) recorded in `tr`.
+pub fn analyze_traced(samples: &[f32], sr: u32, beats: &[Beat], track_bpm: f64, key: i32, tr: &mut crate::phrase_rb_d::Trace) -> Option<RbResult> {
+    let (bpm100, first_ms, first_bar) = grid_input(beats, track_bpm)?;
+    if !caller_accepts(bpm100, first_ms, (samples.len() / 2) as i64 - 1, sr as i64) {
+        return None;
+    }
     let (l, r) = s16_channels(samples);
     let inp = Input { sr: sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key };
     let mono = mono_mix(&l, &r);
@@ -205,8 +241,7 @@ pub fn analyze(samples: &[f32], sr: u32, beats: &[Beat], key: i32) -> Option<RbR
     let c = stage_c(&mono, &inp, &b)?;
     drop(mono);
     let din = crate::phrase_rb_d::DIn { c: &c, b: &b, bpm: bpm100 as f64 * 0.01, sr: inp.sr as f64, sr8: inp.sr as f64 * 0.125, total: inp.total, ms_in: first_ms, key };
-    let mut tr = crate::phrase_rb_d::Trace::default();
-    let d = crate::phrase_rb_d::sub_main_d(&din, &mut tr)?;
+    let d = crate::phrase_rb_d::sub_main_d(&din, tr)?;
     if d.n <= 0 {
         return None;
     }
@@ -286,12 +321,16 @@ mod unit {
 
     #[test]
     fn grid_input_maps_the_first_beat() {
-        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 1)), Some((12800, 100, 1)));
-        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 2)).map(|g| g.2), Some(4));
-        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 4)).map(|g| g.2), Some(2));
+        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 1), 0.0), Some((12800, 100, 1)));
+        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 2), 0.0).map(|g| g.2), Some(4));
+        assert_eq!(grid_input(&grid(8, 128.0, 0.1, 4), 128.0).map(|g| g.2), Some(2));
         // A first beat later than one beat period is not a grid the analyser accepts.
-        assert_eq!(grid_input(&grid(8, 128.0, 0.6, 1)), None);
-        assert_eq!(grid_input(&[]), None);
+        assert_eq!(grid_input(&grid(8, 128.0, 0.6, 1), 0.0), None);
+        assert_eq!(grid_input(&[], 0.0), None);
+        // A variable-tempo grid: the track's BPM goes in; a first beat between one and two of its
+        // beat periods in moves back one period, with the downbeat index.
+        assert_eq!(grid_input(&grid(8, 129.84, 0.21, 3), 130.43), Some((13043, 210, 3)));
+        assert_eq!(grid_input(&grid(8, 125.0, 0.6, 1), 126.0), Some((12600, 124, 4)));
     }
 
     #[test]
@@ -340,7 +379,7 @@ mod unit {
             b0 += len * 4;
         }
         let samples: Vec<f32> = x.iter().flat_map(|v| [*v, *v]).collect();
-        let r = analyze(&samples, sr, &grid(total_beats, bpm, 0.0, 1), 0).expect("the port covers a High-mood track");
+        let r = analyze(&samples, sr, &grid(total_beats, bpm, 0.0, 1), 0.0, 0).expect("the port covers a High-mood track");
         assert_eq!(r.mood, 1);
         assert!(!r.rows.is_empty());
         assert!(r.rows.windows(2).all(|w| w[0][0] < w[1][0]), "phrase starts ascend: {:?}", r.rows);
@@ -432,6 +471,10 @@ pub(crate) mod oracle {
 
     pub struct Track {
         pub audio: String,
+        /// rekordbox's ANLZ path without the extension.
+        pub base: String,
+        /// The track's BPM in rekordbox's library (PREPDECK_KEYTAB), 0 when not known.
+        pub bpm: f64,
         pub beats: Vec<Beat>,
         pub stored: RbResult,
     }
@@ -439,6 +482,7 @@ pub(crate) mod oracle {
     /// Tracks of PREPDECK_ANLZ_PAIRS with a stored PSSI and grid (read only).
     pub fn tracks() -> Vec<Track> {
         let Ok(f) = std::env::var("PREPDECK_ANLZ_PAIRS") else { return vec![] };
+        let keytab = read_keytab();
         let mut out = vec![];
         for l in std::fs::read_to_string(f).unwrap_or_default().lines() {
             let Some((audio, base)) = l.split_once('\t') else { continue };
@@ -457,7 +501,8 @@ pub(crate) mod oracle {
             if !std::path::Path::new(audio).exists() {
                 continue;
             }
-            out.push(Track { audio: audio.to_string(), beats, stored });
+            let bpm = keytab.iter().find(|(k, _)| !k.is_empty() && base.ends_with(k.as_str())).map(|x| x.1 .2).unwrap_or(0.0);
+            out.push(Track { audio: audio.to_string(), base: base.to_string(), bpm, beats, stored });
         }
         out
     }
@@ -486,7 +531,7 @@ pub(crate) mod oracle {
                     }
                     let t = &rows[i];
                     let Ok(d) = crate::audio::decode_file(&t.audio) else { continue };
-                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats) else {
+                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats, t.bpm) else {
                         res.lock().unwrap().push((i, None));
                         continue;
                     };
@@ -523,8 +568,46 @@ pub(crate) mod oracle {
         eprintln!("oracle vs stored: {same}/{n} equal in every field, {same_rows}/{n} equal phrases+mood");
     }
 
+    /// rekordbox's key and `AnalysisUpdated` per ANLZ path (PREPDECK_KEYTAB, the TSV
+    /// `phrase_rb_var::phrase_key_table` writes).
+    pub fn read_keytab() -> std::collections::HashMap<String, (String, String, f64)> {
+        let Ok(f) = std::env::var("PREPDECK_KEYTAB") else { return Default::default() };
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        let mut lines = text.lines();
+        let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+        let col = |n: &str| head.iter().position(|h| *h == n);
+        let (Some(ck), Some(cp), Some(cu)) = (col("key"), col("AnalysisDataPath"), col("AnalysisUpdated")) else { return Default::default() };
+        let cb = col("BPM");
+        lines
+            .filter_map(|l| {
+                let v: Vec<&str> = l.split('\t').collect();
+                let bpm = cb.and_then(|c| v.get(c)).and_then(|x| x.parse::<f64>().ok()).map(|x| x / 100.0).unwrap_or(0.0);
+                Some((v.get(cp)?.trim_end_matches(".DAT").to_string(), (v.get(ck)?.to_string(), v.get(cu)?.to_string(), bpm)))
+            })
+            .collect()
+    }
+
+    /// The analyser's key input in a test run (PREPDECK_PHRASE_KEY): empty = 0 (unknown);
+    /// `rb` = rekordbox's library key; `rule` = rekordbox's key only where its `AnalysisUpdated`
+    /// is 3 (tracks whose key was in the library before their phrases were analysed; 6 = analysed
+    /// in one run with the key); `own` = recordbox's key detection on the audio and grid.
+    pub fn test_key(mode: &str, keytab: &std::collections::HashMap<String, (String, String, f64)>, t: &Track, d: &crate::audio::Decoded) -> i32 {
+        let entry = |t: &Track| keytab.iter().find(|(k, _)| !k.is_empty() && t.base.ends_with(k.as_str())).map(|x| x.1.clone());
+        let k = match mode {
+            "rb" => entry(t).map(|e| crate::model::parse_key(&e.0)).unwrap_or(-1),
+            "rule" => entry(t).filter(|e| e.1 == "3").map(|e| crate::model::parse_key(&e.0)).unwrap_or(-1),
+            "own" => {
+                let b = t.beats.first();
+                let g = b.map(|b| crate::model::BeatGrid::constant(b.time, b.bpm, b.beat));
+                crate::key::detect_key_stereo(&d.samples, d.sr, b.map(|b| b.bpm).unwrap_or(0.0), g.as_ref())
+            }
+            _ => return 0,
+        };
+        analyser_key(k)
+    }
+
     /// The port's final result against the stored PSSI and the harness (PREPDECK_NOHARNESS=1
-    /// skips the harness). Also times both.
+    /// skips the harness). Also times both. PREPDECK_PHRASE_KEY selects the key input.
     #[test]
     #[ignore]
     fn phrase_port_vs_stored() {
@@ -536,6 +619,8 @@ pub(crate) mod oracle {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let res = std::sync::Mutex::new(vec![]);
         let threads: usize = std::env::var("PREPDECK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let key_mode = std::env::var("PREPDECK_PHRASE_KEY").unwrap_or_default();
+        let keytab = read_keytab();
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| loop {
@@ -544,13 +629,14 @@ pub(crate) mod oracle {
                     let t = &rows[i];
                     let Ok(d) = crate::audio::decode_file(&t.audio) else { continue };
                     let t0 = std::time::Instant::now();
-                    let port = analyze(&d.samples, d.sr, &t.beats, 0);
+                    let key = test_key(&key_mode, &keytab, t, &d);
+                    let port = analyze(&d.samples, d.sr, &t.beats, t.bpm, key);
                     let tp = t0.elapsed().as_secs_f64();
                     let mut harness = None;
                     if !noh {
-                        if let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats) {
+                        if let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats, t.bpm) {
                             let (l, r) = s16_channels(&d.samples);
-                            let inp = Input { sr: d.sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key: 0 };
+                            let inp = Input { sr: d.sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key };
                             let dir = tmp_dir(&format!("p{i}"));
                             let pcm = dir.join("pcm.s16");
                             harness = write_s16(&pcm, &l, &r).ok().and_then(|_| run(&pcm, &inp, &[]));
@@ -644,7 +730,7 @@ pub(crate) mod oracle {
                     }
                     let t = &rows[i];
                     let Ok(d) = crate::audio::decode_file(&t.audio) else { continue };
-                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats) else { continue };
+                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats, t.bpm) else { continue };
                     let (l, r) = s16_channels(&d.samples);
                     let inp = Input { sr: d.sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key: 0 };
                     let dir = tmp_dir(&format!("s{i}"));
@@ -747,7 +833,7 @@ pub(crate) mod oracle {
         let Ok(want) = std::env::var("PREPDECK_TRACK") else { return };
         let Some(t) = tracks().into_iter().find(|t| t.audio.contains(&want)) else { return };
         let d = crate::audio::decode_file(&t.audio).unwrap();
-        let (bpm100, first_ms, first_bar) = grid_input(&t.beats).unwrap();
+        let (bpm100, first_ms, first_bar) = grid_input(&t.beats, t.bpm).unwrap();
         let (l, r) = s16_channels(&d.samples);
         let inp = Input { sr: d.sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key: 0 };
         let dir = tmp_dir("probe");
@@ -824,7 +910,7 @@ pub(crate) mod oracle {
                     let Some(&i) = sel.get(j) else { break };
                     let t = &rows[i];
                     let Ok(d) = crate::audio::decode_file(&t.audio) else { continue };
-                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats) else { continue };
+                    let Some((bpm100, first_ms, first_bar)) = grid_input(&t.beats, t.bpm) else { continue };
                     let (l, r) = s16_channels(&d.samples);
                     let inp = Input { sr: d.sr as i32, total: l.len() as i32, bpm100, first_ms, first_bar, key: 0 };
                     let dir = tmp_dir(&format!("d{i}"));
@@ -853,7 +939,7 @@ pub(crate) mod oracle {
                     if let Some(b) = crate::phrase_rb_b::sub_main_b(&dec, inp.sr as f64 * 0.125, bpm100 as f64 * 0.01, first_ms, first_bar) {
                         if let Some(c) = stage_c(&mono, &inp, &b) {
                             let din = crate::phrase_rb_d::DIn { c: &c, b: &b, bpm: bpm100 as f64 * 0.01, sr: inp.sr as f64, sr8: inp.sr as f64 * 0.125, total: inp.total, ms_in: first_ms, key: 0 };
-                            let mut tr = crate::phrase_rb_d::Trace { on: true, calls: vec![] };
+                            let mut tr = crate::phrase_rb_d::Trace { on: true, ..Default::default() };
                             let _ = crate::phrase_rb_d::sub_main_d(&din, &mut tr);
                             let mut ti = 0usize;
                             for call in &tr.calls {

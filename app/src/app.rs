@@ -2240,6 +2240,7 @@ impl App {
             return;
         }
         let Some(path) = self.track(id).map(|t| t.path.clone()) else { return };
+        let (key, bpm) = self.track(id).map(|t| (crate::phrase::key_input(t), t.bpm)).unwrap_or((-1, 0.0));
         let map: HashMap<String, String> = self.db.setting("rb_anlz").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let base = map.get(&path).map(std::path::PathBuf::from);
         let grid = self.deck.grid.clone();
@@ -2254,7 +2255,7 @@ impl App {
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
             });
-            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze_audio(&a, &beats) });
+            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze_audio(&a, &beats, bpm, key) });
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });

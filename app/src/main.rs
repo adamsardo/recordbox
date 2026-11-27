@@ -81,6 +81,9 @@ mod phrase_rb_d11;
 mod phrase_rb_d12;
 mod phrase_rb_d13;
 mod phrase_rb_d14;
+mod phrase_rb_d15;
+#[cfg(test)]
+mod phrase_rb_var;
 mod phrase_rb_dsp;
 mod playlist_files;
 mod preview;
