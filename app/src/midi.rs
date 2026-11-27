@@ -408,6 +408,10 @@ fn build_registry() -> Vec<Func> {
         add(t, "PadFX", &format!("PadFX{bank}Beat Up"), &format!("Parameter1Right_PadFx{bank}"), b, true, A::Stub(Stub::PadFxBeat(bank, 1)));
         add(t, "PadFX", &format!("PadFX{bank}Beat Down"), &format!("Parameter1Left_PadFx{bank}"), b, true, A::Stub(Stub::PadFxBeat(bank, -1)));
     }
+    // (rekordbox's combination pads, controller only: pads 33..48 of the deck's PAD FX.)
+    for n in 1..=16u8 {
+        add(t, "PadFX", &format!("PadFXCombination Pad{n}"), &format!("PAD{n}_PadFxCombination"), pad, true, A::Stub(Stub::PadFx(3, n - 1)));
+    }
     for (lp, mode) in [(false, "Slicer"), (true, "SlicerLoop")] {
         add(t, "Slicer", &format!("{mode}Mode"), mode, b, true, A::Stub(Stub::SlicerMode(lp)));
         for n in 1..=8u8 {
@@ -2586,6 +2590,7 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
         }
         Stub::PadFxBeat(bank, dir) => {
             if press {
+                crate::ui_padfx::beat_shift(app, deck as usize, dir < 0);
                 note(app, format!("PadFxBeat {bank} {dir:+} deck {}", deck + 1));
             }
         }

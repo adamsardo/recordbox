@@ -2253,7 +2253,7 @@ impl App {
                 }
                 crate::export::anlz::read_sections(&b.with_extension("EXT")).get("PSSI").and_then(|s| crate::phrase::parse(s))
             });
-            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze(&a.mono(), a.sr as f64, &beats) });
+            let r = from_rb.or_else(|| if beats.is_empty() { None } else { crate::phrase::analyze_audio(&a, &beats) });
             let _ = tx.send((id, r));
             ctx.request_repaint();
         });

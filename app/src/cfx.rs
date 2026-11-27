@@ -11,8 +11,7 @@
 //! echo and filter bodies are plain ones. PITCH (`ColorFxPitch`: range and COLOR law, through
 //! rekordbox's pitch shifter in `fx_core`) and NOISE (`ColorFxNoise`: level, band-pass centre,
 //! Q and gain) are traced. CRUSH's hold, bit mask and mix are traced (`ColorFxCrush`); its high-pass cutoffs are
-//! a log line through the ends of rekordbox's table. SPACE and GATE COMP are recordbox's own takes on the effects of those names (GATE COMP with the thresholds and time constants of rekordbox's
-//! `GateCore` / `CompCore` parameter lists). LPF and HPF (`InstFxLPF` / `InstFxHPF`) exist
+//! a log line through the ends of rekordbox's table. SPACE and GATE COMP are ported from rekordbox's code in `cfx_space`. LPF and HPF (`InstFxLPF` / `InstFxHPF`) exist
 //! for the PAD FX pads and MERGE FX.
 
 /// The USER menu's nine types in rekordbox's order (the effect if recordbox has it).
@@ -265,29 +264,19 @@ pub struct Cfx {
     delay: Vec<f32>,
     w: usize,
     fb_lp: [f32; 2],
-    combs: Vec<Vec<f32>>,
-    comb_pos: [usize; 8],
-    comb_lp: [f32; 8],
     made: (f32, f32, u32),
     /// PITCH: rekordbox's pitch shifter (`fx_core`) and the rate it is set up for.
     ps: crate::fx_core::PitchShifter,
     ps_rate: u32,
-    /// GATE COMP: the level follower and the gain in use.
-    env: f32,
-    gain: f32,
+    /// SPACE and GATE COMP (`cfx_space`), made with the rest so nothing is allocated later.
+    space: crate::cfx_space::Space,
+    gc: crate::cfx_space::GateComp,
 }
 
 
 impl Cfx {
     pub fn new() -> Cfx {
-        let lens = [1117usize, 1291, 1433, 1559];
-        let mut combs = Vec::new();
-        for ch in 0..2 {
-            for l in lens {
-                combs.push(vec![0.0; l + ch * 31]);
-            }
-        }
-        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], combs, comb_pos: [0; 8], comb_lp: [0.0; 8], made: (-1.0, -1.0, 0), ps: crate::fx_core::PitchShifter::new(48000.0), ps_rate: 48000, env: 0.0, gain: 1.0 }
+        Cfx { kind: 0, color: 0.5, lp: Bq::default(), hp: Bq::default(), band: Bq::default(), seed: 0x1234_5678, hold: [0.0; 2], hold_n: 0.0, delay: vec![0.0; ECHO_LEN * 2], w: 0, fb_lp: [0.0; 2], made: (-1.0, -1.0, 0), ps: crate::fx_core::PitchShifter::new(48000.0), ps_rate: 48000, space: crate::cfx_space::Space::new(), gc: crate::cfx_space::GateComp::new() }
     }
 
     fn reset(&mut self) {
@@ -295,14 +284,10 @@ impl Cfx {
         self.hp.z = [[0.0; 2]; 2];
         self.band.z = [[0.0; 2]; 2];
         self.delay.iter_mut().for_each(|v| *v = 0.0);
-        self.combs.iter_mut().for_each(|c| c.iter_mut().for_each(|v| *v = 0.0));
-        self.comb_lp = [0.0; 8];
         self.fb_lp = [0.0; 2];
         self.hold = [0.0; 2];
         self.made = (-1.0, -1.0, 0);
         self.ps.reset();
-        self.env = 0.0;
-        self.gain = 1.0;
     }
 
     #[inline]
@@ -315,9 +300,29 @@ impl Cfx {
 
     /// Process `buf` (stereo interleaved) in place. `color` and `param`: the knobs, 0..1.
     pub fn process(&mut self, kind: u8, color: f32, param: f32, buf: &mut [f32], rate: u32) {
+        let ci = (color.clamp(0.0, 1.0) * 255.0).round() as i32;
+        let pi = (param.clamp(0.0, 1.0) * 255.0).round() as i32;
         if kind != self.kind {
             self.kind = kind;
             self.reset();
+            self.space.reset(ci);
+            self.gc.reset(ci);
+        }
+        if kind == 5 || kind == 8 {
+            // SPACE / GATE COMP glide COLOR themselves (0.66667 ms a step). At the centre with
+            // nothing left ringing the sound passes untouched.
+            let now = if kind == 5 { self.space.color() } else { self.gc.color() };
+            if (124..=131).contains(&ci) && now == ci && (if kind == 5 { !self.space.ringing() } else { self.gc.dry() }) {
+                self.color = color;
+                return;
+            }
+            self.color = color;
+            if kind == 5 {
+                self.space.process(buf, ci, pi, rate);
+            } else {
+                self.gc.process(buf, ci, pi, rate);
+            }
+            return;
         }
         // The effect is out of the path while the knob rests in the centre and nothing rings.
         let centred = (color - 0.5).abs() < 0.012;
@@ -416,31 +421,6 @@ impl Cfx {
                         f[1] += y;
                     }
                 }
-                5 => {
-                    // SPACE: a reverb whose amount the knob sets; left keeps the lows of the
-                    // reverb, right the highs. PARAM is the decay.
-                    let fbk = 0.80 + 0.17 * p;
-                    let k = 1.0 - (-std::f32::consts::TAU * 600.0 / r).exp();
-                    for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
-                        for (ch, v) in f.iter_mut().enumerate() {
-                            let x = *v * 0.25;
-                            let mut acc = 0.0;
-                            for j in 0..4 {
-                                let i = ch * 4 + j;
-                                let line = &mut self.combs[i];
-                                let len = line.len();
-                                let y = line[self.comb_pos[i]];
-                                self.comb_lp[i] = y * 0.7 + self.comb_lp[i] * 0.3;
-                                line[self.comb_pos[i]] = x + self.comb_lp[i] * fbk;
-                                self.comb_pos[i] = (self.comb_pos[i] + 1) % len;
-                                acc += y;
-                            }
-                            self.fb_lp[ch] += (acc - self.fb_lp[ch]) * k;
-                            let wet = if right { acc - self.fb_lp[ch] } else { self.fb_lp[ch] * 1.5 };
-                            *v += wet * depth;
-                        }
-                    }
-                }
                 6 => {
                     // DUB ECHO: a short echo at rekordbox's time, feedback and input level
                     // for the knob position; left low-passes the repeats, right high-passes
@@ -486,38 +466,6 @@ impl Cfx {
                             buf[i * 2] = l;
                             buf[i * 2 + 1] = rr;
                         }
-                    }
-                }
-                8 => {
-                    // GATE COMP: left a gate whose threshold rises with the knob, right a
-                    // compressor that squeezes harder with it and makes the level up. The
-                    // follower's release (0.99964 / 0.99919 a sample at 44.1 kHz), the gate's
-                    // opening and closing (0.0026571, 0.99982), the compressor's threshold
-                    // (0.24) and its make-up limit (3.6) are rekordbox's defaults; PARAM is
-                    // the gate's closing time or the compressor's make-up.
-                    let per = 44100.0 / r;
-                    let rel = if right { 0.99919f32 } else { 0.99964f32 }.powf(per);
-                    for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
-                        let a = f[0].abs().max(f[1].abs());
-                        self.env = if a > self.env { a } else { self.env * rel };
-                        let want = if right {
-                            let th = 0.24 * (1.0 - 0.75 * depth);
-                            let ratio = 1.0 - 0.85 * depth;
-                            let g = if self.env > th { (th + (self.env - th) * ratio) / self.env } else { 1.0 };
-                            g * (1.0 + (3.6 - 1.0) * depth * p)
-                        } else if self.env >= 0.5 * depth * depth {
-                            1.0
-                        } else {
-                            0.0
-                        };
-                        if want > self.gain {
-                            self.gain += (want - self.gain) * (0.0026571 * per * 4.0).min(1.0);
-                        } else {
-                            let close = 0.99982f32.powf(per * (0.25 + 3.0 * (1.0 - p)));
-                            self.gain = want + (self.gain - want) * close;
-                        }
-                        f[0] *= self.gain;
-                        f[1] *= self.gain;
                     }
                 }
                 LPF | HPF => {
@@ -657,26 +605,21 @@ mod tests {
             let got = hz(&x[96000..]);
             assert!((got - want).abs() < want * 0.06, "{color}: {got}");
         }
-        // GATE: fully left the threshold is 0.5, so a 0.1 sound is shut out and a 0.7 one passes.
+        // GATE COMP (rekordbox's thresholds follow each band's recent peak): a steady tone
+        // keeps the gate open at the left end, and the compressor at the right end turns any
+        // steady tone down by the same share whatever its level.
         let mut fx = Cfx::new();
         let mut x = tone(0.1);
         fx.process(8, 0.0, 0.5, &mut x, 48000);
-        assert!(rms(&x[96000..]) < 0.001);
-        let mut fx = Cfx::new();
-        let mut x = tone(0.7);
-        fx.process(8, 0.0, 0.5, &mut x, 48000);
-        assert!((rms(&x[96000..]) - 0.7 * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
-        // COMP: fully right a loud sound comes down and a quiet one comes up (make-up), so
-        // the two end up closer than the 20 dB they started apart.
+        assert!((rms(&x[96000..]) / (0.1 * std::f32::consts::FRAC_1_SQRT_2) - 1.0).abs() < 0.1, "{}", rms(&x[96000..]));
         let level = |amp: f32| {
             let mut fx = Cfx::new();
             let mut x = tone(amp);
             fx.process(8, 1.0, 0.5, &mut x, 48000);
-            rms(&x[96000..])
+            rms(&x[96000..]) / (amp * std::f32::consts::FRAC_1_SQRT_2)
         };
         let (loud, quiet) = (level(0.8), level(0.08));
-        assert!(loud < 0.8 * std::f32::consts::FRAC_1_SQRT_2 && quiet > 0.08 * std::f32::consts::FRAC_1_SQRT_2, "{loud} {quiet}");
-        assert!(20.0 * (loud / quiet).log10() < 12.0, "{}", 20.0 * (loud / quiet).log10());
+        assert!(loud > 0.3 && loud < 0.6 && (loud - quiet).abs() < 0.02, "{loud} {quiet}");
     }
 
     #[test]

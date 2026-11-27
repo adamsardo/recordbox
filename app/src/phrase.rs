@@ -26,6 +26,34 @@ pub struct Structure {
     pub phrases: Vec<Phrase>,
     /// Beat number where the last phrase ends.
     pub end_beat: u16,
+    /// rekordbox's other PSSI fields, when the structure came from rekordbox or from the port of
+    /// its analyser (`phrase_rb`); written back as they are. Dropped by edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rb: Option<RbFields>,
+}
+
+/// The PSSI fields besides beat and kind: header bytes 28/29 and, per phrase, entry words 3..11
+/// (k1, k2, b, beat2, beat3, beat4, k3, fill, fill beat).
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct RbFields {
+    pub h28: u8,
+    pub h29: u8,
+    pub rows: Vec<[u16; 9]>,
+}
+
+/// The phrase structure for a decoded track: the port of rekordbox's own analyser
+/// (`phrase_rb`), or recordbox's earlier algorithm with `PREPDECK_PHRASE=own` and for the tracks
+/// the port does not cover yet (Mid/Low-mood structures).
+/// The key goes in as unknown: on all 94 minor-key library tracks whose key recordbox knows,
+/// rekordbox's stored byte 29 is the "no key" value (see `phrase_rb::analyser_key`).
+pub fn analyze_audio(d: &crate::audio::Decoded, beats: &[Beat]) -> Option<Structure> {
+    if std::env::var("PREPDECK_PHRASE").map(|v| v == "own").unwrap_or(false) {
+        return analyze(&d.mono(), d.sr as f64, beats);
+    }
+    if let Some(r) = crate::phrase_rb::analyze(&d.samples, d.sr, beats, crate::phrase_rb::analyser_key(-1)) {
+        return Some(crate::phrase_rb::to_structure(&r));
+    }
+    analyze(&d.mono(), d.sr as f64, beats)
 }
 
 /// Per-bar log energies in three bands (low < 200 Hz, mid, high > 2.5 kHz).
@@ -138,7 +166,7 @@ pub fn analyze(mono: &[f32], sr: f64, beats: &[Beat]) -> Option<Structure> {
         .enumerate()
         .map(|(k, ((a, _), kind))| Phrase { beat: if k == 0 { 1 } else { (bar_idx[*a] + 1) as u16 }, kind: *kind })
         .collect();
-    Some(Structure { mood: 1, phrases, end_beat: beats.len().min(u16::MAX as usize) as u16 })
+    Some(Structure { mood: 1, phrases, end_beat: beats.len().min(u16::MAX as usize) as u16, rb: None })
 }
 
 fn max_bars() -> usize {
@@ -213,6 +241,7 @@ pub fn cut(s: &mut Structure, beat: u16) -> bool {
     }
     let kind = s.phrases[i].kind;
     s.phrases.insert(i + 1, Phrase { beat, kind });
+    s.rb = None;
     true
 }
 
@@ -222,6 +251,7 @@ pub fn set_kind(s: &mut Structure, beat: u16, kind: u16) -> bool {
     match index_at(s, beat) {
         Some(i) if s.phrases[i].kind != kind => {
             s.phrases[i].kind = kind;
+            s.rb = None;
             true
         }
         _ => false,
@@ -286,7 +316,9 @@ pub fn pssi(s: &Structure) -> Vec<u8> {
     body.extend_from_slice(&0u32.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes());
     body.extend_from_slice(&s.end_beat.to_be_bytes());
-    body.extend_from_slice(&0u16.to_be_bytes());
+    let rb = s.rb.as_ref().filter(|r| r.rows.len() == s.phrases.len());
+    body.push(rb.map(|r| r.h28).unwrap_or(0));
+    body.push(rb.map(|r| r.h29).unwrap_or(0));
     body.push(0); // bank: default
     body.push(0);
     for (i, p) in s.phrases.iter().enumerate() {
@@ -294,8 +326,15 @@ pub fn pssi(s: &Structure) -> Vec<u8> {
         e[0..2].copy_from_slice(&(i as u16 + 1).to_be_bytes());
         e[2..4].copy_from_slice(&p.beat.to_be_bytes());
         e[4..6].copy_from_slice(&p.kind.to_be_bytes());
-        // k1 = 1 for intro, chorus and outro, as rekordbox writes them most often.
-        e[7] = matches!(p.kind, INTRO | CHORUS | OUTRO) as u8;
+        match rb {
+            Some(r) => {
+                for (j, w) in r.rows[i].iter().enumerate() {
+                    e[6 + 2 * j..8 + 2 * j].copy_from_slice(&w.to_be_bytes());
+                }
+            }
+            // k1 = 1 for intro, chorus and outro, as rekordbox writes them most often.
+            None => e[7] = matches!(p.kind, INTRO | CHORUS | OUTRO) as u8,
+        }
         body.extend_from_slice(&e);
     }
     let mut v = vec![];
@@ -321,11 +360,20 @@ pub fn parse(section: &[u8]) -> Option<Structure> {
     let mood = u16::from_be_bytes([s[18], s[19]]);
     let end_beat = u16::from_be_bytes([s[26], s[27]]);
     let mut phrases = vec![];
+    let mut rows = vec![];
     for k in 0..n {
         let e = s.get(32 + k * 24..32 + (k + 1) * 24)?;
         phrases.push(Phrase { beat: u16::from_be_bytes([e[2], e[3]]), kind: u16::from_be_bytes([e[4], e[5]]) });
+        let mut r = [0u16; 9];
+        for (j, w) in r.iter_mut().enumerate() {
+            *w = u16::from_be_bytes([e[6 + 2 * j], e[7 + 2 * j]]);
+        }
+        rows.push(r);
     }
-    Some(Structure { mood, phrases, end_beat })
+    // Fields equal to what `pssi` writes without them are left out, so the round trip holds.
+    let plain = s[28] == 0 && s[29] == 0 && rows.iter().zip(&phrases).all(|(r, p)| *r == [matches!(p.kind, INTRO | CHORUS | OUTRO) as u16, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let rb = if plain { None } else { Some(RbFields { h28: s[28], h29: s[29], rows }) };
+    Some(Structure { mood, phrases, end_beat, rb })
 }
 
 #[cfg(test)]
@@ -334,7 +382,7 @@ mod tests {
 
     #[test]
     fn phrase_edits() {
-        let mut s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }], end_beat: 129 };
+        let mut s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }], end_beat: 129, rb: None };
         // CUT inside the Up phrase: a second Up phrase starts at the cut.
         assert!(cut(&mut s, 49));
         assert_eq!(s.phrases.iter().map(|p| (p.beat, p.kind)).collect::<Vec<_>>(), vec![(1, INTRO), (33, UP), (49, UP), (65, CHORUS)]);
@@ -375,13 +423,26 @@ mod tests {
 
     #[test]
     fn pssi_roundtrip_and_mask() {
-        let s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }, Phrase { beat: 129, kind: OUTRO }], end_beat: 160 };
+        let s = Structure { mood: 1, phrases: vec![Phrase { beat: 1, kind: INTRO }, Phrase { beat: 33, kind: UP }, Phrase { beat: 65, kind: CHORUS }, Phrase { beat: 129, kind: OUTRO }], end_beat: 160, rb: None };
         let mut b = pssi(&s);
         assert_eq!(b.len(), 32 + 4 * 24);
-        assert_eq!(parse(&b), Some(s.clone()));
+        let p = parse(&b).unwrap();
+        assert_eq!((p.mood, &p.phrases, p.end_beat), (s.mood, &s.phrases, s.end_beat));
+        // The other fields come back from the section and are written as they were.
+        assert_eq!(pssi(&p), b);
         mask_section(&mut b);
         assert!(is_masked(&b));
-        assert_eq!(parse(&b), Some(s));
+        assert_eq!(parse(&b), Some(p));
+        // rekordbox's own flags, fill beats and header bytes survive a round trip.
+        let rb = RbFields { h28: 0, h29: 1, rows: vec![[1, 0, 0, 0, 0, 0, 0, 0, 0], [0, 1, 1, 37, 45, 49, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 1, 127], [0, 0, 0, 0, 0, 0, 1, 0, 0]] };
+        let s2 = Structure { rb: Some(rb), ..s.clone() };
+        let b2 = pssi(&s2);
+        assert_eq!((b2[28], b2[29]), (0, 1));
+        assert_eq!(parse(&b2), Some(s2.clone()));
+        // An edit drops them (the phrases no longer match what rekordbox wrote).
+        let mut s3 = s2;
+        assert!(set_kind(&mut s3, 33, DOWN));
+        assert_eq!(s3.rb, None);
     }
 
     /// Compare Recordbox's phrases with rekordbox's for the user's library, on rekordbox's own
@@ -428,7 +489,8 @@ mod tests {
                             eprintln!("cues {:?} first beat {:.3}", user.iter().map(|u| format!("{:.2}s (beat {:.1})", u, (u - first) / beat_len)).collect::<Vec<_>>(), first);
                         }
                         let Ok(d) = crate::audio::decode_file(audio) else { continue };
-                        let Some(mine) = analyze(&d.mono(), d.sr as f64, &beats) else { continue };
+                        // PREPDECK_PHRASE=own measures the earlier algorithm, the default the port.
+                        let Some(mine) = analyze_audio(&d, &beats) else { continue };
                         let ours: Vec<f64> = cue_proposals(&mine, &beats).iter().map(|p| p.0).collect();
                         let rb_ext = crate::export::anlz::read_sections(std::path::Path::new(&format!("{base}.EXT")));
                         let theirs: Vec<f64> = rb_ext.get("PSSI").and_then(|s| parse(s)).map(|s| cue_proposals(&s, &beats).iter().map(|p| p.0).collect()).unwrap_or_default();
@@ -473,7 +535,8 @@ mod tests {
                             Beat { time: u32::from_be_bytes(q[o + 4..o + 8].try_into().unwrap()) as f64 / 1000.0, bpm: u16::from_be_bytes([q[o + 2], q[o + 3]]) as f64 / 100.0, beat: u16::from_be_bytes([q[o], q[o + 1]]) as u8, index: k }
                         }).collect();
                         let Ok(d) = crate::audio::decode_file(audio) else { continue };
-                        let Some(mine) = analyze(&d.mono(), d.sr as f64, &beats) else { continue };
+                        // PREPDECK_PHRASE=own measures the earlier algorithm, the default the port.
+                        let Some(mine) = analyze_audio(&d, &beats) else { continue };
                         // Per-beat label agreement and boundary F1 (exact beat).
                         let label_at = |s: &Structure, b: u16| s.phrases.iter().rev().find(|p| p.beat <= b).map(|p| p.kind).unwrap_or(0);
                         let total = rb.end_beat.max(1);

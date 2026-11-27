@@ -1335,7 +1335,7 @@ pub fn run_export(mut req: ExportRequest, progress: &dyn Fn(Progress), cancel: &
         if let Ok(d) = crate::audio::decode_file(&et.track.path) {
             let full = d.duration();
             let beats = et.grid.as_ref().map(|g| g.beats(full)).unwrap_or_default();
-            if let Some(st) = crate::phrase::analyze(&d.mono(), d.sr as f64, &beats) {
+            if let Some(st) = crate::phrase::analyze_audio(&d, &beats) {
                 phrases.insert(id, st);
             }
         }
