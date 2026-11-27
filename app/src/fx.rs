@@ -710,17 +710,6 @@ pub fn trans_single_duty(k: f32) -> f32 {
     if k < 0.48627 { 1.0 - 0.5 * h } else if k <= 0.51373 { 0.5 } else { 0.5 - 0.4375 * h }
 }
 
-/// PAN's knob 1 in single mode: the left and right sides' LFO periods as multiples of the beat
-/// value (`SingleBeatFxPan::updateParameter`; a side other than 1 runs at twice its table
-/// value of the beat).
-pub fn pan_rates(k: f32) -> (f32, f32) {
-    const L: [f32; 11] = [0.125, 0.25, 0.33333, 0.5, 0.66667, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-    const R: [f32; 11] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.66667, 0.5, 0.33333, 0.25, 0.125];
-    let i = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95].iter().position(|t| k < *t).unwrap_or(10);
-    let m = |v: f32| if (v - 1.0).abs() < 1e-6 { 1.0 } else { 2.0 * v };
-    (m(L[i]), m(R[i]))
-}
-
 /// Beat FX FILTER's RESONANCE in single mode (`SingleBeatFxFilter::updateParameter`): 0 .. 0.72
 /// on the left, 0.72 in the centre, up to 0.96 on the right.
 pub fn filter_single_reso(k: f32) -> f32 {
@@ -1173,8 +1162,8 @@ pub(crate) struct Slot {
     /// The x1, y1 of `NewReverbCore`'s first-order filters: the input's (low-pass L R,
     /// high-pass L R) and the ten combs' loops.
     rv1: [[f32; 2]; 14],
-    /// ROLL: where the captured loop starts in the history, its length and the read position.
-    roll: Option<(usize, usize, f32)>,
+    /// ROLL / REV ROLL / SLIP ROLL: rekordbox's roll core (its buffer is `delay`).
+    roll: crate::fx_roll::RollFx,
     was_on: bool,
     /// Odd turn of the LFO (SWING).
     odd: bool,
@@ -1226,7 +1215,15 @@ pub(crate) struct Slot {
     /// FLANGER (`FlangerCore`): the feedback, each side's output gain, each side's sweep centre
     /// and half-range (ms; the LFO's range moves over 50 ms), all `SmoothFloat`s.
     fl: [crate::fx_core::SmoothF; 7],
+    /// TRANS / PAN: rekordbox's beat quantizer (`FxQuantizeManager`) and the effect it drives
+    /// (`BeatFxTrans` on two square LFOs, `BeatFxPan` on two triangle ones).
+    tq: crate::fx_lfo::Quant,
+    trans: crate::fx_lfo::TransFx,
+    pan: crate::fx_lfo::PanFx,
 }
+
+/// Frames of TRANS / PAN gain worked out at a time (on the stack).
+const LFO_PIECE: usize = 1024;
 
 impl Slot {
     pub(crate) fn new() -> Slot {
@@ -1235,7 +1232,7 @@ impl Slot {
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: None, was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rev_k: 0.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT }
+        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rev_k: 0.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0) }
     }
 
     fn clear(&mut self) {
@@ -1270,7 +1267,7 @@ impl Slot {
         self.hx = (false, 1.0, 0.0);
         self.lfo = 0.0;
         self.lfo2 = 0.0;
-        self.roll = None;
+        self.roll = crate::fx_roll::RollFx::new(match self.kind { Kind::RevRoll => crate::fx_roll::RollKind::Rev, Kind::SlipRoll => crate::fx_roll::RollKind::Slip, _ => crate::fx_roll::RollKind::Roll }, self.ps_rate as f32);
         self.odd = false;
         self.rev_k = 0.0;
         self.hold = [0.0; 2];
@@ -1287,6 +1284,11 @@ impl Slot {
         self.ifl[0].reset(0, 0);
         self.ifl[1].reset(0, 0);
         self.fl = FL_INIT;
+        // (A new effect is made selected: its LFOs start over.)
+        self.tq = crate::fx_lfo::Quant::new();
+        self.tq.slip = self.kind == Kind::SlipRoll;
+        self.trans = crate::fx_lfo::TransFx::new(self.ps_rate as f32, crate::fx_lfo::Wave::SQUARE);
+        self.pan = crate::fx_lfo::PanFx::new(self.ps_rate as f32);
     }
 
     /// Read the delay line `frames` back (fractional), channel `c`.
@@ -1498,6 +1500,47 @@ impl Slot {
     /// from LEVEL/DEPTH alone; otherwise single mode, where the two knobs and two buttons set
     /// them. `beat`: where the channel's deck is on its beat grid at the start of `buf`
     /// (beats), when Beat FX quantize applies.
+    /// TRANS / PAN: the next `gl.len()` frames of each side's gain (`BeatFxTrans` /
+    /// `BeatFxPan` driven by `FxQuantizeManager`).
+    #[allow(clippy::too_many_arguments)]
+    fn lfo_piece(&mut self, kind: Kind, multi: bool, level: f32, k: (f32, f32), beat: Option<f64>, bpm: f32, rate: u32, cycle: f32, on: bool, gl: &mut [f32], gr: &mut [f32]) {
+        use crate::fx_lfo::{PanPar, TransPar};
+        let frames = gl.len();
+        if kind == Kind::Trans {
+            // (`MultiBeatFxTrans` / `SingleBeatFxTrans::updateParameter`.)
+            self.trans.par = if multi { TransPar::multi(level) } else { TransPar::single(recommend_value(level), k.0, k.1) };
+            let (q, fx) = (&mut self.tq, &mut self.trans);
+            q.process(fx, beat, bpm, rate, frames, cycle, on, |fx, s, l| fx.gains(&mut gl[s..s + l], &mut gr[s..s + l]));
+        } else {
+            let last = self.pan.trans.last_period;
+            self.pan.par = if multi { PanPar::multi(level) } else { PanPar::single(recommend_value(level), k.0, k.1, last) };
+            let (q, fx) = (&mut self.tq, &mut self.pan);
+            q.process(fx, beat, bpm, rate, frames, cycle, on, |fx, s, l| fx.gains(&mut gl[s..s + l], &mut gr[s..s + l]));
+        }
+    }
+
+    /// ROLL family: the next `gl.len()` frames of the roll's sound and its place in the turn
+    /// (rekordbox's roll core driven by `FxQuantizeManager`). `end`: the history's write place
+    /// after these frames.
+    #[allow(clippy::too_many_arguments)]
+    fn roll_piece(&mut self, ring: &Ring, end: i64, beat: Option<f64>, bpm: f32, rate: u32, cycle: f32, on: bool, gl: &mut [f32], gr: &mut [f32], ph: &mut [f32]) {
+        let frames = gl.len();
+        let nrb = crate::fx_roll::RollFx::buffer_frames(rate as f32).min(DELAY_LEN);
+        let (q, fx, rb) = (&mut self.tq, &mut self.roll, &mut self.delay[..nrb * 2]);
+        let start = end - frames as i64;
+        q.process(fx, beat, bpm, rate, frames, cycle, on, |fx, s, l| {
+            let e = start + (s + l) as i64;
+            fx.set_block(e, l as i64);
+            let h = crate::fx_roll::Hist { buf: &ring.buf, len: RING_LEN, end: e, block: l as i64 };
+            let p0 = fx.phase();
+            fx.process(rb, &h, &mut gl[s..s + l], &mut gr[s..s + l]);
+            let step = fx.phase_step();
+            for (k, v) in ph[s..s + l].iter_mut().enumerate() {
+                *v = (p0 + k as f32 * step).fract();
+            }
+        });
+    }
+
     pub(crate) fn process(&mut self, p: &SlotParams, bpm: f32, buf: &mut [f32], rate: u32, ring: &Ring, beat: Option<f64>, multi: bool) {
         if p.kind != self.kind {
             self.kind = p.kind;
@@ -1517,6 +1560,8 @@ impl Slot {
             self.ps.prepare(r);
             self.ej.prepare(r);
             self.mob.prepare(r);
+            self.trans.set_rate(r);
+            self.pan.trans.set_rate(r);
         }
         let bpm = bpm.clamp(20.0, 1000.0);
         let beat_secs = 60.0 / bpm;
@@ -1553,21 +1598,6 @@ impl Slot {
             self.t = 0.0;
             self.speed = 1.0;
             self.rev_k = 0.0;
-            if matches!(kind, Roll | RevRoll | SlipRoll) {
-                // Catch the last beat value (10 ms to 4 s) from the history and loop it. With
-                // quantize the loop ends on the grid's last step (the beat value, or a beat
-                // for longer ones) and playback joins it where the deck is now.
-                let len = (((secs.clamp(0.010, 4.0)) * r) as usize).clamp(1, RING_LEN / 2);
-                let since = match beat {
-                    Some(b) => {
-                        let q = beats.min(1.0) as f64;
-                        ((b / q).rem_euclid(1.0) * q * beat_secs as f64 * r as f64) as usize
-                    }
-                    None => 0,
-                };
-                let back = if beat.is_some() { since.min(RING_LEN / 4) + frames } else { 0 };
-                self.roll = Some(((ring.w + 2 * RING_LEN - len - back) % RING_LEN, len, (since % len) as f32));
-            }
         }
         // DELAY / REV DELAY's first knob in single mode: the pan LFO's beats (none in the
         // centre zone).
@@ -1745,7 +1775,9 @@ impl Slot {
                     mix = (mix.0 * g, mix.1 * g);
                 }
             }
-            Roll | RevRoll | SlipRoll => mix = if self.roll.is_some() { roll_mix(level) } else { (1.0, 0.0) },
+            // (`MultiBeatFxRollBase::calculateMixRatio`: the curve once the roll has its sound;
+            // before the quantizer starts it the effect is not in.)
+            Roll | RevRoll | SlipRoll => mix = if self.roll.valid || p.on { roll_mix(level) } else { (1.0, 0.0) },
             Robot | Helix => mix = (0.0, 1.0),
             Pitch => mix = if level <= 0.0 || p.value == 0.0 && (multi || (k1 - 0.5).abs() <= 0.02) { (1.0, 0.0) } else { (0.0, 1.0) },
             Noise => {
@@ -1826,11 +1858,14 @@ impl Slot {
             }
             _ => Rv::new(50.0, 1.0, 1.0, r),
         };
-        // TRANS: the open share of a turn, never under 5 ms.
-        let duty = (if multi { trans_duty(level) } else { trans_single_duty(k1) }).clamp((0.005 / secs).min(0.5), 1.0);
-        // TRANS's SWING (single mode): every second opening at 1 - 0.37 x the distance from
-        // the centre (the even ones on the left, the odd ones on the right).
-        let trans_acc = if multi { 1.0 } else { 1.0 - 0.37 * through_value(k2) };
+        // TRANS / PAN: each side's gain from rekordbox's LFOs, worked out a piece at a time
+        // (the quantizer splits a piece where the effect restarts).
+        let lfo_kind = matches!(kind, Trans | Pan | Roll | RevRoll | SlipRoll);
+        // (ROLL: the roll's sound in the two gain arrays, its place in the turn here.)
+        let mut rphase = [0.0f32; LFO_PIECE];
+        let mut lgain = [1.0f32; LFO_PIECE];
+        let mut rgain = [1.0f32; LFO_PIECE];
+        let cycle = if down { -beats } else { beats };
         // FLANGER / PHASER feedback: multi mode from LEVEL/DEPTH, single mode from FEEDBACK.
         let fl_fb = if multi { mod_fb(level) } else { flanger_fb(k1, b1) };
         // FLANGER's sweep per side (`MultiBeatFxFlanger` / `SingleBeatFxFlanger::updateParameter`):
@@ -1873,7 +1908,18 @@ impl Slot {
             _ => false,
         };
         for n in 0..frames {
-            let target = if p.on { 1.0 } else { 0.0 };
+            if lfo_kind && n % LFO_PIECE == 0 {
+                let len = (frames - n).min(LFO_PIECE);
+                let b = beat.map(|b| b + n as f64 * bpm as f64 / (60.0 * r as f64));
+                if matches!(kind, Trans | Pan) {
+                    self.lfo_piece(kind, multi, level, (k1, k2), b, bpm, rate, cycle, p.on, &mut lgain[..len], &mut rgain[..len]);
+                } else {
+                    let end = ring.w as i64 - frames as i64 + (n + len) as i64;
+                    self.roll_piece(ring, end, b, bpm, rate, cycle, p.on, &mut lgain[..len], &mut rgain[..len], &mut rphase[..len]);
+                }
+            }
+            // (TRANS / PAN come in when the quantizer starts them, on the beat or half beat.)
+            let target = if p.on && (!lfo_kind || self.tq.running()) { 1.0 } else { 0.0 };
             self.gate += (target - self.gate).clamp(-gate_k, gate_k);
             let g = self.gate;
             if g <= 0.0 && !p.on {
@@ -2077,36 +2123,12 @@ impl Slot {
                     }
                     mixed(rl, rr)
                 }
-                Trans => {
-                    // A square gate once per beat value, open for its duty (never under 5 ms),
-                    // its edges smoothed over 3.33 ms; SWING moves every second opening.
-                    let acc = if !multi && (self.odd == (k2 >= 0.5)) { trans_acc } else { 1.0 };
-                    let open = if self.lfo < duty { acc } else { 0.0 };
-                    self.fb[0] += (open - self.fb[0]).clamp(-gate_k, gate_k);
-                    mixed(dl * self.fb[0], dr * self.fb[0])
-                }
-                Pan => {
-                    // The sound moves left and right once per beat value, each side up to
-                    // 1.4125 (+3 dB, rekordbox's LFO range) as the other falls to nothing.
-                    // Single mode: LFO AMP is how far, LFO its shape.
-                    // Single mode (`SingleBeatFxPan::updateParameter`): knob 1 gives each side
-                    // its own rate (1/8 .. 1 x the beat value on the left half for the left
-                    // side, the right side likewise on the right half), knob 2 moves the two
-                    // sides' phases apart by up to 0.185 of a turn.
-                    if multi {
-                        let s = (TAU * self.lfo).sin();
-                        let a = (s + 1.0) * 0.25 * PI;
-                        mixed(dl * 1.4125 * a.cos(), dr * 1.4125 * a.sin())
-                    } else {
-                        let (ml, mr) = pan_rates(k1);
-                        let off = 0.185 * through_value(k2) * if k2 < 0.5 { -1.0 } else { 1.0 };
-                        self.rob[2] = (self.rob[2] + lfo_step / ml).fract();
-                        self.rob[3] = (self.rob[3] + lfo_step / mr).fract();
-                        let sl = (TAU * (self.rob[2] + off)).sin();
-                        let sr = (TAU * (self.rob[3] - off)).sin();
-                        let (al, ar) = ((sl + 1.0) * 0.25 * PI, (sr + 1.0) * 0.25 * PI);
-                        mixed(dl * 1.4125 * al.cos(), dr * 1.4125 * ar.sin())
-                    }
+                Trans | Pan => {
+                    // `TransCore::processEffect` 0x102a530d0: each side times its LFO. TRANS: a
+                    // square between 0 and 1 (open for the duty, edges a 3.3333 ms line ending on
+                    // the jump). PAN: a triangle between 0 and 1.4125, the sides half a turn apart.
+                    let i = n % LFO_PIECE;
+                    mixed(dl * lgain[i], dr * rgain[i])
                 }
                 Filter => {
                     // rekordbox's LFO filter: three first-order sections at the swept cutoff,
@@ -2209,32 +2231,19 @@ impl Slot {
                     mixed(o[0], o[1])
                 }
                 Roll | RevRoll | SlipRoll => {
-                    let (mut ol, mut or) = (dl, dr);
-                    if let Some((start, len, pos)) = self.roll.as_mut() {
-                        let i = *pos as usize % *len;
-                        let j = if kind == RevRoll { *len - 1 - i } else { i };
-                        let k = (*start + j) % RING_LEN;
-                        // A few frames of fade at the loop's ends, so the splice is silent.
-                        let edge = (i.min(*len - 1 - i) as f32 / (0.002 * r)).min(1.0);
-                        // Single mode's first knob (`SingleBeatFxRollBase::updateAndSetParameter`):
-                        // two square gates over each turn (3.33 ms edges), one on the roll and
-                        // one on the live sound; see `roll_gates`.
-                        let (rd, rh, dd, dh) = if multi { (1.0, 0.0, 0.0, 0.0) } else { roll_gates(k1) };
-                        let ph = i as f32 / *len as f32;
-                        let sq = |d: f32, h: f32| if d >= 1.0 || (ph + h).fract() < d { 1.0f32 } else { 0.0 };
-                        self.fb[0] += (sq(rd, rh) - self.fb[0]).clamp(-gate_k, gate_k);
-                        self.fb[1] += (sq(dd, dh) - self.fb[1]).clamp(-gate_k, gate_k);
-                        ol = ring.buf[k * 2] * edge * self.fb[0] + dl * self.fb[1];
-                        or = ring.buf[k * 2 + 1] * edge * self.fb[0] + dr * self.fb[1];
-                        *pos += 1.0;
-                        if *pos as usize >= *len {
-                            *pos = 0.0;
-                            if kind == SlipRoll && p.on {
-                                // SLIP ROLL catches the newest beat again on every turn.
-                                *start = (base as usize + n + 1 + RING_LEN - (*len).min(RING_LEN - 1)) % RING_LEN;
-                            }
-                        }
-                    }
+                    // The roll's sound (`RollCore` / `ReverseRollCore` / `SlipRollCore` read
+                    // through their gate). Single mode's first knob
+                    // (`SingleBeatFxRollBase::updateAndSetParameter`): two square gates over each
+                    // turn (3.33 ms edges), one on the roll and one on the live sound; see
+                    // `roll_gates`.
+                    let i = n % LFO_PIECE;
+                    let (rd, rh, dd, dh) = if multi { (1.0, 0.0, 0.0, 0.0) } else { roll_gates(k1) };
+                    let ph = rphase[i];
+                    let sq = |d: f32, h: f32| if d >= 1.0 || (ph + h).fract() < d { 1.0f32 } else { 0.0 };
+                    self.fb[0] += (sq(rd, rh) - self.fb[0]).clamp(-gate_k, gate_k);
+                    self.fb[1] += (sq(dd, dh) - self.fb[1]).clamp(-gate_k, gate_k);
+                    let ol = lgain[i] * self.fb[0] + dl * self.fb[1];
+                    let or = rgain[i] * self.fb[0] + dr * self.fb[1];
                     mixed(ol, or)
                 }
                 Robot => {
@@ -3016,29 +3025,29 @@ mod tests {
 
     #[test]
     fn roll_loops_the_last_beat_value() {
+        // rekordbox's ROLL records from the point it starts and plays that back: the first turn
+        // is the sound itself, every restart (each beat value) fades out over 3.3333 ms (159
+        // frames) and plays the turn's start again.
         let mut rack = Rack::new();
         rack.enabled = true;
-        // History: a rising ramp, so a frame's value tells where it came from.
         rack.units[0].params.assign = [true, false, false, false, false, false];
-            let a = rack.units[0].params.assign;
-            rack.units[0].prepare(&a);
-        let mut hist: Vec<f32> = (0..48000).flat_map(|i| { let v = i as f32 / 48000.0; [v, v] }).collect();
-        rack.process(0, &mut hist, 48000);
-        // ROLL on, 1/4 beat = 6,000 frames. It catches what was heard up to the buffer in
-        // which it is switched on (here one of 64 frames, silent), and repeats that.
-        rack.units[0].params = unit(Kind::Roll, 0.25, 1.0);
         let a = rack.units[0].params.assign;
         rack.units[0].prepare(&a);
-        let mut first = vec![0.0f32; 64 * 2];
-        rack.process(0, &mut first, 48000);
-        let mut x = vec![0.0f32; 20000 * 2];
-        rack.process(0, &mut x, 48000);
-        // The loop is frames 42,064..48,064 of the history; the first buffer played 64 of it.
+        let ramp = |from: usize, n: usize| -> Vec<f32> { (from..from + n).flat_map(|i| { let v = i as f32 / 96000.0; [v, v] }).collect() };
+        let mut hist = ramp(0, 48000);
+        rack.process(0, &mut hist, 48000);
+        // ROLL on, 1/4 beat = 6,000 frames at 120 BPM (no beat grid: it starts at once).
+        rack.units[0].params = unit(Kind::Roll, 0.25, 1.0);
+        let input = ramp(48000, 20000);
+        let mut x = input.clone();
+        for c in x.chunks_mut(480 * 2) {
+            rack.process(0, c, 48000);
+        }
         let v = |f: usize| x[f * 2];
-        let want = (42064.0 + 64.0 + 3000.0) / 48000.0;
-        assert!((v(3000) - want).abs() < 0.01, "{} vs {want}", v(3000));
-        assert!((v(9000) - want).abs() < 0.01, "second turn {}", v(9000));
-        assert!((v(15000) - want).abs() < 0.01);
+        let src = |k: usize| input[k * 2];
+        assert!((v(3000) - src(3000)).abs() < 1e-6, "{} vs {}", v(3000), src(3000));
+        assert!((v(9000) - src(9000 - 6159)).abs() < 1e-6, "second turn {} vs {}", v(9000), src(9000 - 6159));
+        assert!((v(15000) - src(15000 - 12159)).abs() < 1e-6, "third turn {}", v(15000));
     }
 
     #[test]
@@ -3223,10 +3232,11 @@ mod tests {
 
     #[test]
     fn quantize_puts_the_gate_and_the_roll_on_the_beat_grid() {
-        // TRANS, 1 beat, switched on half a beat into a beat: with quantize the gate is in
-        // its closed half and opens at the next beat (12,000 frames on at 120 BPM); without,
-        // it opens at once.
-        for (quantize, open_first) in [(true, false), (false, true)] {
+        // TRANS, 1 beat, switched on 0.3 beat into a beat. With quantize rekordbox's
+        // `FxQuantizeManager` waits for the half beat (the sound untouched meanwhile), then
+        // starts the gate there: open half a beat, shut until the next restart at 9.5. Without
+        // quantize it starts at once.
+        for quantize in [true, false] {
             let mut rack = Rack::new();
             rack.enabled = true;
             let mut p = unit(Kind::Trans, 1.0, 0.5);
@@ -3234,18 +3244,22 @@ mod tests {
             rack.units[0].params = p;
             rack.units[0].prepare(&p.assign);
             let mut x = tone(36000, 440.0);
-            let mut beat = 8.5f64;
+            let mut beat = 8.3f64;
             for chunk in x.chunks_mut(480 * 2) {
                 rack.beat[0] = Some(beat);
                 rack.process(0, chunk, 48000);
                 beat += 480.0 / 24000.0;
             }
-            let (a, b) = (rms(&x[2000 * 2..10000 * 2]), rms(&x[14000 * 2..22000 * 2]));
-            assert_eq!(a > 0.3, open_first, "quantize {quantize}: {a}");
-            assert_eq!(b > 0.3, !open_first, "quantize {quantize}: {b}");
+            if quantize {
+                let (w, o, c) = (rms(&x[500 * 2..4500 * 2]), rms(&x[6000 * 2..16000 * 2]), rms(&x[18000 * 2..28000 * 2]));
+                assert!(w > 0.3 && o > 0.3 && c < 0.01, "{w} {o} {c}");
+            } else {
+                let (o, c) = (rms(&x[500 * 2..11000 * 2]), rms(&x[13000 * 2..23000 * 2]));
+                assert!(o > 0.3 && c < 0.01, "{o} {c}");
+            }
         }
-        // ROLL, 1/2 beat, switched on a quarter beat after a beat: the loop is the half beat
-        // that ended on that beat, joined a quarter beat in.
+        // ROLL, 1/2 beat, switched on 0.1 beat after a beat (`FxQuantizeManager::
+        // turnOnWithAdjust`: started at once, 0.1 beat late).
         let mut rack = Rack::new();
         rack.enabled = true;
         rack.units[0].params.assign = [true, false, false, false, false, false];
@@ -3254,12 +3268,12 @@ mod tests {
         let mut hist: Vec<f32> = (0..48000).flat_map(|i| { let v = i as f32 / 48000.0; [v, v] }).collect();
         rack.process(0, &mut hist, 48000);
         rack.units[0].params = unit(Kind::Roll, 0.5, 1.0);
-        rack.beat[0] = Some(4.25);
+        rack.beat[0] = Some(4.1);
         let mut x = vec![0.0f32; 480 * 2];
         rack.process(0, &mut x, 48000);
-        // Beat 4.0 was 6,000 frames before this buffer: the loop is history 30,000..42,000,
-        // and the first frame out is 6,000 into it.
-        assert!((x[400 * 2] - (36000.0 + 400.0) / 48000.0).abs() < 0.001, "{}", x[400 * 2]);
+        // Started 0.1 beat (2,400 frames) after beat 4: the roll plays the sound from beat 4,
+        // which began 2,400 frames before this buffer.
+        assert!((x[400 * 2] - (48000.0 - 2400.0 + 400.0) / 48000.0).abs() < 0.001, "{}", x[400 * 2]);
     }
 
     #[test]
@@ -3316,7 +3330,8 @@ mod tests {
         let (rd, _, dd, _) = roll_gates(1.0);
         assert!((rd - 0.05).abs() < 1e-6 && dd == 0.0);
         // In a run: single ROLL 1 beat, knob half left: the second half of each turn is the
-        // live sound (a 440 Hz tone that changes to 880 Hz once the roll has caught it).
+        // live sound. The roll records from its start (440 Hz for the first turn), then the
+        // live tone changes to 880 Hz; in the second turn the roll part is the 440 Hz.
         let mut rack = Rack::new();
         rack.enabled = true;
         let mut p = unit(Kind::Roll, 1.0, 1.0);
@@ -3328,7 +3343,11 @@ mod tests {
         let mut x = tone(48000, 440.0);
         rack.process(0, &mut x, 48000);
         rack.units[0].params.one.on = true;
-        let mut y = tone(48000, 880.0);
+        let mut first = tone(24000, 440.0);
+        for c in first.chunks_mut(480) {
+            rack.process(0, c, 48000);
+        }
+        let mut y = tone(24000, 880.0);
         let live = y.clone();
         for c in y.chunks_mut(480) {
             rack.process(0, c, 48000);
@@ -3628,7 +3647,8 @@ mod tests {
         assert_eq!((vinyl_brake_beats(0.1), vinyl_brake_beats(1.0)), (4.0, 0.125));
         assert_eq!((delay_pan_beats(0.0), delay_pan_beats(0.5), delay_pan_beats(1.0)), (Some(0.0625), None, Some(0.0625)));
         // Single-mode knobs.
-        assert_eq!((pan_rates(0.0), pan_rates(0.5), pan_rates(1.0)), ((0.25, 1.0), (1.0, 1.0), (1.0, 0.25)));
+        let pr = |k: f32| { let p = crate::fx_lfo::PanPar::single(1.0, k, 0.5, 250.0); (p.free, p.free_ms) };
+        assert_eq!((pr(0.0), pr(0.5), pr(1.0)), (([true, false], [62.5, 0.0]), ([false, false], [0.0, 0.0]), ([false, true], [0.0, 62.5])));
         assert_eq!((filter_single_reso(0.0), filter_single_reso(0.5)), (0.0, 0.72));
         assert!((filter_single_reso(1.0) - 0.96).abs() < 1e-6);
         assert_eq!((flanger_fb(0.5, false), flanger_fb(0.5, true)), (0.26667, -0.8));

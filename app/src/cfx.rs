@@ -920,9 +920,17 @@ impl DubCore {
                 y[ch] = DubCore::iir(c, &mut self.post_h[ch], y[ch]);
             }
         }
-        y
+        // The post gain (`GainSmoother` made at 0.7, applied after the post filter in
+        // `processWithOffset` 0x1029b2474). It only moves when a filter type changes
+        // (`updateParameter` 0x1029b1ccc fades it to 0, then `initFilter` and back to 1), and
+        // `ColorFxDubEcho` sets the types in its constructor; `onCalledMakeSelected` syncs them
+        // (`initFilter`) before the first check, so in use it stays at 0.7.
+        [y[0] * DUB_POST_GAIN, y[1] * DUB_POST_GAIN]
     }
 }
+
+/// `DubEchoCore`'s post gain as it stays in use (see `DubCore::run`).
+const DUB_POST_GAIN: f32 = 0.7;
 
 /// CFX CRUSH for COLOR `c` and PARAM `p` (8-bit): (hold ms, float bit mask, high-pass Hz).
 /// PARAM sets the longest hold (0.104 .. 0.5 ms left of its centre, 0.5 .. 0.75 above, never
@@ -1605,6 +1613,11 @@ mod tests {
         assert!((i as i32 - 9072).abs() < 12, "{i}");
         let (i, _) = first(1.0);
         assert!((i as i32 - 7200).abs() < 12, "{i}");
+        // Each core's output is at `DubEchoCore`'s post gain, made at 0.7 and kept there
+        // (the filter types are synced when the effect is selected, so its fade never runs).
+        let mut c = DubCore::new();
+        let y = c.run([0.0, 0.0], 48000.0);
+        assert!(DUB_POST_GAIN == 0.7 && y == [0.0, 0.0]);
         // Back at the centre with the tails gone the sound is untouched.
         let mut fx = Cfx::new();
         let dry: Vec<f32> = (0..4800).flat_map(|i| { let v = (i as f32 * 0.03).sin() * 0.5; [v, v] }).collect();
