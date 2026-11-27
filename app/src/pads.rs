@@ -33,10 +33,10 @@ pub const MENU: [PadMode; 11] = [PadMode::HotCue, PadMode::PadFx, PadMode::Slice
 /// `PlayerExt::pad_mode` holds a byte per deck. The six modes that existed before this file
 /// keep the bytes they had (other code sets them); every other mode is 32 + rekordbox's value.
 /// PAD FX is the FX track's: its byte is `PAD_FX_CODE`.
-pub const PAD_FX_CODE: u8 = 6;
+pub const PAD_FX_CODE: u8 = crate::ui_padfx::PAD_FX;
 /// PAD FX has a pad view (`ui_perf::pads` draws it for `PAD_FX_CODE`). False until the FX
 /// track's arm is merged: the pull-down then lists PAD FX greyed out.
-pub const PAD_FX_READY: bool = false;
+pub const PAD_FX_READY: bool = true;
 
 impl PadMode {
     /// rekordbox's enum value.

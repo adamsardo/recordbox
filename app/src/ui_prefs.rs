@@ -46,7 +46,7 @@ fn tabs_of(page: u8) -> &'static [&'static str] {
         3 => &ACTION_CATEGORIES,
         5 => &["Configuration", "Input/Output"],
         6 => &["STEMS"],
-        7 => &["Deck", "Mixer", "Effect", "Sampler", "Recordings", "Others"],
+        7 => &["Deck", "Mixer", "Effect", "Sampler", "Recordings", "MIX POINT LINK", "Others"],
         _ => &["Database", "Browse", "Others"],
     }
 }
@@ -440,9 +440,10 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
                 7 if sub_tab == 0 => page_deck(app, ui),
                 7 if sub_tab == 1 && crate::ui_midi::prefs_rows_shown(app) => { page_mixer(app, ui); crate::ui_midi::prefs_rows(app, ui) }
                 7 if sub_tab == 1 => page_mixer(app, ui),
-                7 if sub_tab == 2 => page_effect(app, ui),
+                7 if sub_tab == 2 => crate::ui_fx::prefs_effect_page(app, ui),
                 7 if sub_tab == 3 => page_sampler(app, ui),
                 7 if tabs.get(sub_tab) == Some(&"Recordings") => crate::ui_rec::prefs_page(app, ui),
+                7 if tabs[sub_tab] == "MIX POINT LINK" => crate::ui_mpl::prefs_page(app, ui),
                 7 => page_controller_others(app, ui),
                 _ => page_advanced(app, ui, sub_tab),
             }

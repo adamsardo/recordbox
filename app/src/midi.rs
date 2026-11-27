@@ -2321,22 +2321,48 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
         // Automix: start / stop.
         Stub::AutoMixStartStop => {
             if press {
+                app.automix_start_stop();
                 note(app, "AutoMixStartStop".into());
             }
         }
         // MIX POINT LINK: 0 panel, 1 cue select next, 2 back, 3 set, 4 exit, 5 deck select, 6 silent.
         Stub::MixPointLink(cmd) => {
             if press {
+                match cmd {
+                    0 => app.mpl_toggle_panel(),
+                    1 => app.mpl_select_cue(1),
+                    2 => app.mpl_select_cue(-1),
+                    3 => app.mpl_request_link(),
+                    4 => {
+                        for d in 0..4 {
+                            app.mpl_cancel(d, 3);
+                        }
+                    }
+                    5 => {
+                        // Deck select: the deck's playhead becomes the point of the current mode.
+                        let t = app.with_deck(deck, |a| a.pos());
+                        app.mpl_wave_click(deck as usize, t, false);
+                    }
+                    _ => app.mpl_toggle_silent(),
+                }
                 note(app, format!("MixPointLink {cmd} deck {}", deck + 1));
             }
         }
         // PAD FX: pad mode of bank 1 / 2; a pad held; beat value up / down.
         Stub::PadFxMode(bank) => {
             if press {
+                app.with_deck(deck, |a| a.set_pad_mode(crate::pads::PadMode::PadFx));
                 note(app, format!("PadFxMode {bank} deck {}", deck + 1));
             }
         }
         Stub::PadFx(bank, pad) => {
+            // (Pads 1..16 of a bank; the second bank's pads follow the first's.)
+            let idx = ((bank.max(1) - 1) as u8) * 16 + pad as u8;
+            if press {
+                crate::ui_padfx::pad_down(app, deck as usize, idx);
+            } else if release {
+                crate::ui_padfx::pad_up(app, deck as usize, idx);
+            }
             if press || release {
                 note(app, format!("PadFx {bank} pad {} {} deck {}", pad + 1, if press { "on" } else { "off" }, deck + 1));
             }
@@ -2349,21 +2375,42 @@ pub fn stub(app: &mut App, hub: &Arc<Hub>, s: Stub, deck: u8, val: Val) {
         // Slicer / Slicer Loop: pad mode, a section pad, shift, roll, length, capture.
         Stub::SlicerMode(lp) => {
             if press {
+                app.with_deck(deck, |a| {
+                    if a.set_pad_mode(crate::pads::PadMode::Slicer) && a.slicer_now().1 != lp {
+                        a.slicer_toggle_loop();
+                    }
+                });
                 note(app, format!("SlicerMode loop={lp} deck {}", deck + 1));
             }
         }
         Stub::SlicerPad(lp, pad) => {
             if press || release {
+                app.with_deck(deck, |a| a.slicer_pad(pad as u8, press));
                 note(app, format!("SlicerPad loop={lp} pad {} {} deck {}", pad + 1, if press { "on" } else { "off" }, deck + 1));
             }
         }
         Stub::SlicerShift(lp, dir) | Stub::SlicerRoll(lp, dir) | Stub::SlicerLength(lp, dir) => {
             if press {
+                let n = (deck as usize).min(3);
+                match s {
+                    Stub::SlicerShift(..) => app.with_deck(deck, |a| a.slicer_shift(dir > 0)),
+                    Stub::SlicerRoll(..) => {
+                        let ri = (app.prefs.pads.slicer_roll[n] as i32 + dir.signum() as i32).max(0) as usize;
+                        app.with_deck(deck, |a| a.slicer_set_roll(ri));
+                    }
+                    _ => {
+                        let li = (app.prefs.pads.slicer_length[n] as i32 + dir.signum() as i32).clamp(0, 3) as usize;
+                        app.with_deck(deck, |a| a.slicer_set_length(li));
+                    }
+                }
                 note(app, format!("{s:?} loop={lp} {dir:+} deck {}", deck + 1));
             }
         }
         Stub::SlicerCapture => {
             if press {
+                app.with_deck(deck, |a| {
+                    a.slicer_capture();
+                });
                 note(app, format!("SlicerCapture deck {}", deck + 1));
             }
         }

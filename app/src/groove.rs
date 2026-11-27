@@ -316,6 +316,8 @@ impl Engine {
             return;
         }
         let mut rack = Box::new(crate::fx::Rack::new());
+        // (This rack is the panel's own: its unit always runs.)
+        rack.enabled = true;
         let mut assign = [false; crate::fx::CHANNELS];
         assign[self.deck] = true;
         rack.units[0].params.assign = assign;

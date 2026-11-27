@@ -485,6 +485,10 @@ pub fn cache_path(track_path: &str, model: &str) -> PathBuf {
     let meta = std::fs::metadata(track_path).ok();
     let mut h = Sha256::new();
     h.update(track_path.as_bytes());
+    // MP3s decoded before the timebase fix start 1105-1152 samples earlier: don't reuse those stems.
+    if track_path.to_ascii_lowercase().ends_with(".mp3") {
+        h.update(b"timebase-2");
+    }
     h.update(meta.as_ref().map(|m| m.len()).unwrap_or(0).to_le_bytes());
     if let Some(t) = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
         h.update(t.as_secs().to_le_bytes());

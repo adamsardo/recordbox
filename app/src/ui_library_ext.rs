@@ -646,6 +646,8 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
         app.get_info_from_itunes(sel);
         ui.close_menu();
     }
+    // PERFORMANCE: Add To Sampler List (ui_sampler_lib.rs).
+    crate::ui_sampler_lib::track_menu(app, ui, sel);
     // Track Type: how the track plays in the sampler.
     let kind = if one { app.track_type(sel[0]) } else { 255 };
     ui.menu_button("Track Type", |ui| {
@@ -724,6 +726,11 @@ pub fn track_menu(app: &mut App, ui: &mut Ui, sel: &[i64]) {
             let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(&t.path).spawn();
         }
         ui.close_menu();
+    }
+    // PERFORMANCE: Add tracks to Automix playlist (ui_automix.rs).
+    if app.performance() {
+        ui.separator();
+        crate::ui_automix::track_menu(app, ui, sel);
     }
     // ---- recordbox's own
     ui.separator();
@@ -868,10 +875,7 @@ pub fn node_menu(app: &mut App, ui: &mut Ui, n: &PlaylistNode) {
     }
     if !folder && app.performance() {
         ui.separator();
-        if ui.add_enabled(crate::app_hooks::automix_available(), egui::Button::new("Select as Automix playlist")).clicked() {
-            crate::app_hooks::automix_select_playlist(app, n.id);
-            ui.close_menu();
-        }
+        crate::ui_automix::node_menu(app, ui, n.id);
         ui.separator();
         if ui.button("Load the top 16 tracks into the current sampler bank").clicked() {
             crate::app_hooks::playlist_to_sampler_bank(app, n.id);

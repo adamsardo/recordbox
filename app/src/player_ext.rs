@@ -450,7 +450,7 @@ impl App {
     pub fn performance_height(&self) -> f32 {
         // (Every Performance layout's height: ui_perf_layouts.rs.) The GROOVE CIRCUIT rows
         // come on top (ui_groove.rs).
-        crate::ui_perf_layouts::height(self) + crate::ui_perf_layouts::groove_row(self) * if self.deck_count() == 4 { 2.0 } else { 1.0 }
+        crate::ui_perf_layouts::height(self) + crate::ui_perf_layouts::groove_row(self) * if self.deck_count() == 4 { 2.0 } else { 1.0 } + crate::ui_perf_layouts::mpl_extra(self)
     }
 
     /// How many decks exist in the layout showing: 4 (Performance, 4Deck), 2 or 1.

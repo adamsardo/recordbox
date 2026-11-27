@@ -98,7 +98,10 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     // see MECHANICS.md): LAME-tagged files keep the encoder lead-in, ffmpeg-tagged files have it
     // removed, untagged files lose one frame.
     let class = mp3_timing_class(path);
-    let gapless = class == Mp3Timing::Ffmpeg;
+    // rekordbox's timeline (traced, see analysis/mp3_timebase.rs): nothing is trimmed, and a
+    // leading Info frame that looks like the audio frames takes one frame of silence.
+    let rb_lead = crate::analysis::mp3_timebase::lead_frames(path);
+    let gapless = false;
     let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions { enable_gapless: gapless, ..Default::default() }, &MetadataOptions::default())?;
     let mut format = probed.format;
     let track = format
@@ -207,12 +210,10 @@ pub fn decode_file(path: &str) -> Result<Decoded> {
     });
     let truncated = declared_secs.map(|d| decoded_frames as f64 / sr.max(1) as f64 + 1.0 < d).unwrap_or(false);
     let mut raw_frames = decoded_frames;
-    if class == Mp3Timing::Ffmpeg {
-        raw_frames += track.codec_params.delay.unwrap_or(0) as usize + track.codec_params.padding.unwrap_or(0) as usize;
-    }
-    if class == Mp3Timing::Untagged {
-        let drop = (MP3_UNTAGGED_SKIP * 2).min(out.len());
-        out.drain(..drop);
+    let _ = class;
+    if rb_lead > 0 && !out.is_empty() {
+        out.splice(0..0, std::iter::repeat(0.0).take(rb_lead * 2));
+        raw_frames += rb_lead;
     }
     if out.is_empty() {
         return Err(anyhow!("no audio decoded"));
@@ -752,7 +753,11 @@ impl ClipReader {
     pub fn frame(&mut self, audio: &Decoded, pos: f64, step: f64, pitch_step: f64, hop: usize) -> (f32, f32) {
         let src = Src { audio, frames: audio.frames(), stems: None, g: std::cell::Cell::new([1.0, 0.0, 0.0, 0.0, 0.0]), stem_ratio: 1.0 };
         if (step - pitch_step).abs() > 1e-9 {
-            self.st.frame(&src, pos, pitch_step, hop)
+            let out = self.st.frame(&src, pos, pitch_step, hop);
+            // Where the next frame is expected: without this every frame looked like a seek
+            // and the stretcher never got past the first sample of a grain.
+            self.st.expect = pos + step;
+            out
         } else {
             self.st.active = false;
             src.at(pos)
@@ -1069,6 +1074,8 @@ fn render_cue(states: &[Arc<Mutex<PlayState>>], out: &mut [f32], cue: &mut [f32]
     for (g, st) in guards.iter_mut().zip(states.iter()) {
         *g = lock_for_audio(st);
     }
+    // MIX POINT LINK: a linked deck starts here, on the block its start position falls in.
+    crate::mpl::pre_render(&mut guards);
     let master = MASTER_DECK.load(std::sync::atomic::Ordering::Relaxed) as usize;
     if master < states.len() {
         // The master's part of the comparison, taken before the followers are changed.
@@ -2404,4 +2411,24 @@ mod beat_pos_tests {
         assert!((at(5.25) - 8.5).abs() < 1e-9, "{}", at(5.25));
         assert!(super::beat_pos(&[1.0], 2.0).is_none());
     }
+    #[test]
+    fn the_sampler_stretcher_keeps_the_pitch_and_runs_its_grains() {
+        // A 441 Hz tone read at 0.8 of its speed with the pitch kept: one second of output
+        // still crosses zero about 882 times (not 706, as plain slow playback would).
+        let sr = 44100usize;
+        let x: Vec<f32> = (0..sr * 3).flat_map(|i| { let v = (i as f32 * 441.0 * std::f32::consts::TAU / sr as f32).sin() * 0.5; [v, v] }).collect();
+        let audio = super::Decoded { sr: sr as u32, samples: x, raw_frames: sr * 3, damaged: 0, truncated: false };
+        let mut r = super::ClipReader::new();
+        let (mut pos, mut last, mut crossings) = (1000.0f64, 0.0f32, 0);
+        for _ in 0..sr {
+            let (l, _) = r.frame(&audio, pos, 0.8, 1.0, 882);
+            if (l >= 0.0) != (last >= 0.0) {
+                crossings += 1;
+            }
+            last = l;
+            pos += 0.8;
+        }
+        assert!((860..=905).contains(&crossings), "zero crossings in a second: {crossings}");
+    }
+
 }

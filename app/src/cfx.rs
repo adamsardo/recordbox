@@ -5,10 +5,14 @@
 //!
 //! FILTER follows rekordbox's traced rules exactly in its blend zones, cutoff curves and
 //! resonance law (the filters themselves are ordinary second-order sections; rekordbox's own
-//! filter shape was not traced). NOISE, CRUSH and DUB ECHO follow the traced outlines; JET,
-//! SPACE, SWEEP, PITCH and GATE COMP are recordbox's own takes on the effects of those names
-//! (GATE COMP with the thresholds and time constants of rekordbox's `GateCore` / `CompCore`
-//! parameter lists).
+//! filter shape was not traced). JET (delay, feedback and mix for every knob position), DUB
+//! ECHO (its two short tape echoes: time, feedback and input level for every knob position)
+//! and SWEEP (the notch and band-pass edges) follow rekordbox's parameter code; the comb,
+//! echo and filter bodies are plain ones. NOISE and CRUSH follow the traced outlines with
+//! recordbox's own constants; SPACE, PITCH and GATE COMP are recordbox's own takes on the
+//! effects of those names (GATE COMP with the thresholds and time constants of rekordbox's
+//! `GateCore` / `CompCore` parameter lists). LPF and HPF (`InstFxLPF` / `InstFxHPF`) exist
+//! for the PAD FX pads and MERGE FX.
 
 /// The USER menu's nine types in rekordbox's order (the effect if recordbox has it).
 pub const LIST: [(&str, Option<u8>); 9] = [("FILTER", Some(0)), ("JET", Some(1)), ("CRUSH", Some(2)), ("NOISE", Some(3)), ("PITCH", Some(4)), ("SPACE", Some(5)), ("DUB ECHO", Some(6)), ("SWEEP", Some(7)), ("GATE COMP", Some(8))];
@@ -19,7 +23,100 @@ pub const LIST: [(&str, Option<u8>); 9] = [("FILTER", Some(0)), ("JET", Some(1))
 pub const DEFAULT_LIST: [u8; 1] = [0];
 
 pub fn name(kind: u8) -> &'static str {
-    LIST.iter().find(|x| x.1 == Some(kind)).map(|x| x.0).unwrap_or("FILTER")
+    match kind {
+        LPF => "LPF",
+        HPF => "HPF",
+        _ => LIST.iter().find(|x| x.1 == Some(kind)).map(|x| x.0).unwrap_or("FILTER"),
+    }
+}
+
+/// PAD FX's LPF and HPF (rekordbox's `InstFxLPF` / `InstFxHPF`), beside the nine types.
+pub const LPF: u8 = 12;
+pub const HPF: u8 = 13;
+
+/// Cutoff of rekordbox's CFX-style low-pass (12 kHz down to 93 Hz) or high-pass (61 Hz up to
+/// 8.95 kHz) for how far the knob is turned (0..1): its 124-step tables, every 15th step.
+pub fn inst_fc(hp: bool, x: f32) -> f32 {
+    const LP: [f32; 9] = [12000.0, 6634.1, 3685.5, 1949.0, 990.7, 509.1, 249.7, 132.7, 93.0];
+    const HP: [f32; 9] = [61.0, 154.0, 292.0, 523.0, 994.0, 1750.0, 3136.0, 5418.0, 8951.0];
+    crate::fx::knots(if hp { &HP } else { &LP }, x)
+}
+
+/// `InstFxLPF` / `InstFxHPF::updateParameter` for the knob `a` and PARAM `p` in 8-bit steps:
+/// (share of the filtered sound, cutoff, resonance).
+pub fn inst_law(hp: bool, a: f32, p: f32) -> (f32, f32, f32) {
+    if a < 4.0 {
+        return (0.0, if hp { 61.0 } else { 12000.0 }, 1.44);
+    }
+    let wet = if a > 37.0 { 1.0 } else { ((a - 4.0) * 0.029412).min(1.0) };
+    let u = if hp { (a - 3.0) * 0.0039683 } else { (255.0 - a) * 0.0039683 };
+    let v7 = (1.0 - u) - u * (1.0 - u);
+    let k = (255.0 - p) * 0.0039216;
+    let v8 = 1.44 - k * k * (255.0 - p) * if hp { 0.0050974 } else { 0.0056471 };
+    (wet, inst_fc(hp, (a / 2.0).floor() / 123.0), (v8 - v7.powi(8) * v8).max(0.0))
+}
+
+/// rekordbox's CFX JET for COLOR `c` and PARAM `p` in 8-bit steps (`ColorFxJetRZX::
+/// updateAndSetParameter`): (dry, wet, comb delay in ms, feedback). Left the comb grows from
+/// 2.67 ms to 20 ms, right it shrinks to 0.167 ms.
+pub fn jet_law(c: f32, p: f32) -> (f32, f32, f32, f32) {
+    let (dry, wet, delay, mut fb);
+    if (124.0..=131.0).contains(&c) {
+        return (1.0, 0.0, 2.6667, 0.6);
+    } else if c < 124.0 {
+        let n = 124.0 - c;
+        delay = 2.6667 + 0.13978 * n;
+        (dry, wet) = if c >= 105.0 { (1.0 - 0.015 * n, 0.035 * n) } else { (0.7, 0.7) };
+        fb = if c >= 25.0 { 0.55 } else if c < 7.0 { 0.3 } else { 1.8526 - 0.013158 * n };
+    } else {
+        let m = c - 131.0;
+        delay = if c <= 140.0 { 2.6667 } else { (2.8623 - 0.021739 * m).max(0.16667) };
+        (dry, wet) = if c <= 150.0 { (1.0 - 0.015 * m, 0.035 * m) } else { (0.7, 0.7) };
+        fb = if c <= 193.0 { 0.6 } else if c <= 217.0 { 1.344 - 0.012 * m } else { 0.3 };
+    }
+    if p <= 123.0 {
+        fb *= p * 0.0080645;
+    } else if p >= 132.0 {
+        fb *= 0.0026882 * p + 0.64785;
+    }
+    (dry, wet, delay, fb.min(0.97))
+}
+
+/// rekordbox's CFX DUB ECHO for COLOR `c` and PARAM `p` in 8-bit steps (`ColorFxDubEcho::
+/// onCfxKnobValueChanged`): (input level, echo time in ms, feedback). The time does not
+/// follow the tempo: 55 ms near the centre, up to 189 ms fully left and 150 ms fully right.
+pub fn dub_law(c: f32, p: f32) -> (f32, f32, f32) {
+    if c <= 115.0 {
+        let n = 116.0 - c;
+        let x = n * 0.0086207;
+        let fbp = if p <= 115.0 { 0.0075 * p } else if p < 140.0 { 0.87 } else { 0.87 + 0.0010345 * (p - 139.0) };
+        let k = if p < 140.0 { 1.0 } else { (255.0 - p) * 0.0086207 };
+        if x >= 0.2 { ((n * 0.028736).min(1.0), 55.0 + 167.5 * (x - 0.2), (fbp + 0.1 * (x - 0.2) * k).min(0.993)) } else { ((n * 0.028736).min(1.0), 55.0, 0.87) }
+    } else if c > 138.0 {
+        let m = c - 139.0;
+        let fbp = if p <= 115.0 { 0.0075862 * p } else if p < 140.0 { 0.88 } else { 0.88 + 0.00094828 * (p - 139.0) };
+        let k = if p < 140.0 { 1.0 } else { (255.0 - p) * 0.0086207 };
+        if m * 0.0086207 >= 0.2 { ((m * 0.028736).min(1.0), 31.25 + 1.0237 * m, (fbp + 0.00086207 * m * k).min(0.993)) } else { ((m * 0.028736).min(1.0), 55.0, fbp.min(0.993)) }
+    } else {
+        (0.0, 55.0, 0.87)
+    }
+}
+
+/// rekordbox's CFX SWEEP (`ColorFxSweep::updateFilterCoef`) for COLOR `c` and PARAM `p` in
+/// 8-bit steps: PARAM picks a frequency (60 Hz .. 1 kHz .. 20 kHz). Left of the centre the
+/// sound loses a band around it that widens with the knob (what is kept: below the first
+/// frequency and above the second); right of it only a band around it is kept, narrowing
+/// with the knob (high-pass at the first, low-pass at the second, with the resonance).
+pub fn sweep_law(c: f32, p: f32) -> (f32, f32, f32) {
+    let f = if p < 128.0 { 60.0 + 7.4015748 * p } else { 1000.0 + 149.606299 * (p - 128.0) };
+    if c < 125.0 {
+        let t = c.min(123.0) / 123.0;
+        (60.0 * (f / 60.0).powf(t), 20000.0 * (f / 20000.0).powf(t), 1.0)
+    } else {
+        let k = if c > 130.0 { (256.0 - c) * (256.0 - c) * 0.00100781053 + 1.4 } else { 17.4 };
+        let q = if c > 130.0 && c <= 161.0 { (162.0 - c) * 0.009375 + 0.707945784 } else if c > 161.0 { 0.707945784 } else { 1.00794578 };
+        (f / k, (f * k).min(20000.0), q)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -202,11 +299,10 @@ impl Cfx {
                     }
                 }
                 1 => {
-                    // JET: a short feedback comb whose delay the knob sets (left: with the
-                    // comb's phase turned over); PARAM is the feedback.
-                    let d = (0.0003 + 0.006 * (1.0 - depth)) * r;
-                    let fbk = 0.3 + 0.6 * p;
-                    let sign = if right { 1.0 } else { -1.0 };
+                    // JET: a feedback comb at rekordbox's delay, feedback and mix for the
+                    // knob position; PARAM scales the feedback.
+                    let (dry, wet, ms, fbk) = jet_law((c * 255.0).round(), (p * 255.0).round());
+                    let d = (ms * 0.001 * r).max(1.0);
                     for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
                         for (ch, v) in f.iter_mut().enumerate() {
                             let i = d as usize;
@@ -214,8 +310,8 @@ impl Cfx {
                             let a = self.delay[((self.w + ECHO_LEN - i) % ECHO_LEN) * 2 + ch];
                             let b = self.delay[((self.w + ECHO_LEN - i - 1) % ECHO_LEN) * 2 + ch];
                             let e = a + (b - a) * t;
-                            self.delay[self.w * 2 + ch] = *v + e * fbk * sign;
-                            *v += e * depth.min(0.9) * sign;
+                            self.delay[self.w * 2 + ch] = (*v + e * fbk).clamp(-4.0, 4.0);
+                            *v = *v * dry + e * wet;
                         }
                         self.w = (self.w + 1) % ECHO_LEN;
                     }
@@ -286,18 +382,19 @@ impl Cfx {
                     }
                 }
                 6 => {
-                    // DUB ECHO: a filtered feedback echo; left low-passes the repeats, right
-                    // high-passes them. PARAM is the feedback.
-                    let d = ((0.375 * r) as usize).min(ECHO_LEN - 1);
-                    let fbk = 0.35 + 0.5 * p;
-                    let k = 1.0 - (-std::f32::consts::TAU * if right { 900.0 } else { 1800.0 } / r).exp();
+                    // DUB ECHO: a short echo at rekordbox's time, feedback and input level
+                    // for the knob position; left low-passes the repeats, right high-passes
+                    // them (around its pre-filter's 1375 Hz).
+                    let (inp, ms, fbk) = dub_law((c * 255.0).round(), (p * 255.0).round());
+                    let d = ((ms * 0.001 * r) as usize).clamp(1, ECHO_LEN - 1);
+                    let k = 1.0 - (-std::f32::consts::TAU * 1375.0 / r).exp();
                     for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
                         for (ch, v) in f.iter_mut().enumerate() {
                             let e = self.delay[((self.w + ECHO_LEN - d) % ECHO_LEN) * 2 + ch];
                             self.fb_lp[ch] += (e - self.fb_lp[ch]) * k;
                             let coloured = if right { e - self.fb_lp[ch] } else { self.fb_lp[ch] };
-                            self.delay[self.w * 2 + ch] = *v * depth + coloured * fbk;
-                            *v += coloured * depth.min(1.0);
+                            self.delay[self.w * 2 + ch] = (*v * inp + coloured * fbk).clamp(-4.0, 4.0);
+                            *v += coloured;
                         }
                         self.w = (self.w + 1) % ECHO_LEN;
                     }
@@ -361,19 +458,39 @@ impl Cfx {
                         f[1] *= self.gain;
                     }
                 }
-                _ => {
-                    // SWEEP: left takes a band out of the sound (a notch moving down), right
-                    // leaves only a band (moving up). PARAM is the band's width.
+                LPF | HPF => {
+                    // rekordbox's CFX-style low-pass / high-pass: the knob's distance from
+                    // the centre is how far the filter is turned.
+                    let hp = self.kind == HPF;
+                    let (wet, fc, reso) = inst_law(hp, (depth * 255.0).round(), (p * 255.0).round());
                     if self.made != (c, p, rate) {
                         self.made = (c, p, rate);
-                        let fc = if right { 150.0 * (9000.0f32 / 150.0).powf(depth) } else { 9000.0 * (150.0f32 / 9000.0).powf(depth) };
-                        self.band.band(r, fc, 0.6 + 4.0 * (1.0 - p));
+                        self.lp.set(r, fc.min(0.45 * r), 0.5 + reso, hp);
                     }
-                    let amount = (depth * 4.0).min(1.0);
                     for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
                         for (ch, v) in f.iter_mut().enumerate() {
-                            let b = self.band.run(ch, *v);
-                            *v = if right { *v * (1.0 - amount) + b * amount } else { *v - b * amount };
+                            let y = self.lp.run(ch, *v);
+                            *v += (y - *v) * wet;
+                        }
+                    }
+                }
+                _ => {
+                    // SWEEP: left a widening gap around PARAM's frequency, right a narrowing
+                    // band around it (rekordbox's edges).
+                    let (f1, f2, q) = sweep_law((c * 255.0).round(), (p * 255.0).round());
+                    if self.made != (c, p, rate) {
+                        self.made = (c, p, rate);
+                        if right {
+                            self.hp.set(r, f1.max(20.0), q, true);
+                            self.lp.set(r, f2.min(0.45 * r), q, false);
+                        } else {
+                            self.lp.set(r, f1.max(20.0), 0.7071, false);
+                            self.hp.set(r, f2.min(0.45 * r), 1.0, true);
+                        }
+                    }
+                    for f in buf[n * 2..end * 2].chunks_exact_mut(2) {
+                        for (ch, v) in f.iter_mut().enumerate() {
+                            *v = if right { let h = self.hp.run(ch, *v); self.lp.run(ch, h) } else { self.lp.run(ch, *v) + self.hp.run(ch, *v) };
                         }
                     }
                 }
@@ -478,5 +595,51 @@ mod tests {
         let (loud, quiet) = (level(0.8), level(0.08));
         assert!(loud < 0.8 * std::f32::consts::FRAC_1_SQRT_2 && quiet > 0.08 * std::f32::consts::FRAC_1_SQRT_2, "{loud} {quiet}");
         assert!(20.0 * (loud / quiet).log10() < 12.0, "{}", 20.0 * (loud / quiet).log10());
+    }
+
+    #[test]
+    fn traced_laws_of_jet_dub_echo_sweep_and_the_filters() {
+        let near = |a: f32, b: f32| (a - b).abs() < 2e-3;
+        // JET: out of the path at the centre; left the comb grows to 20 ms, right it shrinks
+        // to 0.167 ms; feedback 0.55 / 0.6 over the middle of each side, 0.3 at the ends.
+        assert_eq!(jet_law(128.0, 128.0), (1.0, 0.0, 2.6667, 0.6));
+        let (d, w, ms, fb) = jet_law(0.0, 128.0);
+        assert!(d == 0.7 && w == 0.7 && near(ms, 20.0) && near(fb, 0.3));
+        let (d, w, ms, fb) = jet_law(114.0, 128.0);
+        assert!(near(d, 0.85) && near(w, 0.35) && near(ms, 4.0645) && near(fb, 0.55));
+        let (_, _, ms, fb) = jet_law(255.0, 128.0);
+        assert!(near(ms, 0.16667) && near(fb, 0.3));
+        assert!(near(jet_law(180.0, 128.0).3, 0.6) && near(jet_law(180.0, 62.0).3, 0.3) && near(jet_law(180.0, 255.0).3, 0.8));
+        // DUB ECHO: 55 ms and 0.87 near the centre, 189 ms fully left, 150 ms fully right;
+        // the input comes in over the first 30 % of the travel.
+        assert_eq!(dub_law(128.0, 128.0), (0.0, 55.0, 0.87));
+        let (inp, ms, fb) = dub_law(0.0, 128.0);
+        assert!(inp == 1.0 && near(ms, 189.0) && near(fb, 0.95));
+        let (inp, ms, fb) = dub_law(255.0, 128.0);
+        assert!(inp == 1.0 && near(ms, 150.0) && near(fb, 0.98));
+        assert!(near(dub_law(110.0, 128.0).0, 0.1724) && dub_law(110.0, 128.0).1 == 55.0);
+        assert!(near(dub_law(0.0, 60.0).2, 0.45 + 0.08) && near(dub_law(0.0, 255.0).2, 0.99));
+        // SWEEP: PARAM picks 60 Hz .. 1 kHz .. 20 kHz; left the gap around it widens to
+        // 60 Hz .. 20 kHz, right the band narrows to within a factor 1.4 of it.
+        assert!(near(sweep_law(0.0, 0.0).0, 60.0) && near(sweep_law(123.0, 128.0).0, 1000.0) && near(sweep_law(123.0, 128.0).1, 1000.0));
+        let (lo, hi, _) = sweep_law(0.0, 128.0);
+        assert!(near(lo, 60.0) && near(hi, 20000.0));
+        let (hp, lp, q) = sweep_law(255.0, 128.0);
+        assert!((hp - 1000.0 / 1.401).abs() < 1.0 && (lp - 1401.0).abs() < 1.5 && near(q, 0.7079));
+        assert!(sweep_law(131.0, 128.0).0 < 60.0 && near(sweep_law(140.0, 128.0).2, 0.9142));
+        // LPF / HPF: the cutoffs' ends, the blend over the first steps, the resonance law.
+        assert!(near(inst_fc(false, 0.0), 12000.0) && near(inst_fc(false, 1.0), 93.0) && near(inst_fc(true, 0.0), 61.0) && near(inst_fc(true, 1.0), 8951.0));
+        assert_eq!(inst_law(false, 0.0, 128.0).0, 0.0);
+        assert!(near(inst_law(false, 21.0, 128.0).0, 0.5) && inst_law(false, 100.0, 128.0).0 == 1.0);
+        assert!(inst_law(false, 255.0, 128.0).2 < 1e-4 && near(inst_law(false, 10.0, 255.0).2, 1.44) && near(inst_law(true, 255.0, 255.0).2, 1.44));
+    }
+
+    #[test]
+    fn lpf_and_hpf_for_the_pads() {
+        // Fully turned: the LPF (93 Hz) removes 5 kHz, the HPF (8.95 kHz) removes 200 Hz.
+        assert!(level(LPF, 1.0, 0.5, 5000.0) < -50.0);
+        assert!(level(LPF, 1.0, 0.5, 40.0).abs() < 6.0);
+        assert!(level(HPF, 1.0, 0.5, 200.0) < -50.0);
+        assert_eq!((name(LPF), name(HPF)), ("LPF", "HPF"));
     }
 }

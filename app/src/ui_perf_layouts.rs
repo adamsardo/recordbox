@@ -1453,6 +1453,12 @@ pub(crate) struct Frame {
 }
 
 pub(crate) fn frame_of(l: Layout, area: Rect, extra: f32, mixer_on: bool) -> Frame {
+    frame_with(l, area, extra, mixer_on, 0.0)
+}
+
+/// `mpl_h`: the height of the MIX POINT LINK strip when it stands in for the stacked
+/// waveforms of the horizontal layouts (0: the waveforms).
+pub(crate) fn frame_with(l: Layout, area: Rect, extra: f32, mixer_on: bool, mpl_h: f32) -> Frame {
     let count = l.decks();
     let four = count == 4;
     let (x0, t, wd, cx) = (area.min.x, area.min.y, area.width(), area.center().x);
@@ -1471,7 +1477,7 @@ pub(crate) fn frame_of(l: Layout, area: Rect, extra: f32, mixer_on: bool) -> Fra
         Layout::H2 | Layout::H4 => {
             // Waveforms across the top (142 / 198 pt with their 3 pt gutter), the decks under
             // them at both sides of the mixer (106 / 190 pt wide between 3 pt gutters).
-            let waves_h = if four { 198.0 } else { 142.0 };
+            let waves_h = if mpl_h > 0.0 { mpl_h } else if four { 198.0 } else { 142.0 };
             let deck_h = g.info_h + 3.0 + g.lower_h + extra;
             let mw = if four { 190.0 } else { 106.0 };
             let (dw, d2x) = if mixer_on { ((cx - mw / 2.0 - 3.0 - x0).round(), (cx + mw / 2.0 + 3.0).round()) } else { (((wd - 3.0) / 2.0).floor(), x0 + ((wd - 3.0) / 2.0).floor() + 3.0) };
@@ -1520,7 +1526,27 @@ pub(crate) fn frame_of(l: Layout, area: Rect, extra: f32, mixer_on: bool) -> Fra
 }
 
 pub(crate) fn frame(app: &App, area: Rect) -> Frame {
-    frame_of(layout(app), area, deck_extra(app) + groove_row(app), mixer_shown(app))
+    frame_with(layout(app), area, deck_extra(app) + groove_row(app), mixer_shown(app), mpl_strip(app))
+}
+
+/// Height of the MIX POINT LINK strip (ui_mpl.rs) when it is showing: it takes the place of
+/// the stacked waveforms, so only in the two horizontal layouts.
+pub(crate) fn mpl_strip(app: &App) -> f32 {
+    if matches!(layout(app), Layout::H2 | Layout::H4) {
+        crate::ui_mpl::strip_height(app)
+    } else {
+        0.0
+    }
+}
+
+/// How much taller the player area is while that strip is shown.
+pub(crate) fn mpl_extra(app: &App) -> f32 {
+    let h = mpl_strip(app);
+    if h > 0.0 {
+        h - if app.deck_count() == 4 { 198.0 } else { 142.0 }
+    } else {
+        0.0
+    }
 }
 
 /// Height of the GROOVE CIRCUIT panel under each deck's pads (ui_groove.rs): only in the
@@ -1593,8 +1619,8 @@ pub(crate) fn panel_tile(app: &App, ui: &Ui, i: usize, tr: Rect, lit: bool) {
     let name = ["FX", "mix_point_link", "sampler", "mixer", "rec"][i.min(4)];
     let on = lit && panel_enabled(app, i);
     let file = format!("globalsection/glb_{name}_{}.svg", if on { "ON" } else { "OFF" });
-    // (Mix Point Link is not built: its tile is dim, as rekordbox shows it while unavailable.)
-    let tint = if panel_enabled(app, i) && i != 1 { WHITE } else { Color32::from_white_alpha(90) };
+    // (Mix Point Link's tile is dim while its function is switched off in Preferences.)
+    let tint = if panel_enabled(app, i) && (i != 1 || crate::app_hooks::mpl_available(app)) { WHITE } else { Color32::from_white_alpha(90) };
     let p = ui.painter();
     if skin(p.ctx(), &file).is_some() {
         p.rect_filled(tr.expand(0.5), 0.0, BG1);

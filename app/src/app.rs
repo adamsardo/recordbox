@@ -237,6 +237,8 @@ pub struct Prefs {
     pub rec: crate::ui_rec::RecPrefs,
     /// The pad modes' settings (layout, BEAT JUMP pages, hot cue colour set, slicer, USER pads).
     pub pads: crate::pads::PadsPrefs,
+    /// Automix, MIX POINT LINK and the sampler lists (automix.rs, mpl.rs, sampler_lib.rs).
+    pub mixx: crate::automix::MixPrefs,
     /// The FX panel's choices (rekordbox's FxUnitSettings): modes, effects, beat values,
     /// single-mode snapshots, RELEASE FX and the CFX row.
     pub fx: crate::ui_fx::FxSaved,
@@ -751,6 +753,7 @@ impl Default for Prefs {
             midi: Default::default(),
             rec: Default::default(),
             pads: Default::default(),
+            mixx: Default::default(),
             app_mode: 0,
             edit: Default::default(),
             eq_isolator: false,
@@ -910,6 +913,8 @@ pub enum View {
     /// An outside library (kind 0 iTunes, 1 rekordbox xml): node "" is All Tracks, else the
     /// playlist's key (see `SourceLib::node`). Its tracks are not collection tracks.
     Source { kind: u8, node: String },
+    /// A row of the Sampler tree (sampler_lib.rs): -1 All Samples, -2 Capture, else a list.
+    Sampler(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -926,6 +931,8 @@ pub enum SideMode {
     RekordboxXml,
     /// The Recordings folder (ui_rec.rs).
     Recordings,
+    /// The Sampler tree (PERFORMANCE mode).
+    Sampler,
 }
 
 pub struct Deck {
@@ -1123,6 +1130,8 @@ pub struct App {
     pub rec: crate::ui_rec::RecUi,
     /// The pad modes' state per deck (`pads_ext.rs`).
     pub pads: crate::pads_ext::PadsState,
+    /// Automix, MIX POINT LINK and the sampler lists (automix.rs, mpl.rs, sampler_lib.rs).
+    pub mixx: crate::automix::MixExt,
     /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
     /// (B only in the 2 Players layout).
     pub load_target: u8,
@@ -1272,6 +1281,7 @@ impl App {
             gc: Default::default(),
             rec: Default::default(),
             pads: Default::default(),
+            mixx: Default::default(),
             load_target: 0,
             deck: Deck::default(),
             pool,
@@ -1688,6 +1698,7 @@ impl App {
             }
             // PREPDECK_SHOT_PLAYER=…: player layouts and states (player_ext.rs).
             app.shot_player_setup();
+            crate::mix_selftest::shot_setup(&mut app);
         }
         app
     }
@@ -1878,6 +1889,7 @@ impl App {
                 None => vec![],
             },
             View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. } => vec![],
+            View::Sampler(_) => vec![],
             View::History(id) => self.db.history_tracks(*id).unwrap_or_default().into_iter().filter(|t| self.index.contains_key(t)).collect(),
             View::TagList => self.ext.tag_list.iter().copied().filter(|t| self.index.contains_key(t)).collect(),
             View::Matching => self.related_source().map(|s| self.matching_of(s)).unwrap_or_default(),

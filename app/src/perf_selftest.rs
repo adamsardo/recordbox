@@ -202,29 +202,7 @@ impl App {
         // and snapshot, back to multi mode, CFX multi mode.
         let fxt = std::env::var("PREPDECK_SHOT_VIEW").map(|v| v.split(',').any(|x| x.trim() == "perffx2")).unwrap_or(false);
         let steps = if fxt {
-            let (y1, y2, cy) = (28.0 + 14.0, 28.0 + 37.5, 28.0 + 66.0);
-            let p = |x: f32, y: f32| (pos2(x, y), pos2(x, y));
-            let st = |n: &'static str, (a, b): (egui::Pos2, egui::Pos2)| (n, a, b);
-            vec![
-                st("FX1 assign deck 1", p(85.0, y1)),
-                st("FX1 single mode", p(169.0, y2)),
-                st("FX1 single effect on (DELAY)", p(233.0, y1)),
-                ("FX1 single knob 1 up", pos2(318.0, y2), pos2(318.0, y2 - 30.0)),
-                st("FX1 single button 1 (LOW CUT)", p(471.0, y1)),
-                st("FX1 single beat up", p(285.0, y2)),
-                st("FX1 snapshot", p(516.0, y1)),
-                st("FX1 multi mode", p(169.0, y1 + 4.0)),
-                st("FX1 slot 3 (SPIRAL) on", p(193.0 + 222.0 + 40.0, y1)),
-                st("FX1 slot 3 beat down", p(454.0, y2)),
-                st("FX2 single mode", p(756.0 + 169.0, y2)),
-                st("CFX multi mode", p(92.0, cy)),
-                st("CFX multi: deck 1's effect off", p(660.0, cy)),
-                st("CFX multi: deck 1's effect on", p(660.0, cy)),
-                ("CFX multi: deck 1's COLOR to the right", pos2(748.0, cy), pos2(748.0, cy - 40.0)),
-                st("CFX single mode", p(116.0, cy)),
-                st("CFX multi mode again (deck 1 keeps its COLOR)", p(92.0, cy)),
-                st("FX1 single mode again (snapshot kept)", p(169.0, y2)),
-            ]
+            crate::ui_fx::selftest_steps(self)
         } else {
             steps
         };
@@ -308,6 +286,10 @@ impl App {
             }
             return;
         }
+        if name.starts_with("FXCALL:") {
+            crate::ui_fx::selftest_call(self, name, f, raw);
+            return;
+        }
         if name.starts_with("CALL:seqload") {
             if f == 3 && !name.contains("check") {
                 self.sampler_sequence_load(1);
@@ -345,6 +327,7 @@ impl App {
                 raw.events.push(button(a, true));
                 raw.events.push(button(a, false));
             }
+            10 if fxt && name.contains("held") => eprintln!("perftest: {name} (while held): {}", crate::ui_fx::selftest_state(self)),
             10 if smp && name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state_sampler()),
             10 if name.contains("held") => eprintln!("perftest: {name} (while held): {} | {}", self.perf_state(), crate::deck::state_line(self, 0)),
             4..=11 => {
@@ -358,7 +341,7 @@ impl App {
                     raw.events.push(button(b, false));
                 }
             }
-            30 if fxt => eprintln!("perftest: {name}: {}", self.perf_state_fx()),
+            30 if fxt => eprintln!("perftest: {name}: {} || {}", self.perf_state_fx(), crate::ui_fx::selftest_state(self)),
             // The loop is left running for a while before its state is read.
             30 if smp => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
             30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),

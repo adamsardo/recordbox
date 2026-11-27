@@ -57,11 +57,22 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     // The sampler panel, when shown, is the last row, under the mixer's bottom row.
     let sampler_h = if app.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 };
     app.sampler_poll();
+    // MIX POINT LINK: its strip takes the place of the stacked waveforms (horizontal layouts).
+    let mpl_h = lay::mpl_strip(app);
     let count = app.deck_count();
     let fr = lay::frame(app, Rect::from_min_max(pos2(l, t), pos2(full.max.x, full.max.y - sampler_h)));
 
     // ---- the enlarged waveforms, one lane per deck, and the control strip over their left end
-    let lanes = lay::waves_h(app, ui, &fr);
+    let lanes = if mpl_h > 0.0 {
+        crate::ui_mpl::strip(app, ui, Rect::from_min_size(pos2(l, t), vec2(full.width(), mpl_h)));
+        Vec::new()
+    } else {
+        let lanes = lay::waves_h(app, ui, &fr);
+        if !lay::layout(app).vertical() {
+            crate::ui_mpl::after_waves(app, ui);
+        }
+        lanes
+    };
 
     // ---- decks
     let mut rects = [Rect::NOTHING; 4];
@@ -349,6 +360,10 @@ pub(crate) fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
                 }
             }
         }
+    } else if mode == crate::ui_padfx::PAD_FX {
+        let (sy, sh) = if c4 { (81.0, 15.0) } else { (91.5, 17.0) };
+        let strip = Rect::from_min_max(pos2(r.min.x + if n % 2 == 0 { 76.0 } else { 0.0 }, r.min.y + sy), pos2(r.max.x - if n % 2 == 0 { 0.0 } else { 76.0 }, r.min.y + sy + sh));
+        crate::ui_padfx::pads(app, ui, n, &pad, strip);
     } else if mode == PAD_SAMPLER {
         // SAMPLER: the pads play the slots of the sampler's bank (1-8; the second page 9-16),
         // in the slot's colour with its sample's name. They follow the sequencer's MUTE /
@@ -503,6 +518,7 @@ pub(crate) fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
         3 => "BEAT LOOP",
         PAD_SAMPLER => "SAMPLER",
         PAD_SEQ_CALL => "SEQ. CALL",
+        crate::ui_padfx::PAD_FX => "PAD FX",
         _ => "HOT CUE",
     };
     // (The pull-down is as wide as its label: 58.5 pt for STEMS, 68 pt for HOT CUE.)
@@ -532,7 +548,11 @@ pub(crate) fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
             app.px.pad_mode[n as usize] = PAD_SEQ_CALL;
             ui.memory_mut(|m| m.close_popup());
         }
-        for name in ["PAD FX", "SLICER", "KEYBOARD", "KEY SHIFT", "ACT. CENSR", "MEMORY CUE"] {
+        if ui.selectable_label(mode == crate::ui_padfx::PAD_FX, "PAD FX").clicked() {
+            app.px.pad_mode[n as usize] = crate::ui_padfx::PAD_FX;
+            ui.memory_mut(|m| m.close_popup());
+        }
+        for name in ["SLICER", "KEYBOARD", "KEY SHIFT", "ACT. CENSR", "MEMORY CUE"] {
             ui.add_enabled(false, egui::SelectableLabel::new(false, name)).on_disabled_hover_text("Not built in recordbox yet.");
         }
         // (In rekordbox SAMPLER is a pad mode of the controllers only; recordbox has no
@@ -546,7 +566,7 @@ pub(crate) fn pads(app: &mut App, ui: &mut Ui, r: Rect, n: u8, c4: bool) {
     // The second page (HOT CUE: I-P; BEAT JUMP and BEAT LOOP: their second page): rekordbox
     // scrolls the pads, with a 3 pt bar under them (beside them in 2Deck Vertical) whose
     // handle covers the half showing. A click on the bar's other half, or a drag, changes it.
-    if mode != 1 && mode != PAD_SEQ_CALL {
+    if mode != 1 && mode != PAD_SEQ_CALL && mode != crate::ui_padfx::PAD_FX {
         let (track, thumb) = pg.scroll_bar(page);
         let resp = ui.interact(track.expand(3.0), ui.id().with("padpage"), Sense::click_and_drag());
         if pg.cols == 2 {

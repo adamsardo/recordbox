@@ -63,12 +63,17 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
     if app.prefs.groove.enable {
         tiles.push((5, "GROOVE CIRCUIT", true));
     }
-    tiles.extend([(1, "Mix Point Link", crate::app_hooks::mpl_available()), (2, "Sampler", true), (3, "Mixer", true), (4, "Rec", true)]);
+    tiles.extend([(1, "Mix Point Link", crate::app_hooks::mpl_available(app)), (2, "Sampler", true), (3, "Mixer", true), (4, "Rec", true)]);
     let mut last_right = r.min.x + 195.0;
     for (i, (kind, name, built)) in tiles.iter().enumerate() {
         let tr = Rect::from_min_size(pos2(r.min.x + 195.0 + 37.0 * i as f32, r.min.y + 4.0), vec2(20.0, 20.0));
         last_right = tr.max.x;
         let resp = ui.interact(tr, ui.id().with(("panel", *kind)), Sense::click());
+        if *kind == 1 {
+            // (Where the scripted Mix Point Link run finds the panel button.)
+            app.mixx.mpl.ui.rects.retain(|x| x.0 != "panel");
+            app.mixx.mpl.ui.rects.push(("panel".into(), tr));
+        }
         let lit = match kind {
             0 => app.prefs.perf_fx,
             1 => crate::app_hooks::mpl_shown(app),
@@ -559,6 +564,7 @@ pub fn browser(app: &mut App, ui: &mut Ui) {
             }
         }
     }
+    let list = crate::ui_automix::pane(app, ui, list);
     let mut lui = ui.new_child(egui::UiBuilder::new().max_rect(list));
     lui.set_clip_rect(list.intersect(ui.clip_rect()));
     list_for_view(app, &mut lui);
@@ -619,6 +625,7 @@ pub(crate) fn list_for_view(app: &mut App, lui: &mut Ui) {
         View::Explorer(dir) if crate::ui_rec::owns(app, &dir) => crate::ui_rec::list(app, lui, &dir),
         View::Explorer(dir) => explorer_list(app, lui, &dir),
         View::Source { kind, node } => crate::ui_library_ext::source_list(app, lui, kind, &node),
+        View::Sampler(id) => crate::ui_sampler_lib::list(app, lui, id),
         _ => track_list(app, lui),
     }
 }
@@ -640,11 +647,12 @@ enum Tile {
 /// the selection colour, a 21 pt band behind it and a 2 pt bar at the window edge.
 fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
     use crate::icons_src as src;
-    let items: [(src::SrcIcon, Tile, &str); 12] = [
+    let items: [(src::SrcIcon, Tile, &str); 13] = [
         (src::collection, Tile::Side(SideMode::Collection), "Collection"),
         (src::playlist, Tile::Side(SideMode::Playlists), "Playlists"),
         (src::related, Tile::Side(SideMode::Related), "Related Tracks"),
         (src::matching, Tile::Suggest, "Track Suggestion"),
+        (crate::ui_sampler_lib::tile_icon, Tile::Side(SideMode::Sampler), "Sampler"),
         (src::tag_list, Tile::TagList, "Tag List"),
         (src::hot_cue_bank, Tile::HotCueBank, "Hot Cue Bank List"),
         (src::itunes, Tile::Side(SideMode::Itunes), "iTunes"),
@@ -657,7 +665,7 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
     // The highlight is bright while the tree side was clicked last (reference 04) and muted
     // while the track list was, or nothing yet (references 01 and 02).
     let hi = if app.ext.tree_focus { TILE_ON } else { ROW_SEL };
-    for (i, (draw, tile, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2)).collect::<Vec<_>>().into_iter().enumerate() {
+    for (i, (draw, tile, name)) in items.iter().filter(|it| app.prefs.tree_item(it.2) && crate::ui_sampler_lib::tile_shown(app, it.2)).collect::<Vec<_>>().into_iter().enumerate() {
         let c = pos2(r.min.x + 16.0, r.min.y + 34.0 + i as f32 * 20.0);
         let rr = Rect::from_center_size(c, vec2(18.0, 18.0));
         let on = match tile {
@@ -717,6 +725,7 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
                         SideMode::RekordboxXml => app.set_view(View::Source { kind: crate::library_ext::SRC_RBXML, node: String::new() }),
                         SideMode::Recordings => app.set_view(View::Explorer(crate::ui_rec::rec_dir(&app.prefs.rec).to_string_lossy().to_string())),
                         SideMode::Playlists | SideMode::Suggest => {}
+                        SideMode::Sampler => crate::ui_sampler_lib::open(app),
                     }
                 }
             }
@@ -746,7 +755,8 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
         (src::info, "Display information window."),
         (src::sub_browser, "Display sub-browser window."),
     ];
-    let y0 = (50.0 + (r.height() - 298.0) * 0.4548).round().max(30.0);
+    // rekordbox's own rule (`LowerContainer::resized`): half the height (164 at least) less 114.
+    let y0 = (r.height() / 2.0).max(164.0).floor() - 114.0;
     let now = crate::ui_browser_ext::right_panel(app);
     for (i, (draw, tipt)) in items.iter().enumerate() {
         let rr = Rect::from_center_size(pos2(r.min.x + 12.0, r.min.y + y0 + 34.0 * i as f32), vec2(18.0, 18.0));
@@ -772,6 +782,7 @@ fn right_icons(app: &mut App, ui: &mut Ui, r: Rect) {
             crate::ui_browser_ext::set_right_panel(app, if on { 0 } else { i as u8 + 1 });
         }
     }
+    crate::ui_automix::strip_tile(app, ui, r, y0);
 }
 
 /// Kind of glyph drawn before a tree row's text.
@@ -1004,6 +1015,7 @@ pub(crate) fn tree_pane(app: &mut App, ui: &mut Ui, drop: &mut Vec<(Rect, i64)>)
         SideMode::RekordboxXml => crate::ui_library_ext::source_tree(app, ui, crate::library_ext::SRC_RBXML),
         SideMode::Explorer => explorer_tree(app, ui),
         SideMode::Recordings => crate::ui_rec::tree(app, ui),
+        SideMode::Sampler => crate::ui_sampler_lib::tree(app, ui, drop),
     }
 }
 
@@ -1595,6 +1607,7 @@ pub fn view_title(app: &App) -> String {
         View::Device { .. } | View::DeviceHistory { .. } | View::Explorer(_) | View::Source { .. } => String::new(),
         View::History(id) => app.ext.histories.iter().find(|h| h.id == *id).map(|h| h.name.clone()).unwrap_or_else(|| "Histories".into()),
         View::TagList => "Tag List".into(),
+        View::Sampler(_) => String::new(),
         View::Matching => format!("Matching — {}", app.related_source().and_then(|id| app.track(id)).map(|t| t.display_title()).unwrap_or_else(|| "load or select a track".into())),
         View::Suggest(k) => format!("{} — {}", if *k == 0 { "Track Suggestion" } else { crate::browser_ext::SUGGEST_KINDS[(*k as usize).min(3)] }, app.related_source().and_then(|id| app.track(id)).map(|t| t.display_title()).unwrap_or_else(|| "load or select a track".into())),
         View::Related => format!("Related Tracks — {}", app.related_source().and_then(|id| app.track(id)).map(|t| t.display_title()).unwrap_or_else(|| "load or select a track".into())),
