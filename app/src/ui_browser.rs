@@ -81,18 +81,22 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
         }
     });
     // Panel buttons. Only the mixer exists; the others are shown unlit with the reason.
-    for (i, (name, built)) in [("FX", true), ("Sampler", true), ("Groove Circuit", false), ("Mixer", true), ("Rec", false)].iter().enumerate() {
+    for (i, (name, built)) in [("FX", true), ("Sampler", true), ("GROOVE CIRCUIT", true), ("Mixer", true), ("Rec", false)].iter().enumerate() {
         let tr = Rect::from_min_size(pos2(r.min.x + 195.0 + 37.0 * i as f32, r.min.y + 4.0), vec2(20.0, 20.0));
         let resp = ui.interact(tr, ui.id().with(("panel", i)), Sense::click());
         // The FX button shows and hides the FX panel; the mixer is always shown so far.
         let lit = match i {
             0 => app.prefs.perf_fx,
             1 => app.prefs.perf_sampler,
+            2 => app.groove_visible(),
             _ => *built,
         };
         if i == 1 && resp.clicked() {
             app.prefs.perf_sampler = !app.prefs.perf_sampler;
             app.save_prefs();
+        }
+        if i == 2 && resp.clicked() {
+            crate::ui_groove::toggle_panel(app);
         }
         if i == 0 && resp.clicked() {
             app.prefs.perf_fx = !app.prefs.perf_fx;
@@ -110,13 +114,7 @@ fn performance_header(app: &mut App, ui: &mut Ui, r: Rect) {
                     p.rect_filled(Rect::from_center_size(pos2(c.x - 6.0 + 3.0 * k as f32, c.y), vec2(1.5, *h)), 0.0, col);
                 }
             }
-            2 => {
-                for gx in 0..3 {
-                    for gy in 0..3 {
-                        p.rect_filled(Rect::from_center_size(c + vec2((gx as f32 - 1.0) * 4.5, (gy as f32 - 1.0) * 4.5), vec2(3.5, 3.5)), 0.0, col);
-                    }
-                }
-            }
+            2 => crate::ui_groove::header_icon(app, ui, tr, lit),
             3 => {
                 for (k, y) in [2.5, -3.0, 1.0].iter().enumerate() {
                     let x = c.x - 5.0 + 5.0 * k as f32;
@@ -1142,70 +1140,7 @@ fn node_rows(app: &mut App, ui: &mut Ui, parent: i64, depth: usize, drop: &mut V
             }
         }
         let nn = n.clone();
-        resp.context_menu(|ui| {
-            let parent_for_new = if nn.kind == NodeKind::Folder { nn.id } else { nn.parent };
-            if ui.button("Create New Playlist").clicked() {
-                app.create_node(parent_for_new, NodeKind::Playlist);
-                ui.close_menu();
-            }
-            if ui.button("Create New Intelligent Playlist").clicked() {
-                app.create_node(parent_for_new, NodeKind::Smart);
-                ui.close_menu();
-            }
-            if ui.button("Create New Folder").clicked() {
-                app.create_node(parent_for_new, NodeKind::Folder);
-                ui.close_menu();
-            }
-            ui.separator();
-            if nn.kind == NodeKind::Smart && ui.button("Edit the Intelligent Playlist").clicked() {
-                app.dialogs.smart_edit = Some((Some(nn.id), nn.parent, nn.name.clone(), nn.smart.clone().unwrap_or_default()));
-                ui.close_menu();
-            }
-            if nn.kind == NodeKind::Smart && ui.button("Convert to a normal playlist").clicked() {
-                let tracks = nn.smart.as_ref().map(|r| app.smart_tracks(r)).unwrap_or_default();
-                let id = app.db.create_node(nn.parent, &format!("{} (copy)", nn.name), NodeKind::Playlist, None).unwrap_or(0);
-                let _ = app.db.set_playlist_tracks(id, &tracks);
-                app.reload_playlists();
-                ui.close_menu();
-            }
-            let what = if nn.kind == NodeKind::Folder { "Folder" } else { "Playlist" };
-            if ui.button(format!("Rename {what}")).clicked() {
-                app.dialogs.rename = Some((nn.id, nn.name.clone()));
-                ui.close_menu();
-            }
-            if nn.kind == NodeKind::Playlist && ui.button("Sort Items by Track Title").clicked() {
-                let mut v = app.db.playlist_tracks(nn.id).unwrap_or_default();
-                v.sort_by_key(|t| app.track(*t).map(|t| crate::smart::fold(&t.display_title())).unwrap_or_default());
-                let _ = app.db.set_playlist_tracks(nn.id, &v);
-                app.reload_playlists();
-                ui.close_menu();
-            }
-            if ui.button(format!("Export {what}")).clicked() {
-                open_export(app, vec![nn.id], vec![]);
-                ui.close_menu();
-            }
-            crate::ui_library_ext::node_menu_extra(app, ui, &nn);
-            if ui.button("Move to top level").clicked() {
-                let _ = app.db.move_node(nn.id, 0, 0);
-                app.reload_playlists();
-                ui.close_menu();
-            }
-            ui.menu_button("Move into folder", |ui| {
-                let folders: Vec<PlaylistNode> = app.nodes.iter().filter(|f| f.kind == NodeKind::Folder && f.id != nn.id).cloned().collect();
-                for f in folders {
-                    if ui.button(&f.name).clicked() {
-                        let _ = app.db.move_node(nn.id, f.id, 0);
-                        app.reload_playlists();
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.separator();
-            if ui.button(format!("Delete {what}")).clicked() {
-                app.dialogs.confirm_delete_node = Some((nn.id, nn.name.clone(), nn.kind == NodeKind::Folder));
-                ui.close_menu();
-            }
-        });
+        resp.context_menu(|ui| crate::ui_library_ext::node_menu(app, ui, &nn));
         if n.kind == NodeKind::Folder && open {
             node_rows(app, ui, n.id, depth + 1, drop);
         }

@@ -10,6 +10,8 @@ mod brand;
 mod cfx;
 mod browser_ext;
 mod db;
+mod cue_tools;
+mod deck;
 mod demo;
 mod dupes;
 mod device_ext;
@@ -25,6 +27,8 @@ mod key;
 mod library_ext;
 mod menus;
 mod mixer;
+mod groove;
+mod ui_groove;
 mod perf_selftest;
 mod sampler;
 mod sampler_ext;
@@ -83,6 +87,7 @@ impl eframe::App for Gui {
                 }
             }
         }
+        ui_groove::frame_hook(&mut self.app, raw);
         let Some((_, frame)) = self.app.screenshot.clone() else { return };
         self.app.shot_player_events(frame, raw);
         self.app.shot_perf_events(frame, raw);
@@ -197,6 +202,7 @@ impl eframe::App for Gui {
         });
         step!(ui_dialogs::dialogs(app, ctx));
         step!(dupes::windows(app, ctx));
+        step!(cue_tools::windows(app, ctx));
 
         if app.analysis_total > 0 || app.importing.is_some() || app.export_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));

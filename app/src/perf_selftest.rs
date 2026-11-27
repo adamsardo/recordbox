@@ -52,6 +52,28 @@ impl App {
             ("quick click on channel fader 2, half way", pos2(782.0, my + 194.5), pos2(782.0, my + 194.5)),
             ("quick click on the crossfader, a quarter in", pos2(733.5, by + 21.5), pos2(733.5, by + 21.5)),
             ("quick click on master volume, half way", pos2(1512.0 - 87.5, 14.0), pos2(1512.0 - 87.5, 14.0)),
+            // The deck engine (`deck.rs`): the platter dragged a quarter turn (a scratch), then
+            // its rules called as a controller would, on the playing deck 1.
+            ("platter drag scratch held", o + egui::vec2(105.0 + 49.0, 65.0), o + egui::vec2(105.0, 65.0 + 49.0)),
+            ("DECK:reverse|reverse on", o, o),
+            ("DECK:reverse|reverse off", o, o),
+            ("DECK:slipreverse|slip reverse on", o, o),
+            ("DECK:reverseoff|slip reverse off (back to where the track would be)", o, o),
+            ("DECK:syncrate|sync rate button", o, o),
+            ("DECK:loop4|4-beat loop", o, o),
+            ("DECK:loopmove|loop move forward", o, o),
+            ("DECK:loophalve|loop halve", o, o),
+            ("DECK:loopexit|loop exit", o, o),
+            ("DECK:scan|FF held", o, o),
+            ("DECK:scanoff|FF released", o, o),
+            ("DECK:needle|needle search at 50 % while playing (Needle Lock)", o, o),
+            ("DECK:touch|platter touched", o, o),
+            ("DECK:release|platter let go", o, o),
+            ("DECK:cup|CUP (back to the cue and play)", o, o),
+            ("DECK:cuedown|CUE on the playing deck (back to the cue, standby)", o, o),
+            ("DECK:cuedown|CUE held at the cue (cue sampler)", o, o),
+            ("DECK:play|PLAY while CUE is held (back-cue: plays on)", o, o),
+            ("DECK:cueup|CUE let go (still playing)", o, o),
             ("PLAY/PAUSE deck 1 (pause)", o + egui::vec2(20.0, 102.0), o + egui::vec2(20.0, 102.0)),
         ];
         let _ = d2;
@@ -275,6 +297,17 @@ impl App {
             }
             return;
         }
+        if let Some(rest) = name.strip_prefix("DECK:") {
+            let what = rest.split('|').next().unwrap_or("");
+            // (A held FF button is sent every frame, as the on-screen one does.)
+            if f == 3 || (what == "scan" && (3..=30).contains(&f)) {
+                self.with_deck(0, |a| crate::deck::selftest_call(a, what));
+            }
+            if f == 30 {
+                eprintln!("perftest: {name}: {}", crate::deck::state_line(self, 0));
+            }
+            return;
+        }
         if name.starts_with("CALL:seqload") {
             if f == 3 && !name.contains("check") {
                 self.sampler_sequence_load(1);
@@ -313,7 +346,7 @@ impl App {
                 raw.events.push(button(a, false));
             }
             10 if smp && name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state_sampler()),
-            10 if name.contains("held") => eprintln!("perftest: {name} (while held): {}", self.perf_state()),
+            10 if name.contains("held") => eprintln!("perftest: {name} (while held): {} | {}", self.perf_state(), crate::deck::state_line(self, 0)),
             4..=11 => {
                 if a != b {
                     let k = (f - 3) as f32 / 8.0;
@@ -329,7 +362,7 @@ impl App {
             // The loop is left running for a while before its state is read.
             30 if smp => eprintln!("perftest: {name}: {}", self.perf_state_sampler()),
             30 if four => eprintln!("perftest: {name}: {}", self.perf_state4()),
-            30 => eprintln!("perftest: {name}: {}", self.perf_state()),
+            30 => eprintln!("perftest: {name}: {} | {}", self.perf_state(), crate::deck::state_line(self, 0)),
             _ => {}
         }
     }

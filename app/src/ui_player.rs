@@ -456,6 +456,10 @@ pub(crate) fn draw_overview(app: &mut App, ui: &mut Ui, r: Rect, pos: f64) {
     let resp = ui.interact(r.expand2(vec2(0.0, 4.0)), ui.id().with("overview"), Sense::click_and_drag());
     if (resp.clicked() || resp.dragged()) && app.deck.audio.is_some() {
         if let Some(pp) = resp.interact_pointer_pos() {
+            // Performance: needle search by rekordbox's rules (Needle Lock, 400 steps).
+            if app.needle_search(((pp.x - r.min.x) / r.width()) as f64) {
+                return;
+            }
             let t = ((pp.x - r.min.x) / r.width()).clamp(0.0, 1.0) as f64 * dur;
             app.seek(t);
             if !app.playing() {

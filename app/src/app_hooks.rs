@@ -51,3 +51,15 @@ pub fn pack_import_available(_id: &str) -> bool {
 }
 
 pub fn pack_import(_app: &mut App, _id: &str) {}
+
+/// Playlist menu (PERFORMANCE) > Select as Automix playlist.
+pub fn automix_select_playlist(_app: &mut App, _playlist: i64) {}
+
+/// Playlist menu (PERFORMANCE) > Load the top 16 tracks into the current sampler bank: the
+/// playlist's first sixteen tracks go to slots 1..16 of the bank that is showing.
+pub fn playlist_to_sampler_bank(app: &mut App, playlist: i64) {
+    let tracks: Vec<i64> = app.db.playlist_tracks(playlist).unwrap_or_default().into_iter().take(16).collect();
+    for (slot, id) in tracks.into_iter().enumerate() {
+        app.sampler_load(slot, id);
+    }
+}

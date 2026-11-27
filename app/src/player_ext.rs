@@ -58,6 +58,8 @@ pub struct DeckExt {
     /// Performance: how many steps the platter's tempo range is past its default of ±10
     /// (0 = ±10, 1 = ±16, 2 = WIDE, 3 = ±6).
     pub tempo_range: u8,
+    /// The deck engine's state for the interface (`deck.rs`): reverse, jog, sync rate.
+    pub dk: crate::deck::DeckUi,
 }
 
 impl DeckExt {
@@ -69,7 +71,7 @@ impl DeckExt {
     }
 
     pub fn carried(&self) -> DeckExt {
-        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, tempo_range: self.tempo_range, slip: self.slip, pad_page: self.pad_page, ..Default::default() }
+        DeckExt { master_tempo: self.master_tempo, beat_sync: self.beat_sync, key_sync: self.key_sync, eq_kill: self.eq_kill, tempo_range: self.tempo_range, slip: self.slip, pad_page: self.pad_page, dk: crate::deck::DeckUi { again: self.dk.again, ..Default::default() }, ..Default::default() }
     }
 }
 
@@ -448,7 +450,7 @@ impl App {
         // 4Deck Horizontal: 576 + 43, and the per-deck rows count twice (two rows of decks).
         let rows = if self.prefs.perf_four { 2.0 } else { 1.0 };
         let base = if self.prefs.perf_four { 576.0 } else { 368.0 };
-        base + 43.0 + if self.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 } + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + rows * (if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 })
+        base + 43.0 + self.groove_extra_height() + if self.prefs.perf_sampler { crate::ui_sampler::SAMPLER_H } else { 0.0 } + if self.prefs.perf_fx { crate::ui_fx::FX_H } else { 0.0 } + rows * (if self.prefs.show_stems { 21.0 } else { 0.0 } + if self.prefs.show_phrase_bar { crate::ui_perf::PHRASE_ROW } else { 0.0 })
     }
 
     /// How many decks exist in the layout showing: 4 (Performance, 4Deck), 2 or 1.
@@ -512,9 +514,10 @@ impl App {
     /// Instant Doubles (Preferences > Controller > Deck > Load): the track just loaded is also
     /// on the other deck, so this deck takes over its position, tempo and play state.
     pub fn instant_double(&mut self) {
-        if !(self.performance() && self.prefs.instant_doubles) || self.deck.track.is_none() {
+        if !(self.performance() && (self.prefs.instant_doubles || self.deck.x.dk.double_pending)) || self.deck.track.is_none() {
             return;
         }
+        self.deck.x.dk.double_pending = false;
         // The first other deck (1, 2, 3, 4 in that order) that has the same track.
         let Some(src) = (0..self.deck_count()).find(|n| *n != self.px.active && self.deck_of(*n).track == self.deck.track) else { return };
         let (pos, playing, rate) = {
@@ -648,6 +651,7 @@ impl App {
             o.volume = v;
             o.muted = self.px.muted;
         }
+        self.master_handover();
         self.push_deck_controls();
         crate::ui_fx::sync(self);
     }
@@ -764,6 +768,9 @@ impl App {
                 s.grid = g;
             }
         }
+        // The deck engine's own rules on top: sync rate and range, vinyl ramps, crossfader
+        // curve and assign, Headroom, EQ type.
+        self.push_deck_engine(infos.map(|i| i.1), master_bpm);
     }
 
     // ------------------------------------------------------------------ tempo, sync and key
@@ -797,8 +804,14 @@ impl App {
     /// RST: back to the track's own tempo.
     pub fn tempo_reset(&mut self) {
         if self.sync_follower() {
-            self.toast_err("Invalid operation. In Sync mode, Tempo Reset is only available for Master Deck.");
-            return;
+            // Performance, as rekordbox's `requestTempoReset`: a follower leaves SYNC and
+            // goes back to its own tempo.
+            if !self.performance() {
+                self.toast_err("Invalid operation. In Sync mode, Tempo Reset is only available for Master Deck.");
+                return;
+            }
+            self.deck.x.beat_sync = false;
+            self.prefs.deck.player_sync[(self.px.active as usize).min(3)] = false;
         }
         self.deck.x.tempo_adj = 0.0;
         self.push_deck_controls();
@@ -868,6 +881,11 @@ impl App {
             }
         }
         self.deck.x.beat_sync = on;
+        // (A new SYNC starts on rekordbox's own rate and on the beat again.)
+        self.deck.x.dk.sync_rate = None;
+        self.deck.x.dk.beat_lost = false;
+        self.deck.x.dk.out_of_range = false;
+        self.prefs.deck.player_sync[(self.px.active as usize).min(3)] = on;
         self.push_deck_controls();
         if on {
             self.sync_align();

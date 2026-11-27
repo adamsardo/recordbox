@@ -81,7 +81,7 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
     zoom_column(app, ui, pos2(l, t), waves_h);
 
     // ---- decks
-    let deck_h = if four { 189.0 + stems_row + phrase_h } else { deck_bottom - (t + waves_h) };
+    let deck_h = if four { 189.0 + stems_row + phrase_h + app.groove_row_height() } else { deck_bottom - (t + waves_h) };
     let mut rects = [Rect::NOTHING; 4];
     for n in 0..count {
         let right = n % 2 == 1;
@@ -96,6 +96,8 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
         app.with_deck(n, |app| deck(app, &mut child, dr, n, is_active, stems_row, four));
         app.with_deck(n, |app| crate::ui_player2::drop_to_load(app, ui, dr));
     }
+
+    crate::ui_groove::row(app, ui, &rects[..count as usize]);
 
     // ---- mixer
     let mr = Rect::from_min_max(pos2(mixer_x, t + waves_h), pos2(mixer_x + mixer_w, deck_bottom));
@@ -125,6 +127,9 @@ pub fn performance(app: &mut App, ui: &mut Ui) {
 fn zoom_column(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) {
     let p = ui.painter().clone();
     p.rect_filled(Rect::from_min_size(o, vec2(28.0, waves_h)), 0.0, BG);
+    if crate::ui_groove::wave_column(app, ui, o, waves_h) {
+        return;
+    }
     let o = pos2(o.x, o.y + (waves_h - WAVES_H) / 2.0);
     let tile = |y: f32| Rect::from_center_size(pos2(o.x + 10.6, o.y + y), vec2(18.0, 18.0));
     let zin = ui.interact(tile(45.0), ui.id().with("pzin"), Sense::click());
@@ -245,7 +250,8 @@ fn deck(app: &mut App, ui: &mut Ui, r: Rect, n: u8, is_active: bool, stems_row: 
     let bsr = if c4 { Rect::from_min_size(pos2(rx - 76.0, y0 + 4.5), vec2(41.0, 19.5)) } else { Rect::from_min_size(pos2(rx - 79.0, y0 + 8.5), vec2(44.0, 20.0)) };
     let bresp = ui.interact(bsr, ui.id().with("beatsync"), Sense::click());
     p.rect_filled(bsr, 2.0, if bs { BLUE } else if bresp.hovered() { lighten(BTN) } else { BTN });
-    p.text(pos2(bsr.center().x, bsr.min.y + 5.5), Align2::CENTER_CENTER, "BEAT", caps(8.0), WHITE);
+    p.text(pos2(bsr.center().x, bsr.min.y + 5.5), Align2::CENTER_CENTER, if app.prefs.deck.beat_sync { "BEAT" } else { "BPM" }, caps(8.0), WHITE);
+    crate::deck::sync_rate_hook(app, ui, n, bsr);
     p.text(pos2(bsr.center().x, bsr.min.y + 14.5), Align2::CENTER_CENTER, "SYNC", caps(8.0), WHITE);
     if tip(bresp, app, "BEAT SYNC").clicked() {
         app.toggle_beat_sync();
@@ -693,6 +699,8 @@ fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_active: bool, c4
         let m = c + vec2(a.cos(), a.sin()) * (0.968 * d / 2.0);
         p.circle_filled(m, 3.2, hex(0xE61E1E));
     }
+    // (The jog: touch, scratch, drag to another deck, the hot cue countdown; `deck.rs`.)
+    crate::deck::platter_hook(app, ui, n, c, d / 2.0);
     let plat = ui.interact(Rect::from_center_size(c, vec2(84.0 * sc, 84.0 * sc)), ui.id().with("platter"), Sense::hover());
     let bpm = if loaded { app.effective_bpm() } else { 0.0 };
     let tcol = if loaded { hex(0xE0E0E0) } else { hex(0x3C3C3C) };
@@ -758,8 +766,7 @@ fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_active: bool, c4
     }
     let q = app.prefs.quantize;
     if tip(flat(ui, at(col_x, ys[1], 30.0, 18.0), "quant", "Q", 8.5, if q { BLUE } else { BTN }, WHITE), app, "Quantize").clicked() {
-        app.prefs.quantize = !q;
-        app.save_prefs();
+        app.toggle_quantize();
     }
     let mt = app.deck.x.master_tempo;
     if tip(flat(ui, at(col_x, ys[2], 30.0, 18.0), "mt", "MT", 8.5, if mt { BLUE } else { PANEL }, WHITE), app, "Master Tempo").clicked() {
@@ -832,6 +839,7 @@ fn mixer(app: &mut App, ui: &mut Ui, r: Rect) {
         lab(&p, 32.5, "TRIM", WHITE);
         let tdb = crate::mixer::trim_db(m.trim);
         let _ = tl.on_hover_text(if tdb.is_finite() { format!("{tdb:+.1}dB") } else { "-inf dB".to_string() });
+        crate::deck::again_hook(app, ui, n as u8, pos2(cx, y0 + 18.5), pos2(cx, y0 + 32.5));
         // HIGH / MID / LOW, or the parts in STEM ISO mode. A click on a label sets it to 0
         // (and back to the centre).
         let iso = m.stem_iso_on && stems;
@@ -930,6 +938,7 @@ fn mixer4(app: &mut App, ui: &mut Ui, r: Rect) {
         p.text(pos2(cx, y0 + 55.0), Align2::CENTER_CENTER, "TRIM", caps(8.0), WHITE);
         let tdb = crate::mixer::trim_db(m.trim);
         let _ = tl.on_hover_text(if tdb.is_finite() { format!("{tdb:+.1}dB") } else { "-inf dB".to_string() });
+        crate::deck::again_hook(app, ui, n as u8, pos2(cx, y0 + 40.0), pos2(cx, y0 + 55.0));
         let iso = m.stem_iso_on && stems;
         let names: [(&str, usize); 3] = if iso { [("VOCAL", 2), (if app.prefs.stem_parts == 3 { "INST" } else { "INST/BA." }, 1), ("DRUMS", 0)] } else { [("HIGH", 2), ("MID", 1), ("LOW", 0)] };
         for (i, (name, idx)) in names.iter().enumerate() {

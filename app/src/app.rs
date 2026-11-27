@@ -224,6 +224,11 @@ pub struct Prefs {
     pub sampler: crate::ui_sampler::SamplerPrefs,
     /// Traffic Light (traffic.rs): on / off, target per mode, range.
     pub traffic: crate::traffic::TrafficPrefs,
+    /// The Performance deck's settings (Preferences > Controller > Deck and Mixer; `deck.rs`).
+    #[serde(default)]
+    pub deck: crate::deck::DeckPrefs,
+    /// Groove Circuit: Preferences > Extensions > STEMS, its rows (groove.rs).
+    pub groove: crate::groove::GroovePrefs,
     /// The FX panel's choices (rekordbox's FxUnitSettings): modes, effects, beat values,
     /// single-mode snapshots, RELEASE FX and the CFX row.
     pub fx: crate::ui_fx::FxSaved,
@@ -730,6 +735,8 @@ impl Default for Prefs {
             perf_sampler: false,
             sampler: Default::default(),
             traffic: Default::default(),
+            deck: Default::default(),
+            groove: Default::default(),
             app_mode: 0,
             eq_isolator: false,
             ch_fader_curve: 1,
@@ -1091,7 +1098,10 @@ pub struct App {
     /// lights up this frame (traffic.rs).
     pub dupes: crate::dupes::Dupes,
     pub split: crate::split::Split,
+    pub cue_tools: crate::cue_tools::CueTools,
     pub traffic_now: Vec<i32>,
+    /// Groove Circuit's state while the app runs (groove.rs).
+    pub gc: crate::groove::GrooveUi,
     /// Deck that double-click / Return / "Load to Player" load into: 0 = PLAYER A, 1 = PLAYER B
     /// (B only in the 2 Players layout).
     pub load_target: u8,
@@ -1232,7 +1242,9 @@ impl App {
             px: Default::default(),
             dupes: Default::default(),
             split: Default::default(),
+            cue_tools: Default::default(),
             traffic_now: Vec::new(),
+            gc: Default::default(),
             load_target: 0,
             deck: Deck::default(),
             pool,
@@ -3422,16 +3434,22 @@ impl App {
         if self.deck.audio.is_none() {
             return;
         }
+        // As rekordbox's `eventCueOn`: CUE leaves loop adjust and ends a running loop first.
+        self.deck.x.loop_adjust = 0;
         if self.playing() {
             self.set_playing(false);
             let c = self.deck.cue_point;
             self.seek(c);
-            self.player.state.lock().loop_range = None;
+            let mut s = self.player.state.lock();
+            s.loop_range = None;
+            s.dk.warp = None;
         } else {
             let p = self.pos();
             if (p - self.deck.cue_point).abs() < 0.01 {
                 self.deck.cue_preview = true;
                 self.set_playing(true);
+            } else if p >= self.deck.duration - 0.01 {
+                // (At the end of the track CUE does nothing.)
             } else {
                 let q = self.quantized(p);
                 self.deck.cue_point = q;
@@ -3451,6 +3469,7 @@ impl App {
         if self.deck.audio.is_none() {
             return;
         }
+        self.deck.x.loop_adjust = 0;
         if self.deck.cue_preview {
             self.deck.cue_preview = false;
             return;
@@ -3474,7 +3493,9 @@ impl App {
                 }
                 st.slip_hold = st.slip && st.playing;
             }
-            self.seek(c.start);
+            if c.end.is_some() || !self.hot_cue_quantized(c.start) {
+                self.seek(c.start);
+            }
             if let Some(e) = c.end.filter(|e| *e > c.start) {
                 self.player.state.lock().loop_range = Some((c.start, e));
                 self.deck.last_loop = Some((c.start, e));
@@ -3734,18 +3755,23 @@ impl App {
         if self.deck.audio.is_none() {
             return;
         }
+        let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
+        // With Q the loop starts on the nearest beat (rekordbox prepares an auto beat loop
+        // with its SNAP rule; a loop ahead of the playhead begins when the playhead gets
+        // there). Loops shorter than a beat start on the beat behind, so they sound at once.
         let start = if self.prefs.quantize && !self.deck.beats.is_empty() {
             let p = self.pos();
             let i = self.deck.beats.partition_point(|b| b.time <= p + 0.001);
-            if i > 0 {
-                self.deck.beats[i - 1].time
-            } else {
-                p
-            }
+            let behind = if i > 0 { self.deck.beats[i - 1].time } else { p };
+            if self.performance() && beats >= 1.0 && self.playing() { crate::deck::quantize_point(&self.deck.beats, p, crate::deck::QType::Snap, 1.0, false) } else { behind }
         } else {
             self.pos()
         };
-        let end = loop_end_on_grid(&self.deck.beats, start, beats).unwrap_or(start + beats * self.beat_len());
+        let start = crate::deck::on_frame(start, sr);
+        // The end is found on the grid (so a tempo change inside the loop is followed) and
+        // both ends are whole frames; never shorter than rekordbox's minimum loop.
+        let end = crate::deck::grid_pos(&self.deck.beats, start).and_then(|p| crate::deck::grid_time(&self.deck.beats, p + beats)).unwrap_or(start + beats * self.beat_len());
+        let end = crate::deck::on_frame(end.max(start + crate::deck::MIN_LOOP_SECS), sr);
         self.player.state.lock().loop_range = Some((start, end));
         self.deck.last_loop = Some((start, end));
     }
@@ -3767,8 +3793,9 @@ impl App {
     }
     pub fn loop_out(&mut self) {
         if let Some(a) = self.deck.loop_in {
-            let b = self.quantized(self.pos());
-            if b > a + 0.01 {
+            let sr = self.deck.audio.as_ref().map(|a| a.sr).unwrap_or(44100);
+            let (a, b) = (crate::deck::on_frame(a, sr), crate::deck::on_frame(self.quantized(self.pos()), sr));
+            if b > a + crate::deck::MIN_LOOP_SECS {
                 self.player.state.lock().loop_range = Some((a, b));
                 self.deck.last_loop = Some((a, b));
                 self.seek(a);
@@ -3776,12 +3803,8 @@ impl App {
         }
     }
     pub fn resize_loop(&mut self, factor: f64) {
-        self.prefs.loop_beats = (self.prefs.loop_beats * factor).clamp(1.0 / 64.0, 512.0);
-        if let Some((a, b)) = self.loop_active() {
-            let nb = a + (b - a) * factor;
-            self.player.state.lock().loop_range = Some((a, nb));
-            self.deck.last_loop = Some((a, nb));
-        }
+        // (One step in the 16 sizes; a running loop is halved or doubled on the beat grid.)
+        self.loop_step(if factor > 1.0 { 1 } else { -1 });
     }
 
     // ------------------------------------------------------------------ grid editing

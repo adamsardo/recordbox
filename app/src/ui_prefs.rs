@@ -1662,6 +1662,7 @@ fn page_deck(app: &mut App, ui: &mut Ui) {
     if changed {
         app.save_prefs();
     }
+    crate::deck::prefs_deck(app, ui);
 }
 
 /// Controller > Mixer, as far as the Performance mixer goes: rekordbox's EQ / ISOLATOR choice
@@ -1692,6 +1693,7 @@ fn page_mixer(app: &mut App, ui: &mut Ui) {
         app.poll_decks();
         app.save_prefs();
     }
+    crate::deck::prefs_mixer(app, ui);
 }
 
 /// A section title over the cards (rekordbox's "SAMPLER", "SEQUENCER", "Quantize").
@@ -1902,6 +1904,7 @@ fn page_stems(app: &mut App, ui: &mut Ui) {
         }
         toggle(ui, &mut app.prefs.stem_reset_on_load, "Reset the MUTE/SOLO state while loading");
     });
+    crate::ui_groove::prefs_section(app, ui);
     card(ui, "Stem separation model (recordbox)", |ui| {
         if let Some(hw) = &app.stem.hw {
             kit::line(
