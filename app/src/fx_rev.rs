@@ -265,11 +265,11 @@ pub struct DLine {
 }
 
 impl DLine {
-    fn new() -> DLine {
+    pub(crate) fn new() -> DLine {
         DLine { buf: vec![0.0; DM_CAP], size: DM_CAP as i64, w: 0, rd: 0, rate: 48000.0, ms: 50.0, frames: 2400, pend: false, p_ms: 50.0, p_frames: 2400, gate: new_gate(48000.0), ready: false, full: false, written: 0 }
     }
 
-    fn setup(&mut self, rate: f32) {
+    pub(crate) fn setup(&mut self, rate: f32) {
         self.rate = rate;
         self.size = ((frames_of(MAX_MS, rate) + 2500) as i64).clamp(16, DM_CAP as i64);
         self.ms = 50.0;
@@ -281,7 +281,7 @@ impl DLine {
     }
 
     /// `reset` 0x10298fbcc.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         if self.pend {
             self.ms = self.p_ms;
             self.frames = self.p_frames;
@@ -332,12 +332,12 @@ impl DLine {
     }
 
     /// `getMaxAudioCallbackBlockSize` 0x10298ff24.
-    fn max_block(&self) -> i32 {
+    pub(crate) fn max_block(&self) -> i32 {
         if self.pend { self.frames.min(self.p_frames) } else { self.frames }
     }
 
     /// `read` 0x10298ff44: `out.len()` frames through the gate.
-    fn read(&mut self, out: &mut [f32]) {
+    pub(crate) fn read(&mut self, out: &mut [f32]) {
         let a3 = out.len() as i32;
         let full_frames = frames_of(MAX_MS, self.rate);
         let mut left = a3;
@@ -379,7 +379,7 @@ impl DLine {
         }
     }
 
-    fn write(&mut self, xs: &[f32]) {
+    pub(crate) fn write(&mut self, xs: &[f32]) {
         for &x in xs {
             self.buf[self.w as usize] = x;
             self.w = (self.w + 1) % self.size;

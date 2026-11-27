@@ -1270,6 +1270,18 @@ pub(crate) struct Slot {
     /// The echoes' time as the beat quantizer last gave it (`setEffectBeatTimeWithPlayHead`,
     /// ms; 0 = not yet).
     qms: f32,
+    // fx7a
+    /// The forward echo core of DELAY, ECHO, LOW CUT ECHO and PING PONG (`EchoCore`, two
+    /// `DelayModule`s: `crate::fx_echo`), made by the interface (`ensure_rev`); a slot without
+    /// it runs the line above.
+    ec: Option<Box<crate::fx_echo::EchoCore>>,
+    /// The band split (`EffectFrequencyModule`) of single DELAY / REV DELAY and LOW CUT ECHO.
+    b3: crate::fx_echo::Bands3,
+    /// UP ECHO / DOWN ECHO / PITCH ECHO's core (`PitchEchoCore`, with its own pitch shifter),
+    /// made by the interface (`ensure_rev`).
+    pe: Option<Box<crate::fx_echo::PitchEchoCore>>,
+    /// MT DELAY's core (`MultiTapDelayCore`), made by the interface (`ensure_rev`).
+    mt: Option<Box<crate::fx_echo::MtCore>>,
 }
 
 /// The beat quantizer's calls for the echo family over one buffer: the stretches between
@@ -1351,7 +1363,13 @@ impl Slot {
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0 }
+        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0), bf: crate::fx_sweep::BeatFilter::new(48000.0), bp: crate::fx_sweep::BeatPhaser::new(48000.0), qms: 0.0,
+            // fx7a
+            ec: None,
+            b3: crate::fx_echo::Bands3::new(),
+            pe: None,
+            mt: None,
+        }
     }
 
     fn clear(&mut self) {
@@ -1464,6 +1482,15 @@ impl Slot {
         };
         if want && self.rv.is_none() && !self.delay.is_empty() {
             self.rv = Some(crate::fx_rev::RevFx::new());
+        }
+        if matches!(k, Kind::Delay | Kind::Echo | Kind::LowCutEcho | Kind::PingPong) && self.ec.is_none() && !self.delay.is_empty() {
+            self.ec = Some(crate::fx_echo::EchoCore::new());
+        }
+        if matches!(k, Kind::PitchEcho | Kind::UpEcho | Kind::DownEcho) && self.pe.is_none() && !self.delay.is_empty() {
+            self.pe = Some(crate::fx_echo::PitchEchoCore::new());
+        }
+        if k == Kind::MtDelay && self.mt.is_none() && !self.delay.is_empty() {
+            self.mt = Some(crate::fx_echo::MtCore::new());
         }
     }
 
@@ -1866,6 +1893,8 @@ impl Slot {
         // (dry, wet) of the effects that mix a wet sound with the dry one.
         let mut mix = echo_mix(level);
         let mut spiral_out = 1.0;
+        // (fx7a: the repeats' pitch percent for `PitchEchoCore`.)
+        let mut pe_pct = 0.0f32;
         match kind {
             Delay | RevDelay => {
                 // Multi mode: one repeat, both sides at the beat value. Single mode: LR RATIO
@@ -1895,6 +1924,7 @@ impl Slot {
                 mix = (1.0, wet);
                 e.fb = 0.85;
                 e.ratio = pitch_ratio(if kind == UpEcho { pct } else { -pct });
+                pe_pct = if kind == UpEcho { pct } else { -pct };
             }
             PitchEcho => {
                 // `SingleBeatFxPitchEcho`: FEEDBACK 0 .. 0.85 .. 0.993; PITCH -50 % .. +50 % a
@@ -1903,16 +1933,28 @@ impl Slot {
                 e.fb = pitch_echo_fb(k1, !p.on);
                 let pct = through_value(k2) * if k2 < 0.5 { -50.0 } else { 50.0 };
                 e.ratio = pitch_ratio(pct);
+                pe_pct = pct;
                 e.rev = b1;
                 e.freeze = b2;
-                mix = if b2 { let (d, w) = roll_mix(level); (d, w * 0.7) } else { (if level <= 0.75 { 1.0 } else { 4.0 - 4.0 * level }, if level < 0.5 { 1.4 * level } else { 0.7 }) };
+                // (`SingleBeatFxPitchEcho::calculateMixRatio` 0x1029c7bb4: FREEZE's curve and
+                // the law only once the line holds the delay, or turning off; before that the dry
+                // sound alone.)
+                let full = p.on && self.filled && !starting;
+                mix = if b2 && full { let (d, w) = roll_mix(level); (d, w * 0.7) } else if full || !p.on { (if level <= 0.75 { 1.0 } else { 4.0 - 4.0 * level }, if level < 0.5 { 1.4 * level } else { 0.7 }) } else { (1.0, 0.0) };
             }
             LowCutEcho => {
                 // An echo (feedback 0.7) of the sound without its lows (under 284 Hz).
                 e.fb = if multi { 0.7 } else { echo_fb(k1, !p.on) };
                 if !multi {
-                    e.ml = swing(k2);
-                    e.mr = swing(k2);
+                    // SWING (`SingleLowCutFxEcho::updateParameter` 0x1029c1dc0, a
+                    // `CenterThroughParameter`): turned left the left side, turned right the
+                    // right side runs at 1 - 0.25 x the distance from the centre of the time.
+                    let s = 1.0 - 0.25 * through_value(k2);
+                    if k2 < 0.48627 {
+                        e.ml = s;
+                    } else if k2 > 0.51373 {
+                        e.mr = s;
+                    }
                     e.rev = b1;
                     e.freeze = b2;
                 }
@@ -2014,9 +2056,22 @@ impl Slot {
             e.freeze = false;
         }
         // Multi-mode ECHO keeps the whole dry sound until the line holds the delay
-        // (`MultiBeatFxEcho::updateParameter` 0x1029bf934).
-        if kind == Echo && multi && !(p.on && self.filled) {
-            mix.0 = 1.0;
+        // (`MultiBeatFxEcho::updateParameter` 0x1029bf934); so do single ECHO, PING PONG and
+        // both LOW CUT ECHOs (`SingleBeatFxEcho::calcMixRatioInternal` 0x1029c05a8,
+        // `SingleBeatFxPingPong::calculateMixRatio` 0x1029c44d8, `SingleLowCutFxEcho::
+        // calculateMixRatio` 0x1029c2064, `MultiLowCutEcho::calculateMixRatio` 0x1029c1764).
+        // FREEZE once it holds: the dry sound on the ROLL curve (`MultiBeatFxRollBase::
+        // calcMixRatio`); LOW CUT ECHO takes the curve's wet too.
+        if matches!(kind, Echo | PingPong | LowCutEcho) {
+            if freeze_on {
+                let (d, w) = roll_mix(level);
+                mix.0 = d;
+                if kind == LowCutEcho {
+                    mix.1 = w;
+                }
+            } else if !(p.on && self.filled) {
+                mix.0 = 1.0;
+            }
         }
         let t_ms = (echo_secs * 1000.0).clamp(1.0, 4000.0);
         let mut revc = if rev_mode.is_some() { self.rv.take() } else { None };
@@ -2039,6 +2094,68 @@ impl Slot {
         }
         let made = !self.fresh;
         self.fresh = true;
+        // fx7a: the forward core (`crate::fx_echo::EchoCore`) and each side's time for it:
+        // ECHO / LOW CUT ECHO 1 .. 4000 ms (`SingleBeatFxEcho::updateAndSetParameter`,
+        // `SingleLowCutFxEcho::updateParameter`), PING PONG's right side 0.75 x the time held
+        // to 10 .. 4000 ms (`SingleBeatFxPingPong::updateParameter` 0x1029c4620), DELAY's sides
+        // at their LR RATIO steps.
+        let use_ec = matches!(kind, Delay | Echo | LowCutEcho | PingPong) && self.ec.is_some();
+        let fwd_ms = |t: f32| -> [f32; 2] {
+            if kind == PingPong { [t.clamp(1.0, 4000.0), (0.75 * t).clamp(10.0, 4000.0)] } else { [(t * e.ml).clamp(1.0, 4000.0), (t * e.mr).clamp(1.0, 4000.0)] }
+        };
+        let ec_fb = [e.fb; 2];
+        let mut ec_ms = fwd_ms(t_ms);
+        if use_ec && made {
+            // (`onCalledMakeSelected`: the core made at the rate, then `EchoCore::reset`.)
+            if let Some(c) = self.ec.as_deref_mut() {
+                if (c.rate() - r).abs() > 0.5 {
+                    c.setup(r);
+                }
+                c.reset(ec_ms, ec_fb);
+            }
+        }
+        let mut ei = 0usize;
+        // MT DELAY (`MultiTapDelayCore`): base time in whole ms, each side's swing (the knob's
+        // stretch 1 + 2 s), the eight tap gains; one call a buffer.
+        let use_mt = kind == MtDelay && self.mt.is_some();
+        let mt_base = (secs * 1000.0) as i32;
+        let mt_sw = { let (a, b) = if multi { (1.0, 1.0) } else { mt_swing(k1) }; [(a - 1.0) * 0.5, (b - 1.0) * 0.5] };
+        let mt_g = mt_taps(level, multi, k2);
+        if use_mt {
+            if let Some(m) = self.mt.as_deref_mut() {
+                if made || (m.rate() - r).abs() > 0.5 {
+                    m.setup(r);
+                    m.reset(mt_base, mt_sw, mt_g, 1.0);
+                }
+                m.call(frames, mt_base, mt_sw, mt_g, 1.0);
+            }
+        }
+        // (Single MT DELAY passes the cut bands live beside the taps, `SingleMultiTapDelay::
+        // processEffectConcrete` 0x102a08c5c: the left side's thru on both sides.)
+        let mut b3_thru = 0.0f32;
+        let use_pe = matches!(kind, PitchEcho | UpEcho | DownEcho) && self.pe.is_some();
+        let pe_ms = |t: f32| t.clamp(1.0, 4000.0);
+        let mut pe_t = pe_ms(t_ms);
+        if use_pe && made {
+            if let Some(c) = self.pe.as_deref_mut() {
+                if (c.rate() - r).abs() > 0.5 {
+                    c.setup(r);
+                }
+                c.reset(pe_t, e.fb, pe_pct);
+            }
+        }
+        // The band split in front of the effect: single DELAY / REV DELAY (`BeatFxDelay` made
+        // with its `EffectFrequencyModule`; `SingleBeatFxDelayBase::updateAndSetParameter`:
+        // LOW CUT takes band 2 out, HI CUT band 0) and LOW CUT ECHO (`setThru(2)`: band 2 out).
+        // Only what the effect is given is used: the dry sound stays whole.
+        let b3_on = (!multi && matches!(kind, Delay | RevDelay | MtDelay)) || kind == LowCutEcho;
+        if b3_on {
+            if made || (self.b3.rate() - r).abs() > 0.5 {
+                self.b3.setup(r);
+            }
+            let (lo, hi) = if kind == LowCutEcho { (true, false) } else { (b1, b2) };
+            self.b3.set_gains([if hi { 0.0 } else { 1.0 }, 1.0, if lo { 0.0 } else { 1.0 }]);
+        }
         // Each side's time for the reverse core (`BeatFxEcho::updateAndSetParameter` 0x1029bf05c:
         // at least 10 ms), its feedback, which sides run themselves (status not on; single REV
         // DELAY: also the side with the longer time), and the restarts the beat quantizer
@@ -2187,7 +2304,8 @@ impl Slot {
         // (TRACK SPEED: how fast the held loop's speed follows, 0.5 in multi mode.)
         let helix_v = if multi { 0.5 } else { k2 };
         let ps_on = match kind {
-            UpEcho | DownEcho | PitchEcho | Spiral | SpiralUp | SpiralDown => (e.ratio - 1.0).abs() > 1e-4,
+            UpEcho | DownEcho | PitchEcho => (e.ratio - 1.0).abs() > 1e-4 && !use_pe,
+            Spiral | SpiralUp | SpiralDown => (e.ratio - 1.0).abs() > 1e-4,
             Robot | Pitch => true,
             Stretch => !b1 && speed < 0.999,
             VinylBrake => self.vb_state == 2,
@@ -2236,7 +2354,11 @@ impl Slot {
             let (xl, xr) = (buf[n * 2], buf[n * 2 + 1]);
             // What the effect is given (`dl`, `dr`) and the bands kept from it (`tl`, `tr`).
             let (mut dl, mut dr, mut tl, mut tr) = (xl, xr, 0.0, 0.0);
-            if cuts {
+            if b3_on {
+                let (f, t) = self.b3.next([xl, xr]);
+                [dl, dr] = f;
+                b3_thru = t[0];
+            } else if cuts {
                 for (c, x) in [xl, xr].into_iter().enumerate() {
                     let z = &mut self.bands[c];
                     let (mut thru, mut y) = (0.0, x);
@@ -2327,7 +2449,42 @@ impl Slot {
                     } else {
                         (1.0, 0.0)
                     };
-                    let (mut el, mut er) = if kind == RevDelay { (0.0, 0.0) } else { self.echo(il, ir, &e, r) };
+                    let (mut el, mut er) = if kind == RevDelay {
+                        (0.0, 0.0)
+                    } else if let (true, Some(c)) = (use_ec, self.ec.as_deref_mut()) {
+                        // Each of the quantizer's stretches is one `processEffect` call:
+                        // `updateAndSetParameter` (a new time from `setEffectBeatTimeWithPlayHead`),
+                        // then the call.
+                        while ei < sync.n && sync.at[ei] as usize <= n {
+                            if sync.beat_ms[ei] > 0.0 {
+                                ec_ms = fwd_ms(sync.beat_ms[ei]);
+                            }
+                            c.set(ec_ms, ec_fb);
+                            c.call(sync.len[ei] as usize);
+                            ei += 1;
+                        }
+                        if sync.n == 0 && n == 0 {
+                            c.set(ec_ms, ec_fb);
+                            c.call(frames);
+                        }
+                        c.next(il, ir)
+                    } else if let (true, Some(c)) = (use_pe, self.pe.as_deref_mut()) {
+                        while ei < sync.n && sync.at[ei] as usize <= n {
+                            if sync.beat_ms[ei] > 0.0 {
+                                pe_t = pe_ms(sync.beat_ms[ei]);
+                            }
+                            c.set(pe_t, e.fb, pe_pct);
+                            c.call(sync.len[ei] as usize);
+                            ei += 1;
+                        }
+                        if sync.n == 0 && n == 0 {
+                            c.set(pe_t, e.fb, pe_pct);
+                            c.call(frames);
+                        }
+                        c.next(il, ir)
+                    } else {
+                        self.echo(il, ir, &e, r)
+                    };
                     if let Some(f) = revc.as_deref_mut() {
                         while si < sync.n && sync.at[si] as usize == n {
                             if sync.both[si] {
@@ -2353,8 +2510,11 @@ impl Slot {
                     }
                     if let Some((ha, la)) = echo_filt {
                         let mut fr = [el, er];
-                        self.ifl[0].process(&mut fr, ha, 0, rate);
-                        self.ifl[1].process(&mut fr, la, 0, rate);
+                        // (Both made with their resonance knob at 0.2, 51 as 8 bits:
+                        // `SingleBeatFxEcho` 0x1029bfaa4 in its single layer's filter type 1,
+                        // `SingleBeatFxPingPong` 0x1029c36e0.)
+                        self.ifl[0].process(&mut fr, ha, 51, rate);
+                        self.ifl[1].process(&mut fr, la, 51, rate);
                         (el, er) = (fr[0], fr[1]);
                     }
                     if let Some(pb) = delay_pan {
@@ -2376,6 +2536,11 @@ impl Slot {
                         er = m * self.ga[1];
                     }
                     mixed(el, er)
+                }
+                MtDelay if use_mt => {
+                    let (a, b) = self.mt.as_deref_mut().map(|m| m.next(il, ir)).unwrap_or((0.0, 0.0));
+                    let th = if multi { 0.0 } else { b3_thru * target };
+                    mixed(a + th, b + th)
                 }
                 MtDelay => {
                     // `MultiTapDelayCore`: eight taps at whole milliseconds of k/8 of each
@@ -2834,11 +2999,15 @@ impl Slot {
         if matches!(kind, Echo | LowCutEcho | PingPong | PitchEcho) {
             // `BeatFxEcho::processEffectConcrete`: the line holds the longest delay (counted up
             // to 4 s).
-            if self.fill_n >= (r * 4.0) as i32 {
-                self.filled = true;
-            } else {
-                self.fill_n += frames as i32;
-                self.filled = self.fill_n >= ((r * 0.001) * (t_ms * e.ml).max(t_ms * e.mr)) as i32;
+            // (At the end of each call: each of the quantizer's stretches.)
+            let lim = ((r * 0.001) * (t_ms * e.ml).max(t_ms * e.mr)) as i32;
+            for i in 0..sync.n.max(1) {
+                if self.fill_n >= (r * 4.0) as i32 {
+                    self.filled = true;
+                } else {
+                    self.fill_n += if sync.n == 0 { frames as i32 } else { sync.len[i] as i32 };
+                    self.filled = self.fill_n >= lim;
+                }
             }
         }
         if !p.on && self.gate <= 0.0 {
@@ -4454,5 +4623,50 @@ mod tests {
         }
         // Later it is clearly behind the live sound (slower), never ahead, never the old history.
         assert!(x[4700 * 2] < dry[4700 * 2] && x[4700 * 2] > dry[4000 * 2]);
+    }
+
+    // fx7a
+    /// Run single-mode `kind` (made through `prepare_rev`, so on its rekordbox cores) over
+    /// `x` in 960-frame buffers at 120 BPM, beat value 1 (24000 frames).
+    fn run_single(kind: Kind, level: f32, knob: [f32; 2], x: &mut [f32]) {
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        let mut p = unit(kind, 1.0, level);
+        p.single = true;
+        p.one = SlotParams { on: true, level, value: 1.0, knob, btn: [false, false], ..SlotParams::new(kind) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        rack.prepare_rev();
+        for c in x.chunks_mut(960 * 2) {
+            rack.process(0, c, 48000);
+        }
+    }
+
+    #[test]
+    fn single_echo_runs_echo_core_and_keeps_the_dry_sound_until_the_line_is_full() {
+        // ECHO at LEVEL/DEPTH 1 (law: dry 0, wet 1), FEEDBACK at its centre (0.7): a 480-frame
+        // block of 1.0 at 5000. The dry sound stays whole until the line holds a beat
+        // (`SingleBeatFxEcho::calcMixRatioInternal`); the repeats come whole frames of the beat
+        // later through `EchoCore`, 0.7 each.
+        let mut y: Vec<f32> = (0..72000).flat_map(|t| { let v = if (5000..5480).contains(&t) { 1.0 } else { 0.0 }; [v, v] }).collect();
+        run_single(Kind::Echo, 1.0, [0.5, 0.5], &mut y);
+        assert!((y[5200 * 2] - 1.0).abs() < 1e-4, "dry whole before the line is full: {}", y[5200 * 2]);
+        let first = (20000..40000).find(|&t| y[t * 2].abs() > 1e-6).unwrap();
+        assert_eq!(first, 29000, "first repeat a beat (24000 frames) on");
+        assert!((y[29200 * 2] - 1.0).abs() < 1e-4, "{}", y[29200 * 2]);
+        assert!((y[53200 * 2] - 0.7).abs() < 1e-4, "second repeat at the feedback: {}", y[53200 * 2]);
+        assert!(y[(5000 + 24000 + 600) * 2].abs() < 1e-6, "dry gone once the line is full");
+    }
+
+    #[test]
+    fn low_cut_echo_swing_shortens_one_side() {
+        // SWING turned fully left: the left side at 0.75 of the beat (18000 frames), the right at
+        // the beat (`SingleLowCutFxEcho::updateParameter`).
+        let mut y: Vec<f32> = (0..48000).flat_map(|t| { let v = if (5000..5480).contains(&t) { (t as f32 * 0.25).sin() } else { 0.0 }; [v, v] }).collect();
+        run_single(Kind::LowCutEcho, 1.0, [0.5, 0.0], &mut y);
+        let l = (15000..40000).find(|&t| y[t * 2].abs() > 1e-3).unwrap();
+        let r = (15000..40000).find(|&t| y[t * 2 + 1].abs() > 1e-3).unwrap();
+        assert!((23000..23010).contains(&l), "left repeat at {l}");
+        assert!((29000..29010).contains(&r), "right repeat at {r}");
     }
 }

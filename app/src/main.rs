@@ -29,6 +29,7 @@ mod fx_lfo;
 mod fx_roll;
 mod fx_sweep;
 mod fx_rev;
+mod fx_echo;
 mod mfx;
 mod icons;
 mod icons_player;
