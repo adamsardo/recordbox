@@ -674,7 +674,7 @@ impl App {
         let keys = self.key_controls();
         let hp_on = crate::audio::HP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
         let (hp_mix, hp_level) = (self.px.hp_mix, crate::mixer::headphones_level(self.px.hp_level));
-        let hp_master = if perf && hp_on { crate::mixer::cue_master_balance(hp_mix) * hp_level } else { 0.0 };
+        let hp_master = if perf && hp_on && self.midi.more.master_cue { crate::mixer::cue_master_balance(hp_mix) * hp_level } else { 0.0 };
         crate::audio::HP_MASTER_GAIN.store(hp_master.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let (isolator, curve, three) = (self.prefs.eq_isolator, self.prefs.ch_fader_curve, self.prefs.stem_parts == 3);
         crate::audio::LIMITER_ON.store(perf, std::sync::atomic::Ordering::Relaxed);

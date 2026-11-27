@@ -44,6 +44,7 @@ mod midi;
 mod midi_csv;
 mod midi_map;
 mod midi_cover;
+mod midi_acts;
 mod mix_selftest;
 mod mixer;
 mod groove;

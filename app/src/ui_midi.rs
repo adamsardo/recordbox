@@ -375,7 +375,14 @@ pub fn learn_message(app: &mut App, dev_name: &str, msg: [u8; 3]) {
 
 /// ADD: the command joins the current tab without codes, on deck 1 when it has decks.
 pub fn add_row(app: &mut App, name: &str) {
-    let Some(f) = registry().by_name(name) else { return };
+    let tag = registry().tag(name);
+    add_row_tag(app, tag);
+}
+
+/// ADD with the menu entry chosen (an entry such as "Sampler9 Play" shares its function with
+/// "Sampler1 Play"; the row keeps the entry's name).
+pub fn add_row_tag(app: &mut App, tag: u32) {
+    let Some(f) = registry().get(tag) else { return };
     let w = &mut app.midi.win;
     let tab = w.tab;
     if w.rows.len() <= tab {
@@ -766,7 +773,7 @@ fn add_menu(app: &mut App, ui: &mut Ui, resp: &egui::Response) {
     }
     let tab = tab_of(app.midi.win.tab);
     let reg = registry();
-    let mut pick: Option<String> = None;
+    let mut pick: Option<u32> = None;
     let mut at = std::mem::take(&mut app.midi.win.at);
     menu_style(ui);
     egui::popup::popup_above_or_below_widget(ui, id, resp, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
@@ -784,13 +791,19 @@ fn add_menu(app: &mut App, ui: &mut Ui, resp: &egui::Response) {
             }
             let open_id = id.with("open_cat");
             let open: Option<String> = ui.ctx().data(|d| d.get_temp(open_id));
+            let tag_of = |f: &Func| reg.funcs.iter().position(|g| std::ptr::eq(g, f)).map(|i| i as u32 + 1).unwrap_or(0);
+            // (A function listed twice keeps the place of its first entry under its name.)
+            let mut seen: std::collections::HashSet<String> = Default::default();
             for c in cats {
                 if c.is_empty() {
                     for f in reg.of_tab(tab).filter(|f| f.category.is_empty()) {
                         let r = menu_item(ui, &f.display, false);
-                        at.insert(format!("add:{}", f.name), r.rect.center());
+                        if seen.insert(f.name.clone()) {
+                            at.insert(format!("add:{}", f.name), r.rect.center());
+                        }
+                        at.insert(format!("add:{}#{}", f.name, f.display), r.rect.center());
                         if r.clicked() {
-                            pick = Some(f.name.clone());
+                            pick = Some(tag_of(f));
                         }
                     }
                 } else {
@@ -805,9 +818,12 @@ fn add_menu(app: &mut App, ui: &mut Ui, resp: &egui::Response) {
                             ui.horizontal(|ui| {
                                 ui.add_space(14.0);
                                 let r = menu_item(ui, &f.display, false);
-                                at.insert(format!("add:{}", f.name), r.rect.center());
+                                if seen.insert(f.name.clone()) {
+                                    at.insert(format!("add:{}", f.name), r.rect.center());
+                                }
+                                at.insert(format!("add:{}#{}", f.name, f.display), r.rect.center());
                                 if r.clicked() {
-                                    pick = Some(f.name.clone());
+                                    pick = Some(tag_of(f));
                                 }
                             });
                         }
@@ -817,9 +833,9 @@ fn add_menu(app: &mut App, ui: &mut Ui, resp: &egui::Response) {
         });
     });
     app.midi.win.at = at;
-    if let Some(name) = pick {
+    if let Some(tag) = pick {
         ui.memory_mut(|m| m.close_popup());
-        add_row(app, &name);
+        add_row_tag(app, tag);
     }
 }
 
@@ -1277,6 +1293,8 @@ impl App {
         let file = std::env::var("PREPDECK_MIDI_FILE").unwrap_or_default();
         enum S {
             Click(&'static str),
+            /// The command added as ADD does (for entries below the menu's scrolled view).
+            Add(&'static str),
             Send([u8; 3]),
             Note(&'static str),
         }
@@ -1314,6 +1332,41 @@ impl App {
             ("back to DECK", S::Click("tab:DECK")),
             ("DEFAULT asks", S::Click("DEFAULT")),
             ("Cancel: nothing changes", S::Click("ask:Cancel")),
+            // The third pass's functions, learned and played (state lines: `more`).
+            ("the MIXER tab again", S::Click("tab:MIXER")),
+            ("ADD (MIXER)", S::Click("ADD")),
+            ("MasterCue is added", S::Click("add:MasterCue")),
+            ("LEARN is armed", S::Click("LEARN")),
+            ("note 20 learned for MasterCue", S::Send([0x90, 0x20, 0x7F])),
+            ("release", S::Send([0x90, 0x20, 0x00])),
+            ("LEARN is switched off", S::Click("LEARN")),
+            ("MASTER CUE before", S::Note("more")),
+            ("MasterCue pressed: master cue off", S::Send([0x90, 0x20, 0x7F])),
+            ("release", S::Send([0x90, 0x20, 0x00])),
+            ("MASTER CUE after", S::Note("more")),
+            ("the PAD tab", S::Click("tab:PAD")),
+            ("ADD (PAD)", S::Click("ADD")),
+            ("BeatJump Bank Right is added", S::Add("Parameter2Right_BeatJump")),
+            ("LEARN is armed", S::Click("LEARN")),
+            ("note 21 learned for it", S::Send([0x90, 0x21, 0x7F])),
+            ("release", S::Send([0x90, 0x21, 0x00])),
+            ("LEARN is switched off", S::Click("LEARN")),
+            ("BeatJump Bank Right pressed: page 5 -> 9", S::Send([0x90, 0x21, 0x7F])),
+            ("release", S::Send([0x90, 0x21, 0x00])),
+            ("the beat jump page", S::Note("more")),
+            ("KeyShiftMode is added", S::Add("KeyShift")),
+            ("LEARN is armed", S::Click("LEARN")),
+            ("note 22 learned for it", S::Send([0x90, 0x22, 0x7F])),
+            ("release", S::Send([0x90, 0x22, 0x00])),
+            ("LEARN is switched off", S::Click("LEARN")),
+            ("KeyShiftMode pressed: deck 1 shows KEY SHIFT", S::Send([0x90, 0x22, 0x7F])),
+            ("release", S::Send([0x90, 0x22, 0x00])),
+            ("the pad mode", S::Note("more")),
+            ("the SAMPLER tab", S::Click("tab:SAMPLER")),
+            ("ADD (SAMPLER)", S::Click("ADD")),
+            ("the Sampler submenu", S::Click("cat:Sampler")),
+            ("Sampler9 Play (the second eight) is added", S::Click("add:PAD1_Sampler#Sampler9 Play")),
+            ("the rows of the tab", S::Note("rows")),
             ("the window closes", S::Click("close")),
         ];
         // `PREPDECK_SHOT_PLAYER=mids1test` with `PREPDECK_MIDI_RB_DIR=<folder>` holding the user's
@@ -1446,6 +1499,14 @@ impl App {
                     _ => {}
                 }
             }
+            S::Add(name) => {
+                if phase == 0 {
+                    add_row(self, name);
+                }
+                if phase == 6 {
+                    eprintln!("miditest: {name} -> {}", self.midi_state_line());
+                }
+            }
             S::Send(m) => {
                 if phase == 0 {
                     test_send(*m);
@@ -1459,6 +1520,12 @@ impl App {
                 if phase == 6 {
                     if *kind == "state" {
                         eprintln!("miditest: {name}: {}", self.s1_state());
+                    } else if *kind == "more" {
+                        let pm = crate::pads::PadMode::from_code(self.px.pad_mode[0]).label();
+                        eprintln!("miditest: {name}: master_cue {} | beat_jump_page deck1 {} | pad mode deck1 {pm} | cfx_user {} kind {}", self.midi.more.master_cue, self.prefs.pads.beat_jump_page[0], self.px.cfx_user, self.px.cfx_kind);
+                    } else if *kind == "rows" {
+                        let rows: Vec<String> = self.midi.win.rows.get(self.midi.win.tab).map(|v| v.iter().map(|r| format!("{} ({})", r.display, r.name)).collect()).unwrap_or_default();
+                        eprintln!("miditest: {name}: {}", rows.join(", "));
                     } else if *kind == "wait" {
                     } else if *kind == "files" {
                         let own = crate::db::data_dir().join("MidiMappings").join(format!("{TEST_NAME}.midi.csv"));

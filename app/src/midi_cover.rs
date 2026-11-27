@@ -48,9 +48,32 @@ pub fn survey(files: &[std::path::PathBuf]) -> Vec<Use> {
     v
 }
 
+/// Names used by the factory mapping files that no part of rekordbox 7.2.19 registers: the
+/// string is nowhere in the program, neither whole nor as a `%d` pattern it formats, so a row
+/// of this name does nothing in rekordbox either (checked against the arm64 slice's strings;
+/// names rekordbox builds by joining parts, such as `FXPartSelect` + `Inst`, are not here).
+#[rustfmt::skip]
+pub const NOT_IN_REKORDBOX: [&str; 83] = ["BrowseRefresh", "CfxMultiView", "CfxMultiView.Shift", "CfxSingleView", "CfxSingleView.Shift", "ChannelLevelSwitch", "ComboFxView.Left", "ComboFxView.Left.Twice", "ComboFxView.Right", "ComboFxView.Right.Twice", "CrossFaderStartCue", "CrossFaderStartPlay", "CrossFaderStopCue", "CrossFaderStopPlay", "DeckMove", "DeckView", "DeckView.Long", "DeckView.Shift", "DrumRelease+Shift", "FX1-1On.ECHO", "FX1-1On.FLANGER", "FX1-1On.ROLL", "FX1-1On.TRANS", "FX2-1On.ECHO", "FX2-1On.FLANGER", "FX2-1On.ROLL", "FX2-1On.TRANS", "LinkCue", "OSCAssign.PRESET", "PAD1_PianoPlay+Shift", "PAD2_PianoPlay+Shift", "PAD3_PianoPlay+Shift", "PAD4_PianoPlay+Shift", "PAD5_PianoPlay+Shift", "PAD6_PianoPlay+Shift", "PAD7_PianoPlay+Shift", "PAD8_PianoPlay+Shift", "PadInfoView.Left", "PadInfoView.Right", "PadModeSelect", "Parameter1Left_SequenceCall", "Parameter1Right_SequenceCall", "Parameter2Left_HotCue", "Parameter2Left_PadFx1", "Parameter2Left_PadFx2", "Parameter2Left_Sampler", "Parameter2Left_SequenceCall", "Parameter2Left_VelocitySampler", "Parameter2Right_HotCue", "Parameter2Right_PadFx1", "Parameter2Right_PadFx2", "Parameter2Right_Sampler", "Parameter2Right_SequenceCall", "Parameter2Right_VelocitySampler", "PhraseSync", "PianoPlay", "SamplerRepeatView.Left", "SamplerRepeatView.Left.Twice", "SamplerRepeatView.Right", "SamplerRepeatView.Right.Twice", "TouchScreen.Center", "TouchScreen.Center.X", "TouchScreen.Center.Y", "TouchScreen.Left", "TouchScreen.Left.X", "TouchScreen.Left.Y", "TouchScreen.Right", "TouchScreen.Right.X", "TouchScreen.Right.Y", "TrackInfoView.Left", "TrackInfoView.Left.Long", "TrackInfoView.Right", "TrackInfoView.Right.Long", "UsbA.Left", "UsbA.Left.Sampler", "UsbA.Right", "UsbB.Left", "UsbB.Right", "UsbB.Right.Sampler", "WaveFormView", "WaveFormView.Long", "WaveFormView.Shift", "WaveFormView.Twice"];
+
 /// Why recordbox has no action for a function, when the feature is not one recordbox has.
 pub fn reason(name: &str) -> Option<&'static str> {
     let n = name;
+    if n.starts_with('＃') {
+        return Some("a row commented out with a full-width ＃: rekordbox reads it as a name with no codes");
+    }
+    if let Some(crate::midi::Act::More(crate::midi_acts::M::Off(r))) = crate::midi::registry().by_name(n).map(|f| f.act) {
+        return Some(r);
+    }
+    if NOT_IN_REKORDBOX.contains(&n) {
+        return Some("rekordbox has no function by this name (nothing in rekordbox 7.2.19 registers it)");
+    }
+    // The +Shift pads of the slicer other than 5 and 6: `SlicerView::eventOnChanged`
+    // 0x1007466b8 registers them and passes them over.
+    if let Some(p) = n.strip_prefix("PAD").and_then(|r| r.strip_suffix("_Slicer+Shift").or_else(|| r.strip_suffix("_SlicerLoop+Shift"))) {
+        if p != "5" && p != "6" {
+            return Some("rekordbox registers it and does nothing with it (SlicerView::eventOnChanged)");
+        }
+    }
     let has = |s: &str| n.contains(s);
     let starts = |s: &str| n.starts_with(s);
     if has("Video") || has("TouchFX") || has("TransitionFX") || has("Camera") || starts("Text") || starts("Image") {
@@ -64,6 +87,36 @@ pub fn reason(name: &str) -> Option<&'static str> {
     }
     if has("Kuvo") || has("Tidal") || has("Beatport") || has("Soundcloud") || has("Streaming") || has("Internet") {
         return Some("streaming (out of scope)");
+    }
+    if has("DDJFX") || starts("UsbA") || starts("UsbB") || starts("SamplerRoutingSwitch") || starts("CrossFaderStart") || starts("BpmInformation") || starts("InstantScratch") {
+        return Some("hardware-only (a setting, state or input of the device itself)");
+    }
+    if starts("ChannelFader.CH5") || starts("ChannelFader.CH6") {
+        return Some("channels 5 and 6 of a mixer: recordbox's mixer has four channels");
+    }
+    if starts("SmartCFX") || starts("SmartFader") {
+        return Some("SMART CFX / SMART FADER: recordbox has neither");
+    }
+    if n.contains("PianoPlay") {
+        return Some("PIANO PLAY pad mode (DDJ-REV5): recordbox has no PIANO PLAY");
+    }
+    if starts("JogCutter") || starts("JogJogCutter") {
+        return Some("JOG CUTTER: recordbox has no jog cutter");
+    }
+    if n == "Mute" {
+        return Some("SILENT CUE (a deck muted, `DeckMuteManager`): recordbox's mixer has no deck mute");
+    }
+    if n == "TrackFilter" {
+        return Some("TRACK FILTER: recordbox's browser has no track filter");
+    }
+    if starts("FxBank") {
+        return Some("FX BANK: recordbox has no FX banks");
+    }
+    if starts("SFX") {
+        return Some("SLIDE FX (the DJM-S11 / S7 FX slider, `RbxSlideFxDeviceComponent`): recordbox has no slide FX");
+    }
+    if starts("OSC") {
+        return Some("OSCILLATOR (DDJ-RZ / RZX): recordbox has no oscillator");
     }
     if n.ends_with(".MIC") || n.ends_with("Mic") {
         return Some("hardware-only (the controller's mic input: recordbox has no mic channel)");

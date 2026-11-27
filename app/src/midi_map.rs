@@ -366,6 +366,11 @@ impl MidiMap {
     }
 
     /// Let the app mark the entries of the functions it knows (0 = not known).
+    /// The comments of the rows of a function (inputs, then outputs).
+    pub fn inputs_named(&self, name: &str) -> Vec<String> {
+        self.inputs.iter().flatten().filter(|i| i.e.name == name).map(|i| i.e.comment.clone()).chain(self.outputs.iter().filter(|e| e.name == name).map(|e| e.comment.clone())).collect()
+    }
+
     pub fn tag_inputs(&mut self, f: impl Fn(&str) -> u32) {
         for i in self.inputs.iter_mut().flatten() {
             i.tag = f(&i.e.name);

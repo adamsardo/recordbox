@@ -170,7 +170,7 @@ pub fn in_class(k: Kind) -> Option<InClass> {
 pub const PARAMS: [&str; 3] = ["MidiOutInterval", "JogIndicatorInterval", "JogRatency"];
 
 /// Outputs that follow the engine and are sent by row name (`Hub::engine_outputs`).
-pub const NAMED_OUTPUTS: [&str; 7] = ["JogPlayPauseIndicator", "JogPlayPauseIndicatorShort", "ChannelLevel", "LoadedIndicator", "GetLoopActive", "SlipStateForFlashing", "PlayingState"];
+pub const NAMED_OUTPUTS: [&str; 26] = ["JogPlayPauseIndicator", "JogPlayPauseIndicatorShort", "ChannelLevel", "LoadedIndicator", "GetLoopActive", "SlipStateForFlashing", "PlayingState", "EndWarningIndicator", "TriggerEndWarning", "OnAirIndicator", "ChannelLevel.1", "ChannelLevel.2", "ChannelLevel.3", "ChannelLevel.4", "ChannelLevel.5", "LoadedIndicatorDdjRz", "LoadedIndicatorDdjRzWithoutFlashing", "ReverseIndicator", "JogCurrentCueIndicator", "BeatIndicatorNumerator", "BeatIndicator1", "BeatIndicator2", "BeatIndicator4", "BeatIndicator8", "BeatIndicator16", "BeatIndicator32"];
 
 /// recordbox acts on an input row of this function and type.
 pub fn input_acts(name: &str, kind: Kind) -> bool {
@@ -193,11 +193,13 @@ pub fn act_accepts(a: Act, c: InClass) -> bool {
         A::SamplerVolume | A::FxUnitBeatRot(_) => matches!(c, InClass::Abs | InClass::Rel),
         A::Needle | A::Tempo | A::FxLevel(..) | A::CfxColor(_) | A::SamplerGain | A::Trim | A::Eq(_) | A::StemIsoKnob(_) | A::ChFader | A::HpMix | A::HpLevel | A::CrossFader | A::MasterLevel => c == InClass::Abs,
         A::LoopSize | A::FxReleaseType(_) | A::Browse | A::Zoom | A::LoopMoveRot => c == InClass::Rel,
-        A::FxSelect(..) => matches!(c, InClass::Press | InClass::Rel),
+        A::FxSelect(..) => matches!(c, InClass::Press | InClass::Rel | InClass::Abs),
+        A::FxReleaseOn(_) => matches!(c, InClass::Press | InClass::Abs),
         A::VinylAdjust(_) | A::XfAssignKnob => c == InClass::Abs,
         A::Jog(_) | A::JogSearch => c == InClass::Jog,
         A::TempoLed(_) => false,
         A::Stub(Stub::VinylBrake(_)) => c == InClass::Abs,
+        A::More(m) => crate::midi_acts::accepts(m, c),
         _ => c == InClass::Press,
     }
 }
@@ -211,9 +213,12 @@ pub fn echo_led(a: Act) -> bool {
 pub fn act_has_led(a: Act) -> bool {
     use Act as A;
     use crate::sampler_ext::SmpAct;
+    if let A::More(m) = a {
+        return crate::midi_acts::has_led(m);
+    }
     matches!(
         a,
-        A::PlayPause | A::Cue | A::Search(_) | A::Slip | A::Quantize | A::QuantizeAll | A::MasterTempo | A::Sync | A::Master | A::KeySync | A::TempoLed(_) | A::AutoLoop | A::Loop4 | A::Reloop | A::LoopIn | A::LoopOut | A::PitchBend(_) | A::PadMode(_) | A::HotCue(_) | A::HotCueDelete(_) | A::BeatJumpPad(_) | A::BeatLoopPad(_) | A::StemPart(_) | A::StemFx(_) | A::StemSolo | A::FxOn(..) | A::FxMode(_) | A::FxAuto(_) | A::FxTap(_) | A::FxReleaseOn(_) | A::FxAssign(..) | A::SamplerPad(..) | A::SamplerPadStop(_) | A::Smp(SmpAct::Sync | SmpAct::Master | SmpAct::Quantize | SmpAct::SeqPlay | SmpAct::SeqRec) | A::SamplerCue | A::SeqCall(..) | A::HeadCue | A::XfAssign(_) | A::StemIso | A::Panel(_) | A::Related | A::Stub(Stub::Vinyl) | A::Stub(Stub::Reverse)
+        A::FxLevel(..) | A::PlayPause | A::Cue | A::Search(_) | A::Slip | A::Quantize | A::QuantizeAll | A::MasterTempo | A::Sync | A::Master | A::KeySync | A::TempoLed(_) | A::AutoLoop | A::Loop4 | A::Reloop | A::LoopIn | A::LoopOut | A::PitchBend(_) | A::PadMode(_) | A::HotCue(_) | A::HotCueDelete(_) | A::BeatJumpPad(_) | A::BeatLoopPad(_) | A::StemPart(_) | A::StemFx(_) | A::StemSolo | A::FxOn(..) | A::FxMode(_) | A::FxAuto(_) | A::FxTap(_) | A::FxReleaseOn(_) | A::FxAssign(..) | A::SamplerPad(..) | A::SamplerPadStop(_) | A::Smp(SmpAct::Sync | SmpAct::Master | SmpAct::Quantize | SmpAct::SeqPlay | SmpAct::SeqRec) | A::SamplerCue | A::SeqCall(..) | A::HeadCue | A::XfAssign(_) | A::StemIso | A::Panel(_) | A::Related | A::Stub(Stub::Vinyl) | A::Stub(Stub::Reverse)
     )
 }
 
@@ -361,6 +366,8 @@ pub enum Act {
     /// An FX slot's effect by its place in `fx::INFO`.
     FxSelectKind(u8, u8, u8),
     Stub(Stub),
+    /// The functions of `midi_acts.rs`.
+    More(crate::midi_acts::M),
 }
 
 /// One function recordbox can be mapped to.
@@ -416,13 +423,19 @@ pub fn registry() -> &'static Registry {
 }
 
 fn build_registry() -> Vec<Func> {
+    use crate::midi_acts::M;
     use crate::sampler_ext::SmpAct;
     use Act as A;
     let mut v: Vec<Func> = vec![];
     let mut add = |tab: Tab, category: &'static str, display: &str, name: &str, ty: u8, per_deck: bool, act: Act| v.push(Func { name: name.to_string(), display: display.to_string(), tab, category, ty, per_deck, act });
     let (b, rot, k7, ind, pad, val) = (T_BUTTON, T_ROTARY, T_KNOB7, T_INDICATOR, T_PAD, T_VALUE);
+    const DVS: &str = "DVS (no timecode vinyl in recordbox)";
+    const LINK: &str = "Ableton Link (recordbox has no Ableton Link)";
+    const DRUM_FX: &str = "GROOVE CIRCUIT DRUM ROLL / TRANS: the PAD FX engine (ui_padfx.rs, the effects track's) has no entry for an effect and beat of its own on the DRUMS part";
+    const ADJUST_TIME: &str = "FX ADJUST TIME: the FX units of recordbox (ui_fx.rs, the effects track's) have no time encoder (rekordbox's `rotateTimeEncoder`)";
+    const DISCOVER: &str = "DISCOVER (rekordbox's recommendations from its online service: streaming, out of scope)";
 
-    // ---- DECK
+    // ---- DECK (the ADD menu's order)
     let t = Tab::Deck;
     add(t, "", "PlayPause", "PlayPause", b, true, A::PlayPause);
     add(t, "", "Cue", "Cue", b, true, A::Cue);
@@ -439,6 +452,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "Vinyl", "Vinyl", b, true, A::Stub(Stub::Vinyl));
     add(t, "", "VinylBrakeSpeed LeftDeck", "VinylAdjustBrake.Left", k7, false, A::Stub(Stub::VinylBrake(0)));
     add(t, "", "VinylBrakeSpeed RightDeck", "VinylAdjustBrake.Right", k7, false, A::Stub(Stub::VinylBrake(1)));
+    add(t, "", "AutoCue All Decks", "AutoCue4", b, false, A::More(M::AutoCueAll));
     add(t, "", "Quantize All Decks", "Quantize4", b, false, A::QuantizeAll);
     add(t, "", "AutoCue", "AutoCue", b, true, A::Stub(Stub::AutoCue));
     add(t, "Tempo", "MasterTempo", "MasterTempo", b, true, A::MasterTempo);
@@ -456,6 +470,10 @@ fn build_registry() -> Vec<Func> {
     add(t, "Loop", "AutoLoop", "AutoLoop", b, true, A::AutoLoop);
     add(t, "Loop", "4BeatLoop", "4BeatLoop", b, true, A::Loop4);
     add(t, "Loop", "ActiveLoop", "ActiveLoop", b, true, A::Stub(Stub::ActiveLoop));
+    add(t, "Loop", "ActiveLoop Select (HotCue)", "ActiveLoopSelectHotCue", b, true, A::More(M::ActiveLoopSel { hot: true, off: false }));
+    add(t, "Loop", "ActiveLoop Off (HotCue)", "ActiveLoopOffHotCue", b, true, A::More(M::ActiveLoopSel { hot: true, off: true }));
+    add(t, "Loop", "ActiveLoop Select (MemoryCue)", "ActiveLoopSelectMemCue", b, true, A::More(M::ActiveLoopSel { hot: false, off: false }));
+    add(t, "Loop", "ActiveLoop Off (MemoryCue)", "ActiveLoopOffMemCue", b, true, A::More(M::ActiveLoopSel { hot: false, off: true }));
     add(t, "Loop", "Loop Half", "LoopHalf", b, true, A::LoopResize(0.5));
     add(t, "Loop", "Loop Double", "LoopDouble", b, true, A::LoopResize(2.0));
     add(t, "Loop", "Loop Size", "LoopHalfDouble", rot, true, A::LoopSize);
@@ -470,14 +488,29 @@ fn build_registry() -> Vec<Func> {
         let label = ["1/64", "1/32", "1/16", "1/8", "1/4", "1/2", "1", "2", "4", "8", "16", "32", "64", "128", "256", "512"][i];
         add(t, "Loop", &format!("AutoBeatLoop {label}"), &format!("BeatLoop{}", label.replace('/', "_")), b, true, A::BeatLoop(*beats));
     }
+    add(t, "Grid", "GridAdjust", "GridAdjust", b, true, A::More(M::Grid(false)));
+    add(t, "Grid", "GridSlide", "GridSlide", b, true, A::More(M::Grid(true)));
     add(t, "Grid", "GridAdjust Half", "GridAdjustHalf", b, true, A::GridHalfDouble(false));
     add(t, "Grid", "GridAdjust Double", "GridAdjustDouble", b, true, A::GridHalfDouble(true));
     add(t, "Capture", "SlicerCapture", "SlicerCapture", b, true, A::Stub(Stub::SlicerCapture));
+    for (d, nm) in [("DVS Switch to Absolute", "DvsAbsolute"), ("DVS Switch to Relative", "DvsRelative"), ("DVS Switch to Internal", "DvsInternal"), ("DVS Switch to Through", "DvsThrough"), ("DVS Switch to Wireless(A)", "DvsWireless(A)"), ("DVS Switch to Wireless(B)", "DvsWireless(B)"), ("DVS Toggle INT and WIR/REL/ABS", "DvsWirAbsRelInt")] {
+        add(t, "DVS", d, nm, b, true, A::More(M::Off(DVS)));
+    }
     add(t, "KeyShift", "Semitone Up", "SemitoneUp", b, true, A::KeyShift(1));
     add(t, "KeyShift", "Semitone Down", "SemitoneDown", b, true, A::KeyShift(-1));
     add(t, "KeyShift", "KeySync", "KeySync", b, true, A::KeySync);
     add(t, "KeyShift", "KeyReset", "KeyReset", b, true, A::KeyReset);
     add(t, "STEMS", "ActiveStem Mute/Solo", "ActivePartMuteSolo", b, false, A::StemSolo);
+    add(t, "STEMS", "DRUM SWAP SINGLE Mode", "DrumSwapSingle", b, true, A::More(M::DrumMulti(false)));
+    add(t, "STEMS", "DRUM SWAP MULTI Mode", "DrumSwapMulti", b, true, A::More(M::DrumMulti(true)));
+    add(t, "STEMS", "DRUM LOOP BANK A", "DrumSwapBankA", b, true, A::More(M::DrumBank(0)));
+    add(t, "STEMS", "DRUM LOOP BANK B", "DrumSwapBankB", b, true, A::More(M::DrumBank(1)));
+    add(t, "STEMS", "DRUM SWAP Gain", "DrumSwapGain", k7, true, A::More(M::DrumGain));
+    for s in 0..4u8 {
+        add(t, "STEMS", &format!("DRUM SWAP Slot {} Play/Stop", s + 1), &format!("DrumSwap{}", s + 1), b, true, A::More(M::DrumSlot(s)));
+    }
+    add(t, "STEMS", "DRUM CAPTURE On/Off", "DrumSwapCapture", b, true, A::More(M::DrumCapture));
+    add(t, "STEMS", "DRUM CAPTURE Length", "DrumSwapCaptureLength", b, true, A::More(M::DrumCaptureLen));
 
     // ---- PAD
     let t = Tab::Pad;
@@ -499,10 +532,6 @@ fn build_registry() -> Vec<Func> {
         }
         add(t, "PadFX", &format!("PadFX{bank}Beat Up"), &format!("Parameter1Right_PadFx{bank}"), b, true, A::Stub(Stub::PadFxBeat(bank, 1)));
         add(t, "PadFX", &format!("PadFX{bank}Beat Down"), &format!("Parameter1Left_PadFx{bank}"), b, true, A::Stub(Stub::PadFxBeat(bank, -1)));
-    }
-    // (rekordbox's combination pads, controller only: pads 33..48 of the deck's PAD FX.)
-    for n in 1..=16u8 {
-        add(t, "PadFX", &format!("PadFXCombination Pad{n}"), &format!("PAD{n}_PadFxCombination"), pad, true, A::Stub(Stub::PadFx(3, n - 1)));
     }
     for (lp, mode) in [(false, "Slicer"), (true, "SlicerLoop")] {
         add(t, "Slicer", &format!("{mode}Mode"), mode, b, true, A::Stub(Stub::SlicerMode(lp)));
@@ -528,9 +557,50 @@ fn build_registry() -> Vec<Func> {
     }
     add(t, "BeatJump", "BeatJump Page Right", "Parameter1Right_BeatJump", b, true, A::BeatJumpPage(1));
     add(t, "BeatJump", "BeatJump Page Left", "Parameter1Left_BeatJump", b, true, A::BeatJumpPage(-1));
+    add(t, "BeatJump", "BeatJump Bank Right", "Parameter2Right_BeatJump", b, true, A::More(M::JumpPage2(1)));
+    add(t, "BeatJump", "BeatJump Bank Left", "Parameter2Left_BeatJump", b, true, A::More(M::JumpPage2(-1)));
     add(t, "BeatLoop", "BeatLoopMode", "BeatLoop", b, true, A::PadMode(3));
     for n in 1..=16u8 {
         add(t, "BeatLoop", &format!("BeatLoop Pad{n}"), &format!("PAD{n}_BeatLoop"), pad, true, A::BeatLoopPad(n - 1));
+    }
+    let code = |m: crate::pads::PadMode| m.code();
+    use crate::pads::PadMode as PM;
+    add(t, "ActiveCensor", "ActiveCensorMode", "ActiveCensor", b, true, A::PadMode(code(PM::ActiveCensor)));
+    for (i, d) in ["ActiveCensor FX1", "ActiveCensor FX2", "ActiveCensor FX3", "ActiveCensor FX4", "ActiveCensor In", "ActiveCensor Out", "ActiveCensor Clear", "ActiveCensor On/Off"].iter().enumerate() {
+        add(t, "ActiveCensor", d, &format!("PAD{}_ActiveCensor", i + 1), pad, true, A::More(M::Censor(i as u8)));
+    }
+    add(t, "ActiveCensor", "ActiveCensorCall Next", "Parameter1Right_ActiveCensor", b, true, A::More(M::CensorCall(1)));
+    add(t, "ActiveCensor", "ActiveCensorCall Back", "Parameter1Left_ActiveCensor", b, true, A::More(M::CensorCall(-1)));
+    add(t, "ActiveCensor", "ActiveCensorBeat Up", "Parameter2Right_ActiveCensor", b, true, A::More(M::CensorBeat(1)));
+    add(t, "ActiveCensor", "ActiveCensorBeat Down", "Parameter2Left_ActiveCensor", b, true, A::More(M::CensorBeat(-1)));
+    add(t, "KeyShift", "KeyShiftMode", "KeyShift", b, true, A::PadMode(code(PM::KeyShift)));
+    for n in 1..=16u8 {
+        add(t, "KeyShift", &format!("KeyShift Pad{n}"), &format!("PAD{n}_KeyShift"), pad, true, A::More(M::KeyShiftPad(n - 1)));
+    }
+    add(t, "KeyShift", "KeyShift Page Right", "Parameter1Right_KeyShift", pad, true, A::More(M::KeyShiftPage(1)));
+    add(t, "KeyShift", "KeyShift Page Left", "Parameter1Left_KeyShift", pad, true, A::More(M::KeyShiftPage(-1)));
+    add(t, "Keyboard", "KeyboardMode", "Keyboard", b, true, A::PadMode(code(PM::Keyboard)));
+    for n in 1..=16u8 {
+        add(t, "Keyboard", &format!("Keyboard Pad{n}"), &format!("PAD{n}_Keyboard"), pad, true, A::More(M::KeyboardPad(n - 1)));
+    }
+    for n in 1..=16u8 {
+        add(t, "Keyboard", &format!("Keyboard HotCue Delete Pad{n}"), &format!("PAD{n}_Keyboard+Shift"), pad, true, A::More(M::KeyboardDelete(n - 1)));
+    }
+    add(t, "Keyboard", "Keyboard Page Right", "Parameter1Right_Keyboard", pad, true, A::More(M::KeyboardPage(1)));
+    add(t, "Keyboard", "Keyboard Page Left", "Parameter1Left_Keyboard", pad, true, A::More(M::KeyboardPage(-1)));
+    add(t, "SampleScratch", "SampleScratchMode", "SampleScratch", b, true, A::PadMode(code(PM::SamplerScratch)));
+    for n in 1..=8u8 {
+        add(t, "SampleScratch", &format!("SampleScratch Pad{n}"), &format!("PAD{n}_SampleScratch"), pad, true, A::More(M::ScratchPad(n - 1, false)));
+    }
+    for n in 1..=8u8 {
+        add(t, "SampleScratch", &format!("SampleScratch Eject Pad{n}"), &format!("PAD{n}_SampleScratch+Shift"), pad, true, A::More(M::ScratchPad(n - 1, true)));
+    }
+    add(t, "HotCue", "HotCue/SamplerMode", "HotCueSampler", b, true, A::PadMode(0));
+    for n in 1..=3u8 {
+        add(t, "HotCue", &format!("HotCue{n}/Sampler{n} Play"), &format!("PAD{n}_HotCueSampler"), pad, true, A::More(M::HotCueSampler(n - 1, false)));
+    }
+    for n in 1..=3u8 {
+        add(t, "HotCue", &format!("HotCue{n} Delete/Sampler{n} Stop"), &format!("PAD{n}_HotCueSampler+Shift"), pad, true, A::More(M::HotCueSampler(n - 1, true)));
     }
     add(t, "STEMS", "StemsMode", "Stems", b, true, A::PadMode(1));
     // (Sources in the engine's order: 0 drums, 1 bass, 2 other, 3 vocals; FX rows as on screen.)
@@ -560,6 +630,7 @@ fn build_registry() -> Vec<Func> {
         add(t, cat, &format!("{cat} Beat Up"), &format!("{cat}BeatUp"), b, false, A::FxUnitBeat(u, 1));
         add(t, cat, &format!("{cat} Beat Down"), &format!("{cat}BeatDown"), b, false, A::FxUnitBeat(u, -1));
         add(t, cat, &format!("{cat} BeatSize"), &format!("{cat}BeatUpDown"), rot, false, A::FxUnitBeatRot(u));
+        add(t, cat, &format!("{cat} AdjustTime"), &format!("{cat}AdjustTime"), rot, false, A::More(M::Off(ADJUST_TIME)));
         add(t, cat, &format!("{cat} BPM AutoMode"), &format!("{cat}AutoBeat"), b, false, A::FxAuto(u));
         add(t, cat, &format!("{cat} BPM TapMode/TapBpm"), &format!("{cat}TapBeat"), b, false, A::FxTap(u));
         add(t, cat, &format!("{cat} ReleaseFX Select"), &format!("{cat}ReleaseFXType"), rot, false, A::FxReleaseType(u));
@@ -570,27 +641,58 @@ fn build_registry() -> Vec<Func> {
             add(t, cat, &format!("{cat} AssignDeck{}", d + 1), &format!("{cat}Assign{}", d + 1), b, false, A::FxAssign(u, d));
         }
     }
-    for (i, ch) in ["CH1", "CH2", "CH3", "CH4", "Master", "Sampler"].iter().enumerate() {
+    for (i, ch) in ["CH1", "CH2", "CH3", "CH4"].iter().enumerate() {
         add(t, "CFX", &format!("CFX Parameter{ch}"), &format!("CFXParameter{ch}"), k7, false, A::CfxColor(i as u8));
     }
+    add(t, "CFX", "CFX ParameterSampler", "CFXParameterSampler", k7, false, A::CfxColor(crate::fx::SAMPLER as u8));
+    add(t, "CFX", "CFX ParameterMaster", "CFXParameterMaster", k7, false, A::CfxColor(4));
+    add(t, "CFX", "CFX On", "CFXOn", b, false, A::More(M::CfxOn));
     add(t, "CFX", "CFX Select Next", "CFXSelect", b, false, A::CfxSelect(1));
     add(t, "CFX", "CFX Select Back", "CFXSelectBack", b, false, A::CfxSelect(-1));
+    for u in 0..2u8 {
+        let cat: &'static str = if u == 0 { "MFX1" } else { "MFX2" };
+        let n = u + 1;
+        add(t, cat, &format!("{cat} Parameter"), cat, rot, false, A::More(M::MfxParam(u)));
+        add(t, cat, &format!("{cat} On"), &format!("{cat}On"), b, false, A::More(M::MfxOn(u)));
+        add(t, cat, &format!("{cat} AssignDeck{n}"), &format!("{cat}Assign{n}"), b, false, A::More(M::MfxAssign(u, u)));
+        add(t, cat, &format!("{cat} AssignDeck{}", n + 2), &format!("{cat}Assign{}", n + 2), b, false, A::More(M::MfxAssign(u, u + 2)));
+        add(t, cat, &format!("{cat} Select Next"), &format!("{cat}SelectUp"), b, false, A::More(M::MfxSelect(u, 1)));
+        add(t, cat, &format!("{cat} Select Back"), &format!("{cat}SelectDown"), b, false, A::More(M::MfxSelect(u, -1)));
+        add(t, cat, &format!("{cat} Cancel"), &format!("{cat}Abort"), b, false, A::More(M::MfxCancel(u)));
+    }
+    add(t, "", "MFX Sample Volume", "MFXSampleVolume", rot, false, A::More(M::MfxSampleVolume));
+    for (kind, word) in [("Roll", "ROLL"), ("Trans", "TRANS")] {
+        let beats: &[&str] = if kind == "Roll" { &["1/16", "1/8", "1/4", "1/2", "3/4", "1", "2", "4", "8"] } else { &["1/16", "1/8", "1/4", "1/2", "3/4", "1", "2", "4", "8", "16"] };
+        for bt in beats {
+            add(t, "STEMS", &format!("DRUM {word} {bt} On"), &format!("Drum{kind}{}", bt.replace('/', "_")), b, true, A::More(M::Off(DRUM_FX)));
+        }
+    }
+    add(t, "STEMS", "DRUM RELESE FX On", "DrumReleaseFx", b, true, A::More(M::DrumRelease));
+    add(t, "STEMS", "DRUM RELESE FX Select", "DrumReleaseFxSelect", b, true, A::More(M::DrumReleaseSelect));
 
-    // ---- SAMPLER
+    // ---- SAMPLER (pads 9-16 are listed for the second eight slots; they are the same rows)
     let t = Tab::Sampler;
     add(t, "Sampler", "SamplerMode", "Sampler", b, true, A::PadMode(crate::ui_perf::PAD_SAMPLER));
-    for n in 1..=8u8 {
-        add(t, "Sampler", &format!("Sampler{n} Play"), &format!("PAD{n}_Sampler"), pad, true, A::SamplerPad(n - 1, false));
+    for n in 1..=16u8 {
+        let p = (n - 1) % 8;
+        add(t, "Sampler", &format!("Sampler{n} Play"), &format!("PAD{}_Sampler", p + 1), pad, true, A::SamplerPad(p, false));
     }
-    for n in 1..=8u8 {
-        add(t, "Sampler", &format!("Sampler{n} Stop"), &format!("PAD{n}_Sampler+Shift"), pad, true, A::SamplerPadStop(n - 1));
+    for n in 1..=16u8 {
+        let p = (n - 1) % 8;
+        add(t, "Sampler", &format!("Sampler{n} Stop"), &format!("PAD{}_Sampler+Shift", p + 1), pad, true, A::SamplerPadStop(p));
     }
     add(t, "VelocitySampler", "VelocitySamplerMode", "VelocitySampler", b, true, A::PadMode(crate::ui_perf::PAD_SAMPLER));
-    for n in 1..=8u8 {
-        add(t, "VelocitySampler", &format!("VelocitySampler{n} Play"), &format!("PAD{n}_VelocitySampler"), pad, true, A::SamplerPad(n - 1, true));
+    for n in 1..=16u8 {
+        let p = (n - 1) % 8;
+        add(t, "VelocitySampler", &format!("VelocitySampler{n} Play"), &format!("PAD{}_VelocitySampler", p + 1), pad, true, A::SamplerPad(p, true));
     }
-    for n in 1..=8u8 {
-        add(t, "VelocitySampler", &format!("VelocitySampler{n} Stop"), &format!("PAD{n}_VelocitySampler+Shift"), pad, true, A::SamplerPadStop(n - 1));
+    for n in 1..=16u8 {
+        let p = (n - 1) % 8;
+        add(t, "VelocitySampler", &format!("VelocitySampler{n} Stop"), &format!("PAD{}_VelocitySampler+Shift", p + 1), pad, true, A::SamplerPadStop(p));
+    }
+    for n in 1..=16u8 {
+        let p = (n - 1) % 8;
+        add(t, "VelocitySampler", &format!("VelocitySampler{n} Level"), &format!("PAD{}_VelocitySampler+Velocity", p + 1), val, true, A::More(M::VelocityLevel(p)));
     }
     add(t, "Bank", "SamplerBank Up/SeqEraseMode", "Parameter1Right_Sampler", b, true, A::SamplerBank(1));
     add(t, "Bank", "SamplerBank Down/SeqMuteMode", "Parameter1Left_Sampler", b, true, A::SamplerBank(-1));
@@ -599,6 +701,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "SamplerSync", "SamplerSync", b, false, A::Smp(SmpAct::Sync));
     add(t, "", "SamplerMaster", "SamplerMaster", b, false, A::Smp(SmpAct::Master));
     add(t, "", "SamplerCue", "SamplerCue", b, false, A::SamplerCue);
+    add(t, "", "SamplerTapBpm", "SamplerTapBpm", b, false, A::More(M::SamplerTapBpm));
     add(t, "", "SamplerQuantize", "SamplerQuantize", b, false, A::Smp(SmpAct::Quantize));
     add(t, "Sequence", "SequencerRec", "SequencerRec", b, true, A::Smp(SmpAct::SeqRec));
     add(t, "Sequence", "SequencerStart", "SequencerStart", b, true, A::Smp(SmpAct::SeqPlay));
@@ -620,6 +723,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "EQ Mid", "EQMid", k7, true, A::Eq(1));
     add(t, "", "EQ Low", "EQLow", k7, true, A::Eq(0));
     add(t, "", "HeadphoneCue", "HeadphoneCue", b, true, A::HeadCue);
+    add(t, "", "MasterCue", "MasterCue", b, false, A::More(M::MasterCue));
     add(t, "", "ChannelFader", "ChannelFader", k7, true, A::ChFader);
     add(t, "", "HeadphonesMix", "HeadphonesMix", k7, false, A::HpMix);
     add(t, "", "HeadphonesVolume", "HeadphonesVolume", k7, false, A::HpLevel);
@@ -627,6 +731,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "CrossfaderAssignA", "CrossfaderAssign.A", b, true, A::XfAssign(1));
     add(t, "", "CrossfaderAssignB", "CrossfaderAssign.B", b, true, A::XfAssign(2));
     add(t, "", "CrossfaderAssignThru", "CrossfaderAssign.Thru", b, true, A::XfAssign(0));
+    add(t, "", "CrossFaderCurve", "CrossFaderCurve", k7, false, A::More(M::XfCurve(false)));
     add(t, "", "MasterLevel", "MasterLevel", k7, false, A::MasterLevel);
     add(t, "STEMS", "StemISO Mode", "PartIsolator", b, true, A::StemIso);
     add(t, "STEMS", "StemISO Inst/Bass", "PartIsolatorInst", k7, true, A::StemIsoKnob(1));
@@ -644,6 +749,7 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "Browse Jump Down", "BrowseJumpDown", b, false, A::BrowseStep(10));
     add(t, "", "AddToTagList", "AddToTagList", b, false, A::TagList);
     add(t, "", "RelatedTracks", "RelatedTracks", b, false, A::Related);
+    add(t, "", "DISCOVER", "Discover", b, false, A::More(M::Off(DISCOVER)));
     add(t, "", "Area", "Area", b, false, A::Area);
     add(t, "", "Area Right", "AreaRight", b, false, A::Forward);
     add(t, "", "Area Left", "AreaLeft", b, false, A::Back);
@@ -654,17 +760,24 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "SortTRACK", "SortTRACK", b, false, A::Sort(Col::TrackNumber));
     add(t, "", "SortARTIST", "SortARTIST", b, false, A::Sort(Col::Artist));
     add(t, "", "SortKEY", "SortKEY", b, false, A::Sort(Col::Key));
+    add(t, "", "Preview/PreviewPlayer PlayStop", "PlayPausePreview", b, false, A::More(M::Preview(false)));
+    add(t, "", "Preview/PreviewPlayer Skip", "SkipPreview", b, false, A::More(M::Preview(true)));
 
     // ---- OTHER
     let t = Tab::Other;
     add(t, "", "FXPanel", "FxPanel", b, false, A::Panel(0));
     add(t, "", "SamplerPanel", "SamplerPanel", b, false, A::Panel(1));
+    add(t, "", "MixerPanel", "MixerPanel", b, false, A::Panel(2));
     add(t, "", "RecPanel", "RecPanel", b, false, A::Stub(Stub::RecPanel));
-    add(t, "", "WaveZoom", "Zoom", rot, false, A::Zoom);
-    add(t, "", "AutoMix StartStop", "AutoMixStartStop", b, false, A::Stub(Stub::AutoMixStartStop));
     add(t, "", "PanelSelect Next", "PanelForward", b, false, A::PanelStep(1));
     add(t, "", "PanelSelect Back", "PanelBack", b, false, A::PanelStep(-1));
+    add(t, "", "WaveZoom", "Zoom", rot, false, A::Zoom);
     add(t, "", "BrowseView", "SwitchActiveWindow", b, false, A::BrowseView);
+    add(t, "", "AutoMix StartStop", "AutoMixStartStop", b, false, A::Stub(Stub::AutoMixStartStop));
+    add(t, "AbletonLink", "AbletonLink TapBpm", "AbletonLinkTapBpm", b, false, A::More(M::Off(LINK)));
+    add(t, "AbletonLink", "AbletonLink BPM Up", "AbletonLinkBpmUp", b, false, A::More(M::Off(LINK)));
+    add(t, "AbletonLink", "AbletonLink BPM Down", "AbletonLinkBpmDown", b, false, A::More(M::Off(LINK)));
+    add(t, "AbletonLink", "AbletonLink BPM", "AbletonLinkBpmUpDown", rot, false, A::More(M::Off(LINK)));
 
     // ---- MIXPOINTLINK
     let t = Tab::MixPointLink;
@@ -681,8 +794,6 @@ fn build_registry() -> Vec<Func> {
     add(t, "", "", "WheelSearch", b, true, A::JogSearch);
     add(t, "", "", "JogTouch", b, true, A::JogTouch);
     add(t, "", "", "Shift", b, true, A::Shift);
-    // (CDJ-style CALL buttons: the next / previous memory cue; while a loop plays, the loop
-    // doubles / halves. `UiPlayer::deviceMemoryCue` 0x1020281dc.)
     // (A long press of LOOP IN, sent by the hardware as its own code: the 4-beat loop.)
     add(t, "", "", "4BeatLoopLongPress", b, true, A::Loop4);
     // (A crossfader-assign switch as a knob: A at 0x00, THRU at 0x40, B at 0x7F.)
@@ -691,6 +802,8 @@ fn build_registry() -> Vec<Func> {
         // (The CFX knob's centre click: the knob back to the middle.)
         add(t, "", "", &format!("CFXParameterCH{}Center", ch + 1), b, false, A::CfxCenter(ch));
     }
+    // (CDJ-style CALL buttons: the next / previous memory cue; while a loop plays, the loop
+    // doubles / halves. `UiPlayer::deviceMemoryCue` 0x1020281dc.)
     add(t, "", "", "CallNext", b, true, A::CallStep(1));
     add(t, "", "", "CallPrev", b, true, A::CallStep(-1));
     // (Vinyl Speed Adjust knobs of a deck: brake, start, or both. `deviceVinylAdjust`.)
@@ -716,6 +829,147 @@ fn build_registry() -> Vec<Func> {
             }
         }
         add(t, "", "", &format!("{cat}Assign.MASTER"), b, false, A::FxAssignHold(u, crate::fx::MASTER as u8));
+    }
+    // (rekordbox's combination pads, controller only: pads 33..48 of the deck's PAD FX.)
+    for n in 1..=16u8 {
+        add(t, "", "", &format!("PAD{n}_PadFxCombination"), pad, true, A::Stub(Stub::PadFx(3, n - 1)));
+    }
+    // Shift layers of the pads that act as the pad itself (`BeatJumpView::eventOnChanged`
+    // 0x101ddd50c, `PadFxView::eventOnChanged` 0x101e2643c, `ActiveCensorView` 0x101084c40,
+    // `KeyShiftView` 0x101d64adc: the +Shift component of pad n goes the same way as pad n).
+    for n in 1..=16u8 {
+        add(t, "", "", &format!("PAD{n}_BeatJump+Shift"), pad, true, A::BeatJumpPad(n - 1));
+        for bank in 1..=2u8 {
+            add(t, "", "", &format!("PAD{n}_PadFx{bank}+Shift"), pad, true, A::Stub(Stub::PadFx(bank, n - 1)));
+        }
+        add(t, "", "", &format!("PAD{n}_KeyShift+Shift"), pad, true, A::More(M::KeyShiftPad(n - 1)));
+        add(t, "", "", &format!("PAD{n}_BeatLoop+Shift"), pad, true, A::BeatLoopPad(n - 1));
+    }
+    for n in 1..=8u8 {
+        add(t, "", "", &format!("PAD{n}_ActiveCensor+Shift"), pad, true, A::More(M::Censor(n - 1)));
+    }
+    add(t, "", "", "PageLeft_BeatJump", b, true, A::More(M::JumpPage2(-1)));
+    add(t, "", "", "PageRight_BeatJump", b, true, A::More(M::JumpPage2(1)));
+    // (PAD FX pages: PageLeft is `onPageUp`, PageRight `onPageDown`, as rekordbox names them.)
+    for bank in 1..=2u8 {
+        add(t, "", "", &format!("PageLeft_PadFx{bank}"), b, true, A::More(M::PadFxPage(0)));
+        add(t, "", "", &format!("PageRight_PadFx{bank}"), b, true, A::More(M::PadFxPage(1)));
+    }
+    // (The velocity sampler's bank buttons: `SamplerControlPanel`.)
+    add(t, "", "", "Parameter1Right_VelocitySampler", b, true, A::SamplerBank(1));
+    add(t, "", "", "Parameter1Left_VelocitySampler", b, true, A::SamplerBank(-1));
+    add(t, "", "", "CrossFaderCurve3Pos", k7, false, A::More(M::XfCurve(true)));
+    add(t, "", "", "VinylState", b, true, A::More(M::VinylState));
+    for n in 1..=6u8 {
+        add(t, "", "", &format!("CFX{n}On"), b, false, A::More(M::CfxButton(n - 1)));
+    }
+    // The Pad Editor's slots (`PadEditorData::createDevice` 0x1020f64c4).
+    for m in 1..=8u8 {
+        add(t, "", "", &format!("PadMode{m}"), b, true, A::More(M::EditorMode(m - 1)));
+        add(t, "", "", &format!("PageLeft_PadMode{m}"), b, true, A::More(M::EditorPage(m - 1, -1)));
+        add(t, "", "", &format!("PageRight_PadMode{m}"), b, true, A::More(M::EditorPage(m - 1, 1)));
+        add(t, "", "", &format!("Permission_PadMode{m}"), ind, true, A::More(M::Permission(m - 1)));
+        for p in 1..=16u8 {
+            add(t, "", "", &format!("PAD{p}_PadMode{m}"), pad, true, A::More(M::EditorPad(m - 1, p - 1, false)));
+            add(t, "", "", &format!("PAD{p}_PadMode{m}+Shift"), pad, true, A::More(M::EditorPad(m - 1, p - 1, true)));
+        }
+    }
+    // Second batch: deck, browse, FX and mixer functions of the factory files.
+    add(t, "", "", "JogTimestamp", b, true, A::Jog(true));
+    add(t, "", "", "ShiftWeGO4", b, true, A::Shift);
+    add(t, "", "", "Deck", b, true, A::More(M::DeckHeld));
+    add(t, "", "", "AutoLoopMode", b, true, A::More(M::LoopBox(false)));
+    add(t, "", "", "ManualLoopMode", b, true, A::More(M::LoopBox(true)));
+    add(t, "", "", "TimeMode", b, true, A::More(M::TimeMode(false)));
+    add(t, "", "", "TimeMode4", b, false, A::More(M::TimeMode(true)));
+    add(t, "", "", "ForwardAndLoad", b, true, A::More(M::ForwardAndLoad));
+    for u in 0..2u8 {
+        for sl in 0..3u8 {
+            add(t, "", "", &format!("Fx{}-{}_BeatTarget", u + 1, sl + 1), b, false, A::More(M::BeatTarget(u, sl)));
+            add(t, "", "", &format!("FX{}-{}OnMomentary", u + 1, sl + 1), b, false, A::More(M::FxMomentary(u, sl, 255)));
+            for ch in 0..2u8 {
+                add(t, "", "", &format!("CH{}_FX{}-{}OnMomentary", ch + 1, u + 1, sl + 1), b, false, A::More(M::FxMomentary(u, sl, ch)));
+            }
+            add(t, "", "", &format!("Sampler_FX{}-{}OnMomentary", u + 1, sl + 1), b, false, A::More(M::FxMomentary(u, sl, crate::fx::SAMPLER as u8)));
+        }
+        let cat = if u == 0 { "FX1" } else { "FX2" };
+        add(t, "", "", &format!("{cat}BeatMultiplier"), ind, false, A::More(M::Out(crate::midi_acts::Out::FxBeat(u))));
+        add(t, "", "", &format!("ReleaseFxIlluminationFx{}", u + 1), ind, false, A::More(M::Out(crate::midi_acts::Out::ReleaseOn(u))));
+        for k in 0..3u8 {
+            add(t, "", "", &format!("{cat}ReleaseFXIndicator.{}", k + 1), ind, false, A::More(M::Out(crate::midi_acts::Out::ReleaseType(u, k))));
+        }
+        add(t, "", "", &format!("{cat}AssignMaster"), b, false, A::FxAssign(u, crate::fx::MASTER as u8));
+        add(t, "", "", &format!("{cat}AssignSampler"), b, false, A::FxAssign(u, crate::fx::SAMPLER as u8));
+        add(t, "", "", &format!("{cat}Assign.LEFT"), b, false, A::FxAssignHold(u, 0));
+        add(t, "", "", &format!("{cat}Assign.RIGHT"), b, false, A::FxAssignHold(u, 1));
+        let mf = if u == 0 { "MFX1" } else { "MFX2" };
+        add(t, "", "", &format!("{mf}Illumi"), ind, false, A::More(M::Out(crate::midi_acts::Out::MfxIllumi(u, 0))));
+        for p in 1..=4u8 {
+            add(t, "", "", &format!("{mf}Illumi.PRESET{p}"), ind, false, A::More(M::Out(crate::midi_acts::Out::MfxIllumi(u, p))));
+        }
+    }
+    add(t, "", "", "DeselectAllFxBeatTarget", b, false, A::More(M::BeatTarget(255, 255)));
+    add(t, "", "", "ReleaseFxIlluminationPadLeft", ind, false, A::More(M::Out(crate::midi_acts::Out::ReleaseOn(0))));
+    add(t, "", "", "ReleaseFxIlluminationPadRight", ind, false, A::More(M::Out(crate::midi_acts::Out::ReleaseOn(1))));
+    add(t, "", "", "Capture", b, true, A::More(M::Capture));
+    add(t, "", "", "CaptureValidCondition", ind, true, A::More(M::CaptureOk));
+    add(t, "", "", "Bank", b, true, A::More(M::BankMode));
+    for p in 1..=4u8 {
+        add(t, "", "", &format!("PAD{p}_Bank"), b, true, A::More(M::BankPad(p - 1)));
+    }
+    for (i, nm) in ["CrossFaderCurve.STRAIGHT", "CrossFaderCurve.MID", "CrossFaderCurve.SHARP", "CrossFaderCurve.THRU"].iter().enumerate() {
+        add(t, "", "", nm, b, false, A::More(M::XfCurvePos(i as u8)));
+    }
+    for (i, nm) in ["ChFaderCurve.STRAIGHT", "ChFaderCurve.MID", "ChFaderCurve.SHARP"].iter().enumerate() {
+        add(t, "", "", nm, b, false, A::More(M::ChCurvePos(i as u8)));
+    }
+    add(t, "", "", "FxBpmAutoMode", b, false, A::More(M::FxBpmMode(false)));
+    add(t, "", "", "FxBpmTapMode", b, false, A::More(M::FxBpmMode(true)));
+    add(t, "", "", "CFXSubParameter", k7, false, A::More(M::CfxSub));
+    add(t, "", "", "CustomPartLayout", ind, false, A::More(M::Out(crate::midi_acts::Out::PartLayout)));
+    for beats in [4, 8, 16] {
+        add(t, "", "", &format!("Jump{beats}Fwd"), b, true, A::More(M::Jump(beats)));
+        add(t, "", "", &format!("Jump{beats}Prev"), b, true, A::More(M::Jump(-beats)));
+    }
+    add(t, "", "", "DirectionFwdRev", b, true, A::More(M::Direction(false)));
+    add(t, "", "", "DirectionSlipRev", b, true, A::More(M::Direction(true)));
+    add(t, "", "", "EqCurve", b, false, A::More(M::EqCurve));
+    add(t, "", "", "Rec", b, false, A::More(M::Rec));
+    add(t, "", "", "PadFx", b, true, A::Stub(Stub::PadFxMode(1)));
+    for (nm, src) in [("Vocal", 3u8), ("Inst", 2), ("Drums", 0)] {
+        add(t, "", "", &format!("ActivePartButton{nm}"), b, true, A::StemPart(src));
+    }
+    for (nm, row) in [("Inst", 1u8), ("Vocal", 0), ("Drums", 3)] {
+        add(t, "", "", &format!("FXPartSelect{nm}"), b, false, A::StemFx(row));
+    }
+    add(t, "", "", "SamplerBpmUp", b, false, A::Smp(SmpAct::Bpm(0.01)));
+    add(t, "", "", "SamplerBpmDown", b, false, A::Smp(SmpAct::Bpm(-0.01)));
+    add(t, "", "", "TempoCenter", b, true, A::More(M::TempoStep(0)));
+    for (nm, st) in [("Small", 10), ("Medium", 50), ("Large", 200)] {
+        add(t, "", "", &format!("TempoInc{nm}"), b, true, A::More(M::TempoStep(st)));
+        add(t, "", "", &format!("TempoDec{nm}"), b, true, A::More(M::TempoStep(-st)));
+    }
+    for (i, nm) in ["Deck3", "Deck4"].iter().enumerate() {
+        add(t, "", "", nm, b, false, A::More(M::DeckSide(i as u8 + 3)));
+        add(t, "", "", &format!("{nm}WithoutState"), b, false, A::More(M::DeckSide(i as u8 + 3)));
+    }
+    for (nm, src) in [("Vocal", 3u8), ("Inst", 2), ("Bass", 1), ("Drums", 0)] {
+        add(t, "", "", &format!("{nm}PartInstDoubles"), b, true, A::More(M::PartDoubles(src)));
+    }
+    add(t, "", "", "AreaLeftEdge", b, false, A::More(M::AreaEdge(true)));
+    add(t, "", "", "AreaRightEdge", b, false, A::More(M::AreaEdge(false)));
+    add(t, "", "", "BrowseJumpTop", b, false, A::More(M::BrowseEdge(true)));
+    add(t, "", "", "BrowseJumpBottom", b, false, A::More(M::BrowseEdge(false)));
+    add(t, "", "", "BrowseLineNumber", val, false, A::More(M::BrowseLine));
+    add(t, "", "", "ScrollBarControl", val, false, A::More(M::ScrollBar));
+    add(t, "", "", "SortType", val, false, A::More(M::SortType));
+    // (The DDJ-RZ's own names for the browse functions: the same handlers.)
+    add(t, "", "", "ForwardDdjRz", b, false, A::Forward);
+    add(t, "", "", "LoadDdjRz", b, true, A::Load);
+    add(t, "", "", "AddToTagListDdjRz", b, false, A::TagList);
+    add(t, "", "", "RelatedTracksDdjRz", b, false, A::Related);
+    for p in 1..=8u8 {
+        add(t, "", "", &format!("PAD{p}_VelocitySampler+VelocityRzx"), val, true, A::More(M::VelocityLevel(p - 1)));
     }
     v
 }
@@ -750,11 +1004,14 @@ pub struct DeckSnap {
     /// The on-screen position of the knob a pick-up compares with (LOW, MID, HIGH).
     pub eq: [f32; 3],
     pub stem_iso: [f32; 3],
+    /// The auto loop's size in beats, and a beat's length (seconds).
+    pub loop_beats: f64,
+    pub beat_len: f64,
 }
 
 impl Default for DeckSnap {
     fn default() -> DeckSnap {
-        DeckSnap { loaded: false, cue_point: 0.0, hot: [None; 16], range: 0.10, follower: false, button_bend: 0.0, stem_iso_on: false, assign: 0, eq: [0.5; 3], stem_iso: [0.5; 3] }
+        DeckSnap { loaded: false, cue_point: 0.0, hot: [None; 16], range: 0.10, follower: false, button_bend: 0.0, stem_iso_on: false, assign: 0, eq: [0.5; 3], stem_iso: [0.5; 3], loop_beats: 4.0, beat_len: 0.5 }
     }
 }
 
@@ -826,6 +1083,8 @@ pub struct Device {
     leds: Mutex<HashMap<(u32, u8), Led>>,
     /// Last values sent to outputs the registry does not name (jog ring, level meters).
     named: Mutex<HashMap<u16, u16>>,
+    /// The names of the output rows (so that `set_named` passes over names the map lacks).
+    out_names: Mutex<std::collections::HashSet<String>>,
     out: Mutex<OutState>,
     out_cv: Condvar,
     interval_ms: AtomicU64,
@@ -853,6 +1112,7 @@ impl Device {
             }
         }
         self.interval_ms.store(m.out_interval_ms(), Relaxed);
+        *self.out_names.lock() = m.outputs.iter().map(|o| o.name.clone()).collect();
         drop(m);
         *self.out_index.lock() = idx;
         self.leds.lock().clear();
@@ -901,6 +1161,9 @@ impl Device {
     /// `MidiData::getLongMessage` 0x10132107c builds them: the upper seven bits on the code,
     /// the lower seven on the code + 0x10.
     pub fn set_named(&self, name: &str, deck: u8, value: &dyn Fn(&Entry) -> u16) {
+        if !self.out_names.lock().contains(name) {
+            return;
+        }
         let entries: Vec<Entry> = self.map.lock().outputs.iter().filter(|e| e.name == name && e.deck == deck).cloned().collect();
         if entries.is_empty() {
             return;
@@ -1161,6 +1424,10 @@ pub struct Hub {
     /// Jog vinyl mode per deck (on by default, as in rekordbox).
     pub vinyl: [AtomicBool; 4],
     pub shift: [AtomicBool; 4],
+    /// GRID ADJUST (1) / GRID SLIDE (2) held per deck, and the platter's travel waiting to
+    /// be applied (milliseconds of the track).
+    pub grid: [AtomicU8; 4],
+    pub grid_acc: Mutex<[f64; 4]>,
     /// Ports recordbox opened itself, by name: never taken as controllers.
     pub ignore: Mutex<Vec<String>>,
     /// When set, only these ports are opened (tests and the hardware scripted run: a real
@@ -1200,6 +1467,8 @@ impl Hub {
             pickup: Mutex::new([[Pickup::default(); 3]; 4]),
             vinyl: std::array::from_fn(|_| AtomicBool::new(true)),
             shift: std::array::from_fn(|_| AtomicBool::new(false)),
+            grid: std::array::from_fn(|_| AtomicU8::new(0)),
+            grid_acc: Mutex::new([0.0; 4]),
             ignore: Mutex::new(vec![]),
             only: Mutex::new(None),
             ui_seen_ms: AtomicU64::new(0),
@@ -1338,6 +1607,7 @@ impl Hub {
             out_index: Mutex::new(HashMap::new()),
             leds: Mutex::new(HashMap::new()),
             named: Mutex::new(HashMap::new()),
+            out_names: Mutex::new(Default::default()),
             out: Mutex::new(OutState { queue: OutQueue::default(), blink: Blinker::default(), blinking: HashMap::new(), conn }),
             out_cv: Condvar::new(),
             interval_ms: AtomicU64::new(1),
@@ -1715,6 +1985,9 @@ impl Hub {
             }
             Act::JogTouch => {
                 let Val::On(on, _) = val else { return true };
+                if self.grid[n].load(Relaxed) != 0 {
+                    return true;
+                }
                 let playing = self.decks[n].lock().playing;
                 let snap = *self.snap.lock();
                 let out = {
@@ -1728,6 +2001,13 @@ impl Hub {
             }
             Act::Jog(scratch_row) => {
                 let Val::Jog { delta, t_ms } = val else { return true };
+                // GRID ADJUST / SLIDE held: the platter's travel goes to the grid
+                // (`deviceJogValue`: jog x 60000 / rpm, in ms of the track).
+                if self.grid[n].load(Relaxed) != 0 {
+                    let k = dev.jog.lock()[n].k();
+                    self.grid_acc.lock()[n] += delta as f64 * k;
+                    return true;
+                }
                 let out = dev.jog.lock()[n].rotate(delta, t_ms, scratch_row);
                 self.jog_out(n, out);
                 true
@@ -1761,18 +2041,28 @@ impl Hub {
         let count = self.snap.lock().count.min(4) as usize;
         for n in 0..count {
             self.transport_leds(n);
-            let (loaded, angle, level, looping, slipping, playing) = {
+            let snap_d = self.snap.lock().decks[n];
+            // (The platter's turn for a time on the record at 33 1/3 rpm.)
+            let turn_of = |secs: f64| (secs * (100.0 / 3.0) / 60.0 * 360.0).rem_euclid(360.0) as i32;
+            let (loaded, angle, level, looping, slipping, playing, remain, reverse, on_air, loop_beats) = {
                 let s = self.decks[n].lock();
                 let (looping, slipping, playing) = (s.loop_range.is_some(), s.slip && s.slip_pos.is_some(), s.playing);
                 match s.audio.as_ref() {
                     Some(a) => {
                         let secs = s.pos / a.sr.max(1) as f64;
-                        let turn = (secs * (100.0 / 3.0) / 60.0 * 360.0).rem_euclid(360.0);
-                        (true, turn as i32, s.peak[0].max(s.peak[1]), looping, slipping, playing)
+                        let dur = a.frames() as f64 / a.sr.max(1) as f64;
+                        // (On air: the deck is heard at the master: playing, its channel fader
+                        // and its crossfader side open. A decision; `MixerControlPanel` was
+                        // not traced.)
+                        let air = playing && s.ch_fader > 0.0 && s.fader > 0.0;
+                        let lb = s.loop_range.map(|(a, b)| (b - a) / snap_d.beat_len.max(1e-9)).unwrap_or(snap_d.loop_beats);
+                        (true, turn_of(secs), s.peak[0].max(s.peak[1]), looping, slipping, playing, dur - secs, s.dk.reverse, air, lb)
                     }
-                    None => (false, 360, 0.0, false, false, false),
+                    None => (false, 360, 0.0, false, false, false, f64::INFINITY, false, false, snap_d.loop_beats),
                 }
             };
+            let cue_angle = turn_of(snap_d.cue_point);
+            let blink_on = |e: &Entry| (self.born.elapsed().as_millis() as u64 / (if e.opts.blink > 0 { e.opts.blink as u64 } else { 500 } / 2).max(1)) % 2 == 0;
             let lvl = ((level.clamp(0.0, 1.0) * 100.0) as i32).clamp(0, 127) as u8;
             for d in &devs {
                 for deck in [n as u8 + 1, if n as u8 == self.snap.lock().active { 0 } else { 255 }] {
@@ -1789,6 +2079,30 @@ impl Hub {
                     d.set_named("GetLoopActive", deck, &|_| if looping { 127 } else { 0 });
                     d.set_named("SlipStateForFlashing", deck, &|_| if slipping { 127 } else { 0 });
                     d.set_named("PlayingState", deck, &|_| if playing { 127 } else { 0 });
+                    // The end of the track coming (the last 30 s while it plays: the waveform's
+                    // end warning; the time is a decision), on air, the level meter's segments
+                    // (WeGO: ChannelLevel.1..5, lit from 20 % steps of the meter), the loaded
+                    // lights of the DDJ-RZ, REVERSE blinking, the cue point on the jog ring.
+                    let warn = playing && remain < 30.0;
+                    d.set_named("EndWarningIndicator", deck, &|_| if warn { 127 } else { 0 });
+                    d.set_named("TriggerEndWarning", deck, &|_| if warn { 127 } else { 0 });
+                    d.set_named("OnAirIndicator", deck, &|_| if on_air { 127 } else { 0 });
+                    for seg in 1..=5u16 {
+                        d.set_named(&format!("ChannelLevel.{seg}"), deck, &|_| if lvl as u16 >= seg * 20 - 10 { 127 } else { 0 });
+                    }
+                    d.set_named("LoadedIndicatorDdjRz", deck, &|_| if loaded { 127 } else { 0 });
+                    d.set_named("LoadedIndicatorDdjRzWithoutFlashing", deck, &|_| if loaded { 127 } else { 0 });
+                    d.set_named("ReverseIndicator", deck, &|e| if reverse && blink_on(e) { 127 } else { 0 });
+                    if loaded {
+                        d.set_named("JogCurrentCueIndicator", deck, &|e: &Entry| crate::midi_map::jog_ring(cue_angle, &e.opts) as u16);
+                    }
+                    // The DDJ-SR's loop size lights (`1/Beat`, `1Beat` ... `32Beat or
+                    // 1/32Beat`): the size of the loop playing, else the auto loop's.
+                    let (frac, whole) = if loop_beats < 1.0 { (true, (1.0 / loop_beats.max(1e-9)).round() as i32) } else { (false, loop_beats.round() as i32) };
+                    d.set_named("BeatIndicatorNumerator", deck, &|_| if frac { 127 } else { 0 });
+                    for k in [1, 2, 4, 8, 16, 32] {
+                        d.set_named(&format!("BeatIndicator{k}"), deck, &|_| if whole == k { 127 } else { 0 });
+                    }
                 }
             }
         }
@@ -1866,11 +2180,15 @@ pub struct MidiState {
     pub tap_held: [Option<Instant>; 2],
     /// A controller holds SEARCH FWD / REV on the deck (the window may have no focus then).
     pub search_held: [bool; 4],
+    /// The state of the functions of `midi_acts.rs` (MASTER CUE, velocity levels ...).
+    pub more: crate::midi_acts::MoreState,
+    /// The Pad Editor slot (0..7) a controller's pad mode button last chose, per deck.
+    pub editor_slot: [u8; 4],
 }
 
 impl Default for MidiState {
     fn default() -> MidiState {
-        MidiState { hub: None, rx: None, _keeper: None, win: Default::default(), devices: vec![], jump_page: [5; 4], pending_double: None, stub_log: vec![], last_tempo: [0.0; 4], last_iso: [false; 4], last_follow: [false; 4], started: false, handled: 0, tap_held: [None; 2], search_held: [false; 4] }
+        MidiState { hub: None, rx: None, _keeper: None, win: Default::default(), devices: vec![], jump_page: [5; 4], pending_double: None, stub_log: vec![], last_tempo: [0.0; 4], last_iso: [false; 4], last_follow: [false; 4], started: false, handled: 0, tap_held: [None; 2], search_held: [false; 4], more: Default::default(), editor_slot: [0; 4] }
     }
 }
 
@@ -1935,7 +2253,11 @@ fn snapshot(app: &App) -> Snapshot {
         let m = app.px.mix[n as usize];
         let follower = app.two_players() && d.x.beat_sync && (n != app.px.master || app.sampler_is_master());
         let range = if app.performance() { crate::player_ext::TEMPO_RANGES[(d.x.tempo_range as usize + 1) % 4] / 100.0 } else { crate::player_ext::TEMPO_RANGE };
-        decks[n as usize] = DeckSnap { loaded: d.audio.is_some(), cue_point: d.cue_point, hot, range, follower, button_bend: d.x.bend as f64 * crate::player_ext::BEND_AMOUNT, stem_iso_on: m.stem_iso_on, assign: m.assign, eq: m.eq, stem_iso: m.stem_iso };
+        let auto = crate::prefs_bridge::auto_beat_loop_beats(&app.prefs);
+        let loop_beats = if n == app.px.active { auto } else { app.px.parked_loop[n as usize].unwrap_or(auto) };
+        let bpm = crate::player_ext::bpm_at(&d.beats, d.cue_point);
+        let beat_len = if bpm > 0.0 { 60.0 / bpm } else { 0.5 };
+        decks[n as usize] = DeckSnap { loaded: d.audio.is_some(), cue_point: d.cue_point, hot, range, follower, button_bend: d.x.bend as f64 * crate::player_ext::BEND_AMOUNT, stem_iso_on: m.stem_iso_on, assign: m.assign, eq: m.eq, stem_iso: m.stem_iso, loop_beats, beat_len };
     }
     let bank = app.prefs.sampler.bank.min(3);
     let pads = app.sampler_pads().min(16);
@@ -2025,6 +2347,8 @@ pub fn poll(app: &mut App) {
         app.midi.last_tempo[n] = app.deck_of(n as u8).x.tempo_adj;
     }
     finish_double(app);
+    crate::midi_acts::part_doubles_tick(app);
+    crate::midi_acts::grid_tick(app, &hub);
     for u in 0..2 {
         if app.midi.tap_held[u].map(|t| t.elapsed() >= Duration::from_millis(1000)).unwrap_or(false) {
             app.midi.tap_held[u] = None;
@@ -2395,7 +2719,10 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         }
         Act::PadMode(m) => {
             if press {
-                app.px.pad_mode[ni] = m;
+                // (Through the deck's own choice, so that rekordbox's refusals apply.)
+                if !app.with_deck(n, |a| a.set_pad_mode(crate::pads::PadMode::from_code(m))) && m < 32 {
+                    app.px.pad_mode[ni] = m;
+                }
             }
         }
         Act::MemoryStep(dir) => {
@@ -2415,20 +2742,21 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         }
         Act::BeatJumpPad(i) => {
             if press {
-                // rekordbox's cells: FINE, 1/8 ... 128, each back and forward; the page
-                // chooses the first cell on the pads (page 5: 1 beat on pads 1 and 2).
-                const CELLS: [f64; 12] = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
-                let first = (2 * app.midi.jump_page[ni] as i32 - 2).clamp(0, 16) as usize;
-                let id = first + i as usize;
-                if let Some(b) = CELLS.get(id / 2) {
-                    let beats = if id % 2 == 0 { -*b } else { *b };
-                    app.with_deck(n, |a| a.beat_jump(beats));
+                // rekordbox's cells FINE, 1/8 ... 128, each back and forward; the deck's page
+                // (BeatJumpPage<n>, as the pads on screen) chooses the first cell on the pads
+                // (page 5: 1 beat on pads 1 and 2). `BeatJumpView::onPadPressed` 0x101dda6c0.
+                let page = app.prefs.pads.beat_jump_page[ni];
+                let id = crate::pads::jump_page_first(page) + i;
+                if id < 24 {
+                    app.with_deck(n, |a| a.pad_beat_jump(id));
                 }
             }
         }
         Act::BeatJumpPage(dir) => {
             if press {
-                app.midi.jump_page[ni] = (app.midi.jump_page[ni] as i32 + dir).clamp(1, 9) as u8;
+                let pg = app.prefs.pads.beat_jump_page[ni];
+                app.prefs.pads.beat_jump_page[ni] = crate::pads::jump_page_step(pg, dir > 0, false);
+                app.save_prefs();
             }
         }
         Act::StemPart(src) => {
@@ -2473,6 +2801,10 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
                 }
             }
         }
+        Act::FxSelect(u, s, _) if unit.is_some() => {
+            // (A knob row: the effect at the knob's place across the list.)
+            crate::midi_acts::apply(app, hub, device, crate::midi_acts::M::FxSelectKnob(u, s), deck, n, val);
+        }
         Act::FxSelect(u, s, dir) => {
             // (A Rotary row steps the list by its direction, one effect per message.)
             let dir = if rel != 0 { rel.signum() } else { dir };
@@ -2498,7 +2830,9 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         }
         Act::FxUnitBeat(u, dir) => {
             if press {
-                fx_beat(&mut app.px.fx[u as usize % 2], None, dir);
+                // (A beat target chosen on the controller: that slot only.)
+                let target = app.midi.more.beat_target[u as usize % 2].map(|s| s as usize);
+                fx_beat(&mut app.px.fx[u as usize % 2], target, dir);
             }
         }
         Act::FxUnitBeatRot(u) => {
@@ -2554,6 +2888,10 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
             }
         }
         Act::FxReleaseOn(u) => {
+            let (press, release) = match val {
+                Val::Abs { v, .. } => (v > 0, v == 0),
+                _ => (press, release),
+            };
             if press || release {
                 let fx = &mut app.px.fx[u as usize % 2];
                 let k = fx.release_kind as usize % 3;
@@ -2789,10 +3127,15 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
         }
         Act::Panel(p) => {
             if press {
-                if p == 0 {
-                    app.prefs.perf_fx = !app.prefs.perf_fx;
-                } else {
-                    app.prefs.perf_sampler = !app.prefs.perf_sampler;
+                match p {
+                    0 => app.prefs.perf_fx = !app.prefs.perf_fx,
+                    1 => app.prefs.perf_sampler = !app.prefs.perf_sampler,
+                    // (MixerPanel: the mixer panel shown or hidden, where the layout has one.)
+                    _ => {
+                        if crate::ui_perf_layouts::panel_enabled(app, 3) {
+                            crate::ui_perf_layouts::toggle_mixer(app);
+                        }
+                    }
                 }
                 app.save_prefs();
             }
@@ -2888,6 +3231,7 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
             }
         }
         Act::Stub(s) => stub(app, hub, s, n, val),
+        Act::More(m) => crate::midi_acts::apply(app, hub, device, m, deck, n, val),
     }
 }
 
@@ -3273,6 +3617,12 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
                     on(if p.single { s == 0 && p.one.on } else { p.slots[s as usize % 3].on })
                 }
                 Act::FxMode(u) => on(app.px.fx[u as usize % 2].params.single),
+                // (A knob's ring: the level as a value, `operateValueChange`.)
+                Act::FxLevel(u, s) => {
+                    let p = &app.px.fx[u as usize % 2].params;
+                    let lv = if p.single { if s == 0 { p.one.level } else { 0.0 } } else { p.slots[s as usize % 3].level };
+                    Led::Value((lv.clamp(0.0, 1.0) * 127.0).round() as u8)
+                }
                 Act::FxAuto(u) => on(app.px.fx[u as usize % 2].auto),
                 Act::FxTap(u) => on(!app.px.fx[u as usize % 2].auto),
                 Act::FxReleaseOn(u) => on(app.px.fx[u as usize % 2].params.release.is_some()),
@@ -3291,11 +3641,19 @@ fn leds(app: &mut App, hub: &Arc<Hub>) {
                 Act::HeadCue => on(m.cue),
                 Act::XfAssign(side) => on(m.assign == side),
                 Act::StemIso => on(m.stem_iso_on),
-                Act::Panel(p) => on(if p == 0 { app.prefs.perf_fx } else { app.prefs.perf_sampler }),
+                Act::Panel(p) => on(match p {
+                    0 => app.prefs.perf_fx,
+                    1 => app.prefs.perf_sampler,
+                    _ => crate::ui_perf_layouts::mixer_shown(app),
+                }),
                 Act::Related => on(app.view == View::Related),
                 Act::Stub(Stub::Vinyl) => on(hub.vinyl[ni].load(Relaxed)),
                 // (Blinking while the deck plays backwards: `deviceUpdateLed` 0x10202a7f4.)
                 Act::Stub(Stub::Reverse) => if d.reverse { Led::Blink } else { Led::Off },
+                Act::More(mo) => match crate::midi_acts::led(app, hub, &dev.name, mo, n) {
+                    Some(l) => l,
+                    None => continue,
+                },
                 _ => continue,
             };
             dev.set_led(tag, deck, led);
@@ -3376,14 +3734,18 @@ mod tests {
     fn registry_names_are_unique_per_tab_and_typed() {
         let r = registry();
         assert!(r.funcs.len() > 300, "{}", r.funcs.len());
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashMap<String, (Tab, Act)> = std::collections::HashMap::new();
         for f in &r.funcs {
-            assert!(seen.insert(f.name.clone()), "{} twice", f.name);
+            // (A name is listed twice only as an ADD-menu entry of the same tab and action:
+            // Sampler9 Play is PAD1_Sampler again.)
+            if let Some((t, a)) = seen.insert(f.name.clone(), (f.tab, f.act)) {
+                assert!(t == f.tab && a == f.act && f.tab != Tab::None, "{} twice", f.name);
+            }
             if f.tab != Tab::None {
                 assert!(!f.display.is_empty(), "{}", f.name);
                 assert!((1..=8).contains(&f.ty));
                 // Pad rows are pads; pads of the catalogue are named PAD<n>_ or are stem parts.
-                if is_pad_name(&f.name) {
+                if is_pad_name(&f.name) && !f.name.ends_with("+Velocity") {
                     assert_eq!(f.ty, T_PAD, "{}", f.name);
                 }
             }
@@ -3409,6 +3771,65 @@ mod tests {
         assert_eq!(type_choices(T_PAD), &[T_PAD]);
         assert_eq!(type_text(T_KNOB14), "Knob/Slider(0h-3FFFh)");
         assert_eq!(kind_of_type(T_KNOB14), Kind::KnobSliderHiRes);
+    }
+
+    /// `cargo test --release midi_catalogue -- --nocapture`: every tab of the MIDI setting
+    /// window against rekordbox's ADD menus (the traced catalogue, research material outside
+    /// `app/`, read when it is on this computer): lines `CATALOGUE <tab> missing|extra|differs`
+    /// and the totals line `CATALOGUE TOTAL`.
+    #[test]
+    fn midi_catalogue_matches_rekordboxs_add_menus() {
+        let path = std::path::Path::new("/Users/adamsardo/Developer/rekordbox-3/checks/re-7.2.19/controllers-midi-learn-catalogue.tsv");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("CATALOGUE: no traced catalogue on this computer; skipped");
+            return;
+        };
+        let tab_of = |s: &str| TABS.iter().find(|t| t.1.eq_ignore_ascii_case(s)).map(|t| t.0);
+        let r = registry();
+        let (mut missing, mut extra, mut differs, mut same) = (0, 0, 0, 0);
+        let mut want: Vec<(Tab, String, String, String, u8, bool)> = vec![];
+        for l in text.lines().skip(2) {
+            let c: Vec<&str> = l.split('\t').collect();
+            if c.len() < 6 {
+                continue;
+            }
+            let Some(tab) = tab_of(c[0]) else { continue };
+            if matches!(tab, Tab::Video | Tab::Lighting) {
+                continue;
+            }
+            want.push((tab, c[1].to_string(), c[2].to_string(), c[4].to_string(), c[3].parse().unwrap_or(0), c[5] == "1"));
+        }
+        for (tab, disp, csv, cat, ty, pd) in &want {
+            match r.of_tab(*tab).find(|f| f.name == *csv && f.display == *disp).or_else(|| r.of_tab(*tab).find(|f| f.name == *csv)) {
+                None => {
+                    missing += 1;
+                    eprintln!("CATALOGUE {:?} missing {csv} ({disp}, {cat}, type {ty})", tab);
+                }
+                Some(f) if f.display != *disp || f.category != cat || f.ty != *ty || f.per_deck != *pd => {
+                    differs += 1;
+                    eprintln!("CATALOGUE {:?} differs {csv}: has ({}, {}, {}, {}) wants ({disp}, {cat}, {ty}, {pd})", tab, f.display, f.category, f.ty, f.per_deck);
+                }
+                Some(_) => same += 1,
+            }
+        }
+        for f in r.funcs.iter().filter(|f| f.tab != Tab::None) {
+            if !want.iter().any(|w| w.0 == f.tab && w.2 == f.name) {
+                extra += 1;
+                eprintln!("CATALOGUE {:?} extra {} ({})", f.tab, f.name, f.display);
+            }
+        }
+        // ADD-menu order: the registry's order of each tab is the catalogue's.
+        let mut order_ok = true;
+        for (tab, _) in TABS {
+            let a: Vec<&str> = r.of_tab(tab).map(|f| f.name.as_str()).collect();
+            let b: Vec<&str> = want.iter().filter(|w| w.0 == tab).map(|w| w.2.as_str()).filter(|n| a.contains(n)).collect();
+            let a2: Vec<&str> = a.iter().copied().filter(|n| b.contains(n)).collect();
+            if a2 != b {
+                order_ok = false;
+                eprintln!("CATALOGUE {tab:?} order differs");
+            }
+        }
+        eprintln!("CATALOGUE TOTAL commands {} | same {same} | differs {differs} | missing {missing} | extra {extra} | order {}", want.len(), if order_ok { "same" } else { "differs" });
     }
 
     #[test]
@@ -3488,6 +3909,7 @@ mod tests {
             out_index: Mutex::new(HashMap::new()),
             leds: Mutex::new(HashMap::new()),
             named: Mutex::new(HashMap::new()),
+            out_names: Mutex::new(Default::default()),
             out: Mutex::new(OutState { queue: OutQueue::default(), blink: Blinker::default(), blinking: HashMap::new(), conn: None }),
             out_cv: Condvar::new(),
             interval_ms: AtomicU64::new(1),
@@ -3721,6 +4143,205 @@ mod tests {
         // Lights: a button with no state of its own is lit while held; REVERSE blinks.
         assert!(echo_led(Act::Load) && echo_led(Act::CallStep(1)) && echo_led(Act::Stub(Stub::SlipReverse)));
         assert!(!echo_led(Act::Sync) && act_has_led(Act::Stub(Stub::Reverse)));
+    }
+
+
+    // ------------------------------------------------------------------ the third pass
+
+    /// `cargo test --release third_pass -- --nocapture`: every input row of rekordbox's
+    /// factory mappings whose function this pass built (`Act::More`, the Shift pad layers, the
+    /// Pad Editor slots, the factory-only names) is fed its own code: the map must hand it to
+    /// that function (or to the function rekordbox's first row with that code has). Line
+    /// `THIRD PASS ROWS`.
+    #[test]
+    fn third_pass_factory_rows_reach_their_functions() {
+        let dir = crate::midi_csv::factory_dir();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            eprintln!("THIRD PASS ROWS: no rekordbox here; skipped");
+            return;
+        };
+        let reg = registry();
+        let (mut checked, mut wrong, mut files) = (0, 0, 0);
+        let mut by_name: std::collections::BTreeMap<String, usize> = Default::default();
+        for f in rd.flatten() {
+            let p = f.path();
+            let Some(fname) = p.file_name().map(|s| s.to_string_lossy().to_string()) else { continue };
+            let Some(dev) = fname.strip_suffix(".midi.csv") else { continue };
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let Ok(mut map) = MidiMap::load(dev, Some(&bytes), None) else { continue };
+            files += 1;
+            map.tag_inputs(|n| reg.tag(n));
+            let rows: Vec<(String, u16, Kind, u32)> = map.inputs.iter().flatten().map(|i| (i.e.name.clone(), i.e.code, i.e.kind, i.tag)).collect();
+            for (name, code, kind, tag) in rows {
+                let Some(func) = reg.get(tag) else { continue };
+                let new = matches!(func.act, Act::More(m) if !matches!(m, crate::midi_acts::M::Off(_))) || name.contains("+Shift") || name.contains("PadMode") || name.starts_with("Page");
+                if !new || code == 0 || matches!(kind, Kind::KnobSliderHiRes | Kind::Slider | Kind::Knob | Kind::JogTimestamp) {
+                    continue;
+                }
+                let st = (code >> 8) as u8;
+                if st < 0x80 || st >= 0xF0 {
+                    continue;
+                }
+                let v = match in_class(kind) {
+                    Some(InClass::Rel) | Some(InClass::Jog) => 0x41,
+                    Some(InClass::Abs) => 0x40,
+                    _ => 0x7F,
+                };
+                let Some(ev) = map.handle(&[st, code as u8, v], 1000.0) else { continue };
+                // (Release a held button so the next row starts clean.)
+                if in_class(kind) == Some(InClass::Press) {
+                    let _ = map.handle(&[st, code as u8, 0], 1001.0);
+                }
+                checked += 1;
+                *by_name.entry(name.clone()).or_default() += 1;
+                let got = reg.get(ev.tag).map(|g| (g.name.clone(), g.act));
+                if got.as_ref().map(|g| g.0 != name && g.1 != func.act).unwrap_or(true) {
+                    wrong += 1;
+                    eprintln!("THIRD PASS ROW {fname}: {name} {code:04X} went to {got:?}");
+                }
+                assert!(input_acts(&name, kind), "{name} {kind:?} does not act");
+            }
+        }
+        eprintln!("THIRD PASS ROWS files {files} | rows fed {checked} | names {} | went elsewhere {wrong}", by_name.len());
+        assert!(files == 0 || (checked > 500 && wrong == 0));
+    }
+
+    fn output_device(name: &str, csv: &str) -> (Arc<Hub>, Arc<Device>) {
+        let (hub, dev, _rx) = test_device(name, csv);
+        // (A device with an output port: the same, but its lights are queued.)
+        let d2 = Arc::new(Device {
+            name: dev.name.clone(),
+            map: Mutex::new(MidiMap::load(name, None, Some(csv.as_bytes())).unwrap()),
+            factory: false,
+            needs_auth: false,
+            has_output: true,
+            learning: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            out_index: Mutex::new(HashMap::new()),
+            leds: Mutex::new(HashMap::new()),
+            named: Mutex::new(HashMap::new()),
+            out_names: Mutex::new(Default::default()),
+            out: Mutex::new(OutState { queue: OutQueue::default(), blink: Blinker::default(), blinking: HashMap::new(), conn: None }),
+            out_cv: Condvar::new(),
+            interval_ms: AtomicU64::new(1),
+            jog: Mutex::new(std::array::from_fn(|_| Jog::new(jog_counts(name)))),
+            scan: Mutex::new(Default::default()),
+            load_at: Mutex::new([None; 4]),
+            in_conn: Mutex::new(None),
+            received: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+        });
+        d2.reindex();
+        hub.devices.lock().clear();
+        hub.devices.lock().push(d2.clone());
+        (hub, d2)
+    }
+
+    fn sent(dev: &Device) -> Vec<[u8; 3]> {
+        let mut v = vec![];
+        let mut o = dev.out.lock();
+        while let Some(m) = o.queue.pop() {
+            v.push(m);
+        }
+        v
+    }
+
+    /// The lights that follow the engine: end warning, on air, a meter's segments, the
+    /// DDJ-SR's loop size lights, the cue point on the jog ring, REVERSE (rows as the factory
+    /// files have them).
+    #[test]
+    fn third_pass_engine_lights_follow_the_deck() {
+        let csv = "@file,1,t\r\nEndWarningIndicator,EndWarningIndicator,Indicator,,,,,,,9B04,9B05,9B06,9B07,RO;Priority=100,\r\nOnAirIndicator,OnAirIndicator,Indicator,,,,,,,BB04,BB05,BB06,BB07,RO;Priority=100,\r\nChannelLevel.1,ChannelLevel,Indicator,,,,,,,9C28,9C2D,9C32,9C37,RO;Priority=50,\r\nChannelLevel.5,ChannelLevel,Indicator,,,,,,,9C2C,9C31,9C36,9C3B,RO;Priority=50,\r\nBeatIndicatorNumerator,BeatIndicatorNumerator,Indicator,,,,,,9056,0,1,2,3,,\r\nBeatIndicator4,BeatIndicator4,Indicator,,,,,,905B,0,1,2,3,,\r\nBeatIndicator2,BeatIndicator2,Indicator,,,,,,905A,0,1,2,3,,\r\nJogCurrentCueIndicator,JogCurrentCueIndicator,JogIndicator,,,,,,,BB24,BB25,BB26,BB27,RO;Min=1;Max=72;Priority=100,\r\n";
+        let (hub, dev) = output_device("t", csv);
+        {
+            let mut s = hub.snap.lock();
+            s.decks[0].loop_beats = 4.0;
+            s.decks[0].cue_point = 0.9;
+        }
+        {
+            let mut s = hub.decks[0].lock();
+            let frames = s.audio.as_ref().unwrap().frames() as f64;
+            s.pos = frames - 44100.0 * 10.0;
+            s.playing = true;
+            s.ch_fader = 1.0;
+            s.fader = 1.0;
+            s.peak = [0.95, 0.9];
+        }
+        hub.engine_outputs();
+        let m = sent(&dev);
+        let has = |a: u8, b: u8, v: u8| m.contains(&[a, b, v]);
+        assert!(has(0x9B, 0x04, 127), "end warning in the last 30 s: {m:02X?}");
+        assert!(has(0xBB, 0x04, 127), "on air");
+        assert!(has(0x9C, 0x28, 127) && has(0x9C, 0x2C, 127), "meter segments 1 and 5 at 95 %");
+        assert!(has(0x90, 0x5B, 127) && has(0x90, 0x56, 0) && has(0x90, 0x5A, 0), "4 beats: 4Beat lit");
+        // The cue point 0.9 s in: (0.9 x 33 1/3 / 60 x 360) = 180 degrees: half way round.
+        assert!(has(0xBB, 0x24, 1 + 36), "cue on the ring: {m:02X?}");
+        // A loop of half a beat: 1/Beat and 2Beat lit.
+        hub.snap.lock().decks[0].loop_beats = 0.5;
+        hub.engine_outputs();
+        let m = sent(&dev);
+        assert!(m.contains(&[0x90, 0x56, 127]) && m.contains(&[0x90, 0x5A, 127]) && m.contains(&[0x90, 0x5B, 0]), "{m:02X?}");
+        // Stopped: no end warning, off air.
+        hub.decks[0].lock().playing = false;
+        hub.engine_outputs();
+        let m = sent(&dev);
+        assert!(m.contains(&[0x9B, 0x04, 0]) && m.contains(&[0xBB, 0x04, 0]));
+    }
+
+    /// GRID SLIDE / ADJUST held: the platter's turns go to the grid (milliseconds of the
+    /// track, `jog x 60000 / rpm`), and the deck is not scratched.
+    #[test]
+    fn third_pass_grid_takes_the_platter() {
+        let csv = "@file,1,PIONEER DDJ-ERGO\r\nJogScratch,Jog,JogRotate,B022,0,,,,,,,,,RO;Fast,\r\nJogTouch,JogTouch,JogTouch,9036,0,,,,,,,,,RO;Fast,\r\n";
+        let (hub, dev, _rx) = test_device("PIONEER DDJ-ERGO", csv);
+        hub.grid[0].store(2, Relaxed);
+        let _ = feed(&hub, &dev, &[0x90, 0x36, 0x7F], 0.0);
+        let _ = feed(&hub, &dev, &[0xB0, 0x22, 0x45], 10.0);
+        let k = dev.jog.lock()[0].k();
+        let acc = hub.grid_acc.lock()[0];
+        assert!((acc - 5.0 * k).abs() < 1e-9, "{acc} vs {}", 5.0 * k);
+        assert!(matches!(hub.decks[0].lock().dk.jog, crate::deck::Jog::None), "no scratch while the grid has the platter");
+        // Let go of GRID SLIDE: the platter, touched again, scratches.
+        hub.grid[0].store(0, Relaxed);
+        let _ = feed(&hub, &dev, &[0x90, 0x36, 0x7F], 15.0);
+        let _ = feed(&hub, &dev, &[0xB0, 0x22, 0x45], 20.0);
+        assert!(!matches!(hub.decks[0].lock().dk.jog, crate::deck::Jog::None));
+    }
+
+    /// The Pad Editor's slots: rekordbox's `Mode.pad.csv` gives button n its mode, and the
+    /// pads of a slot are the mode's own pads.
+    #[test]
+    fn third_pass_pad_editor_slots() {
+        use crate::midi_acts::{editor_pad_mode, editor_pad_name};
+        let modes = crate::pads::read_mode_csv();
+        if !modes.is_empty() {
+            let sel: Vec<String> = (1..=8u8).map(|k| modes.iter().find(|m| m.select == Some(k)).map(|m| m.function.clone()).unwrap_or_default()).collect();
+            assert_eq!(sel, ["HotCue", "PadFx1", "BeatJump", "Sampler", "Keyboard", "PadFx2", "BeatLoop", "KeyShift"]);
+        }
+        assert_eq!(editor_pad_name("HotCue", 0, true).as_deref(), Some("PAD1_HotCue+Shift"));
+        assert_eq!(editor_pad_name("BeatJump", 7, true).as_deref(), Some("PAD8_BeatJump"));
+        assert_eq!(editor_pad_name("Slicers", 4, true).as_deref(), Some("PAD5_Slicer+Shift"));
+        assert_eq!(editor_pad_name("User3", 0, false), None);
+        assert_eq!(editor_pad_mode("User3"), Some(crate::pads::PadMode::User(2)));
+        assert_eq!(editor_pad_mode("KeyShift"), Some(crate::pads::PadMode::KeyShift));
+        for name in ["PAD1_HotCue+Shift", "PAD8_BeatJump", "PAD5_Slicer+Shift", "PAD3_Keyboard+Shift", "PAD2_PadFx2"] {
+            assert!(registry().by_name(name).is_some(), "{name}");
+        }
+    }
+
+    /// Names no part of rekordbox registers are not functions here either, and every name of
+    /// the factory files that does not act has a reason or is listed as not built.
+    #[test]
+    fn third_pass_reasons() {
+        for n in crate::midi_cover::NOT_IN_REKORDBOX {
+            assert!(registry().by_name(n).is_none(), "{n}");
+            assert!(crate::midi_cover::reason(n).is_some());
+        }
+        assert!(crate::midi_cover::reason("DvsAbsolute").unwrap().contains("DVS"));
+        assert!(crate::midi_cover::reason("PAD1_Slicer+Shift").is_some() && crate::midi_cover::reason("PAD5_Slicer+Shift").is_none());
+        // The jog's grid mode and the master cue are functions with lights.
+        assert!(act_has_led(Act::More(crate::midi_acts::M::MasterCue)) && act_has_led(Act::More(crate::midi_acts::M::Grid(true))));
+        assert!(!input_acts("Discover", Kind::Button) && input_acts("MasterCue", Kind::Button) && input_acts("PAD3_PadMode5+Shift", Kind::Pad(crate::midi_csv::PadType::Rx)));
     }
 
     fn tone(secs: f64) -> Arc<crate::audio::Decoded> {
