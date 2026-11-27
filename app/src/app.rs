@@ -2541,11 +2541,17 @@ impl App {
         let wanted = std::env::var("PREPDECK_STEM_MODEL").ok().or_else(|| self.prefs.stem_model.clone());
         let auto = self.prefs.stems_auto_download;
         let cancel = self.stem.cancel.clone();
+        let enabled = self.prefs.show_stems;
         std::thread::spawn(move || {
             let hw = crate::stems::assess();
             let m = wanted.as_deref().and_then(crate::stems::spec).unwrap_or_else(|| crate::stems::choose(&hw));
             let _ = tx.send(StemMsg::Hardware(hw, m.id.to_string()));
             ctx.request_repaint();
+            // The engine (GPU kernels, model) is made ready now, off the path of the first
+            // separation (rekordbox loads its engine at start when STEMS is enabled).
+            if enabled && crate::stems::model_ready(m) {
+                let _ = crate::stems::warm_up(m);
+            }
             if auto && !crate::stems::model_ready(m) {
                 let tx2 = tx.clone();
                 let ctx2 = ctx.clone();
@@ -2557,8 +2563,12 @@ impl App {
                         last = std::time::Instant::now();
                     }
                 }, &cancel);
+                let ok = r.is_ok();
                 let _ = tx.send(StemMsg::DownloadDone(r.map_err(|e| e.to_string())));
                 ctx.request_repaint();
+                if ok && enabled {
+                    let _ = crate::stems::warm_up(m);
+                }
             }
         });
     }
@@ -3598,6 +3608,7 @@ impl App {
             if c.end.is_some() || !self.hot_cue_quantized(c.start) {
                 self.seek(c.start);
             }
+            self.stem_caution_at(c.start);
             if let Some(e) = c.end.filter(|e| *e > c.start) {
                 self.player.state.lock().loop_range = Some((c.start, e));
                 self.deck.last_loop = Some((c.start, e));

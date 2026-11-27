@@ -271,3 +271,34 @@ fn bench_first_chunk() {
         println!("first usable chunk, {label:<24} {:6.3} s (whole track {total:.2} s)", first.unwrap_or(total));
     }
 }
+
+/// From nothing to the first separated segment, as the app's first separation after a start
+/// sees it: GPU, model load (and the kernels it compiles), one segment; then the same again
+/// with everything ready. With PREPDECK_STEM_COLD=1 every Metal source of this module is new
+/// to the system's shader cache (as after a build that changed them, or on a new machine).
+/// Run it in a fresh process: `cargo test --release bench_cold_start -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_cold_start() {
+    let m = std::env::var("PREPDECK_STEM_MODEL").ok().and_then(|id| spec(&id)).unwrap_or(&CATALOG[1]);
+    if !model_ready(m) {
+        println!("{} is not downloaded", m.id);
+        return;
+    }
+    let t = Instant::now();
+    let dev = device();
+    println!("CS GPU device            {:6.2} s", t.elapsed().as_secs_f64());
+    let t1 = Instant::now();
+    let g = graph(m.files[0]).unwrap();
+    println!("CS model load            {:6.2} s", t1.elapsed().as_secs_f64());
+    let len = 10 * htdemucs::SAMPLE_RATE as usize;
+    let audio: Vec<f32> = (0..2 * len).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+    let opts = htdemucs::Options { overlap: OVERLAP, source: None };
+    for label in ["first segment", "next segment"] {
+        let t2 = Instant::now();
+        htdemucs::separate(&g, &dev, &audio, len, &opts, &mut |_, _| true).unwrap();
+        println!("CS {label:<20} {:6.2} s", t2.elapsed().as_secs_f64());
+    }
+    htdemucs::release_scratch();
+    println!("CS total to the first segment {:6.2} s (cold sources: {})", t.elapsed().as_secs_f64(), std::env::var("PREPDECK_STEM_COLD").unwrap_or_default());
+}

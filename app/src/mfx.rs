@@ -376,16 +376,23 @@ struct UnitEng {
     /// REPEAT UP: CFX PITCH on the build sample, and the buffer it is made in.
     pitch: Cfx,
     sbuf: Vec<f32>,
+    /// UP / DOWN ECHO OUT (`ReleasePitchEcho`, a `PitchEchoCore`): its line (stereo), write
+    /// place and pitch shifter.
+    pe_line: Vec<f32>,
+    pe_w: usize,
+    pe_ps: crate::fx_core::PitchShifter,
 }
 
 impl UnitEng {
     fn new() -> UnitEng {
-        UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2] }
+        UnitEng { slots: [Slot::new(), Slot::new(), Slot::new()], cfx: [Cfx::new(), Cfx::new()], cfx_last: [(0, 0.5); 2], ring: Ring::new(), phase: Phase::Idle, t: 0, rel_len: 0, comps: [NONE; 4], cancel: 0, knob: 0.0, rel_start: 0, gate: 0.0, brake: (1.0, 0.0), build: Voice::default(), hit: [Voice::default(); 2], osc: [0.0; 6], sweep: 0.0, seed: 0x1357_9BDF, nz: [0.0; 2], clock: 0.0, dry: 1.0, npb: 0, grid0: 0.0, pitch: Cfx::new(), sbuf: vec![0.0; SBUF * 2], pe_line: vec![0.0; PE_LEN * 2], pe_w: 0, pe_ps: crate::fx_core::PitchShifter::new(48000.0) }
     }
 }
 
 /// Frames the build sample is made in at a time (longer buffers go in pieces).
 const SBUF: usize = 2048;
+/// UP / DOWN ECHO OUT's line: 4 s at 48 kHz and a block.
+const PE_LEN: usize = 4 * 48000 + 1024;
 
 /// The MERGE FX engine (about 25 MB; made when MERGE FX is first enabled).
 pub struct Engine {
@@ -480,6 +487,38 @@ impl Engine {
                 for n in 0..frames {
                     e.gate = (e.gate + if releasing { gk } else { -gk }).clamp(0.0, 1.0);
                     let i = (e.t as usize).saturating_add(n);
+                    if rel == 25 || rel == 26 {
+                        // UP / DOWN ECHO OUT (`ReleasePitchEcho::processEffectConcrete`
+                        // 0x1029cafd8): for one echo time (a beat) the track plays on and goes
+                        // into a `PitchEchoCore`; then the input is shut and only the core is
+                        // heard, at 0.7. Its repeats come back through rekordbox's pitch
+                        // shifter at the preset's pitch (0.529 / 0.456 of -100 .. +100 %: +5.8 %
+                        // / -8.8 %, by the shifter's percent law), feedback 0.8.
+                        let pct = if rel == 25 { 0.529f32 * 200.0 - 100.0 } else { 0.456f32 * 200.0 - 100.0 };
+                        e.pe_ps.set_percent(pct);
+                        let d = len.min(PE_LEN - 1);
+                        if e.pe_ps.block_left() == 0 {
+                            let (line, w) = (&e.pe_line, e.pe_w);
+                            let k = (frames - n).min(crate::fx_core::PitchShifter::BLOCK);
+                            e.pe_ps.begin_block((0..k).map(|j| {
+                                let at = ((w + PE_LEN + j - d) % PE_LEN) * 2;
+                                (line[at], line[at + 1])
+                            }));
+                        }
+                        let at = ((e.pe_w + PE_LEN - d) % PE_LEN) * 2;
+                        let (sl, sr) = e.pe_ps.process(e.pe_line[at], e.pe_line[at + 1]);
+                        let rec = i < len;
+                        let (xl, xr) = if rec { (buf[n * 2], buf[n * 2 + 1]) } else { (0.0, 0.0) };
+                        let k = e.pe_w * 2;
+                        e.pe_line[k] = (xl + sl * 0.8).clamp(-64.0, 64.0);
+                        e.pe_line[k + 1] = (xr + sr * 0.8).clamp(-64.0, 64.0);
+                        e.pe_w = (e.pe_w + 1) % PE_LEN;
+                        let g = e.gate;
+                        let (wl, wr) = if rec { (buf[n * 2] + sl * 0.7, buf[n * 2 + 1] + sr * 0.7) } else { (sl * 0.7, sr * 0.7) };
+                        buf[n * 2] = buf[n * 2] * (1.0 - g) + wl * g;
+                        buf[n * 2 + 1] = buf[n * 2 + 1] * (1.0 - g) + wr * g;
+                        continue;
+                    }
                     let (wl, wr) = match rel {
                         28 => {
                             // VINYL BRAKE ECHO: the sound slows to a stop over the second.
@@ -496,15 +535,10 @@ impl Engine {
                             (x * a * 0.6, y * a * 0.6)
                         }
                         _ => {
-                            // ECHO OUT (0.7 a repeat), UP / DOWN ECHO OUT (0.8, each repeat
-                            // 5.8 % faster or 8.8 % slower).
+                            // ECHO OUT (`ReleaseEcho`: 0.7 out, 0.7 a repeat).
                             let turn = i / len;
-                            let (fb, sp) = match rel {
-                                25 => (0.8f32, 1.058f32),
-                                26 => (0.8, 0.912),
-                                _ => (0.7, 1.0),
-                            };
-                            let pos = ((i % len) as f32 * sp.powi(turn as i32)) as usize % len;
+                            let fb = 0.7f32;
+                            let pos = i % len;
                             let (x, y) = e.ring.at((e.rel_start + len * 4 - len + pos) as f64);
                             let a = fb.powi(turn as i32 + 1);
                             (x * a, y * a)
@@ -551,6 +585,9 @@ impl Engine {
                     e.rel_len = (drop_secs(e.comps[2], cmd.bpm) * r) as u64;
                     e.rel_start = e.ring.w;
                     e.brake = (1.0, 0.0);
+                    e.pe_line.iter_mut().for_each(|v| *v = 0.0);
+                    e.pe_w = 0;
+                    e.pe_ps.prepare(r);
                     e.build.pos = None;
                     if let Some(no) = sample_no(e.comps[2]) {
                         e.hit[0] = Voice { no, pos: Some(0.0), speed: 1.0, wait: 0 };
@@ -1171,5 +1208,14 @@ mod tests {
         assert_eq!((s.rate, s.data.len()), (44100.0, 4));
         assert!((s.data[0] - 0.5).abs() < 1e-6 && (s.data[1] + 0.5).abs() < 1e-6 && s.data[2] > 0.999 && s.data[3] == -1.0);
         assert!(parse_wav(b"nope").is_none());
+    }
+
+    #[test]
+    fn release_pitch_echoes_shift_by_the_shifters_percent_law() {
+        // UP / DOWN ECHO OUT: the preset's pitch 0.529 / 0.456 of -100 .. +100 % through the
+        // shifter's percent law (down: 0.005 x pct): ratios 1.058 and 0.956 per repeat.
+        let up = 1.0 + crate::fx_core::percent_shift(0.529 * 200.0 - 100.0);
+        let down = 1.0 + crate::fx_core::percent_shift(0.456 * 200.0 - 100.0);
+        assert!((up - 1.058).abs() < 1e-4 && (down - 0.956).abs() < 1e-4, "{up} {down}");
     }
 }

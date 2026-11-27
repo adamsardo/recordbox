@@ -25,6 +25,9 @@ use objc2_metal::{MTLResourceOptions, MTLResourceUsage, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[path = "metal_mpp.rs"]
+mod mpp;
+
 const KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -179,6 +182,30 @@ kernel void merge_heads(device const float *src [[buffer(0)]], device float *dst
     uint c = gid.x, l = gid.y;
     uint W = H * D + 1;
     dst[l * W + c] = c >= H * D ? 1.0 : src[((c / D) * L + l) * D + (c % D)];
+}
+
+// Sums of the rows of x (R, N): out (R). One thread group of 256 per row; p = [N].
+kernel void row_sum(device const float *x [[buffer(0)]], device float *out [[buffer(1)]], constant uint *p [[buffer(2)]],
+                    uint r [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+    uint N = p[0];
+    device const float *row = x + r * N;
+    float s = 0;
+    for (uint i = t; i < N; i += 256) { s += row[i]; }
+    s = simd_sum(s);
+    threadgroup float red[32];
+    if (lane == 0) { red[sg] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float tot = 0;
+        for (uint i = 0; i < nsg; i++) { tot += red[i]; }
+        out[r] = tot;
+    }
+}
+
+// Column c of x (L, W) set to one, in place; p = [L, W, c].
+kernel void ones_col(device float *x [[buffer(0)]], constant uint *p [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
+    if (gid < p[0]) { x[gid * p[1] + p[2]] = 1.0; }
 }
 
 // x (L, C) -> GELU(x) with a last column of ones: (L, C + 1).
@@ -493,6 +520,41 @@ fn pipeline(dev: &MetalDevice, name: &'static str) -> Result<Arc<ComputePipeline
     pipeline_in(dev, KERNELS, name)
 }
 
+/// Compile Metal source into a library. Candle's own `new_library_with_source` panics when
+/// the source does not compile (an older system without the tensor-op headers, say); this
+/// returns the compiler's message instead, so the caller can fall back.
+fn compile(dev: &MetalDevice, src: &str) -> Result<Library> {
+    compile_opts(dev, src, false)
+}
+
+/// As `compile`; `candle` uses the options Candle compiles its own sources with (fast math
+/// mode and fast functions), for a copy of one of its kernels that must match it exactly.
+fn compile_opts(dev: &MetalDevice, src: &str, candle: bool) -> Result<Library> {
+    use objc2_metal::{MTLCompileOptions, MTLDevice, MTLMathFloatingPointFunctions, MTLMathMode};
+    let opts = candle.then(|| {
+        let o = MTLCompileOptions::new();
+        if objc2::available!(macos = 15, ios = 18) {
+            o.setMathMode(MTLMathMode::Fast);
+            o.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Fast);
+        } else {
+            #[allow(deprecated)]
+            o.setFastMathEnabled(true);
+        }
+        o
+    });
+    // PREPDECK_STEM_COLD=1 (measurements): every source is new to the system's shader cache.
+    let cold;
+    let src = if std::env::var("PREPDECK_STEM_COLD").is_ok_and(|v| v == "1") {
+        static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        cold = format!("{src}\n// {}\n", TAG.get_or_init(|| format!("{:?}", std::time::SystemTime::now())));
+        &cold
+    } else {
+        src
+    };
+    let raw = dev.metal_device().as_ref().newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(src), opts.as_deref()).map_err(|e| candle_core::Error::Msg(format!("Metal compile: {}", e.localizedDescription())))?;
+    Ok(Library::new(raw))
+}
+
 /// A kernel of the Metal source `src` (compiled once per GPU).
 fn pipeline_in(dev: &MetalDevice, src: &'static str, name: &'static str) -> Result<Arc<ComputePipeline>> {
     let id = dev.metal_device().registry_id();
@@ -504,7 +566,7 @@ fn pipeline_in(dev: &MetalDevice, src: &'static str, name: &'static str) -> Resu
     let lib = match libs.iter().find(|l| l.0 == id && std::ptr::eq(l.1, src)) {
         Some(l) => l.2.clone(),
         None => {
-            let lib = Arc::new(dev.metal_device().new_library_with_source(src, None).map_err(msg)?);
+            let lib = Arc::new(compile(dev, src)?);
             libs.push((id, src, lib.clone()));
             lib
         }
@@ -927,9 +989,15 @@ fn stats(x: &Tensor, per_f: bool) -> Result<Tensor> {
     let nb = t.div_ceil(blk);
     let s = run("row_stats", x, &[], [c, f, t, blk, nb].map(|v| v as u32).to_vec(), &[2, f, c, nb], (nb, c, f))?;
     let groups = if per_f { f } else { 1 };
-    let r = s.reshape((2 * groups, (f / groups) * c * nb))?.sum_keepdim(1)?.flatten_all()?;
-    op_mark(&r, || format!("candle sum {}x{}", 2 * groups, (f / groups) * c * nb));
+    let r = row_sum(&s, 2 * groups)?;
     Ok(r)
+}
+
+/// x (any shape, contiguous) as `rows` rows: the sum of each (Candle's own reduction would
+/// need its reduce library, the slowest of its Metal sources to compile: 16 s on a cold cache).
+fn row_sum(x: &Tensor, rows: usize) -> Result<Tensor> {
+    let n = x.elem_count() / rows.max(1);
+    run_groups(KERNELS, "row_sum", x, &[], vec![n as u32], &[rows], (rows, 1, 1), (256, 1, 1))
 }
 
 struct Norm<'a> {
@@ -957,6 +1025,8 @@ fn norm_act(x: &Tensor, norm: Option<Norm>, act: u32, res: Option<&Tensor>, ones
 
 struct DconvLayer {
     conv: Tensor,
+    /// The same convolution tap by tap (tensor-op GPUs; see `mpp::conv_with`).
+    taps: Option<Taps>,
     norm1: Tensor,
     expand: Tensor,
     norm2: Tensor,
@@ -1012,9 +1082,14 @@ impl Dconv {
                 x = run_groups(KERNELS, kernel, &x, &[&l.conv, &l.norm1, &l.expand, &l.norm2], params, &[c + last_ones as usize, f, t], (f, 1, 1), (threads, 1, 1))?;
                 continue;
             }
-            let geo = Geo { k: (1, 3), s: (1, 1), p: (0, l.dilation), d: (1, l.dilation) };
-            let y = mm(&l.conv, &im2col(&x, geo, (f, t))?)?;
-            let y = norm_act(&y.reshape((h, f, t))?, Some(Norm { cst: &l.norm1, per_f }), 1, None, true)?;
+            let y = match &l.taps {
+                Some(tp) => mpp::conv_with(conv_tile(h), &x, None, &tp.w, &tp.bias, (1, 3), (1, l.dilation))?,
+                None => {
+                    let geo = Geo { k: (1, 3), s: (1, 1), p: (0, l.dilation), d: (1, l.dilation) };
+                    mm(&l.conv, &im2col(&x, geo, (f, t))?)?.reshape((h, f, t))?
+                }
+            };
+            let y = norm_act(&y, Some(Norm { cst: &l.norm1, per_f }), 1, None, true)?;
             let z = mm(&l.expand, &y.reshape((h + 1, f * t))?)?;
             let c2 = z.dim(0)?;
             x = norm_act(&z.reshape((c2, f, t))?, Some(Norm { cst: &l.norm2, per_f }), 2, Some(&x), last_ones)?;
@@ -1031,6 +1106,7 @@ struct Encoder {
 
 struct Decoder {
     rewrite: Tensor,
+    rewrite_taps: Option<Taps>,
     dconv: Dconv,
     /// Transposed convolution as a matrix (Co*8, C) and its bias.
     tr: Tensor,
@@ -1049,6 +1125,190 @@ fn split_heads(x: &Tensor, off: usize, c: usize) -> Result<Tensor> {
     let (l, w) = x.dims2()?;
     let d = c / HEADS;
     run("split_heads", x, &[], [l, w, off, d].map(|v| v as u32).to_vec(), &[1, HEADS, l, d], (d, l, HEADS))
+}
+
+/// Candle's fused attention kernel (`steel_attention`, the one `candle_nn::ops::sdpa` uses)
+/// called with strides, so the heads are read straight out of the projections and written
+/// straight into the layout of the output projection's input: queries are columns
+/// [oq, oq + 512) of the left operand (L, Wq), keys and values columns [ok, ok + 512) and
+/// [ov, ov + 512) of the right one (S, Wk); the result is (L, 513), the 8 heads side by side
+/// and a last column of ones. Same kernel and same arithmetic as splitting the heads into
+/// their own tensors first, without the two copies.
+struct Attend {
+    oq: usize,
+    ok: usize,
+    ov: usize,
+}
+
+impl CustomOp2 for Attend {
+    fn name(&self) -> &'static str {
+        "attend"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("attend runs on Metal only")
+    }
+    fn metal_fwd(&self, q: &MetalStorage, ql: &Layout, kv: &MetalStorage, kl: &Layout) -> Result<(MetalStorage, Shape)> {
+        let (&[l, wq], &[s, wk]) = (ql.dims(), kl.dims()) else { candle_core::bail!("attend: operands must be matrices") };
+        let c = HEADS * 64;
+        if !ql.is_contiguous() || !kl.is_contiguous() || q.dtype() != DType::F32 || kv.dtype() != DType::F32 || self.oq + c > wq || self.ok.max(self.ov) + c > wk {
+            candle_core::bail!("attend: contiguous f32 projections with room for the heads")
+        }
+        let dev = q.device().clone();
+        let w = c + 1;
+        let out = alloc(&dev, l * w)?;
+        let enc = dev.command_encoder()?;
+        enc.set_label("attend");
+        let (qo, ko) = (ql.start_offset() * 4, kl.start_offset() * 4);
+        steel_attention(&dev, &enc, (qo + self.oq * 4, q.buffer(), [l * wq, 64, wq]), (ko + self.ok * 4, ko + self.ov * 4, kv.buffer(), [s * wk, 64, wk]), (&out, [l * w, 64, w]), (l, s))?;
+        let pipe = pipeline(&dev, "ones_col")?;
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&out), 0);
+        enc.use_resource(&*out, MTLResourceUsage::Write);
+        let params = [l as u32, w as u32, c as u32];
+        enc.set_bytes_directly(1, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize { width: l, height: 1, depth: 1 }, MTLSize { width: 256.min(l.max(1)), height: 1, depth: 1 });
+        drop(enc);
+        mark_on(&dev, true, || format!("attend {l}x{s}"));
+        Ok((MetalStorage::new(out, dev, l * w, DType::F32), Shape::from(vec![l, w])))
+    }
+}
+
+/// Candle's `steel_attention` kernel source with only the one instance used here (f32, head
+/// size 64, 32 queries by 32 keys per block, no mask). Candle's own library has 105 instances
+/// and takes 6-7 s to compile on a cold shader cache; this one compiles in well under a second.
+/// Compiled with Candle's options (fast math), so it is the same machine code as Candle's.
+fn sdpa_source() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        let full = candle_metal_kernels::source::SDPA;
+        let cut = full.find("instantiate_attn_mask_helper(float16, half);").unwrap_or(full.len());
+        format!("{}\ninstantiate_attn(float32, float, 32, 32, 64, 4, 1, float32, float)\n", &full[..cut])
+    })
+}
+
+const SDPA_KERNEL: &str = "steel_attention_float32_bq32_bk32_bd64_wm4_wn1_maskfloat32";
+
+/// The attention pipeline for `(align_q, align_k)` (Candle's function constants 200, 201;
+/// no mask, not causal).
+fn sdpa_pipeline(dev: &MetalDevice, align: (bool, bool)) -> Result<Arc<ComputePipeline>> {
+    static PIPES: Mutex<Vec<(u64, (bool, bool), Arc<ComputePipeline>)>> = Mutex::new(Vec::new());
+    let id = dev.metal_device().registry_id();
+    let mut pipes = PIPES.lock().map_err(msg)?;
+    if let Some(p) = pipes.iter().find(|p| p.0 == id && p.1 == align) {
+        return Ok(p.2.clone());
+    }
+    static LIBS: Mutex<Vec<(u64, Arc<Library>)>> = Mutex::new(Vec::new());
+    let lib = {
+        let mut libs = LIBS.lock().map_err(msg)?;
+        match libs.iter().find(|l| l.0 == id) {
+            Some(l) => l.1.clone(),
+            None => {
+                let l = Arc::new(compile_opts(dev, sdpa_source(), true)?);
+                libs.push((id, l.clone()));
+                l
+            }
+        }
+    };
+    use candle_metal_kernels::metal::{ConstantValues, Value};
+    let constants = ConstantValues::new(vec![(200, Value::Bool(align.0)), (201, Value::Bool(align.1)), (300, Value::Bool(false)), (301, Value::Bool(false))]);
+    let func = lib.get_function(SDPA_KERNEL, Some(&constants)).map_err(msg)?;
+    let pipe = Arc::new(dev.metal_device().new_compute_pipeline_state_with_function(&func).map_err(msg)?);
+    pipes.push((id, align, pipe.clone()));
+    Ok(pipe)
+}
+
+/// Encode Candle's `steel_attention` (as `candle_metal_kernels::call_sdpa_full` does, with
+/// the same parameters) from `sdpa_pipeline`: q = (byte offset, buffer, strides of batch, head
+/// and row), kv = (key offset, value offset, buffer, strides), out = (buffer, strides),
+/// (L, S); 8 heads of 64, scale 1.
+#[allow(clippy::type_complexity)]
+fn steel_attention(dev: &MetalDevice, enc: &candle_metal_kernels::metal::ComputeCommandEncoder, q: (usize, &Buffer, [usize; 3]), kv: (usize, usize, &Buffer, [usize; 3]), out: (&Buffer, [usize; 3]), (l, s): (usize, usize)) -> Result<()> {
+    #[repr(C)]
+    struct AttnParams {
+        b: i32,
+        h: i32,
+        d: i32,
+        ql: i32,
+        kl: i32,
+        gqa_factor: i32,
+        scale: f32,
+        softcapping: f32,
+        nq: i32,
+        nk: i32,
+        nq_aligned: i32,
+        nk_aligned: i32,
+        ql_rem: i32,
+        kl_rem: i32,
+        ql_off: i32,
+        q_strides: [i64; 3],
+        k_strides: [i64; 3],
+        v_strides: [i64; 3],
+        o_strides: [i64; 3],
+    }
+    const BQ: usize = 32;
+    const BK: usize = 32;
+    let pipe = sdpa_pipeline(dev, (l % BQ == 0, s % BK == 0))?;
+    let (nq, nk) = (l.div_ceil(BQ), s.div_ceil(BK));
+    let st = |v: [usize; 3]| v.map(|x| x as i64);
+    let params = AttnParams {
+        b: 1,
+        h: HEADS as i32,
+        d: 64,
+        ql: l as i32,
+        kl: s as i32,
+        gqa_factor: 1,
+        scale: 1.0,
+        softcapping: 1.0,
+        nq: nq as i32,
+        nk: nk as i32,
+        nq_aligned: (l / BQ) as i32,
+        nk_aligned: (s / BK) as i32,
+        ql_rem: l.wrapping_sub((l / BQ) * BQ) as i32,
+        kl_rem: s.wrapping_sub((s / BK) * BK) as i32,
+        ql_off: s.wrapping_sub(l) as i32,
+        q_strides: st(q.2),
+        k_strides: st(kv.3),
+        v_strides: st(kv.3),
+        o_strides: st(out.1),
+    };
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(q.1), q.0);
+    enc.set_buffer(1, Some(kv.2), kv.0);
+    enc.set_buffer(2, Some(kv.2), kv.1);
+    enc.set_buffer(3, Some(out.0), 0);
+    enc.set_bytes_directly(4, std::mem::size_of::<AttnParams>(), &params as *const AttnParams as *const std::ffi::c_void);
+    enc.use_resource(q.1, MTLResourceUsage::Read);
+    enc.use_resource(kv.2, MTLResourceUsage::Read);
+    enc.use_resource(out.0, MTLResourceUsage::Write);
+    enc.dispatch_thread_groups(MTLSize { width: nq, height: HEADS, depth: 1 }, MTLSize { width: 32, height: 4, depth: 1 });
+    Ok(())
+}
+
+/// Whether attention reads the heads in place (`Attend`); `PREPDECK_STEM_ATTEND=0` goes back
+/// to copying them out first, for comparisons.
+fn attend_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PREPDECK_STEM_ATTEND").is_ok_and(|v| v == "0"))
+}
+
+/// Tile of the residual multiplies: 32 x 128, as the plain multiply. 64 x 64 gives the same
+/// bits (`mpp::tile_probe`) but measured no faster in the whole network (scratch A/B:
+/// best 6.03 s against 6.16 s); PREPDECK_STEM_RES64=1 picks it.
+fn res_tile() -> (&'static str, usize, usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("PREPDECK_STEM_RES64").is_ok_and(|v| v == "1")) {
+        ("mm_res_64_64", 64, 64)
+    } else {
+        ("mm_res_32_128", 32, 128)
+    }
+}
+
+/// Whether the transformer's multiplies do the GELU and the residual adds themselves
+/// (`mpp::mm_gelu`, `mpp::mm_res`): tensor-op GPUs; `PREPDECK_STEM_EPI=0` turns it off.
+fn epilogues(t: &Tensor) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| !std::env::var("PREPDECK_STEM_EPI").is_ok_and(|v| v == "0"));
+    on && matches!(&*t.storage_and_layout().0, Storage::Metal(s) if mpp_ok(s.device()))
 }
 
 /// One transformer layer (self- or cross-attention) with its weights as transposed matrices
@@ -1108,14 +1368,60 @@ impl Layer {
     fn forward(&self, q: &Tensor, k: Option<&Tensor>, ones: bool) -> Result<Tensor> {
         let (l, c) = q.dims2()?;
         let nq = ln_rows(q, &self.norm1, true)?;
+        let fused = if c != HEADS * 64 || !attend_in_place() {
+            None
+        } else {
+            match (k, &self.norm_k, &self.in_kv) {
+                (Some(k), Some(norm_k), Some(in_kv)) => {
+                    let qp = mm(&nq, &self.in_q)?;
+                    let kv = mm(&ln_rows(k, norm_k, true)?, in_kv)?;
+                    Some(qp.apply_op2_no_bwd(&kv, &Attend { oq: 0, ok: 0, ov: c })?)
+                }
+                _ => {
+                    let p = mm(&nq, &self.in_q)?;
+                    Some(p.apply_op2_no_bwd(&p, &Attend { oq: 0, ok: c, ov: 2 * c })?)
+                }
+            }
+        };
+        let merged = match fused {
+            Some(m) => m,
+            None => self.heads_copied(&nq, k, l, c)?,
+        };
+        let epi = epilogues(q);
+        let x = match epi.then(|| mpp::mm_res(&merged, &self.out, q, res_tile())).transpose()?.flatten() {
+            Some(x) => x,
+            None => add(q, &mm(&merged, &self.out)?)?,
+        };
+        let nf = ln_rows(&x, &self.norm_ff, true)?;
+        let g = match epi.then(|| mpp::mm_gelu(&nf, &self.lin1)).transpose()?.flatten() {
+            Some(g) => g,
+            None => {
+                let y = mm(&nf, &self.lin1)?;
+                let h = y.dim(1)?;
+                run("row_gelu", &y, &[], vec![h as u32], &[l, h + 1], (h + 1, l, 1))?
+            }
+        };
+        let x = match epi.then(|| mpp::mm_res(&g, &self.lin2, &x, res_tile())).transpose()?.flatten() {
+            Some(x) => x,
+            None => add(&x, &mm(&g, &self.lin2)?)?,
+        };
+        // norm_out: group norm with one group over all tokens and channels.
+        let st = row_sum(&run("row_stats", &x, &[], [l, 1, c, c, 1].map(|v| v as u32).to_vec(), &[2, l], (1, l, 1))?, 2)?;
+        let params = vec![c as u32, ones as u32, ((l * c) as f32).to_bits(), 1e-5f32.to_bits()];
+        run("row_norm", &x, &[&st, &self.norm_out], params, &[l, c + ones as usize], (c + ones as usize, l, 1))
+    }
+
+    /// The attention of `forward` with the heads copied into tensors of their own (the way
+    /// before `Attend`): (L, C + 1) with a last column of ones.
+    fn heads_copied(&self, nq: &Tensor, k: Option<&Tensor>, l: usize, c: usize) -> Result<Tensor> {
         let (qh, kh, vh) = match (k, &self.norm_k, &self.in_kv) {
             (Some(k), Some(norm_k), Some(in_kv)) => {
-                let qp = mm(&nq, &self.in_q)?;
+                let qp = mm(nq, &self.in_q)?;
                 let kv = mm(&ln_rows(k, norm_k, true)?, in_kv)?;
                 (split_heads(&qp, 0, c)?, split_heads(&kv, 0, c)?, split_heads(&kv, c, c)?)
             }
             _ => {
-                let p = mm(&nq, &self.in_q)?;
+                let p = mm(nq, &self.in_q)?;
                 (split_heads(&p, 0, c)?, split_heads(&p, c, c)?, split_heads(&p, 2 * c, c)?)
             }
         };
@@ -1124,17 +1430,7 @@ impl Layer {
         let attn = candle_nn::ops::sdpa(&qh, &kh, &vh, None, false, 1.0, 1.0)?;
         op_mark(&attn, || format!("sdpa {l}x{}", kh.dim(2).unwrap_or(0)));
         let d = c / HEADS;
-        let merged = run("merge_heads", &attn, &[], [l, HEADS, d].map(|v| v as u32).to_vec(), &[l, c + 1], (c + 1, l, 1))?;
-        let x = add(q, &mm(&merged, &self.out)?)?;
-        let y = mm(&ln_rows(&x, &self.norm_ff, true)?, &self.lin1)?;
-        let h = y.dim(1)?;
-        let y = mm(&run("row_gelu", &y, &[], vec![h as u32], &[l, h + 1], (h + 1, l, 1))?, &self.lin2)?;
-        let x = add(&x, &y)?;
-        // norm_out: group norm with one group over all tokens and channels.
-        let st = run("row_stats", &x, &[], [l, 1, c, c, 1].map(|v| v as u32).to_vec(), &[2, l], (1, l, 1))?.sum_keepdim(1)?.flatten_all()?;
-        op_mark(&st, || format!("candle sum 2x{l}"));
-        let params = vec![c as u32, ones as u32, ((l * c) as f32).to_bits(), 1e-5f32.to_bits()];
-        run("row_norm", &x, &[&st, &self.norm_out], params, &[l, c + ones as usize], (c + ones as usize, l, 1))
+        run("merge_heads", &attn, &[], [l, HEADS, d].map(|v| v as u32).to_vec(), &[l, c + 1], (c + 1, l, 1))
     }
 }
 
@@ -1173,12 +1469,63 @@ fn conv_matrix(w: &Weights, name: &str) -> Result<Tensor> {
     Tensor::cat(&[weight.reshape((co, ()))?, get(w, &format!("{name}.bias"))?.reshape((co, 1))?], 1)?.contiguous()
 }
 
-fn dconv(w: &Weights, name: &str) -> Result<Dconv> {
+/// A stride-1 convolution's weights one tap at a time, with its bias.
+struct Taps {
+    w: Tensor,
+    bias: Tensor,
+}
+
+/// Whether stride-1 convolutions run tap by tap (`mpp::conv_with`) instead of through an
+/// im2col matrix: GPUs with the tensor-op multiply; `PREPDECK_STEM_TAPS=0` turns it off.
+fn taps_ok(dev: &candle_core::Device) -> bool {
+    let on = !std::env::var("PREPDECK_STEM_TAPS").is_ok_and(|v| v == "0");
+    on && matches!(dev, candle_core::Device::Metal(m) if mpp_ok(m))
+}
+
+fn taps(w: &Weights, name: &str, on: bool) -> Result<Option<Taps>> {
+    if !on {
+        return Ok(None);
+    }
+    Ok(Some(Taps { w: mpp::tap_weights(&get(w, &format!("{name}.weight"))?)?, bias: get(w, &format!("{name}.bias"))?.contiguous()? }))
+}
+
+/// Tile of the tap-wise convolution for `co` output channels (measured in
+/// `mpp::conv_probe::conv_variants`).
+fn conv_tile(co: usize) -> (&'static str, usize, usize) {
+    if co >= 128 {
+        ("conv_taps_64_64", 64, 64)
+    } else if co <= 32 {
+        ("conv_taps_32_64", 32, 64)
+    } else {
+        ("conv_taps_32_128", 32, 128)
+    }
+}
+
+/// Tile of the tap-wise convolution with its GLU, for `ch` output channels (after the GLU).
+fn glu_tile(ch: usize) -> (&'static str, usize, usize) {
+    if ch >= 128 {
+        ("conv_glu_64_64", 64, 64)
+    } else if ch <= 32 {
+        ("conv_glu_32_64", 32, 64)
+    } else {
+        ("conv_glu_32_128", 32, 128)
+    }
+}
+
+/// Whether the decoders' rewrite and its GLU run as one pass (`conv_glu_*`);
+/// PREPDECK_STEM_GLU=0 does them in two.
+fn glu_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PREPDECK_STEM_GLU").is_ok_and(|v| v == "0"))
+}
+
+fn dconv(w: &Weights, name: &str, on: bool) -> Result<Dconv> {
     let mut layers = vec![];
     for i in 0..2 {
         let p = format!("{name}.layers.{i}");
         layers.push(DconvLayer {
             conv: conv_matrix(w, &format!("{p}.0"))?,
+            taps: taps(w, &format!("{p}.0"), on)?,
             norm1: Tensor::cat(&[get(w, &format!("{p}.1.weight"))?, get(w, &format!("{p}.1.bias"))?], 0)?,
             expand: conv_matrix(w, &format!("{p}.3"))?,
             norm2: Tensor::cat(&[get(w, &format!("{p}.4.weight"))?, get(w, &format!("{p}.4.bias"))?, get(w, &format!("{p}.6.scale"))?], 0)?,
@@ -1189,31 +1536,89 @@ fn dconv(w: &Weights, name: &str) -> Result<Dconv> {
 }
 
 impl Fast {
-    pub fn new(w: &Weights) -> Result<Self> {
+    /// The network for `dev` from a checkpoint's tensors. The weights are rearranged on the
+    /// CPU (exact copies, and products by layer scales that round the same on either side) and
+    /// only the results are uploaded, so loading runs no GPU kernels: none of Candle's Metal
+    /// sources has to be compiled for it, which on a cold shader cache took seconds.
+    pub fn new(w: &Weights, dev: &candle_core::Device) -> Result<Self> {
+        let cpu: Weights = w.iter().map(|(k, v)| Ok((k.clone(), v.to_device(&candle_core::Device::Cpu)?))).collect::<Result<_>>()?;
+        Self::prepare(&cpu, taps_ok(dev))?.to_device(dev)
+    }
+
+    fn prepare(w: &Weights, taps_on: bool) -> Result<Self> {
         let encoder = |name: String| -> Result<Encoder> {
-            Ok(Encoder { conv: conv_matrix(w, &format!("{name}.conv"))?, dconv: dconv(w, &format!("{name}.dconv"))?, rewrite: conv_matrix(w, &format!("{name}.rewrite"))? })
+            Ok(Encoder { conv: conv_matrix(w, &format!("{name}.conv"))?, dconv: dconv(w, &format!("{name}.dconv"), taps_on)?, rewrite: conv_matrix(w, &format!("{name}.rewrite"))? })
         };
         let decoder = |name: String| -> Result<Decoder> {
             // (C, Co, 8[, 1]) -> (Co*8, C)
             let tr = get(w, &format!("{name}.conv_tr.weight"))?;
             let (c, co) = (tr.dim(0)?, tr.dim(1)?);
             let tr = tr.reshape((c, co * 8))?.t()?.contiguous()?;
-            Ok(Decoder { rewrite: conv_matrix(w, &format!("{name}.rewrite"))?, dconv: dconv(w, &format!("{name}.dconv"))?, tr, tr_bias: get(w, &format!("{name}.conv_tr.bias"))? })
+            Ok(Decoder { rewrite: conv_matrix(w, &format!("{name}.rewrite"))?, rewrite_taps: taps(w, &format!("{name}.rewrite"), taps_on)?, dconv: dconv(w, &format!("{name}.dconv"), taps_on)?, tr, tr_bias: get(w, &format!("{name}.conv_tr.bias"))? })
+        };
+        // The groups are independent: rearranged side by side (about 4x quicker than in turn).
+        let (encoder, decoder) = (&encoder, &decoder);
+        fn join<T>(h: std::thread::ScopedJoinHandle<'_, Result<Vec<T>>>) -> Result<Vec<T>> {
+            h.join().map_err(|_| candle_core::Error::Msg("weight preparation failed".into()))?
+        }
+        std::thread::scope(|sc| {
+            let enc = sc.spawn(move || (0..4).map(|i| encoder(format!("encoder.{i}"))).collect::<Result<Vec<_>>>());
+            let tenc = sc.spawn(move || (0..4).map(|i| encoder(format!("tencoder.{i}"))).collect::<Result<Vec<_>>>());
+            let dec = sc.spawn(move || (0..4).map(|i| decoder(format!("decoder.{i}"))).collect::<Result<Vec<_>>>());
+            let tdec = sc.spawn(move || (0..4).map(|i| decoder(format!("tdecoder.{i}"))).collect::<Result<Vec<_>>>());
+            let layers = sc.spawn(move || (0..5).map(|i| Layer::new(w, &format!("crosstransformer.layers.{i}"), i % 2 == 1)).collect::<Result<Vec<_>>>());
+            let layers_t = sc.spawn(move || (0..5).map(|i| Layer::new(w, &format!("crosstransformer.layers_t.{i}"), i % 2 == 1)).collect::<Result<Vec<_>>>());
+            Ok(Self {
+                freq_emb: (get(w, "freq_emb.embedding.weight")?.t()? * 2.0)?.contiguous()?,
+                up: conv_matrix(w, "channel_upsampler")?.t()?.contiguous()?,
+                up_t: conv_matrix(w, "channel_upsampler_t")?.t()?.contiguous()?,
+                down: conv_matrix(w, "channel_downsampler")?,
+                down_t: conv_matrix(w, "channel_downsampler_t")?,
+                norm_in: Tensor::cat(&[get(w, "crosstransformer.norm_in.weight")?, get(w, "crosstransformer.norm_in.bias")?], 0)?,
+                norm_in_t: Tensor::cat(&[get(w, "crosstransformer.norm_in_t.weight")?, get(w, "crosstransformer.norm_in_t.bias")?], 0)?,
+                enc: join(enc)?,
+                tenc: join(tenc)?,
+                dec: join(dec)?,
+                tdec: join(tdec)?,
+                layers: join(layers)?,
+                layers_t: join(layers_t)?,
+                pos: std::sync::OnceLock::new(),
+                pos_t: std::sync::OnceLock::new(),
+            })
+        })
+    }
+
+    /// Every tensor moved to `d`.
+    fn to_device(self, d: &candle_core::Device) -> Result<Self> {
+        let t = |x: Tensor| x.to_device(d);
+        let o = |x: Option<Tensor>| x.map(|x| x.to_device(d)).transpose();
+        let taps = |x: Option<Taps>| -> Result<Option<Taps>> { x.map(|x| Ok(Taps { w: t(x.w)?, bias: t(x.bias)? })).transpose() };
+        let dconv = |x: Dconv| -> Result<Dconv> {
+            x.0.into_iter().map(|l| Ok(DconvLayer { conv: t(l.conv)?, taps: taps(l.taps)?, norm1: t(l.norm1)?, expand: t(l.expand)?, norm2: t(l.norm2)?, dilation: l.dilation })).collect::<Result<_>>().map(Dconv)
+        };
+        let enc = |v: Vec<Encoder>| -> Result<Vec<Encoder>> { v.into_iter().map(|e| Ok(Encoder { conv: t(e.conv)?, dconv: dconv(e.dconv)?, rewrite: t(e.rewrite)? })).collect() };
+        let dec = |v: Vec<Decoder>| -> Result<Vec<Decoder>> {
+            v.into_iter().map(|e| Ok(Decoder { rewrite: t(e.rewrite)?, rewrite_taps: taps(e.rewrite_taps)?, dconv: dconv(e.dconv)?, tr: t(e.tr)?, tr_bias: t(e.tr_bias)? })).collect()
+        };
+        let layers = |v: Vec<Layer>| -> Result<Vec<Layer>> {
+            v.into_iter()
+                .map(|l| Ok(Layer { norm1: t(l.norm1)?, norm_k: o(l.norm_k)?, in_q: t(l.in_q)?, in_kv: o(l.in_kv)?, out: t(l.out)?, norm_ff: t(l.norm_ff)?, lin1: t(l.lin1)?, lin2: t(l.lin2)?, norm_out: t(l.norm_out)? }))
+                .collect()
         };
         Ok(Self {
-            enc: (0..4).map(|i| encoder(format!("encoder.{i}"))).collect::<Result<_>>()?,
-            tenc: (0..4).map(|i| encoder(format!("tencoder.{i}"))).collect::<Result<_>>()?,
-            dec: (0..4).map(|i| decoder(format!("decoder.{i}"))).collect::<Result<_>>()?,
-            tdec: (0..4).map(|i| decoder(format!("tdecoder.{i}"))).collect::<Result<_>>()?,
-            freq_emb: (get(w, "freq_emb.embedding.weight")?.t()? * 2.0)?.contiguous()?,
-            up: conv_matrix(w, "channel_upsampler")?.t()?.contiguous()?,
-            up_t: conv_matrix(w, "channel_upsampler_t")?.t()?.contiguous()?,
-            down: conv_matrix(w, "channel_downsampler")?,
-            down_t: conv_matrix(w, "channel_downsampler_t")?,
-            norm_in: Tensor::cat(&[get(w, "crosstransformer.norm_in.weight")?, get(w, "crosstransformer.norm_in.bias")?], 0)?,
-            norm_in_t: Tensor::cat(&[get(w, "crosstransformer.norm_in_t.weight")?, get(w, "crosstransformer.norm_in_t.bias")?], 0)?,
-            layers: (0..5).map(|i| Layer::new(w, &format!("crosstransformer.layers.{i}"), i % 2 == 1)).collect::<Result<_>>()?,
-            layers_t: (0..5).map(|i| Layer::new(w, &format!("crosstransformer.layers_t.{i}"), i % 2 == 1)).collect::<Result<_>>()?,
+            enc: enc(self.enc)?,
+            tenc: enc(self.tenc)?,
+            dec: dec(self.dec)?,
+            tdec: dec(self.tdec)?,
+            freq_emb: t(self.freq_emb)?,
+            up: t(self.up)?,
+            up_t: t(self.up_t)?,
+            down: t(self.down)?,
+            down_t: t(self.down_t)?,
+            norm_in: t(self.norm_in)?,
+            norm_in_t: t(self.norm_in_t)?,
+            layers: layers(self.layers)?,
+            layers_t: layers(self.layers_t)?,
             pos: std::sync::OnceLock::new(),
             pos_t: std::sync::OnceLock::new(),
         })
@@ -1228,6 +1633,9 @@ impl Fast {
         let c = y.dim(0)?;
         let y = norm_act(&y.reshape((c, out.0, out.1))?, None, 1, None, false)?;
         let y = e.dconv.forward(&y, freq, true)?;
+        if glu_fused() && epilogues(&y) {
+            return mpp::mm_glu(&e.rewrite, &y.reshape((c + 1, out.0 * out.1))?, ones)?.reshape((c + ones as usize, out.0, out.1));
+        }
         let z = mm(&e.rewrite, &y.reshape((c + 1, out.0 * out.1))?)?;
         norm_act(&z.reshape((2 * c, out.0, out.1))?, None, 2, None, ones)
     }
@@ -1235,10 +1643,16 @@ impl Fast {
     /// Decoder layer; `length` is the output size along the stride axis.
     fn decode(&self, d: &Decoder, x: &Tensor, skip: &Tensor, freq: bool, length: usize, last: bool) -> Result<Tensor> {
         let (c, f, t) = x.dims3()?;
-        let y = add(x, skip)?;
-        let geo = if freq { Geo { k: (3, 3), s: (1, 1), p: (1, 1), d: (1, 1) } } else { Geo { k: (1, 3), s: (1, 1), p: (0, 1), d: (1, 1) } };
-        let z = mm(&d.rewrite, &im2col(&y, geo, (f, t))?)?;
-        let z = norm_act(&z.reshape((2 * c, f, t))?, None, 2, None, false)?;
+        let k = if freq { (3, 3) } else { (1, 3) };
+        let z = match &d.rewrite_taps {
+            Some(tp) if glu_fused() => mpp::conv_with(glu_tile(c), x, Some(skip), &tp.w, &tp.bias, k, (1, 1))?,
+            Some(tp) => norm_act(&mpp::conv_with(conv_tile(2 * c), x, Some(skip), &tp.w, &tp.bias, k, (1, 1))?, None, 2, None, false)?,
+            None => {
+                let y = add(x, skip)?;
+                let geo = Geo { k, s: (1, 1), p: ((k.0 - 1) / 2, 1), d: (1, 1) };
+                norm_act(&mm(&d.rewrite, &im2col(&y, geo, (f, t))?)?.reshape((2 * c, f, t))?, None, 2, None, false)?
+            }
+        };
         let z = d.dconv.forward(&z, freq, false)?;
         let cols = mm(&d.tr, &z.reshape((c, f * t))?)?;
         let co = cols.dim(0)? / 8;
@@ -1271,7 +1685,8 @@ impl Fast {
         let pos = match self.pos.get() {
             Some(p) if p.dim(0)? == f * t => p.clone(),
             _ => {
-                let p = Tensor::from_vec(super::pos2(f, t, c), (t, f, c), dev)?.transpose(0, 1)?.contiguous()?.reshape((f * t, c))?;
+                // (Rearranged on the CPU: no GPU copy kernel to compile.)
+                let p = Tensor::from_vec(super::pos2(f, t, c), (t, f, c), &candle_core::Device::Cpu)?.transpose(0, 1)?.contiguous()?.reshape((f * t, c))?.to_device(dev)?;
                 let _ = self.pos.set(p.clone());
                 p
             }
@@ -1668,7 +2083,7 @@ MM(mpp_f16_64_32_4, half, 64, 32, 4, 0)
                 let expand = (rand(&dev, &[2 * c, h + 1], &mut rng) * s2 as f64).unwrap();
                 let norm1 = Tensor::cat(&[rand(&dev, &[h], &mut rng).affine(0.2, 1.0).unwrap(), (rand(&dev, &[h], &mut rng) * 0.1).unwrap()], 0).unwrap();
                 let norm2 = Tensor::cat(&[rand(&dev, &[2 * c], &mut rng).affine(0.2, 1.0).unwrap(), (rand(&dev, &[2 * c], &mut rng) * 0.1).unwrap(), rand(&dev, &[c], &mut rng).affine(0.1, 0.3).unwrap()], 0).unwrap();
-                layers.push(DconvLayer { conv, norm1, expand, norm2, dilation: dil });
+                layers.push(DconvLayer { conv, taps: None, norm1, expand, norm2, dilation: dil });
             }
             let d = Dconv(layers);
             let x = rand(&dev, &[c, f, t], &mut rng);
@@ -1696,11 +2111,46 @@ MM(mpp_f16_64_32_4, half, 64, 32, 4, 0)
     fn kernel_compile_time() {
         let Ok(Device::Metal(dev)) = Device::new_metal(0) else { return };
         let tag = format!("\n// {:?}\n", std::time::SystemTime::now());
-        for (name, src) in [("kernels", KERNELS), ("tensor-op multiply", MPP_KERNELS)] {
-            let src = format!("{src}{tag}");
-            let t = std::time::Instant::now();
-            let lib = dev.metal_device().new_library_with_source(&src, None);
-            println!("KC {name}: {:.2} s ({})", t.elapsed().as_secs_f64(), if lib.is_ok() { "ok" } else { "failed" });
+        use candle_metal_kernels::source as cs;
+        let sources = [
+            ("kernels", KERNELS),
+            ("tensor-op multiply", MPP_KERNELS),
+            ("tensor-op epilogues", mpp::GEMM_KERNELS),
+            ("tap-wise convolutions", mpp::CONV_KERNELS),
+            ("candle mlx gemm", cs::MLX_GEMM),
+            ("candle sdpa", cs::SDPA),
+            ("candle reduce", cs::REDUCE),
+            ("candle unary", cs::UNARY),
+            ("candle binary", cs::BINARY),
+            ("candle affine", cs::AFFINE),
+            ("candle cast", cs::CAST),
+            ("candle indexing", cs::INDEXING),
+            ("candle fill", cs::FILL),
+        ];
+        for warm in [false, true] {
+            for (name, src) in sources {
+                // A unique comment makes the source new to the system's shader cache.
+                let src = if warm { src.to_string() } else { format!("{src}{tag}") };
+                let t = std::time::Instant::now();
+                use objc2_metal::{MTLDevice, MTLLibrary};
+                let lib = dev.metal_device().as_ref().newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(&src), None);
+                let t_lib = t.elapsed().as_secs_f64();
+                // And the pipelines (the GPU back end) of this module's own sources (Candle's
+                // have specialisation constants: their pipelines are made per use).
+                let mut n = 0;
+                if let (Ok(raw), false) = (&lib, name.starts_with("candle")) {
+                    let names: Vec<String> = raw.functionNames().iter().map(|s| s.to_string()).collect();
+                    let lib = Library::new(raw.clone());
+                    for f in names {
+                        if let Ok(func) = lib.get_function(&f, None) {
+                            if dev.metal_device().new_compute_pipeline_state_with_function(&func).is_ok() {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                println!("KC {} {name:<24} library {t_lib:6.2} s, {n:3} pipelines {:6.2} s", if warm { "warm" } else { "cold" }, t.elapsed().as_secs_f64() - t_lib);
+            }
         }
     }
 }

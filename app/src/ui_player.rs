@@ -1104,7 +1104,8 @@ fn stems_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
     let status = if let Some((d, t)) = app.stem.downloading {
         if t > 0 { format!("Downloading {model}: {:.0}%", d as f64 / t as f64 * 100.0) } else { format!("Downloading {model}…") }
     } else if let Some((_, pr)) = app.stem.separating {
-        format!("Separating with {model}: {:.0}%", pr * 100.0)
+        // (rekordbox's wording while its engine starts.)
+        if pr == 0.0 && crate::stems::warming() { "Initializing STEMS Engine…".to_string() } else { format!("Separating with {model}: {:.0}%", pr * 100.0) }
     } else if app.stem.loading.is_some() {
         "Loading stems…".to_string()
     } else if let Some(e) = &app.stem.error {

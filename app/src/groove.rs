@@ -700,17 +700,22 @@ pub fn deck_block(s: &crate::audio::PlayState, audio: &Decoded, speed: f64, stem
         }
     })?;
     let e = g.as_deref_mut()?;
+    let step = audio.sr as f64 / rate.max(1) as f64 * speed;
+    // While the stems are still being made, the parts exist only where they are ready: the
+    // DRUMS part cannot be taken out (or fed to the release FX) elsewhere, so there the deck
+    // keeps playing the original, as the deck itself does (rekordbox's per-chunk rule).
+    let parts_ready = s.stems_ready.as_ref().is_none_or(|r| r.ready_around([s.pos, s.pos], n as f64 * step * 2.0, audio.sr));
     let d = DeckIn {
         playing: s.playing && s.search == 0.0,
         pos: s.pos,
         sr: audio.sr,
-        step: audio.sr as f64 / rate.max(1) as f64 * speed,
+        step,
         grid: s.grid.as_deref().map(|v| v.as_slice()),
-        stems: s.stems.as_deref(),
+        stems: s.stems.as_deref().filter(|_| parts_ready),
         drums_gain: if s.stem_on[0] { s.stem_iso[0].clamp(0.0, 10.0) } else { 0.0 },
     };
     let some = e.render(&d, n, rate);
-    if e.cut && s.stems.is_some() {
+    if e.cut && s.stems.is_some() && parts_ready {
         // The other parts as the deck has them, without the drums.
         stem_target[0] = 0.0;
         stem_target[1] = 0.0;
@@ -1097,6 +1102,19 @@ pub struct GrooveUi {
     /// The DRUM CAPTURE area is being dragged from this deck's waveform onto a slot
     /// (`DrumSwapSlot::itemDroppedFromWave` 0x1008508c8: the slot captures that range).
     pub drag_capture: Option<u8>,
+    /// A capture waiting for its DRUMS stretch to be separated.
+    pub capture_wait: Option<CaptureWait>,
+}
+
+/// A DRUM CAPTURE pressed where the deck's DRUMS part is not separated yet.
+pub struct CaptureWait {
+    pub view_deck: usize,
+    pub idx: usize,
+    pub src: u8,
+    /// Where the capture starts (seconds of the track), as when it was pressed.
+    pub start: f64,
+    pub live: Arc<crate::stems::Live>,
+    pub since: std::time::Instant,
 }
 
 impl Default for GrooveUi {
@@ -1121,6 +1139,7 @@ impl Default for GrooveUi {
             dropped: None,
             slot_rects: [[egui::Rect::NOTHING; ROWS]; DECKS],
             drag_capture: None,
+            capture_wait: None,
             panel_rects: [egui::Rect::NOTHING; DECKS],
             frames: 0,
             was_visible: false,
@@ -1376,16 +1395,24 @@ impl App {
     /// 32 beats of its DRUMS part (or of the whole track, as Preferences says) to this slot
     /// (`DrumSwapSlot::doCapture` 0x100854300). The file is a 16-bit stereo WAV.
     pub fn groove_capture(&mut self, view_deck: usize, idx: usize) -> bool {
-        let (view_deck, idx) = (view_deck.min(DECKS - 1), idx.min(SLOTS - 1));
         let Some(src) = self.gc.capture_on else { return false };
+        self.groove_capture_from(view_deck, idx, src, None)
+    }
+
+    /// A capture into slot `idx` of `view_deck` from deck `src`, starting where the deck plays
+    /// or at `start` (seconds). When its DRUMS stretch is still being separated, the stretch is
+    /// asked for first and the capture is made once it is ready (`groove_poll`), so it never
+    /// takes the silence of a part not made yet.
+    fn groove_capture_from(&mut self, view_deck: usize, idx: usize, src: u8, start: Option<f64>) -> bool {
+        let (view_deck, idx) = (view_deck.min(DECKS - 1), idx.min(SLOTS - 1));
         let (track, beats, duration) = {
             let d = self.deck_of(src);
             (d.track.and_then(|id| self.track(id)).cloned(), d.beats.iter().map(|b| (b.time, b.bpm)).collect::<Vec<(f64, f64)>>(), d.duration)
         };
         let Some(track) = track else { return false };
-        let (pos, audio, stems) = {
+        let (pos, audio, stems, live) = {
             let s = self.player.decks[(src as usize).min(3)].lock();
-            (s.pos, s.audio.clone(), s.stems.clone())
+            (s.pos, s.audio.clone(), s.stems.clone(), s.stems_ready.clone())
         };
         let Some(audio) = audio else { return false };
         if self.groove_locked(view_deck, idx, false) {
@@ -1396,8 +1423,18 @@ impl App {
             self.toast_err("Invalid operation. The STEMS function analysis is not complete.");
             return false;
         }
-        let start = pos / audio.sr.max(1) as f64;
+        let start = start.unwrap_or(pos / audio.sr.max(1) as f64);
         let (a, b, bpm, first) = capture_range(&beats, start, self.gc.capture_len as usize, duration.min(audio.duration()));
+        if let (true, Some(live)) = (from_stem, live.filter(|l| !l.complete())) {
+            let sr = crate::stems::htdemucs::SAMPLE_RATE;
+            let f0 = (a * sr as f64).round() as usize;
+            let f1 = f0 + capture_frames(a, b, sr);
+            if !live.ready_span(f0, f1.saturating_sub(1).max(f0)) {
+                live.request(f0, f1);
+                self.gc.capture_wait = Some(CaptureWait { view_deck, idx, src, start, live, since: std::time::Instant::now() });
+                return true;
+            }
+        }
         // The DRUMS part is kept at 44.1 kHz; the whole track at its own rate.
         let (sr, samples): (u32, Vec<f32>) = match stems.filter(|_| from_stem) {
             Some(st) => {
@@ -1575,6 +1612,25 @@ impl App {
     /// shown, take in files that have been read, keep the engines' settings current, apply
     /// the DRUMS mute rule, and stop everything when the panel goes away.
     pub fn groove_poll(&mut self) {
+        // A DRUM CAPTURE waiting for its stretch to be separated.
+        if let Some(w) = self.gc.capture_wait.take() {
+            let still = self.player.decks[(w.src as usize).min(3)].lock().stems_ready.as_ref().is_some_and(|r| Arc::ptr_eq(r, &w.live));
+            let (sr, len) = (crate::stems::htdemucs::SAMPLE_RATE as f64, self.gc.capture_len as usize);
+            let beats: Vec<(f64, f64)> = self.deck_of(w.src).beats.iter().map(|b| (b.time, b.bpm)).collect();
+            let (a, b, _, _) = capture_range(&beats, w.start, len, self.deck_of(w.src).duration);
+            let (f0, f1) = ((a * sr).round() as usize, (a * sr).round() as usize + capture_frames(a, b, sr as u32));
+            let ready = w.live.complete() || w.live.ready_span(f0, f1.saturating_sub(1).max(f0));
+            if !still && !w.live.complete() {
+                // The track left the deck before its stretch was made: nothing to capture.
+            } else if ready {
+                self.groove_capture_from(w.view_deck, w.idx, w.src, Some(w.start));
+            } else if w.since.elapsed() > std::time::Duration::from_secs(180) {
+                self.toast_err("Invalid operation. The STEMS function analysis is not complete.");
+            } else {
+                self.gc.capture_wait = Some(w);
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            }
+        }
         let visible = self.groove_visible();
         let count = self.deck_count() as usize;
         if !visible {

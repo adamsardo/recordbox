@@ -100,6 +100,45 @@ fn graph(file: &str) -> Result<std::sync::Arc<htdemucs::Graph>> {
     Ok(loaded.last().unwrap().1.clone())
 }
 
+/// 0: not started, 1: compiling the GPU kernels and loading the model, 2: done.
+static ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the separation engine is being prepared (`warm_up` running): the first separation
+/// after a build or on a new machine waits for it, so the app says so instead of showing no
+/// progress (rekordbox's "Initializing STEMS Engine").
+pub fn warming() -> bool {
+    ENGINE.load(std::sync::atomic::Ordering::Relaxed) == 1
+}
+
+/// Prepare model `m` for the first separation: load it and push one segment of silence
+/// through it, so every GPU kernel it uses is compiled (the system keeps the compiled kernels
+/// between runs, but not after they change, and compiling them all takes seconds) and the
+/// weights are resident. Run on a background thread at start, as rekordbox loads its engine
+/// when STEMS is enabled. Returns the seconds it took.
+pub fn warm_up(m: &ModelSpec) -> Result<f64> {
+    let t = std::time::Instant::now();
+    ENGINE.store(1, std::sync::atomic::Ordering::Relaxed);
+    let r = (|| -> Result<()> {
+        if !model_ready(m) {
+            return Ok(());
+        }
+        let device = device();
+        let g = graph(m.files[0])?;
+        let len = htdemucs::SAMPLE_RATE as usize;
+        let silence = vec![0f32; 2 * len];
+        let y = htdemucs::separate(&g, &device, &silence, len, &htdemucs::Options { overlap: OVERLAP, source: None }, &mut |_, _| true).map_err(|e| anyhow!("{e}"));
+        htdemucs::release_scratch();
+        y?;
+        // The other networks of a fine-tuned set share the kernels; load them too.
+        for f in &m.files[1..] {
+            graph(f)?;
+        }
+        Ok(())
+    })();
+    ENGINE.store(2, std::sync::atomic::Ordering::Relaxed);
+    r.map(|_| t.elapsed().as_secs_f64())
+}
+
 /// Planar stereo (left samples, then right) at 44.1 kHz from interleaved stereo at `sr`.
 fn planar_44k(samples: &[f32], sr: u32) -> (Vec<f32>, usize) {
     let resampled;
@@ -136,6 +175,10 @@ pub struct ModelSpec {
     pub sha256: &'static [Option<&'static str>],
     pub licence: &'static str,
     pub source: &'static str,
+    /// Whether a separation in progress jumps to where it is needed (rekordbox's "Prioritize
+    /// speed" engine is random access, its "Prioritize sound quality" one goes from the start;
+    /// `next_segment`).
+    pub random_access: bool,
 }
 
 pub const ROOT_URL: &str = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/";
@@ -160,6 +203,7 @@ pub const CATALOG: [ModelSpec; 2] = [
         ],
         licence: "MIT",
         source: "facebookresearch/demucs (Hybrid Transformer Demucs, fine-tuned)",
+        random_access: false,
     },
     ModelSpec {
         id: "htdemucs",
@@ -172,6 +216,7 @@ pub const CATALOG: [ModelSpec; 2] = [
         sha256: &[None],
         licence: "MIT",
         source: "facebookresearch/demucs (Hybrid Transformer Demucs)",
+        random_access: true,
     },
 ];
 
@@ -340,6 +385,9 @@ pub struct Live {
     /// Playhead in frames at 44.1 kHz (usize::MAX: none).
     want: std::sync::atomic::AtomicUsize,
     cues: std::sync::Mutex<Vec<usize>>,
+    /// Stretches someone is waiting for ([a, b) frames, oldest first): made before anything
+    /// else (rekordbox's `requestSeparateAt`).
+    requests: std::sync::Mutex<Vec<(usize, usize)>>,
     complete: std::sync::atomic::AtomicBool,
 }
 
@@ -364,6 +412,7 @@ impl Live {
             ready_frames: Default::default(),
             want: std::sync::atomic::AtomicUsize::new(usize::MAX),
             cues: Default::default(),
+            requests: Default::default(),
             complete: Default::default(),
         }
     }
@@ -416,6 +465,32 @@ impl Live {
         self.ready_frames.load(std::sync::atomic::Ordering::Relaxed) as f32 / self.len().max(1) as f32
     }
 
+    /// Frames that are final so far (grows as stretches finish; the stem waveform is worked
+    /// out again when it has).
+    pub fn ready_count(&self) -> usize {
+        self.ready_frames.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The ready stretches as [a, b) frames (44.1 kHz), in order. Only these may be read
+    /// while the separation runs.
+    pub fn ready_spans(&self) -> Vec<(usize, usize)> {
+        let n = self.ready.len();
+        let mut out = vec![];
+        let mut start = None;
+        for i in 0..=n {
+            let r = i < n && self.ready[i].load(std::sync::atomic::Ordering::Acquire);
+            match (r, start) {
+                (true, None) => start = Some(i),
+                (false, Some(a)) => {
+                    out.push((a * READY_BLOCK, (i * READY_BLOCK).min(self.len())));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The ready stretches as fractions of the track (for the progress line under the
     /// overview, which rekordbox draws per separated range).
     pub fn ranges(&self) -> Vec<(f32, f32)> {
@@ -448,9 +523,24 @@ impl Live {
         }
     }
 
-    fn wanted(&self) -> (Option<usize>, Vec<usize>) {
+    /// Ask for frames [a, b) (44.1 kHz) to be made next, before the playhead's stretch: for
+    /// something that cannot use the stretch until it is separated (a DRUM CAPTURE of it).
+    pub fn request(&self, a: usize, b: usize) {
+        if let Ok(mut r) = self.requests.lock() {
+            if !r.contains(&(a, b)) {
+                r.push((a, b));
+            }
+        }
+    }
+
+    fn wanted(&self) -> Wanted {
         let w = self.want.load(std::sync::atomic::Ordering::Relaxed);
-        ((w != usize::MAX).then_some(w), self.cues.lock().map(|c| c.clone()).unwrap_or_default())
+        let requests = self.requests.lock().map(|mut r| {
+            // Requests whose frames are all made are done.
+            r.retain(|&(a, b)| !self.ready_span(a, b.saturating_sub(1).max(a)));
+            r.clone()
+        });
+        Wanted { requests: requests.unwrap_or_default(), at: (w != usize::MAX).then_some(w), cues: self.cues.lock().map(|c| c.clone()).unwrap_or_default() }
     }
 
     /// Frames [a, b) of every part are final.
@@ -491,31 +581,42 @@ fn len_44k(frames: usize, sr: u32) -> usize {
     }
 }
 
-/// Seconds of audio ahead of the playhead that are made before the hot cues.
-const LOOKAHEAD_FRAMES: usize = 15 * 44100;
+/// What a separation in progress is asked for (`Live::wanted`).
+pub(crate) struct Wanted {
+    /// Stretches waited for ([a, b) frames), oldest first.
+    pub requests: Vec<(usize, usize)>,
+    /// The playhead (frames).
+    pub at: Option<usize>,
+    /// Hot cue positions (frames).
+    pub cues: Vec<usize>,
+}
 
-/// Which segment to make next. Segments are (start, end) frames; `taken` marks the ones
-/// already made or under way. Order: the segments under the playhead, then those starting
-/// within LOOKAHEAD_FRAMES after it, then the ones under each hot cue, then the rest from the
-/// playhead on, then from the start. With no playhead: the hot cues, then in order.
-pub(crate) fn next_segment(spans: &[(usize, usize)], taken: &[bool], want: Option<usize>, cues: &[usize]) -> Option<usize> {
+/// Which segment to make next, in rekordbox's order (`rbxfrm::audiopart::AudioPartSeparator`,
+/// traced in checks/re-7.2.19/stems.md 2.3). Segments are (start, end) frames; `taken` marks
+/// the ones made or under way.
+///
+/// - A model that is not random access (rekordbox's Demucs, "Prioritize sound quality"; here
+///   the fine-tuned set) goes strictly from the start to the end: nothing reorders it.
+/// - A random-access model (rekordbox's Spleeter, "Prioritize speed"; here HTDemucs) first
+///   makes the segments asked for, in track order (rekordbox's sorted priority list, filled
+///   by readiness checks: the play position, the hot cues' buffered ranges, here also a DRUM
+///   CAPTURE waiting for its stretch), then the rest starting where the deck reads, forward to
+///   the end and then from the start (each read moves its chunk and everything after it to
+///   the front of the remaining list).
+pub(crate) fn next_segment(spans: &[(usize, usize)], taken: &[bool], w: &Wanted, random_access: bool) -> Option<usize> {
+    let n = spans.len();
     let free = |k: &usize| !taken[*k];
-    let covering = |f: usize| (0..spans.len()).filter(move |&k| spans[k].0 <= f && f < spans[k].1);
-    if let Some(p) = want {
-        if let Some(k) = covering(p).find(free) {
-            return Some(k);
-        }
-        if let Some(k) = (0..spans.len()).filter(|&k| spans[k].0 > p && spans[k].0 <= p + LOOKAHEAD_FRAMES).find(free) {
-            return Some(k);
-        }
+    if !random_access {
+        return (0..n).find(free);
     }
-    for &c in cues {
-        if let Some(k) = covering(c).find(free) {
-            return Some(k);
-        }
+    let over = |a: usize, b: usize| (0..n).filter(move |&k| spans[k].0 < b.max(a + 1) && a < spans[k].1);
+    let mut asked: Vec<usize> = w.at.iter().flat_map(|&p| over(p, p + 1)).chain(w.cues.iter().flat_map(|&c| over(c, c + 1))).chain(w.requests.iter().flat_map(|&(a, b)| over(a, b))).filter(free).collect();
+    asked.sort_unstable();
+    if let Some(&k) = asked.first() {
+        return Some(k);
     }
-    let p = want.unwrap_or(0);
-    (0..spans.len()).filter(|&k| spans[k].1 > p).find(free).or_else(|| (0..spans.len()).find(free))
+    let p = w.at.unwrap_or(0);
+    (0..n).filter(|&k| spans[k].1 > p).find(free).or_else(|| (0..n).find(free))
 }
 
 /// Separate a decoded track into `live` (made with `Live::for_track` for it), so the player
@@ -538,10 +639,7 @@ fn run_live(m: &ModelSpec, planar: &[f32], len: usize, live: &Live, progress: &m
     let graphs = m.files.iter().map(|f| graph(f)).collect::<Result<Vec<_>>>()?;
     let parts: Vec<htdemucs::Part> = graphs.iter().enumerate().map(|(k, g)| htdemucs::Part { graph: g, source: m.per_source.then_some(k) }).collect();
     let spans = htdemucs::Plan::new(len, OVERLAP).spans;
-    let next = |taken: &[bool]| {
-        let (want, cues) = live.wanted();
-        next_segment(&spans, taken, want, &cues)
-    };
+    let next = |taken: &[bool]| next_segment(&spans, taken, &live.wanted(), m.random_access);
     let ready = |a: usize, b: usize| live.mark(a, b);
     let sink = htdemucs::Sink { out, ready: &ready, next: Some(&next) };
     let mut cb = |done: usize, total: usize| progress(done as f32 / total as f32);
@@ -828,46 +926,49 @@ mod tests {
         htdemucs::Plan::new(len, OVERLAP).spans
     }
 
+    fn order(sp: &[(usize, usize)], w: &Wanted, random: bool) -> Vec<usize> {
+        let mut taken = vec![false; sp.len()];
+        std::iter::from_fn(|| {
+            let i = next_segment(sp, &taken, w, random)?;
+            assert!(!taken[i], "segment {i} handed out twice");
+            taken[i] = true;
+            Some(i)
+        })
+        .collect()
+    }
+
+    /// rekordbox's order: the segments asked for (playhead, hot cues, waiting captures) in
+    /// track order, then from the playhead forward, then from the start; a model that is not
+    /// random access goes from the start whatever is asked.
     #[test]
-    fn makes_the_playhead_first_then_ahead_then_cues_then_the_rest() {
+    fn makes_the_asked_segments_in_track_order_then_from_the_playhead() {
         let len = 60 * 44100 * 5; // 5 minutes
         let sp = spans(len);
         let n = sp.len();
-        let mut taken = vec![false; n];
-        // Playhead in the middle, in the overlap of two segments: both of those first.
+        // Playhead in the middle, in the overlap of two segments; a hot cue early on; a
+        // capture waiting late in the track.
         let k = n / 2;
         let p = sp[k].0 + 1000;
         assert!(sp[k - 1].1 > p, "test position should be in an overlap");
         let cue = sp[3].0 + 10;
-        let mut order = vec![];
-        while let Some(i) = next_segment(&sp, &taken, Some(p), &[cue]) {
-            assert!(!taken[i], "segment {i} handed out twice");
-            taken[i] = true;
-            order.push(i);
-        }
-        assert_eq!(order.len(), n, "every segment is made once");
-        assert_eq!(&order[..2], &[k - 1, k]);
-        // Then the ones starting within the look-ahead, in order.
-        let ahead: Vec<usize> = (0..n).filter(|&i| sp[i].0 > p && sp[i].0 <= p + LOOKAHEAD_FRAMES).collect();
-        assert!(!ahead.is_empty());
-        assert_eq!(&order[2..2 + ahead.len()], &ahead[..]);
-        // Then the two segments under the hot cue.
-        let after = 2 + ahead.len();
-        assert_eq!(&order[after..after + 2], &[2, 3]);
-        // The rest: forward from the playhead to the end, then from the start, each in order.
-        let rest = &order[after + 2..];
+        let req = (sp[n - 3].0 + 50, sp[n - 3].0 + 100);
+        let w = Wanted { requests: vec![req], at: Some(p), cues: vec![cue] };
+        let o = order(&sp, &w, true);
+        assert_eq!(o.len(), n, "every segment is made once");
+        // Asked for, in track order: the hot cue's two segments (it sits in an overlap too),
+        // the playhead's two, the capture's.
+        let mut asked: Vec<usize> = (0..n).filter(|&i| (sp[i].0 <= cue && cue < sp[i].1) || (sp[i].0 <= p && p < sp[i].1) || (sp[i].0 < req.1 && req.0 < sp[i].1)).collect();
+        asked.sort();
+        assert_eq!(&o[..asked.len()], &asked[..]);
+        // Then forward from the playhead to the end, then from the start, each in order.
+        let rest = &o[asked.len()..];
         let split = rest.iter().position(|&i| sp[i].1 <= p).unwrap();
-        assert!(rest[..split].iter().all(|&i| sp[i].1 > p) && rest[split..].iter().all(|&i| sp[i].1 <= p || i < k));
+        assert!(rest[..split].iter().all(|&i| sp[i].1 > p) && rest[split..].iter().all(|&i| sp[i].1 <= p));
         assert!(rest[..split].windows(2).all(|w| w[0] < w[1]) && rest[split..].windows(2).all(|w| w[0] < w[1]));
-        // Without a playhead: in order.
-        let mut taken = vec![false; n];
-        let plain: Vec<usize> = std::iter::from_fn(|| {
-            let i = next_segment(&sp, &taken, None, &[])?;
-            taken[i] = true;
-            Some(i)
-        })
-        .collect();
-        assert_eq!(plain, (0..n).collect::<Vec<_>>());
+        // Not random access: from the start, whatever is asked.
+        assert_eq!(order(&sp, &w, false), (0..n).collect::<Vec<_>>());
+        // Nothing asked: in order.
+        assert_eq!(order(&sp, &Wanted { requests: vec![], at: None, cues: vec![] }, true), (0..n).collect::<Vec<_>>());
     }
 
     #[test]
@@ -888,6 +989,15 @@ mod tests {
         assert!((live.fraction() - (3 * READY_BLOCK + 100) as f32 / live.len() as f32).abs() < 1e-6);
         // Only one separation may fill the buffer.
         assert!(live.claim().is_ok() && live.claim().is_err());
+        // The same stretches in frames, for the stem waveform.
+        assert_eq!(live.ready_spans(), vec![(0, 3 * READY_BLOCK), (10 * READY_BLOCK, 10 * READY_BLOCK + 100)]);
+        assert_eq!(live.ready_count(), 3 * READY_BLOCK + 100);
+        // A stretch asked for stays asked for until it is ready.
+        live.request(4 * READY_BLOCK, 5 * READY_BLOCK);
+        live.request(0, 10);
+        assert_eq!(live.wanted().requests, vec![(4 * READY_BLOCK, 5 * READY_BLOCK)]);
+        live.mark(4 * READY_BLOCK, 5 * READY_BLOCK);
+        assert!(live.wanted().requests.is_empty());
     }
 
     /// The player uses the parts where they are ready and the original where they are not,
@@ -970,7 +1080,21 @@ mod tests {
         let mut best = f64::INFINITY;
         for pass in 0..=passes {
             let t = std::time::Instant::now();
-            let st = separate(m, &dec.samples, dec.sr, &mut |_| true).unwrap();
+            // The longest wait between two finished segments, and after which one (a stall
+            // shows as one long gap; a GPU shared with other work as many longer ones).
+            let (mut last, mut gap, mut at, mut seg) = (0.0f64, 0.0f64, 0usize, 0usize);
+            let st = separate(m, &dec.samples, dec.sr, &mut |_| {
+                let now = t.elapsed().as_secs_f64();
+                if now - last > gap {
+                    (gap, at) = (now - last, seg);
+                }
+                (last, seg) = (now, seg + 1);
+                true
+            })
+            .unwrap();
+            if std::env::var_os("PREPDECK_STEM_TRACE").is_some() {
+                println!("pass {pass}: longest wait {gap:.2} s, before segment {at} finished");
+            }
             let d = t.elapsed().as_secs_f64();
             let label = if pass == 0 { "first (loads the model)".to_string() } else { format!("resident pass {pass}") };
             println!("separate, {label:<24} {d:6.2} s = {:.1}x real time", secs / d);
@@ -991,7 +1115,9 @@ mod tests {
         }
         println!("separate, best resident    {best:6.2} s = {:.1}x real time", secs / best);
         let mut best_v = f64::INFINITY;
-        for _ in 0..passes {
+        // PREPDECK_STEM_VOCAL=0 skips the vocal-stem passes (quicker A/B runs).
+        let vocal_passes = if std::env::var("PREPDECK_STEM_VOCAL").is_ok_and(|v| v == "0") { 0 } else { passes };
+        for _ in 0..vocal_passes {
             let t = std::time::Instant::now();
             let v = separate_vocals(&dec.samples, dec.sr, &mut |_| true).unwrap();
             best_v = best_v.min(t.elapsed().as_secs_f64());

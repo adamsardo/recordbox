@@ -268,19 +268,27 @@ impl Graph {
     fn load_as(path: &Path, device: &Device, fast: bool) -> Result<Self> {
         // Uploading weights encodes GPU work too.
         let _gpu = GPU.lock();
+        // The fused kernels' weights are prepared on the CPU and uploaded once ready
+        // (`metal_fast::Fast::new`); the reference graph wants them on its device.
+        let on = if fast { Device::Cpu } else { device.clone() };
         let raw: HashMap<String, Tensor> = match path.extension().and_then(|e| e.to_str()) {
-            Some("safetensors") => candle_core::safetensors::load(path, device)?,
+            Some("safetensors") => candle_core::safetensors::load(path, &on)?,
             _ => {
                 let mut m = HashMap::new();
                 for (name, t) in read_th(path)? {
-                    m.insert(name, t.to_device(device)?);
+                    m.insert(name, t.to_device(&on)?);
                 }
                 m
             }
         };
-        let weights = raw.into_iter().map(|(k, v)| Ok((k, v.to_dtype(DType::F32)?))).collect::<Result<HashMap<_, _>>>()?;
+        // (Most checkpoints are f32 already: no copy for those.)
+        let weights = raw.into_iter().map(|(k, v)| Ok((k, if v.dtype() == DType::F32 { v } else { v.to_dtype(DType::F32)? }))).collect::<Result<HashMap<_, _>>>()?;
         if weights.len() != 533 {
             candle_core::bail!("expected an HTDemucs checkpoint with 533 tensors, found {}", weights.len())
+        }
+        #[cfg(target_os = "macos")]
+        if fast {
+            return Ok(Self { fast: Some(metal_fast::Fast::new(&weights, device)?), weights: HashMap::new() });
         }
         Self::from_weights(weights, fast)
     }
@@ -288,7 +296,8 @@ impl Graph {
     fn from_weights(weights: HashMap<String, Tensor>, fast: bool) -> Result<Self> {
         #[cfg(target_os = "macos")]
         if fast {
-            return Ok(Self { fast: Some(metal_fast::Fast::new(&weights)?), weights: HashMap::new() });
+            let dev = weights.values().next().map(|t| t.device().clone()).unwrap_or(Device::Cpu);
+            return Ok(Self { fast: Some(metal_fast::Fast::new(&weights, &dev)?), weights: HashMap::new() });
         }
         let _ = fast;
         Ok(Self {

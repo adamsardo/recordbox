@@ -25,9 +25,14 @@
 //! Third pass: SPIRAL's read point follows `SpiralBuffer` (`fx_core::SpiralMotion`); single-mode
 //! ROLL's GATE knob (two square gates), HELIX's held loop after a TIME change and its TRACK
 //! SPEED, REVERB's DECAY, PHASER's stage knob.
-//! Still recordbox's own: STRETCH's LOW / HI CUT knob, the echoes' single-mode FILTER knob (a
-//! second-order filter at the ends of rekordbox's InstFx tables), SPIRAL's loop filters
-//! (state-variable sections at rekordbox's cutoffs), the soft clip in the delay lines, and the
+//! Fourth pass (`checks/re-7.2.19/track-notes/fx-audit.md`): the echoes on `DelayModule` take
+//! whole frames and a new time by closing the read gate, jumping and opening it (no glide);
+//! the lines have no soft clip (rekordbox writes them as they are); the echoes' FILTER knob is
+//! `InstFxHPF` then `InstFxLPF` on the repeats (`cfx::InstFilter`); FLANGER is `FlangerCore`;
+//! Beat FX FILTER reads rekordbox's 129-step coefficient tables; REVERB's filters are
+//! `IirFilter` first-order sections.
+//! Still recordbox's own: STRETCH's LOW / HI CUT knob, SPIRAL's loop filters (state-variable
+//! sections at rekordbox's cutoffs), the reverse echoes, the ROLL / TRANS / PAN bodies, and the
 //! CrushCore inside the FX+ CRUSH buttons.
 
 use parking_lot::Mutex;
@@ -961,6 +966,47 @@ fn sat(x: f32) -> f32 {
     if a <= 1.5 { x } else { x.signum() * (1.5 + (a - 1.5) / (1.0 + (a - 1.5))) }
 }
 
+/// Beat FX FILTER's coefficient tables at `rate` (`LFOFilterCore::CoefficientTable`
+/// 0x1029d5c84): for each of rekordbox's 129 cutoffs (read from the installed rekordbox; the
+/// every-8th-step knots above without it) the cutoff is pre-warped once ((fs / pi) tan(pi
+/// min(fc, 0.319 fs) / fs)) and handed to `IirFilter::calcCoef*1stOrder`, which warps it again;
+/// its b0 is kept, clamped to 0 .. 1. Low-pass type: a low-pass main section on LPF_MAIN and a
+/// high-pass resonance section on LPF_RESO; high-pass type: high-pass on HPF_MAIN, low-pass on
+/// HPF_RESO.
+pub fn lfo_filter_tables(hp: bool, rate: u32) -> [[f32; 129]; 2] {
+    let r = rate as f64;
+    let fcs = crate::cfx::fc_tables().and_then(|t| t.lfo.as_deref());
+    let fc = |k: usize, i: usize| -> f64 {
+        match fcs {
+            Some(t) => t[k][i],
+            None => match k {
+                0 => knots(&LFO_LPF_MAIN, i as f32 / 128.0) as f64,
+                1 => knots(&LFO_LPF_RESO, i as f32 / 128.0) as f64,
+                2 => knots(&LFO_HPF_MAIN, i as f32 / 128.0) as f64,
+                _ => 4.0 * knots(&LFO_HPF_MAIN, i as f32 / 128.0) as f64,
+            },
+        }
+    };
+    let b0 = |f: f64, lp: bool| {
+        let w = ((r * 0.318309886) * (f.min(r * 0.319) * 3.14159265 * (1.0 / r)).tan()) as f32;
+        crate::fx_core::iir_1st(w as f64, r, !lp)[0].clamp(0.0, 1.0)
+    };
+    let (mk, rk) = if hp { (2, 3) } else { (0, 1) };
+    [std::array::from_fn(|i| b0(fc(mk, i), !hp)), std::array::from_fn(|i| b0(fc(rk, i), hp))]
+}
+
+/// FLANGER's smoothers at rest: feedback 0, gains 1, the sweep of one frame .. 2.6667 ms.
+const FL_INIT: [crate::fx_core::SmoothF; 7] = {
+    use crate::fx_core::SmoothF as S;
+    [S::new_const(0.0, 3.3333), S::new_const(1.0, 3.3333), S::new_const(1.0, 3.3333), S::new_const(1.344, 50.0), S::new_const(1.344, 50.0), S::new_const(1.323, 50.0), S::new_const(1.323, 50.0)]
+};
+
+/// Keeps a delay line finite (64 = +36 dB over full scale; never reached by a track).
+#[inline]
+fn guard(x: f32) -> f32 {
+    x.clamp(-64.0, 64.0)
+}
+
 /// The spiral's loop limiter: through up to 1, never past 1.25 (rekordbox works out a
 /// threshold from the input level; this fixed one is recordbox's own).
 #[inline]
@@ -1017,6 +1063,9 @@ struct EchoCfg {
     taps: u8,
     /// The loop goes through the spiral's limiter instead of the plain one.
     limit: bool,
+    /// The line is rekordbox's `DelayModule` (whole frames, and a new time is taken by
+    /// closing the read gate, jumping and opening it again).
+    dm: bool,
 }
 
 /// The reverb's settings for a block.
@@ -1032,6 +1081,11 @@ struct Rv {
     loop_k: f32,
     in_lp: f32,
     in_hp: f32,
+    /// `NewReverbCore`'s filters as rekordbox makes them (`IirLpf1stOrder` 14 kHz and
+    /// `IirHpf1stOrder` 80 Hz on the input, `IirLpf1stOrder` in each comb's loop: bilinear,
+    /// pre-warped; b0, b1, a1). `None`: the FX+ reverbs' `ReverbCore`, whose filters keep the
+    /// one-pole form above (not traced).
+    bil: Option<[[f32; 3]; 3]>,
 }
 
 impl Rv {
@@ -1040,7 +1094,7 @@ impl Rv {
     fn raw(size: f32, rt: f32, gin: f32, rate: f32) -> Rv {
         let step = |fc: f32| 1.0 - (-TAU * fc / rate).exp();
         let lp: f32 = if (rate - 48000.0).abs() < 1.0 { 20500.0 } else if (rate - 44100.0).abs() < 1.0 { 21500.0 } else { 20000.0 };
-        let mut v = Rv { gin, out: 0.71068, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(lp.min(0.45 * rate)), in_lp: step(14000.0), in_hp: step(80.0) };
+        let mut v = Rv { gin, out: 0.71068, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(lp.min(0.45 * rate)), in_lp: step(14000.0), in_hp: step(80.0), bil: None };
         for i in 0..10 {
             let ms = (REVERB_COMB_MS[i] * size).clamp(0.0, 100.0);
             v.d[i] = ((ms * 0.001 * rate) as usize).clamp(1, COMB_LEN - 1);
@@ -1059,7 +1113,11 @@ impl Rv {
         let s = (reverb_size(p) * size).clamp(0.2, 2.08);
         let rt = reverb_rt60_ms(p) * decay;
         let step = |fc: f32| 1.0 - (-TAU * fc / rate).exp();
-        let mut v = Rv { gin: reverb_in_gain(p), out: 0.7081, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(if rate >= 47000.0 { 20500.0f32.min(0.45 * rate) } else { 18000.0 }), in_lp: step(14000.0), in_hp: step(80.0) };
+        // (The loop's cutoff by rate, `MultiBeatFxReverb::CoreParameterCalculator`.)
+        let loop_fc: f32 = match rate as u32 { 44100 => 18000.0, 48000 => 20500.0, 96000 => 30000.0, _ => 20000.0 };
+        let fc = |f: f32| f.min(rate * 0.5).max(5.0) as f64;
+        let bil = Some([crate::fx_core::iir_1st(fc(14000.0), rate as f64, false), crate::fx_core::iir_1st(fc(80.0), rate as f64, true), crate::fx_core::iir_1st(fc(loop_fc), rate as f64, false)]);
+        let mut v = Rv { gin: reverb_in_gain(p), out: 0.7081, d: [1; 10], g: [0.0; 10], ap: [1; 4], loop_k: step(loop_fc.min(0.45 * rate)), in_lp: step(14000.0), in_hp: step(80.0), bil };
         for i in 0..10 {
             let ms = REVERB_COMB_MS[i] * s;
             v.d[i] = ((ms * 0.001 * rate) as usize).clamp(1, COMB_LEN - 1);
@@ -1100,6 +1158,10 @@ pub(crate) struct Slot {
     /// Beat FX FILTER: per channel, the six first-order sections' memories and the resonance
     /// path's last output.
     lf: [[f32; 13]; 2],
+    /// Its coefficient tables (`LFOFilterCore::CoefficientTable`: the b0 of the main and the
+    /// resonance sections at each of the 129 LFO steps) and the rate and type they are for.
+    lfb: [[f32; 129]; 2],
+    lfb_made: (u32, bool),
     /// Reverb: ten comb lines and four all-pass lines (flat), their write positions, the
     /// loop filters and the input filters.
     combs: Vec<f32>,
@@ -1108,6 +1170,9 @@ pub(crate) struct Slot {
     aps: Vec<f32>,
     ap_w: usize,
     rin: [f32; 4],
+    /// The x1, y1 of `NewReverbCore`'s first-order filters: the input's (low-pass L R,
+    /// high-pass L R) and the ten combs' loops.
+    rv1: [[f32; 2]; 14],
     /// ROLL: where the captured loop starts in the history, its length and the read position.
     roll: Option<(usize, usize, f32)>,
     was_on: bool,
@@ -1149,6 +1214,18 @@ pub(crate) struct Slot {
     osc: [f32; 6],
     env: f32,
     lfo2: f32,
+    /// `DelayModule`'s read gate (`SignalGate`, 3.3333 ms), the time waiting for it to close
+    /// (frames, 0 = none), the frames written since the line was cleared, the gate this frame.
+    dg: [crate::fx_core::SmoothF; 2],
+    dpend: f32,
+    dfill: f32,
+    gv: [f32; 2],
+    /// The echoes' FILTER knob (`SingleBeatFxEcho`: an `InstFxHPF` then an `InstFxLPF` on the
+    /// repeats).
+    ifl: [crate::cfx::InstFilter; 2],
+    /// FLANGER (`FlangerCore`): the feedback, each side's output gain, each side's sweep centre
+    /// and half-range (ms; the LFO's range moves over 50 ms), all `SmoothFloat`s.
+    fl: [crate::fx_core::SmoothF; 7],
 }
 
 impl Slot {
@@ -1158,7 +1235,7 @@ impl Slot {
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], roll: None, was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rev_k: 0.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0 }
+        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: None, was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rev_k: 0.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT }
     }
 
     fn clear(&mut self) {
@@ -1187,6 +1264,7 @@ impl Slot {
         self.lf = [[0.0; 13]; 2];
         self.comb_lp = [0.0; 10];
         self.rin = [0.0; 4];
+        self.rv1 = [[0.0; 2]; 14];
         self.time = 0.0;
         self.spiral.reset();
         self.hx = (false, 1.0, 0.0);
@@ -1202,6 +1280,13 @@ impl Slot {
         self.speed = 1.0;
         self.osc = [0.0; 6];
         self.env = 0.0;
+        self.dg.iter_mut().for_each(|g| g.reset(0.0));
+        self.dpend = 0.0;
+        self.dfill = 0.0;
+        self.gv = [1.0; 2];
+        self.ifl[0].reset(0, 0);
+        self.ifl[1].reset(0, 0);
+        self.fl = FL_INIT;
     }
 
     /// Read the delay line `frames` back (fractional), channel `c`.
@@ -1217,9 +1302,10 @@ impl Slot {
 
     #[inline]
     fn push(&mut self, l: f32, r: f32) {
-        // (Rounded off above 1.5, never past 2.5, so a feedback of 1 cannot run away.)
-        self.delay[self.w * 2] = sat(l);
-        self.delay[self.w * 2 + 1] = sat(r);
+        // rekordbox writes the sum as it is (`DelayModule::write`); the guard far above any
+        // level a track reaches only keeps a runaway line finite.
+        self.delay[self.w * 2] = guard(l);
+        self.delay[self.w * 2 + 1] = guard(r);
         self.w = (self.w + 1) % DELAY_LEN;
     }
 
@@ -1234,8 +1320,8 @@ impl Slot {
     #[inline]
     fn part_put(&mut self, part: usize, l: f32, r: f32) {
         let k = (part * PART_LEN + self.w % PART_LEN) * 2;
-        self.delay[k] = sat(l);
-        self.delay[k + 1] = sat(r);
+        self.delay[k] = guard(l);
+        self.delay[k + 1] = guard(r);
     }
 
     /// SPIRAL's limit (`SpiralCore::caluclateLimitterThres` / `checkOutputGain`): the peak of
@@ -1313,14 +1399,13 @@ impl Slot {
             el = self.tap(2.0 * self.rev_k + 1.0, 0) * edge;
             er = self.tap(2.0 * self.rev_k + 1.0, 1) * edge;
             self.rev_k += 1.0;
+        } else if e.dm {
+            // `DelayModule::read`: whole frames, through the read gate.
+            el = self.tap((self.time * e.ml).trunc(), 0) * self.gv[0];
+            er = self.tap((self.time * e.mr).max(0.010 * r).trunc(), 1) * self.gv[1];
         } else {
             el = self.tap(self.time * e.ml, 0);
             er = self.tap((self.time * e.mr).max(0.010 * r), 1);
-        }
-        if e.filt != 0 {
-            let a = svf(&mut self.f1[0], el, e.g, 1.4);
-            let b = svf(&mut self.f1[1], er, e.g, 1.4);
-            (el, er) = if e.filt == 1 { (a.0, b.0) } else { (a.2, b.2) };
         }
         if (e.ratio - 1.0).abs() > 1e-4 {
             (el, er) = self.shift(el, er, e.ratio);
@@ -1342,10 +1427,26 @@ impl Slot {
     #[inline]
     fn reverb(&mut self, l: f32, r: f32, v: &Rv) -> (f32, f32) {
         let mut x = [l, r];
-        for c in 0..2 {
-            self.rin[c] += (x[c] - self.rin[c]) * v.in_lp;
-            self.rin[2 + c] += (self.rin[c] - self.rin[2 + c]) * v.in_hp;
-            x[c] = (self.rin[c] - self.rin[2 + c]) * v.gin;
+        if let Some([lp, hp, _]) = &v.bil {
+            // `NewReverbCore::processEffect`: the input low-pass, then the high-pass, then the
+            // input gain (`IirFilter::handleFilterCore1st`: y = b0 x + b1 x1 - a1 y1).
+            for c in 0..2 {
+                let z = &mut self.rv1[c];
+                let y = lp[0] * x[c] + lp[1] * z[0] - lp[2] * z[1];
+                z[0] = x[c];
+                z[1] = y;
+                let z = &mut self.rv1[2 + c];
+                let h = hp[0] * y + hp[1] * z[0] - hp[2] * z[1];
+                z[0] = y;
+                z[1] = h;
+                x[c] = h * v.gin;
+            }
+        } else {
+            for c in 0..2 {
+                self.rin[c] += (x[c] - self.rin[c]) * v.in_lp;
+                self.rin[2 + c] += (self.rin[c] - self.rin[2 + c]) * v.in_hp;
+                x[c] = (self.rin[c] - self.rin[2 + c]) * v.gin;
+            }
         }
         let w = self.comb_w;
         let mut acc = [0.0f32; 2];
@@ -1355,8 +1456,18 @@ impl Slot {
             let fr = self.combs[ir * COMB_LEN + (w + COMB_LEN - v.d[ir]) % COMB_LEN] * v.g[ir];
             acc[0] += fl;
             acc[1] += fr;
-            self.comb_lp[il] += (fl - self.comb_lp[il]) * v.loop_k;
-            self.comb_lp[ir] += (fr - self.comb_lp[ir]) * v.loop_k;
+            if let Some([_, _, lo]) = &v.bil {
+                for (i, f) in [(il, fl), (ir, fr)] {
+                    let z = &mut self.rv1[4 + i];
+                    let y = lo[0] * f + lo[1] * z[0] - lo[2] * z[1];
+                    z[0] = f;
+                    z[1] = y;
+                    self.comb_lp[i] = y;
+                }
+            } else {
+                self.comb_lp[il] += (fl - self.comb_lp[il]) * v.loop_k;
+                self.comb_lp[ir] += (fr - self.comb_lp[ir]) * v.loop_k;
+            }
             self.combs[il * COMB_LEN + w] = x[0] + self.comb_lp[ir];
             self.combs[ir * COMB_LEN + w] = x[1] + self.comb_lp[il];
         }
@@ -1478,6 +1589,22 @@ impl Slot {
         // SPIRAL's read point moves as rekordbox's `SpiralBuffer` moves it (a new beat value
         // bends the repeats' pitch on the way); the other echoes glide in 50 ms.
         let spiral_kind = matches!(kind, Spiral | SpiralUp | SpiralDown);
+        // The echoes on rekordbox's `DelayModule` (`EchoCore`, `PitchEchoCore`): whole frames;
+        // a new time closes the read gate (3.3333 ms), jumps there and opens it again
+        // (`DelayModule::setDelayTime` 0x10298fc28 / `read` 0x10298ff44), no glide.
+        let dm_kind = matches!(kind, Delay | Echo | LowCutEcho | PingPong | UpEcho | DownEcho | PitchEcho);
+        if dm_kind {
+            let wi = ((echo_secs * 1000.0).clamp(1.0, 4000.0) * 0.001 * r).trunc().clamp(1.0, (DELAY_LEN - 2) as f32);
+            self.dg.iter_mut().for_each(|g| g.set_rate(r));
+            if self.time <= 0.0 {
+                self.time = wi;
+            }
+            let cmp = if self.dpend > 0.0 { self.dpend } else { self.time };
+            if (wi - cmp).abs() >= 0.5 {
+                self.dpend = wi;
+                self.dg.iter_mut().for_each(|g| g.set(0.0));
+            }
+        }
         if spiral_kind {
             self.spiral.setup(r, match kind { SpiralUp => 1, SpiralDown => 2, _ => 0 });
             self.spiral.beat = (beat_secs * r) as i32;
@@ -1505,18 +1632,13 @@ impl Slot {
 
         // The echo core's settings.
         let swing = |k: f32| 1.0 + (k - 0.5) * 0.6667;
-        let mut e = EchoCfg { ml: 1.0, mr: 1.0, fb: 0.0, rev: false, freeze: false, ratio: 1.0, filt: 0, g: 0.0, taps: 0, limit: false };
-        // FILTER knob of the echoes: centre = through, left a low-pass falling from 12 kHz to
-        // 93 Hz, right a high-pass rising from 61 Hz to 8.95 kHz (the ends of rekordbox's
-        // `InstFxLPF` / `InstFxHPF` tables; a plain second-order filter stands in for theirs).
-        let echo_filter = |e: &mut EchoCfg, k: f32| {
-            if k < 0.48 {
-                e.filt = 1;
-                e.g = svf_g(crate::cfx::inst_fc(false, (0.5 - k) * 2.0), r);
-            } else if k > 0.52 {
-                e.filt = 2;
-                e.g = svf_g(crate::cfx::inst_fc(true, (k - 0.5) * 2.0), r);
-            }
+        let mut e = EchoCfg { ml: 1.0, mr: 1.0, fb: 0.0, rev: false, freeze: false, ratio: 1.0, filt: 0, g: 0.0, taps: 0, limit: false, dm: dm_kind };
+        // FILTER knob of the echoes (`SingleBeatFxEcho::updateAndSetParameter`): the right
+        // half turns an `InstFxHPF` (2k - 1), the left half an `InstFxLPF` (1 - 2k), both on the
+        // repeats, as 8-bit values (truncated).
+        let mut echo_filt: Option<(i32, i32)> = None;
+        let echo_filter = |f: &mut Option<(i32, i32)>, k: f32| {
+            *f = Some(if k >= 0.5 { (((k + k - 1.0) * 255.0) as i32, 0) } else { (0, ((1.0 - (k + k)) * 255.0) as i32) });
         };
         // (dry, wet) of the effects that mix a wet sound with the dry one.
         let mut mix = echo_mix(level);
@@ -1537,7 +1659,7 @@ impl Slot {
             Echo => {
                 e.fb = if multi { 0.7 } else { echo_fb(k1, !p.on) };
                 if !multi {
-                    echo_filter(&mut e, k2);
+                    echo_filter(&mut echo_filt, k2);
                     e.rev = b1;
                     e.freeze = b2;
                 }
@@ -1575,7 +1697,7 @@ impl Slot {
                 e.fb = if multi { 0.7 } else { echo_fb(k1, !p.on) };
                 e.mr = 0.75;
                 if !multi {
-                    echo_filter(&mut e, k2);
+                    echo_filter(&mut echo_filt, k2);
                     e.rev = b1;
                     e.freeze = b2;
                 }
@@ -1711,6 +1833,24 @@ impl Slot {
         let trans_acc = if multi { 1.0 } else { 1.0 - 0.37 * through_value(k2) };
         // FLANGER / PHASER feedback: multi mode from LEVEL/DEPTH, single mode from FEEDBACK.
         let fl_fb = if multi { mod_fb(level) } else { flanger_fb(k1, b1) };
+        // FLANGER's sweep per side (`MultiBeatFxFlanger` / `SingleBeatFxFlanger::updateParameter`):
+        // from one frame to 2.6667 ms; single mode's LFO AMP widens the left side's top to
+        // 2.6667 + 25 x (distance from the centre) ms on the left half, the right side's on the
+        // right half.
+        let fl_lo = 1000.0 / r;
+        let fl_top = if multi { [2.6667f32; 2] } else { let t = through_value(k2) * 25.0 + 2.6667; if k2 < 0.48627 { [t, 2.6667] } else if k2 > 0.51373 { [2.6667, t] } else { [2.6667; 2] } };
+        let fl_mid = [(fl_top[0] + fl_lo) * 0.5, (fl_top[1] + fl_lo) * 0.5];
+        let fl_half = [(fl_top[0] - fl_lo) * 0.5, (fl_top[1] - fl_lo) * 0.5];
+        if kind == Flanger {
+            self.fl.iter_mut().for_each(|f| f.set_rate(r));
+            if starting {
+                // (Made fresh: the LFO's range is where it is asked to be.)
+                for c in 0..2 {
+                    self.fl[3 + c].reset(fl_mid[c]);
+                    self.fl[5 + c].reset(fl_half[c]);
+                }
+            }
+        }
         let ph_fb = if multi { mod_fb(level) } else { flanger_fb(k1, b1) };
         // Beat FX FILTER: resonance gain, the LFO's reach and the type.
         let reso = if multi { filter_reso(level) } else { filter_single_reso(k1) };
@@ -1796,6 +1936,24 @@ impl Slot {
             }
             if spiral_kind {
                 self.time = self.spiral.next();
+            } else if dm_kind {
+                self.gv = [self.dg[0].next(), self.dg[1].next()];
+                if self.dpend > 0.0 {
+                    if self.dg.iter().all(|g| g.settled() && g.cur <= 0.0) {
+                        self.time = self.dpend;
+                        self.dpend = 0.0;
+                    }
+                } else {
+                    // (Each side's gate opens once its line holds its delay; the first
+                    // repeat comes in over the gate's 3.3333 ms.)
+                    if self.dfill >= (self.time * e.ml).trunc() {
+                        self.dg[0].set(1.0);
+                    }
+                    if self.dfill >= (self.time * e.mr).max(0.010 * r).trunc() {
+                        self.dg[1].set(1.0);
+                    }
+                }
+                self.dfill += 1.0;
             } else if kind != Helix {
                 // (HELIX's length is set once a buffer, above.)
                 self.time += (want_time - self.time) * glide;
@@ -1817,6 +1975,12 @@ impl Slot {
             let (ol, or) = match kind {
                 Delay | RevDelay | Echo | PitchEcho | UpEcho | DownEcho | LowCutEcho | PingPong => {
                     let (mut el, mut er) = self.echo(il, ir, &e, r);
+                    if let Some((ha, la)) = echo_filt {
+                        let mut fr = [el, er];
+                        self.ifl[0].process(&mut fr, ha, 0, rate);
+                        self.ifl[1].process(&mut fr, la, 0, rate);
+                        (el, er) = (fr[0], fr[1]);
+                    }
                     if let Some(pb) = delay_pan {
                         // DELAY's first knob (`SingleBeatFxDelayBase::BfxPan`, a `BeatFxPan` on
                         // two square waves): the repeats sit on one side, then the other (a full
@@ -1950,12 +2114,26 @@ impl Slot {
                     // and added at the resonance gain. A triangle LFO turns once per beat
                     // value. TONE: the high-pass; PHASE: the LFO turned over.
                     let t = (if flt_inv { 1.0 - tri } else { tri }) * flt_span;
-                    let (main, res) = if flt_hp {
-                        let fc = knots(&LFO_HPF_MAIN, t);
-                        (one_pole(fc, r, true), one_pole(fc * 4.0, r, false))
-                    } else {
-                        (one_pole(knots(&LFO_LPF_MAIN, t), r, false), one_pole(knots(&LFO_LPF_RESO, t), r, true))
-                    };
+                    if self.lfb_made != (rate, flt_hp) {
+                        self.lfb_made = (rate, flt_hp);
+                        self.lfb = lfo_filter_tables(flt_hp, rate);
+                    }
+                    // `LFOFilterCore::processEffect` 0x1029d6688: the LFO's place in 129 steps,
+                    // each section's b0 read between two steps (clamped to 0 .. 1); first-order
+                    // sections derive b1 and a1 from it (low-pass b1 = b0, a1 = 2 b0 - 1; high-pass
+                    // b1 = -b0, a1 = 1 - 2 b0).
+                    let pos = (t * 128.0).clamp(0.0, 128.0);
+                    let i0 = pos.trunc() as usize;
+                    let i1 = if i0 >= 128 { 128 } else { i0 + 1 };
+                    let fr = pos - pos.trunc();
+                    let b0 = |tab: &[f32; 129]| (tab[i0] + (tab[i1] - tab[i0]) * fr).clamp(0.0, 1.0);
+                    let (mb, rb) = (b0(&self.lfb[0]), b0(&self.lfb[1]));
+                    let lpc = |b: f32| [b, b, 2.0 * b - 1.0];
+                    let hpc = |b: f32| [b, -b, 1.0 - 2.0 * b];
+                    let (main, res) = if flt_hp { (hpc(mb), lpc(rb)) } else { (lpc(mb), hpc(rb)) };
+                    // The resonance path's level in the output: 0.8 for the high-pass, 0.4 for
+                    // the low-pass at 44.1 / 48 kHz (0.8 at 96 kHz, none at other rates).
+                    let a7 = if flt_hp { 0.8 } else { match rate { 44100 | 48000 => 0.4, 96000 => 0.8, _ => 0.0 } };
                     let rg = reso * if t < 0.1 { 0.0001 } else if t < 0.2 { (1.0 - 0.9999 * (2.0 - 10.0 * t).powi(3)).clamp(0.0001, 1.0) } else { 1.0 };
                     let mut o = [0.0f32; 2];
                     for (c, x) in [dl, dr].into_iter().enumerate() {
@@ -1974,19 +2152,35 @@ impl Slot {
                             z[k * 2 + 1] = out;
                             q = out;
                         }
-                        z[12] = sat(q);
-                        o[c] = y + rg * q;
+                        z[12] = q;
+                        o[c] = y + rg * a7 * q;
                     }
                     mixed(o[0], o[1])
                 }
                 Flanger => {
-                    // A feedback comb whose delay a triangle LFO sweeps between one sample
-                    // and 2.6667 ms once per beat value.
-                    let t = if !multi && b2 { 1.0 - tri } else { tri };
-                    let d = 1.0 + t * if multi { 1.0 } else { (k2 * 2.0).min(1.0) } * (0.0026667 * r - 1.0);
-                    let (el, er) = (self.tap(d, 0), self.tap(d, 1));
-                    self.push(dl + el * fl_fb, dr + er * fl_fb);
-                    mixed(el, er)
+                    // `FlangerCore::processEffectCore` 0x102a02a44, a frame at a time per side:
+                    // the LFO (a `TriangleWave` between one frame and the side's top, 2.6667 ms;
+                    // turned over by PHASE) gives the delay in ms, the line is read there
+                    // (between frames), its input is the sound plus feedback x the read, and the
+                    // output is the read at a gain that falls below 0.5 ms (0.3686 + 1.2628 x
+                    // ms), the feedback and gain `SmoothFloat`s of 3.3333 ms.
+                    let wave = 2.0 * tri - 1.0;
+                    let (fbk, ..) = (self.fl[0].set_next(fl_fb), ());
+                    let mut o = [0.0f32; 2];
+                    for (c, x) in [dl, dr].into_iter().enumerate() {
+                        self.fl[3 + c].set(fl_mid[c]);
+                        self.fl[5 + c].set(fl_half[c]);
+                        let (mid, half) = (self.fl[3 + c].next(), self.fl[5 + c].next());
+                        let ms = mid + if !multi && b2 { -half } else { half } * wave;
+                        let d = (ms * 0.001 * r).max(1.0);
+                        let y = self.tap(d, c);
+                        o[c] = y;
+                        let k = if ms <= 0.0 { 0.0 } else if ms >= 0.5 { 1.0 } else { ms * 1.2628 + 0.3686 };
+                        o[c] = y * self.fl[1 + c].set_next(k);
+                        self.fb[c] = x + y * fbk;
+                    }
+                    self.push(self.fb[0], self.fb[1]);
+                    mixed(o[0], o[1])
                 }
                 Phaser => {
                     // First-order all-pass stages (six in multi mode), their centre swept by
@@ -2998,10 +3192,10 @@ mod tests {
         assert!(edge(&dull) < edge(&bright) * 0.5, "{} vs {}", edge(&dull), edge(&bright));
         // DELAY, LR RATIO at the left end (1:3): the left repeat comes at a third of the time.
         let x = run([0.5, 0.0], [false, false], Kind::Delay);
-        assert!(x[8100 * 2] > 0.3 && x[8100 * 2 + 1].abs() < 0.01 && x[24100 * 2 + 1] > 0.3);
+        assert!(x[8200 * 2] > 0.3 && x[8200 * 2 + 1].abs() < 0.01 && x[24200 * 2 + 1] > 0.3);
         // At the centre (1:1) both come together.
         let x = run([0.5, 0.5], [false, false], Kind::Delay);
-        assert!(x[24100 * 2] > 0.3 && x[24100 * 2 + 1] > 0.3 && x[8100 * 2].abs() < 0.01);
+        assert!(x[24200 * 2] > 0.3 && x[24200 * 2 + 1] > 0.3 && x[8200 * 2].abs() < 0.01);
         // MT DELAY with TAP NUM at the centre (4 taps, rekordbox's order): 2/8, 4/8, 6/8 and
         // 7/8 of the beat (an eighth is 3,000 frames); the others are silent.
         let x = run([0.5, 0.5], [false, false], Kind::MtDelay);
@@ -3515,13 +3709,13 @@ mod tests {
         // PING PONG, 1 beat: the left repeat a beat later, the right one at three quarters.
         let mut x = burst(48000 * 2);
         run(Kind::PingPong, 0.75, &mut x);
-        assert!(x[24100 * 2] > 0.3 && x[24100 * 2 + 1].abs() < 0.01 && x[18100 * 2 + 1] > 0.3 && x[18100 * 2].abs() < 0.01);
+        assert!(x[24200 * 2] > 0.3 && x[24200 * 2 + 1].abs() < 0.01 && x[18200 * 2 + 1] > 0.3 && x[18200 * 2].abs() < 0.01);
         // Its second repeats at 0.7.
-        assert!((x[48100 * 2] / x[24100 * 2] - 0.7).abs() < 0.03 && (x[36100 * 2 + 1] / x[18100 * 2 + 1] - 0.7).abs() < 0.03);
+        assert!((x[48200 * 2] / x[24200 * 2] - 0.7).abs() < 0.03 && (x[36200 * 2 + 1] / x[18200 * 2 + 1] - 0.7).abs() < 0.03);
         // UP ECHO at the centre: repeats at 0.85 of each other, at 0.7 of the sound, unbent.
         let mut x = burst(48000 * 2);
         run(Kind::UpEcho, 0.5, &mut x);
-        assert!((x[24100 * 2] - 0.35).abs() < 0.02 && (x[48100 * 2] / x[24100 * 2] - 0.85).abs() < 0.03);
+        assert!((x[24200 * 2] - 0.35).abs() < 0.02 && (x[48200 * 2] / x[24200 * 2] - 0.85).abs() < 0.03);
         // LOW CUT ECHO: a 100 Hz tone is not repeated, a 2 kHz one is.
         for (freq, repeated) in [(100.0, false), (2000.0, true)] {
             let mut x: Vec<f32> = tone(12000, freq);
@@ -3572,6 +3766,96 @@ mod tests {
     }
 
     #[test]
+    fn echo_time_change_closes_the_gate_and_jumps() {
+        // `DelayModule`: a new beat value is not a glide. The read gate closes over 3.3333 ms
+        // (159 frames at 48 kHz), the read point jumps, and the gate opens again; the repeats
+        // keep their pitch (a steady tone's repeats keep its zero crossings' spacing).
+        let mut s = Slot::new();
+        let ring = Ring::new();
+        let mut p = SlotParams { on: true, level: 1.0, value: 0.5, ..SlotParams::new(Kind::Echo) };
+        let tone: Vec<f32> = (0..48000).flat_map(|i| { let v = (i as f32 * 440.0 * TAU / 48000.0).sin() * 0.5; [v, v] }).collect();
+        let mut x = tone.clone();
+        s.process(&p, 120.0, &mut x, 48000, &ring, None, true);
+        assert_eq!(s.time, 12000.0);
+        p.value = 1.0;
+        let mut y = tone.clone();
+        s.process(&p, 120.0, &mut y[..512 * 2], 48000, &ring, None, true);
+        assert_eq!(s.time, 24000.0);
+        assert!(s.dpend == 0.0 && s.dg[0].cur > 0.9, "the gate opens again within the buffer");
+        // A repeat of the tone through the jump: still 440 Hz once the gate is open.
+        let mut z = vec![0.0f32; 4800 * 2];
+        s.process(&p, 120.0, &mut z, 48000, &ring, None, true);
+        let c = z.chunks_exact(2).zip(z.chunks_exact(2).skip(1)).filter(|(a, b)| a[0] <= 0.0 && b[0] > 0.0).count();
+        assert!((c as i32 - 44).abs() <= 1, "{c}");
+    }
+
+    #[test]
+    fn reverb_filters_are_rekordboxs_first_order_sections() {
+        // `NewReverbCore`: IirLpf1stOrder 14 kHz and IirHpf1stOrder 80 Hz on the input, an
+        // IirLpf1stOrder in each loop at 20.5 kHz (48 kHz) / 18 kHz (44.1 kHz).
+        let v = Rv::new(50.0, 1.0, 1.0, 48000.0);
+        let [lp, hp, lo] = v.bil.unwrap();
+        assert_eq!(lp, crate::fx_core::iir_1st(14000.0, 48000.0, false));
+        assert_eq!(hp, crate::fx_core::iir_1st(80.0, 48000.0, true));
+        assert_eq!(lo, crate::fx_core::iir_1st(20500.0, 48000.0, false));
+        assert_eq!(Rv::new(50.0, 1.0, 1.0, 44100.0).bil.unwrap()[2], crate::fx_core::iir_1st(18000.0, 44100.0, false));
+        // A first-order high-pass at 80 Hz: -3 dB there (bilinear, pre-warped).
+        let w = std::f64::consts::TAU * 80.0 / 48000.0;
+        let (re, im) = (w.cos(), -w.sin());
+        let (nr, ni) = (hp[0] as f64 + hp[1] as f64 * re, hp[1] as f64 * im);
+        let (dr, di) = (1.0 + hp[2] as f64 * re, hp[2] as f64 * im);
+        let g = ((nr * nr + ni * ni) / (dr * dr + di * di)).sqrt();
+        assert!((20.0 * g.log10() + 3.0103).abs() < 0.01, "{}", 20.0 * g.log10());
+    }
+
+    #[test]
+    fn flanger_sweeps_as_flanger_core() {
+        // Single mode, LFO AMP at the left end: the left side sweeps up to 2.6667 + 25 ms, the
+        // right side to 2.6667 ms (`SingleBeatFxFlanger::updateParameter`, KnobPara2Assign 0).
+        let ring = Ring::new();
+        let mut s = Slot::new();
+        let mut p = SlotParams::new(Kind::Flanger);
+        p.on = true;
+        p.level = 0.5;
+        p.knob = [0.5, 0.0];
+        let mut x = vec![0.0f32; 512 * 2];
+        s.process(&p, 120.0, &mut x, 48000, &ring, None, false);
+        let lo = 1000.0 / 48000.0;
+        assert!((s.fl[3].cur - (27.6667 + lo) / 2.0).abs() < 1e-3 && (s.fl[5].cur - (27.6667 - lo) / 2.0).abs() < 1e-3);
+        assert!((s.fl[4].cur - (2.6667 + lo) / 2.0).abs() < 1e-4);
+        // Multi mode: one frame .. 2.6667 ms on both sides; the output gain at a delay of one
+        // frame tends to 0.3686 + 1.2628 x 0.0208 ms.
+        let mut s = Slot::new();
+        let mut p = SlotParams::new(Kind::Flanger);
+        p.on = true;
+        p.level = 1.0;
+        p.value = 16.0;
+        let mut x = vec![0.0f32; 64 * 2];
+        s.process(&p, 120.0, &mut x, 48000, &ring, Some(0.0), true);
+        assert!((s.fl[5].cur - (2.6667 - lo) / 2.0).abs() < 1e-4);
+        assert!(s.fl[1].cur < 0.9 && s.fl[1].cur > 0.39, "{}", s.fl[1].cur);
+    }
+
+    #[test]
+    fn beat_fx_filter_coefficient_tables() {
+        // The 129 cutoffs read from the installed rekordbox (skipped without it): HPF_RESO is
+        // four times HPF_MAIN; the first and every 8th entry are the knots above.
+        if let Some(t) = crate::cfx::fc_tables_now().and_then(|t| t.lfo.as_deref()) {
+            assert!((t[0][0] - 23718.6).abs() < 0.1 && (t[0][8] - 16080.8).abs() < 0.1 && (t[2][128] - 8892.1).abs() < 0.1);
+            assert!((t[3][64] / t[2][64] - 4.0).abs() < 1e-3);
+        }
+        // `CoefficientTable`: the cutoff warped twice, b0 kept. LPF_MAIN[0] at 48 kHz: 23718.6 Hz
+        // is capped at 0.319 fs = 15312 Hz, warped to 23876 Hz, b0 = t / (1 + t), t = tan(pi x
+        // 23876 / 48000).
+        let [m, _] = lfo_filter_tables(false, 48000);
+        let w = (48000.0f64 / std::f64::consts::PI) * (std::f64::consts::PI * 0.319).tan();
+        let tt = (std::f64::consts::PI * w / 48000.0).tan();
+        assert!((m[0] as f64 - tt / (1.0 + tt)).abs() < 1e-4, "{} {}", m[0], tt / (1.0 + tt));
+        let [h, l] = lfo_filter_tables(true, 48000);
+        assert!(h[0] > 0.99 && h[128] < h[0] && l[0] < 0.1);
+    }
+
+    #[test]
     fn pad_fx_unit_runs_what_its_pads_hold() {
         let mut rack = Rack::new();
         rack.prepare_pad(0);
@@ -3581,7 +3865,7 @@ mod tests {
         assert!(rack.active());
         let mut x = burst(48000);
         rack.process(0, &mut x, 48000);
-        assert!((x[12100 * 2] - 0.5 * 1.3333 * 0.3).abs() < 0.02, "{}", x[12100 * 2]);
+        assert!((x[12200 * 2] - 0.5 * 1.3333 * 0.3).abs() < 0.02, "{}", x[12200 * 2]);
         // Let go: the pad's effect fades out and the sound is the dry one again.
         rack.pad_set[0] = PadSet::NONE;
         let dry = tone(9600, 440.0);

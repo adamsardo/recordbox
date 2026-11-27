@@ -49,6 +49,30 @@ impl crate::app::App {
         }
     }
 
+    /// rekordbox's status message when a hot cue is called into a stretch whose parts are not
+    /// separated yet: the deck plays the original there (`UiPlayer::showTrackSeparationCautionIfNeeded`,
+    /// after every successful hot cue call: STEMS on, the original readable at the cue, the
+    /// track separable and not separated at the cue's sample).
+    pub(crate) fn stem_caution_at(&mut self, secs: f64) {
+        const MSG: &str = "The track before STEMS analysis is played since STEMS analysis is not completed.";
+        if !self.prefs.show_stems {
+            return;
+        }
+        let (live, has_stems) = {
+            let ps = self.player.state.lock();
+            (ps.stems_ready.clone(), ps.stems.is_some())
+        };
+        let frame = (secs.max(0.0) * crate::stems::htdemucs::SAMPLE_RATE as f64) as usize;
+        let not_ready = match live {
+            Some(l) => !l.complete() && !l.ready_at(frame),
+            // No stems yet but being separated (or loaded from the kept file).
+            None => !has_stems && self.deck.track.is_some_and(|t| self.stem.separating.is_some_and(|s| s.0 == t) || self.stem.loading == Some(t)),
+        };
+        if not_ready {
+            self.toast(MSG);
+        }
+    }
+
     /// The stretches of track `id` whose parts are ready, as fractions of the track, for the
     /// blue progress line: from the separation in progress, else from the start to `progress`.
     pub(crate) fn stem_ready_ranges(&self, id: i64, progress: f32) -> Vec<(f32, f32)> {

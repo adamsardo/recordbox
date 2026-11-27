@@ -51,6 +51,9 @@ candle-nn = { version = "0.9", features = ["metal"] }
 # wrappers Candle uses; both crates are already in the tree through candle-core.
 candle-metal-kernels = "0.9"
 objc2-metal = "0.3"
+# For compiling the kernels without Candle's wrapper, which panics on a compile error.
+objc2 = "0.6"
+objc2-foundation = "0.3"
 
 [profile.dev]
 opt-level = 2

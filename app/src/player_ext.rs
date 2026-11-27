@@ -50,7 +50,12 @@ pub struct DeckExt {
     /// STEM Waveform Display: the waveform of the parts that sound (which parts, waveform),
     /// and the one being worked out in the background.
     pub stem_wave: Option<([bool; 4], Waveform)>,
-    pub stem_wave_rx: Option<(i64, [bool; 4], crossbeam_channel::Receiver<Waveform>)>,
+    pub stem_wave_rx: Option<(i64, [bool; 4], crossbeam_channel::Receiver<(Waveform, usize)>)>,
+    /// While the stems are still being separated: how many frames were ready when the shown
+    /// stem waveform was worked out (usize::MAX: from complete stems), and when the last job
+    /// for it started.
+    pub stem_wave_ready: usize,
+    pub stem_wave_at: Option<std::time::Instant>,
     /// SLIP is on for this deck (Performance).
     pub slip: bool,
     /// Pad pages: HOT CUE shows I-P instead of A-H; BEAT JUMP's and BEAT LOOP's second page.
@@ -1033,26 +1038,36 @@ impl App {
     /// Keep the active deck's stem waveform in step with its part switches: worked out on a
     /// background thread from the audible stems whenever the set of parts changes.
     pub fn poll_stem_wave(&mut self) {
-        let (stems, on) = {
+        let (stems, live, on) = {
             let s = self.player.state.lock();
-            // Not from stems still being separated: drawn once they are complete.
-            (s.stems.clone().filter(|_| s.stems_ready.as_ref().is_none_or(|r| r.complete())), s.stem_on)
+            (s.stems.clone(), s.stems_ready.clone().filter(|r| !r.complete()), s.stem_on)
         };
         let (Some(stems), Some(tid), true, false) = (stems, self.deck.track, self.prefs.stem_waveform, on.iter().all(|x| *x)) else {
             self.deck.x.stem_wave_rx = None;
             return;
         };
         if let Some((id, key, rx)) = &self.deck.x.stem_wave_rx {
-            if let Ok(w) = rx.try_recv() {
+            if let Ok((w, made)) = rx.try_recv() {
                 if *id == tid {
                     self.deck.x.stem_wave = Some((*key, w));
+                    self.deck.x.stem_wave_ready = made;
                 }
                 self.deck.x.stem_wave_rx = None;
             }
         }
-        let have = self.deck.x.stem_wave.as_ref().map(|w| w.0 == on).unwrap_or(false);
+        // Stems still being separated give the waveform of the stretches that are ready
+        // (the others stay empty, as in rekordbox), worked out again as more are ready, at
+        // most twice a second.
+        let ready_now = live.as_ref().map(|l| l.ready_count()).unwrap_or(usize::MAX);
+        let have = self.deck.x.stem_wave.as_ref().map(|w| w.0 == on).unwrap_or(false) && self.deck.x.stem_wave_ready == ready_now;
         let running = self.deck.x.stem_wave_rx.as_ref().map(|j| j.1 == on && j.0 == tid).unwrap_or(false);
-        if !have && !running {
+        let due = live.is_none() || self.deck.x.stem_wave_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500));
+        if live.is_some() && !have {
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if !have && !running && due && ready_now > 0 {
+            self.deck.x.stem_wave_at = Some(std::time::Instant::now());
+            let spans = live.as_ref().map(|l| l.ready_spans());
             let (tx, rx) = crossbeam_channel::bounded(1);
             let ctx = self.ctx.clone();
             // The instruments are the mix less the other parts (as in playback), which needs
@@ -1061,32 +1076,37 @@ impl App {
             std::thread::spawn(move || {
                 let n = stems.len;
                 let mut mono = vec![0.0f32; n];
-                let mut add = |src: usize, k: f32| {
-                    let (l, r) = (&stems.data[src * 2 * n..(src * 2 + 1) * n], &stems.data[(src * 2 + 1) * n..(src * 2 + 2) * n]);
-                    for i in 0..n {
-                        mono[i] += k * 0.5 * (l[i] + r[i]);
-                    }
-                };
-                match orig.as_deref().filter(|_| on[2]) {
-                    Some(a) => {
-                        for src in [0, 1, 3] {
-                            if !on[src] {
-                                add(src, -1.0);
+                // Only the ready stretches are read (the rest is still being written).
+                let spans = spans.unwrap_or_else(|| vec![(0, n)]);
+                for &(a, b) in &spans {
+                    let mono = &mut mono[a..b];
+                    let mut add = |src: usize, k: f32| {
+                        let (l, r) = (&stems.data[src * 2 * n + a..src * 2 * n + b], &stems.data[(src * 2 + 1) * n + a..(src * 2 + 1) * n + b]);
+                        for i in 0..b - a {
+                            mono[i] += k * 0.5 * (l[i] + r[i]);
+                        }
+                    };
+                    match orig.as_deref().filter(|_| on[2]) {
+                        Some(au) => {
+                            for src in [0, 1, 3] {
+                                if !on[src] {
+                                    add(src, -1.0);
+                                }
+                            }
+                            for (i, m) in mono.iter_mut().enumerate().take(au.frames().saturating_sub(a)) {
+                                *m += 0.5 * (au.samples[(a + i) * 2] + au.samples[(a + i) * 2 + 1]);
                             }
                         }
-                        for (i, m) in mono.iter_mut().enumerate().take(a.frames()) {
-                            *m += 0.5 * (a.samples[i * 2] + a.samples[i * 2 + 1]);
-                        }
-                    }
-                    None => {
-                        for (src, on) in on.iter().enumerate() {
-                            if *on {
-                                add(src, 1.0);
+                        None => {
+                            for (src, on) in on.iter().enumerate() {
+                                if *on {
+                                    add(src, 1.0);
+                                }
                             }
                         }
                     }
                 }
-                let _ = tx.send(crate::analysis::waveform(&mono, crate::stems::htdemucs::SAMPLE_RATE as f64));
+                let _ = tx.send((crate::analysis::waveform(&mono, crate::stems::htdemucs::SAMPLE_RATE as f64), ready_now));
                 ctx.request_repaint();
             });
             self.deck.x.stem_wave_rx = Some((tid, on, rx));
