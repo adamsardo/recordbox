@@ -810,6 +810,7 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
         app.prefs.show_stems = true;
         app.prefs.perf_four = view == "perfgroove4";
         app.prefs.groove.enable = true;
+        app.prefs.rb.groove_circuit = true;
         // (The scripted run opens the panel itself, with the top bar's button.)
         app.prefs.groove.panel = !test;
         app.prefs.perf_fx = false;
@@ -868,7 +869,7 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
     // (kind, name, from, to). Kinds: 'c' click (press on frame 3, release on 12), 'h' the same
     // with the state printed while it is held, 'd' drag, 'x' a call, 'w' wait, 'f' file drop.
     let steps: Vec<(char, &str, Pos2, Pos2)> = vec![
-        ('c', "top bar: GROOVE CIRCUIT button (show the panel)", pos2(195.0 + 37.0 * 2.0 + 10.0, 14.0), Pos2::ZERO),
+        ('c', "top bar: GROOVE CIRCUIT button (show the panel)", pos2(195.0 + 37.0 * 1.0 + 10.0, 14.0), Pos2::ZERO),
         ('w', "wait (the factory kit is unpacked and read)", Pos2::ZERO, Pos2::ZERO),
         ('w', "wait", Pos2::ZERO, Pos2::ZERO),
         ('x', "CALL load: the deck's own track from the collection into slot A4 (what a drag from the browser does)", Pos2::ZERO, Pos2::ZERO),
@@ -919,8 +920,8 @@ fn shot_events(app: &mut App, frame: u32, raw: &mut egui::RawInput) {
         ('x', "CALL deck: play deck 1", Pos2::ZERO, Pos2::ZERO),
         ('c', "slot A1: Play", play(app, 0), Pos2::ZERO),
         ('w', "wait", Pos2::ZERO, Pos2::ZERO),
-        ('c', "top bar: GROOVE CIRCUIT button (hide the panel: everything stops)", pos2(195.0 + 37.0 * 2.0 + 10.0, 14.0), Pos2::ZERO),
-        ('c', "top bar: GROOVE CIRCUIT button (show it again for the picture)", pos2(195.0 + 37.0 * 2.0 + 10.0, 14.0), Pos2::ZERO),
+        ('c', "top bar: GROOVE CIRCUIT button (hide the panel: everything stops)", pos2(195.0 + 37.0 * 1.0 + 10.0, 14.0), Pos2::ZERO),
+        ('c', "top bar: GROOVE CIRCUIT button (show it again for the picture)", pos2(195.0 + 37.0 * 1.0 + 10.0, 14.0), Pos2::ZERO),
     ];
     let Some((kind, name, a, b)) = steps.get(i).copied() else { return };
     let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };

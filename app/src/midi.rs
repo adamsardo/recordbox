@@ -1464,8 +1464,34 @@ fn snapshot(app: &App) -> Snapshot {
 
 /// Once per frame, before the decks are handed to the audio thread: what the controllers
 /// sent, and the lights.
+/// The first connection to the system's MIDI server takes about half a second. It is made
+/// on a helper thread first, so the main thread's own client (needed there for port-change
+/// notices) is created quickly once the server is up, without holding up the first frames.
+fn midi_server_ready() -> bool {
+    use std::sync::atomic::AtomicU8;
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Relaxed) {
+        0 => {
+            STATE.store(1, Relaxed);
+            let spawned = std::thread::Builder::new().name("midi-warmup".into()).spawn(|| {
+                let _ = midir::MidiInput::new("recordbox warm-up").map(|c| c.port_count());
+                STATE.store(2, Relaxed);
+            });
+            if spawned.is_err() {
+                STATE.store(2, Relaxed);
+            }
+            false
+        }
+        1 => false,
+        _ => true,
+    }
+}
+
 pub fn poll(app: &mut App) {
     if !app.midi.started {
+        if !midi_server_ready() {
+            return;
+        }
         start(app);
     }
     let Some(hub) = app.midi.hub.clone() else { return };
