@@ -30,6 +30,7 @@ mod icons_src;
 mod importer;
 mod itunes;
 mod jobs;
+mod keycmd_data;
 mod key;
 mod library_ext;
 mod menus;
@@ -57,7 +58,12 @@ mod phrase;
 mod playlist_files;
 mod preview;
 mod player_ext;
+mod prefs_bridge;
 mod prefs_ext;
+mod prefs_font;
+mod prefs_rb;
+mod prefs_selftest;
+mod prefs_shell;
 mod rbimport;
 mod recorder;
 mod stems;
@@ -79,6 +85,11 @@ mod ui_sampler_lib;
 mod ui_player;
 mod ui_prefs;
 mod ui_rec;
+mod ui_prefs_adv;
+mod ui_prefs_item;
+mod ui_prefs_keys;
+mod ui_prefs_perf;
+mod ui_prefs_view;
 mod ui_fx;
 mod ui_pads;
 mod ui_padfx;
@@ -125,6 +136,7 @@ impl eframe::App for Gui {
         self.app.shot_pads_events(frame, raw);
         crate::ui_perf_layouts::shot_layout_events(&mut self.app, frame, raw);
         self.app.shot_mix_events(frame, raw);
+        self.app.shot_prefs_events(frame, raw);
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
@@ -244,6 +256,10 @@ impl eframe::App for Gui {
             }
         });
         step!(ui_dialogs::dialogs(app, ctx));
+        // Preferences rows of other files' features take effect (prefs_bridge.rs).
+        if app.dialogs.prefs_open || app.ctx.cumulative_pass_nr() < 3 {
+            app.prefs_bridge();
+        }
         step!(dupes::windows(app, ctx));
         step!(cue_tools::windows(app, ctx));
         step!(ui_midi::window(app, ctx));
@@ -512,7 +528,7 @@ fn main() -> eframe::Result<()> {
     let shot_mode = screenshot.is_some();
     let mut viewport = egui::ViewportBuilder::default().with_title("recordbox").with_inner_size([1512.0, 921.0]).with_min_inner_size([1100.0, 700.0]);
     // The recordbox mark as the window and Dock icon.
-    if let Some(icon) = brand::mark_icon(512) {
+    if let Some(icon) = brand::app_icon(brand::system_dark()) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
     if shot_mode {

@@ -107,6 +107,8 @@ pub fn apply(ctx: &egui::Context) {
         fam.extend(fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default());
         fonts.families.insert(egui::FontFamily::Name(name.into()), fam);
     }
+    // The face of rekordbox's Preferences window (families "pref" and "pref-bold", see prefs_font.rs).
+    crate::prefs_font::install(&mut fonts);
     // The browser's face: Helvetica regular and bold (faces 0 and 1 of the system collection),
     // falling back to the proportional list.
     for (fam, face, idx) in [("rb", "rb-regular", 0u32), ("rb-bold", "rb-boldface", 1)] {

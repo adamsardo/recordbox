@@ -753,10 +753,20 @@ impl ClipReader {
     pub fn frame(&mut self, audio: &Decoded, pos: f64, step: f64, pitch_step: f64, hop: usize) -> (f32, f32) {
         let src = Src { audio, frames: audio.frames(), stems: None, g: std::cell::Cell::new([1.0, 0.0, 0.0, 0.0, 0.0]), stem_ratio: 1.0 };
         if (step - pitch_step).abs() > 1e-9 {
-            let out = self.st.frame(&src, pos, pitch_step, hop);
+            // A grain reads on at the pitch's rate while the position moves at `step`, so its
+            // sound falls behind (or runs ahead) by up to hop x (step - pitch) frames before
+            // the next grain starts. Starting each grain half of that ahead keeps a beat of a
+            // tempo-synced loop within half a grain's drift of its place instead of always late.
+            let lead = 0.5 * hop as f64 * (step - pitch_step);
+            // A loop's wrap (the position goes back by more than a grain) starts a new grain
+            // at once: fading into it would soften the first beat of every pass.
+            if self.st.active && pos + lead < self.st.expect - hop as f64 {
+                self.st.active = false;
+            }
+            let out = self.st.frame(&src, pos + lead, pitch_step, hop);
             // Where the next frame is expected: without this every frame looked like a seek
             // and the stretcher never got past the first sample of a grain.
-            self.st.expect = pos + step;
+            self.st.expect = pos + lead + step;
             out
         } else {
             self.st.active = false;

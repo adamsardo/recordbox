@@ -1741,6 +1741,23 @@ mod tests {
         GcClip { audio: Arc::new(Decoded { sr, samples, raw_frames: frames, damaged: 0, truncated: false }), bpm, gain: 1.0, first_beat: 0.0 }
     }
 
+    /// A loop with a kick on every beat (a decaying 150 Hz burst of about 80 ms): something a
+    /// time stretcher can carry, unlike `drum_loop`'s 20-frame clicks, which fall between grains.
+    fn kick_loop(bpm: f32, beats: usize, sr: u32) -> GcClip {
+        let fpb = sr as f64 * 60.0 / bpm as f64;
+        let frames = (beats as f64 * fpb).round() as usize;
+        let mut samples = vec![0.0f32; frames * 2];
+        for b in 0..beats {
+            let f0 = (b as f64 * fpb).round() as usize;
+            for k in 0..(sr as usize * 80 / 1000).min(frames - f0) {
+                let v = (k as f32 * 150.0 * std::f32::consts::TAU / sr as f32).cos() * (-(k as f32) / (sr as f32 * 0.02)).exp();
+                samples[(f0 + k) * 2] = v;
+                samples[(f0 + k) * 2 + 1] = v;
+            }
+        }
+        GcClip { audio: Arc::new(Decoded { sr, samples, raw_frames: frames, damaged: 0, truncated: false }), bpm, gain: 1.0, first_beat: 0.0 }
+    }
+
     fn grid(bpm: f64, secs: f64) -> Vec<f64> {
         (0..(secs * bpm / 60.0) as usize).map(|i| i as f64 * 60.0 / bpm).collect()
     }
@@ -1794,7 +1811,7 @@ mod tests {
         for (deck_bpm, speed, loop_bpm) in [(125.0f64, 1.04f64, 100.0f32), (90.0, 1.0, 140.0), (128.0, 0.94, 123.0)] {
             let g = grid(deck_bpm, 120.0);
             let mut e = Engine::new(0);
-            e.set_clip(1, 0, Some(drum_loop(loop_bpm, 4, 44100)));
+            e.set_clip(1, 0, Some(kick_loop(loop_bpm, 4, 44100)));
             let mut pos = 0.0;
             e.launch(1, 0);
             let out = run(&mut e, &g, &mut pos, speed, 44100 * 6, true);

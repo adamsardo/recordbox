@@ -396,6 +396,8 @@ pub struct Prefs {
     pub stem_reset_on_load: bool,
     /// STEMS > STEM Waveform Display: the waveform shows only the parts that sound.
     pub stem_waveform: bool,
+    /// The settings of rekordbox's Preferences that came with the full window (prefs_rb.rs).
+    pub rb: crate::prefs_rb::RbPrefs,
 }
 
 /// Keyboard actions: (id, label, default shortcut in stored form or "" for none, category).
@@ -826,6 +828,7 @@ impl Default for Prefs {
             vocal_enlarged: false,
             metronome_sound: 0,
             preview_volume: 0.5,
+            rb: Default::default(),
             stem_solo: false,
             stem_reset_on_load: true,
             stem_waveform: true,

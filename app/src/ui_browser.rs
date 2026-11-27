@@ -132,7 +132,7 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     dropdown(ui, &mode, "modepop", |ui| {
         for (i, name) in ["EXPORT", "PERFORMANCE"].iter().enumerate() {
             if ui.selectable_label(app.prefs.app_mode == i as u8, *name).clicked() {
-                app.set_app_mode(i as u8);
+                crate::prefs_shell::request_mode(app, i as u8);
                 ui.memory_mut(|m| m.close_popup());
             }
         }
