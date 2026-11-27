@@ -181,7 +181,7 @@ const PATH_W: f32 = 20.0;
 
 /// rekordbox's `brws_list_pathsystem_pulldown.svg`: two grey chevrons, 10 x 16 pt.
 fn path_icon(p: &egui::Painter, c: egui::Pos2) {
-    let col = hex(0x646464);
+    let col = gy(0x646464);
     let o = c - vec2(5.0, 8.0);
     let up = vec![o + vec2(5.092, 0.0), o + vec2(10.0, 5.998), o + vec2(7.817, 5.998), o + vec2(5.089, 2.79), o + vec2(2.367, 5.998), o + vec2(0.0, 5.998)];
     let down = vec![o + vec2(4.908, 16.0), o + vec2(0.0, 10.001), o + vec2(2.183, 10.001), o + vec2(4.911, 13.21), o + vec2(7.633, 10.001), o + vec2(10.0, 10.001)];
@@ -198,7 +198,7 @@ fn track_table(app: &mut App, ui: &mut egui::Ui, table: Rect, ids: &[i64], salt:
     let font = rb(11.5);
     let tracks: Vec<Track> = ids.iter().filter_map(|id| app.track(*id).cloned()).collect();
     let paths: Vec<Vec<String>> = tracks.iter().map(|t| app.dupes.paths.get(&t.id).cloned().unwrap_or_default()).collect();
-    let loc_w = tracks.iter().map(|t| p.layout_no_wrap(t.path.clone(), font.clone(), WHITE).size().x).fold(0.0, f32::max);
+    let loc_w = tracks.iter().map(|t| p.layout_no_wrap(t.path.clone(), font.clone(), WHITE.c()).size().x).fold(0.0, f32::max);
     let cols: Vec<(Col, f32)> = COLS.iter().map(|c| (c.0, col_w(app, *c))).collect();
     let fixed: f32 = cols.iter().map(|c| c.1).sum::<f32>() + PATH_W;
     // (Location takes the width that is left; a long path is cut, as in rekordbox's list.)
@@ -216,14 +216,14 @@ fn track_table(app: &mut App, ui: &mut egui::Ui, table: Rect, ids: &[i64], salt:
     egui::ScrollArea::horizontal().id_salt((salt, "h")).auto_shrink([false, false]).show(&mut tui, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         let (hr, _) = ui.allocate_exact_size(vec2(content_w, 22.0), Sense::hover());
-        ui.painter().rect_filled(hr, 0.0, hex(0x1A1A1A));
+        ui.painter().rect_filled(hr, 0.0, gy(0x1A1A1A));
         let mut x = hr.min.x;
         for (i, (c, cw)) in cols.iter().enumerate() {
             if i > 0 {
                 ui.painter().rect_filled(Rect::from_min_max(pos2(x - 1.0, hr.min.y), pos2(x, hr.max.y)), 0.0, BG);
             }
             let label = if *c == Col::Status { "" } else { c.label() };
-            ui.painter().with_clip_rect(Rect::from_min_size(pos2(x, hr.min.y), vec2(if *cw > 0.0 { *cw } else { loc }, hr.height()))).text(pos2(x + 6.0, hr.center().y), Align2::LEFT_CENTER, label, font.clone(), DIM);
+            ui.painter().with_clip_rect(Rect::from_min_size(pos2(x, hr.min.y), vec2(if *cw > 0.0 { *cw } else { loc }, hr.height()))).text(pos2(x + 6.0, hr.center().y), Align2::LEFT_CENTER, label, font.clone(), DIM.c());
             x += if *cw > 0.0 { *cw } else { loc };
         }
         ui.painter().rect_filled(Rect::from_min_max(pos2(x - 1.0, hr.min.y), pos2(x, hr.max.y)), 0.0, BG);
@@ -238,7 +238,7 @@ fn track_table(app: &mut App, ui: &mut egui::Ui, table: Rect, ids: &[i64], salt:
                 if on {
                     ui.painter().rect_filled(rr, 0.0, ROW_SEL);
                 } else if i % 2 == 1 {
-                    ui.painter().rect_filled(rr, 0.0, hex(0x0A0A0A));
+                    ui.painter().rect_filled(rr, 0.0, gy(0x0A0A0A));
                 }
                 let mut x = rr.min.x;
                 for (c, cw) in cols.iter() {
@@ -299,7 +299,7 @@ fn track_table(app: &mut App, ui: &mut egui::Ui, table: Rect, ids: &[i64], salt:
         let list = app.dupes.paths.get(&id).cloned().unwrap_or_default();
         let mut close = false;
         let area = egui::Area::new(egui::Id::new((salt, "paths"))).order(egui::Order::Tooltip).fixed_pos(at).show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).fill(hex(0x202020)).show(ui, |ui| {
+            egui::Frame::popup(ui.style()).fill(gy(0x202020)).show(ui, |ui| {
                 ui.set_min_width(200.0);
                 for l in &list {
                     if ui.add(egui::Label::new(egui::RichText::new(l).font(rb(11.5)).color(WHITE)).sense(Sense::click())).clicked() {
@@ -352,9 +352,9 @@ fn button(ui: &mut egui::Ui, r: Rect, id: &str, label: &str, enabled: bool) -> b
     let resp = ui.interact(r, ui.id().with(id), if enabled { Sense::click() } else { Sense::hover() });
     mark(id.to_string(), r);
     let p = ui.painter();
-    p.rect_filled(r, 2.0, hex(0x141414));
-    p.rect_filled(r.shrink(1.0), 1.5, if enabled && resp.is_pointer_button_down_on() { hex(0x2E2E2E) } else if enabled && resp.hovered() { hex(0x4A4A4A) } else { hex(0x3C3C3C) });
-    p.text(r.center(), Align2::CENTER_CENTER, label, rb(13.0), if enabled { hex(0xC8C8C8) } else { hex(0x787878) });
+    p.rect_filled(r, 2.0, gy(0x141414));
+    p.rect_filled(r.shrink(1.0), 1.5, if enabled && resp.is_pointer_button_down_on() { gy(0x2E2E2E) } else if enabled && resp.hovered() { gy(0x4A4A4A) } else { gy(0x3C3C3C) });
+    p.text(r.center(), Align2::CENTER_CENTER, label, rb(13.0), if enabled { gy(0xC8C8C8) } else { gy(0x787878) });
     resp.clicked()
 }
 
@@ -398,12 +398,12 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     let mut open = true;
     let ids: Vec<i64> = app.dupes.rows.iter().map(|(id, _)| *id).collect();
     let modal = app.dupes.confirm_delete || app.dupes.merge.is_some() || app.dupes.merged_msg;
-    kit::dialog(ctx, "Duplicated File Manager").id(egui::Id::new("dupes_manager")).open(&mut open).resizable(true).default_pos(ctx.screen_rect().center() - vec2(415.0, 315.0)).default_size([830.0, 600.0]).min_size([520.0, 320.0]).frame(egui::Frame::window(&ctx.style()).fill(hex(0x191919)).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
+    kit::dialog(ctx, "Duplicated File Manager").id(egui::Id::new("dupes_manager")).open(&mut open).resizable(true).default_pos(ctx.screen_rect().center() - vec2(415.0, 315.0)).default_size([830.0, 600.0]).min_size([520.0, 320.0]).frame(egui::Frame::window(&ctx.style()).fill(gy(0x191919)).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
         let size = ui.available_size().max(vec2(520.0, 320.0));
         let (r, _) = ui.allocate_exact_size(size, Sense::hover());
         let (w, h) = (r.width(), r.height());
         let p = ui.painter().clone();
-        p.rect_filled(r, 0.0, hex(0x191919));
+        p.rect_filled(r, 0.0, gy(0x191919));
         let list = Rect::from_min_size(pos2(r.min.x + 20.0, r.min.y + 20.0), vec2(w - 40.0, h - 100.0));
         if !modal {
             track_table(app, ui, list, &ids, "dupes_table", None);
@@ -411,7 +411,7 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
             p.rect_filled(list, 0.0, BG);
         }
         // "<n> Track", 16 pt.
-        p.text(pos2(r.min.x + 20.0, r.max.y - 70.0 + 9.0), Align2::LEFT_CENTER, format!("{} Track", ids.len()), rb(16.0), WHITE);
+        p.text(pos2(r.min.x + 20.0, r.max.y - 70.0 + 9.0), Align2::LEFT_CENTER, format!("{} Track", ids.len()), rb(16.0), WHITE.c());
         let y = r.max.y - 42.0;
         let n = app.dupes.sel.len();
         if button(ui, Rect::from_min_size(pos2(r.min.x + 20.0, y), vec2(80.0, 32.0)), "dupes_delete", "Delete", n > 0 && !modal) {
@@ -453,16 +453,16 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     }
     if let Some((chosen, mut keep)) = app.dupes.merge.clone() {
         let mut answer = None;
-        kit::dialog(ctx, "Select Representative File").id(egui::Id::new("dupes_merge_window")).resizable(true).default_pos(ctx.screen_rect().center() - vec2(415.0, 315.0)).default_size([830.0, 600.0]).min_size([520.0, 320.0]).order(egui::Order::Foreground).frame(egui::Frame::window(&ctx.style()).fill(hex(0x191919)).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
+        kit::dialog(ctx, "Select Representative File").id(egui::Id::new("dupes_merge_window")).resizable(true).default_pos(ctx.screen_rect().center() - vec2(415.0, 315.0)).default_size([830.0, 600.0]).min_size([520.0, 320.0]).order(egui::Order::Foreground).frame(egui::Frame::window(&ctx.style()).fill(gy(0x191919)).inner_margin(egui::Margin::ZERO)).show(ctx, |ui| {
             let size = ui.available_size().max(vec2(520.0, 320.0));
             let (r, _) = ui.allocate_exact_size(size, Sense::hover());
             let (w, h) = (r.width(), r.height());
             let p = ui.painter().clone();
-            p.rect_filled(r, 0.0, hex(0x191919));
+            p.rect_filled(r, 0.0, gy(0x191919));
             let tr = Rect::from_min_size(pos2(r.min.x + 20.0, r.min.y + 20.0), vec2(w - 40.0, 40.0));
             // Two centred lines (rekordbox: a centred 16 pt label 40 pt tall).
-            p.text(pos2(tr.center().x, tr.min.y + 10.0), Align2::CENTER_CENTER, "Selected files will be merged.", rb(16.0), WHITE);
-            p.text(pos2(tr.center().x, tr.min.y + 30.0), Align2::CENTER_CENTER, "Please select a representative file as the merge destination.", rb(16.0), WHITE);
+            p.text(pos2(tr.center().x, tr.min.y + 10.0), Align2::CENTER_CENTER, "Selected files will be merged.", rb(16.0), WHITE.c());
+            p.text(pos2(tr.center().x, tr.min.y + 30.0), Align2::CENTER_CENTER, "Please select a representative file as the merge destination.", rb(16.0), WHITE.c());
             let table = Rect::from_min_size(pos2(r.min.x + 20.0, r.min.y + 80.0), vec2(w - 40.0, h - 160.0));
             track_table(app, ui, table, &chosen, "dupes_merge_table", Some(&mut keep));
             let cx = r.min.x + w / 2.0;

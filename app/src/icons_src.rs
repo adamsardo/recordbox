@@ -410,7 +410,7 @@ pub fn tile(p: &Painter, r: Rect, on: bool, hovered: bool, enabled: bool, panel:
     if on {
         p.rect_filled(r, 1.5, blue);
         p.rect_stroke(r, 1.5, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
-        blue
+        blue.c()
     } else {
         let edge = if !enabled {
             Color32::from_rgb(0x3A, 0x3A, 0x3A)
@@ -476,7 +476,7 @@ pub fn plus_disc(p: &Painter, c: Pos2, col: Color32, bg: Color32) {
 /// (My Tag's "Create a new My Tag." button).
 pub fn add_disc11(p: &Painter, c: Pos2, col: Color32) {
     p.circle_filled(c, 5.5, col);
-    let x = Color32::from_rgb(25, 25, 25);
+    let x = crate::theme::gy(0x191919);
     p.rect_filled(Rect::from_center_size(c, vec2(7.0, 1.0)), 0.0, x);
     p.rect_filled(Rect::from_center_size(c, vec2(1.0, 7.0)), 0.0, x);
 }

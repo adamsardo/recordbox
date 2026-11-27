@@ -469,9 +469,10 @@ pub fn state(app: &App) -> HashMap<&'static str, (bool, bool)> {
             "undo" => (!app.undo.is_empty(), false),
             "redo" => (!app.redo.is_empty(), false),
             "fullscreen" => (true, app.dialogs.ext.fullscreen),
-            // The Light appearance does not exist in recordbox (Preferences > View says why).
-            "appearance_dark" => (true, true),
-            "appearance_light" => (false, false),
+            // View > Appearance (commands 0xb053 / 0xb054), ticked by `ColorThemeMode`; EDIT
+            // mode is always drawn Dark.
+            "appearance_dark" => (!crate::ui_edit::is_edit(app), app.prefs.rb.color_theme != 2),
+            "appearance_light" => (!crate::ui_edit::is_edit(app), app.prefs.rb.color_theme == 2),
             "layout_player" => (true, layout == 0),
             "layout_2players" => (true, layout == 1),
             "layout_dual" => (true, layout == 2),
@@ -816,6 +817,8 @@ pub fn handle(app: &mut App, id: &str) {
             let _ = std::process::Command::new("/usr/bin/open").arg(crate::db::data_dir()).spawn();
         }
         "fullscreen" => app.dialogs.ext.toggle_fullscreen = true,
+        "appearance_dark" => app.prefs.rb.color_theme = 1,
+        "appearance_light" => app.prefs.rb.color_theme = 2,
         "layout_player" => app.set_player_layout(0),
         "layout_2players" => app.set_player_layout(1),
         "layout_dual" => app.set_player_layout(2),

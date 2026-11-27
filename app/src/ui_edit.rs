@@ -514,7 +514,7 @@ pub fn intercept_load(app: &mut App, id: i64) -> bool {
         return false;
     }
     // (PREPDECK_SHOT_VIEW=edit is the screen with nothing loaded.)
-    if app.screenshot.is_some() && std::env::var("PREPDECK_SHOT_VIEW").map(|v| v == "edit" || v == "edittools" || v == "editpads").unwrap_or(false) {
+    if app.screenshot.is_some() && std::env::var("PREPDECK_SHOT_VIEW").map(|v| v.trim_start_matches("light,").to_string()).map(|v| v == "edit" || v == "edittools" || v == "editpads").unwrap_or(false) {
         return true;
     }
     load_track(app, id);
@@ -1011,7 +1011,7 @@ pub fn attribute_icons(app: &mut App, p: &egui::Painter, cell: egui::Rect, id: i
 pub fn attribute_header(app: &mut App, ui: &mut egui::Ui, resp: &egui::Response, cell: egui::Rect) -> bool {
     use egui::{vec2, Align2, RichText};
     let on = app.edit.attr_filter.is_some();
-    crate::icons_src::funnel(ui.painter(), egui::pos2(cell.center().x, cell.center().y - 1.0), if on { crate::theme::TILE_ON } else { crate::theme::DIM });
+    crate::icons_src::funnel(ui.painter(), egui::pos2(cell.center().x, cell.center().y - 1.0), if on { crate::theme::TILE_ON.c() } else { crate::theme::DIM.c() });
     let hit = resp.clicked() && resp.interact_pointer_pos().map(|pp| cell.contains(pp)).unwrap_or(false);
     if hit {
         app.edit.attr_popup = !app.edit.attr_popup;

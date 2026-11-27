@@ -114,7 +114,7 @@ pub fn frame(app: &mut App, ctx: &egui::Context) -> bool {
             close = true;
             return;
         }
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(crate::theme::BG)).show(vctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(crate::theme::BG.c())).show(vctx, |ui| {
             crate::ui_browser::browser(app, ui);
         });
         if vctx.input(|i| i.viewport().close_requested()) {

@@ -267,6 +267,8 @@ impl eframe::App for Gui {
         step!(menus::poll(app));
         step!(menus::sync(app));
         shortcuts(app, ctx);
+        // Dark / Light appearance (Preferences > View > Color, View menu); EDIT is always Dark.
+        theme::sync(ctx, app.prefs.rb.color_theme == 2 && !ui_edit::is_edit(app));
         // Preferences > View > Tooltips off: no hover text anywhere, including the ones drawn
         // with egui's own `on_hover_text` (a delay that never runs out; infinity would panic
         // in egui's repaint timer).
@@ -281,7 +283,7 @@ impl eframe::App for Gui {
         }
         app.dialogs.ext.fullscreen = fs;
 
-        egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG1)).show(ctx, |ui| {
+        egui::TopBottomPanel::top("header").exact_height(28.0).show_separator_line(false).frame(egui::Frame::default().fill(theme::HEADER.c())).show(ctx, |ui| {
             step!(ui_browser::header_bar(app, ui));
         });
         // The browser ends 895 pt down (a 26 pt footer) in EXPORT, PERFORMANCE's Browse layouts
@@ -296,12 +298,12 @@ impl eframe::App for Gui {
         } else {
             26.0
         };
-        egui::TopBottomPanel::bottom("footer").exact_height(foot_h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("footer").exact_height(foot_h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG.c())).show(ctx, |ui| {
             ui_browser::footer(app, ui);
         });
         // EXPORT mode's recording panel, a strip under the top bar.
         if !app.performance() && app.prefs.rec.panel_export {
-            egui::TopBottomPanel::top("recstrip").exact_height(ui_rec::EXPORT_H).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG2)).show(ctx, |ui| ui_rec::export_strip(app, ui));
+            egui::TopBottomPanel::top("recstrip").exact_height(ui_rec::EXPORT_H).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG2.c())).show(ctx, |ui| ui_rec::export_strip(app, ui));
         }
         if ui_edit::is_edit(app) { step!(ui_edit_view::top_panel(app, ctx)); } else
         if !app.prefs.browser_only || app.performance() {
@@ -310,7 +312,7 @@ impl eframe::App for Gui {
             // Player is one 58 pt row.
             let h = app.player_height();
             let perf = app.performance();
-            egui::TopBottomPanel::top(egui::Id::new(("player", if perf { 9 } else { app.prefs.player_layout.min(3) }))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| match app.prefs.player_layout {
+            egui::TopBottomPanel::top(egui::Id::new(("player", if perf { 9 } else { app.prefs.player_layout.min(3) }))).exact_height(h).show_separator_line(false).frame(egui::Frame::default().fill(theme::BG.c())).show(ctx, |ui| match app.prefs.player_layout {
                 _ if perf => step!(ui_perf::performance(app, ui)),
                 1 | 3 => step!(ui_player2::two_players(app, ui)),
                 2 => step!(ui_player2::simple_player(app, ui)),
@@ -319,7 +321,7 @@ impl eframe::App for Gui {
         }
         // Split Screen: the browser is in a window of its own (split.rs).
         let split = split::frame(app, ctx);
-        egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::default().fill(theme::BG.c())).show(ctx, |ui| {
             if ui_edit_view::hides_browser(app) { return; }
             if !split {
                 step!(ui_browser::browser(app, ui));

@@ -653,7 +653,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             kit::apply_style(ui);
             ui.set_width(380.0);
             // The logo (mark and wordmark) instead of the name in text.
-            ui.add(crate::brand::logo_image(WHITE, 22.0));
+            ui.add(crate::brand::logo_image(WHITE.c(), 22.0));
             ui.add_space(2.0);
             ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM));
             ui.add_space(6.0);

@@ -1383,6 +1383,8 @@ impl App {
             // Several states can be combined with commas (PREPDECK_SHOT_VIEW=playlists,mytag).
             for v in std::env::var("PREPDECK_SHOT_VIEW").unwrap_or_default().split(',').filter(|v| !v.is_empty()).map(|v| v.to_string()) {
                 match v.as_str() {
+                    // The Light appearance (Preferences > View > Color > Appearance).
+                    "light" => app.prefs.rb.color_theme = 2,
                     "playlists" | "smart" => {
                         app.side = SideMode::Playlists;
                         if app.nodes.is_empty() {
