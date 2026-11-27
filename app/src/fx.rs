@@ -780,6 +780,20 @@ pub fn robot_law(l: f32) -> (f32, f32, f32) {
 }
 
 /// STRETCH's playing speed from LEVEL/DEPTH (`StretchCore::processEffectInternal`).
+/// Single-mode STRETCH's knob and BPF (`SingleBeatFxStretch::updateParameter` 0x102a459c0):
+/// the low band's gain into the stretch and its live gain, then the high band's. Left of the
+/// centre the lows fall to 1 - the distance; right of it the highs. BPF: nothing of them is
+/// stretched; they pass live, the side's band at 1 - the distance.
+pub fn stretch_bands(k1: f32, bpf: bool) -> (f32, f32, f32, f32) {
+    let t = through_value(k1);
+    match (k1 < 0.48627, bpf) {
+        (true, false) => (1.0 - t, 0.0, 1.0, 0.0),
+        (true, true) => (0.0, 1.0 - t, 0.0, 1.0),
+        (false, false) => (1.0, 0.0, 1.0 - t, 0.0),
+        (false, true) => (0.0, 1.0, 0.0, 1.0 - t),
+    }
+}
+
 pub fn stretch_speed(level: f32) -> f32 {
     if level >= 0.5 { 0.75 - 0.5 * level } else { 1.0 - level }
 }
@@ -1189,8 +1203,26 @@ pub(crate) struct Slot {
     /// release's start LEVEL and speed, its sinking, the last LEVEL, its gain.
     vb_state: u8,
     vb: [f32; 6],
-    /// Reverse echo: frames into the current turn.
-    rev_k: f32,
+    /// The reverse echo core of REV DELAY and the REV buttons (`crate::fx_rev`; made by the
+    /// interface for the slots that can run one), and whether it must start clean.
+    rv: Option<Box<crate::fx_rev::RevFx>>,
+    fresh: bool,
+    /// `BeatFxEcho` / `BeatFxPitchEcho`'s gates (`SignalGate`, 3.3333 ms): the input (shut by
+    /// FREEZE), the forward core's output (open without REV) and the reverse core's (with
+    /// it); the line holds the longest delay (`f588`) and the frames counted for it (`f592`).
+    bg: [crate::fx_lfo::Sf; 3],
+    filled: bool,
+    fill_n: i32,
+    /// FLANGER (`BeatFxFlanger`): its two `LFO`s (triangles giving each side's delay in ms,
+    /// smoothed over 50 ms), the output gate (`SignalGate` 3.3333 ms), a restart asked for
+    /// (`f632`), the gate shutting for one (`f633`), and the period waiting for it (`f736`,
+    /// `f740`).
+    flo: [crate::fx_lfo::Lfo; 2],
+    fgate: crate::fx_lfo::Sf,
+    fplay: bool,
+    fclose: bool,
+    fpend: bool,
+    fpend_ms: f32,
     seed: u32,
     hold: [f32; 2],
     hold_n: f32,
@@ -1222,6 +1254,75 @@ pub(crate) struct Slot {
     pan: crate::fx_lfo::PanFx,
 }
 
+/// The beat quantizer's calls for the echo family over one buffer: the stretches between
+/// restarts and, before each, whether the effect was restarted (`setEffectBeatTimeWithPlayHead`
+/// or `playHead`, which end in the core's `playHead`) or switched on (REV DELAY:
+/// `BeatFxDelay::onCalledTurnOn`, `playHead(1, 1)`).
+struct EchoSync {
+    n: usize,
+    at: [u32; 128],
+    len: [u32; 128],
+    play: [bool; 128],
+    both: [bool; 128],
+    /// `setEffectBeatTimeWithPlayHead`'s time, `setTimeUntilNextPlayHead`'s (ms; 0 = none) and
+    /// `onCalledTurnOn`, before each stretch.
+    beat_ms: [f32; 128],
+    until_ms: [f32; 128],
+    on: [bool; 128],
+    pend: bool,
+    pend_both: bool,
+    pend_ms: f32,
+    pend_until: f32,
+    pend_on: bool,
+    turn_on_both: bool,
+}
+
+impl EchoSync {
+    fn new(turn_on_both: bool) -> EchoSync {
+        EchoSync { n: 0, at: [0; 128], len: [0; 128], play: [false; 128], both: [false; 128], beat_ms: [0.0; 128], until_ms: [0.0; 128], on: [false; 128], pend: false, pend_both: false, pend_ms: 0.0, pend_until: 0.0, pend_on: false, turn_on_both }
+    }
+
+    fn seg(&mut self, at: usize, len: usize) {
+        if self.n < 128 {
+            self.at[self.n] = at as u32;
+            self.len[self.n] = len as u32;
+            self.play[self.n] = self.pend;
+            self.both[self.n] = self.pend_both;
+            self.beat_ms[self.n] = self.pend_ms;
+            self.until_ms[self.n] = self.pend_until;
+            self.on[self.n] = self.pend_on;
+            self.n += 1;
+        } else {
+            self.len[127] = (at + len) as u32 - self.at[127];
+        }
+        self.pend = false;
+        self.pend_both = false;
+        self.pend_ms = 0.0;
+        self.pend_until = 0.0;
+        self.pend_on = false;
+    }
+}
+
+impl crate::fx_lfo::BeatSync for EchoSync {
+    fn play_head(&mut self) {
+        self.pend = true;
+    }
+    fn set_beat_time(&mut self, ms: f32, _offset: f32) {
+        self.pend = true;
+        self.pend_ms = ms.abs().max(1e-3);
+    }
+    fn time_until_next(&mut self, ms: f32) {
+        self.pend_until = ms.max(1e-3);
+    }
+    fn turn_on(&mut self, _offset: f32) {
+        self.pend_on = true;
+        if self.turn_on_both {
+            self.pend_both = true;
+        }
+    }
+    fn turn_off(&mut self) {}
+}
+
 /// Frames of TRANS / PAN gain worked out at a time (on the stack).
 const LFO_PIECE: usize = 1024;
 
@@ -1232,7 +1333,7 @@ impl Slot {
 
     /// A slot without its lines, for a place that is never switched on.
     pub(crate) fn empty() -> Slot {
-        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rev_k: 0.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0) }
+        Slot { kind: Kind::Delay, delay: Vec::new(), w: 0, time: 0.0, spiral: crate::fx_core::SpiralMotion::new(48000.0, 0), hx: (false, 1.0, 0.0), gate: 0.0, lfo: 0.0, bands: [[0.0; 16]; 2], f1: [[0.0; 2]; 2], f2: [[0.0; 2]; 2], f3: [[0.0; 2]; 2], lp: [0.0; 2], ap: [[0.0; 60]; 2], fb: [0.0; 2], lf: [[0.0; 13]; 2], lfb: [[0.0; 129]; 2], lfb_made: (0, false), combs: Vec::new(), comb_w: 0, comb_lp: [0.0; 10], aps: Vec::new(), ap_w: 0, rin: [0.0; 4], rv1: [[0.0; 2]; 14], roll: crate::fx_roll::RollFx::new(crate::fx_roll::RollKind::Roll, 48000.0), was_on: false, odd: false, ps: crate::fx_core::PitchShifter::empty(), ps_rate: 48000, ej: crate::fx_core::EnigmaJet::empty(), mob: crate::fx_core::Mobius::empty(), pk: 0.0, quiet: 0, aux: Vec::new(), aux_w: 0, og: 0.0, taps: [0.0; 8], rob: [1.0, 0.177778, 0.0, 0.0], ga: [0.75, 0.75], vb_state: 0, vb: [0.0; 6], rv: None, fresh: false, bg: [crate::fx_rev::new_gate(48000.0); 3], filled: false, fill_n: 0, flo: [crate::fx_lfo::Lfo::new(48000.0, crate::fx_lfo::Wave::TRI); 2], fgate: crate::fx_rev::new_gate(48000.0), fplay: false, fclose: false, fpend: false, fpend_ms: 10.0, seed: 0x2468_ACE1, hold: [0.0; 2], hold_n: 0.0, lag: 0.0, t: 0.0, speed: 1.0, osc: [0.0; 6], env: 0.0, lfo2: 0.0, dg: [crate::fx_core::SmoothF::new(0.0, 3.3333, 48000.0); 2], dpend: 0.0, dfill: 0.0, gv: [1.0; 2], ifl: [crate::cfx::InstFilter::new(crate::cfx::InstKind::Hpf), crate::cfx::InstFilter::new(crate::cfx::InstKind::Lpf)], fl: FL_INIT, tq: crate::fx_lfo::Quant::new(), trans: crate::fx_lfo::TransFx::new(48000.0, crate::fx_lfo::Wave::SQUARE), pan: crate::fx_lfo::PanFx::new(48000.0) }
     }
 
     fn clear(&mut self) {
@@ -1269,7 +1370,9 @@ impl Slot {
         self.lfo2 = 0.0;
         self.roll = crate::fx_roll::RollFx::new(match self.kind { Kind::RevRoll => crate::fx_roll::RollKind::Rev, Kind::SlipRoll => crate::fx_roll::RollKind::Slip, _ => crate::fx_roll::RollKind::Roll }, self.ps_rate as f32);
         self.odd = false;
-        self.rev_k = 0.0;
+        self.fresh = false;
+        self.filled = false;
+        self.fill_n = 0;
         self.hold = [0.0; 2];
         self.hold_n = 0.0;
         self.lag = 0.0;
@@ -1289,6 +1392,60 @@ impl Slot {
         self.tq.slip = self.kind == Kind::SlipRoll;
         self.trans = crate::fx_lfo::TransFx::new(self.ps_rate as f32, crate::fx_lfo::Wave::SQUARE);
         self.pan = crate::fx_lfo::PanFx::new(self.ps_rate as f32);
+    }
+
+    /// `BeatFxFlanger::updateAndSetParameter`: each side's range (`min` .. `max` ms) and PHASE,
+    /// smoothed; the heads (0) are already in place.
+    fn flanger_params(&mut self, min: [f32; 2], max: [f32; 2], rev: bool) {
+        const E: f32 = 1.1920929e-7;
+        for c in 0..2 {
+            let l = &mut self.flo[c];
+            if (min[c] - l.amin).abs() >= E || (max[c] - l.amax).abs() >= E {
+                l.set_amplitude_range(true, min[c], max[c]);
+            }
+            if rev != l.reversed() {
+                l.reverse_amplitude(rev, true);
+            }
+        }
+    }
+
+    /// The beat quantizer's calls before stretch `i` as `BeatFxFlanger` takes them:
+    /// `setTimeUntilNextPlayHead` 0x1029fe87c (the LFOs re-timed to end the turn then, kept
+    /// within 10 ms .. 32 s), `setEffectBeatTimeWithPlayHead` 0x1029fe84c (a new period for the
+    /// next restart, and a restart), `playHead` and `onCalledTurnOn` (a restart).
+    fn flanger_calls(&mut self, s: &EchoSync, i: usize) {
+        if s.until_ms[i] > 0.0 {
+            let old = self.flo[0].period_ms;
+            for l in self.flo.iter_mut() {
+                l.set_remaining_period_time(s.until_ms[i], true);
+            }
+            let p = self.flo[0].period_ms;
+            if !(10.0..=32000.0).contains(&p) {
+                self.flo.iter_mut().for_each(|l| l.set_period_time(old, true));
+            } else {
+                self.fpend_ms = p;
+            }
+        }
+        if s.beat_ms[i] > 0.0 {
+            self.fpend = true;
+            self.fpend_ms = s.beat_ms[i].clamp(10.0, 32000.0);
+            self.fplay = true;
+        }
+        if s.play[i] || s.on[i] {
+            self.fplay = true;
+        }
+    }
+
+    /// Make the reverse echo core if effect `k` can run one here (`single`: the single-mode slot).
+    pub(crate) fn ensure_rev(&mut self, k: Kind, single: bool) {
+        let want = match k {
+            Kind::RevDelay => true,
+            Kind::Echo | Kind::LowCutEcho | Kind::PingPong | Kind::PitchEcho => single,
+            _ => false,
+        };
+        if want && self.rv.is_none() && !self.delay.is_empty() {
+            self.rv = Some(crate::fx_rev::RevFx::new());
+        }
     }
 
     /// Read the delay line `frames` back (fractional), channel `c`.
@@ -1391,16 +1548,6 @@ impl Slot {
             let g = 1.0 / (e.taps as f32).sqrt();
             el *= g;
             er *= g;
-        } else if e.rev {
-            // Reverse: each turn of the delay time is read backwards from where it began.
-            let len = self.time.clamp(0.010 * r, (DELAY_LEN / 2 - 2) as f32);
-            if self.rev_k >= len {
-                self.rev_k = 0.0;
-            }
-            let edge = (self.rev_k.min(len - self.rev_k) / (SMOOTH_SECS * r)).min(1.0);
-            el = self.tap(2.0 * self.rev_k + 1.0, 0) * edge;
-            er = self.tap(2.0 * self.rev_k + 1.0, 1) * edge;
-            self.rev_k += 1.0;
         } else if e.dm {
             // `DelayModule::read`: whole frames, through the read gate.
             el = self.tap((self.time * e.ml).trunc(), 0) * self.gv[0];
@@ -1597,7 +1744,6 @@ impl Slot {
             self.lag = 0.0;
             self.t = 0.0;
             self.speed = 1.0;
-            self.rev_k = 0.0;
         }
         // DELAY / REV DELAY's first knob in single mode: the pan LFO's beats (none in the
         // centre zone).
@@ -1663,6 +1809,8 @@ impl Slot {
         // The echo core's settings.
         let swing = |k: f32| 1.0 + (k - 0.5) * 0.6667;
         let mut e = EchoCfg { ml: 1.0, mr: 1.0, fb: 0.0, rev: false, freeze: false, ratio: 1.0, filt: 0, g: 0.0, taps: 0, limit: false, dm: dm_kind };
+        // DELAY / REV DELAY's LR RATIO zone (single mode; the thresholds are rekordbox's ninths).
+        let lr_zone = [0.11111f32, 0.22222, 0.33333, 0.44444, 0.55556, 0.66667, 0.77778, 0.88889].iter().filter(|&&t| k2 >= t).count();
         // FILTER knob of the echoes (`SingleBeatFxEcho::updateAndSetParameter`): the right
         // half turns an `InstFxHPF` (2k - 1), the left half an `InstFxLPF` (1 - 2k), both on the
         // repeats, as 8-bit values (truncated).
@@ -1677,12 +1825,14 @@ impl Slot {
             Delay | RevDelay => {
                 // Multi mode: one repeat, both sides at the beat value. Single mode: LR RATIO
                 // in rekordbox's nine steps (1:3, 1:2, 1:1.5, 1:1.25, 1:1, ... 3:1).
+                // (`SingleBeatFxDelayBase::updateAndSetParameter` 0x1029ccc24: each side is the
+                // beat time times its step, at most 4 s, `BeatFxDelay::MAX_DELAY_TIME`.)
                 if !multi {
                     const STEP: [(f32, f32); 9] = [(1.0, 3.0), (1.0, 2.0), (1.0, 1.5), (1.0, 1.25), (1.0, 1.0), (1.25, 1.0), (1.5, 1.0), (2.0, 1.0), (3.0, 1.0)];
-                    let (a, b) = STEP[((k2 * 9.0) as usize).min(8)];
-                    let m = a.max(b);
-                    e.ml = a / m;
-                    e.mr = b / m;
+                    let (a, b) = STEP[lr_zone];
+                    let t = (echo_secs * 1000.0).max(1e-3);
+                    e.ml = (a * t).min(4000.0) / t;
+                    e.mr = (b * t).min(4000.0) / t;
                 }
                 e.rev = kind == RevDelay;
             }
@@ -1705,7 +1855,7 @@ impl Slot {
                 // `SingleBeatFxPitchEcho`: FEEDBACK 0 .. 0.85 .. 0.993; PITCH -50 % .. +50 % a
                 // repeat; FREEZE holds the loop at feedback 1. Mix: wet 1.4 x L up to 0.7,
                 // dry from 3/4 down to 0 (FREEZE: the ROLL curve, wet x 0.7).
-                e.fb = if b2 { 1.0 } else { pitch_echo_fb(k1, !p.on) };
+                e.fb = pitch_echo_fb(k1, !p.on);
                 let pct = through_value(k2) * if k2 < 0.5 { -50.0 } else { 50.0 };
                 e.ratio = pitch_ratio(pct);
                 e.rev = b1;
@@ -1793,6 +1943,73 @@ impl Slot {
             VinylBrake => e.fb = if self.vb_state == 2 && self.speed > 0.95 { 14.0 - 14.0 * self.speed } else { 0.7 },
             _ => {}
         }
+        // The `BeatFxEcho` / `BeatFxPitchEcho` / `BeatFxDelay` family. FREEZE takes hold once the
+        // line holds the delay (`SingleBeatFxEcho::updateAndSetParameter` 0x1029c0248,
+        // `SingleBeatFxPitchEcho` 0x1029c7808: feedback 1 and the input gate shut). The reverse
+        // core (`crate::fx_rev`) runs beside the forward one and REV fades between their outputs
+        // (`BeatFxEcho::processEffectConcrete` 0x1029bf630); REV DELAY is the reverse core alone.
+        let gated = matches!(kind, Echo | LowCutEcho | PingPong | PitchEcho) && !multi;
+        let rev_mode = match kind {
+            RevDelay => Some(crate::fx_rev::RevMode::Plain),
+            Echo | LowCutEcho | PingPong if !multi => Some(crate::fx_rev::RevMode::Echo),
+            PitchEcho if !multi => Some(crate::fx_rev::RevMode::Pitch),
+            _ => None,
+        };
+        let rev_on = kind == RevDelay || rev_mode.is_some() && e.rev;
+        if starting {
+            // (`BeatFxEcho::onCalledTurnOn`: the line is counted again.)
+            self.filled = false;
+            self.fill_n = 0;
+        }
+        let freeze_on = gated && e.freeze && p.on && self.filled;
+        if gated {
+            if freeze_on {
+                e.fb = 1.0;
+            }
+            e.freeze = false;
+        }
+        // Multi-mode ECHO keeps the whole dry sound until the line holds the delay
+        // (`MultiBeatFxEcho::updateParameter` 0x1029bf934).
+        if kind == Echo && multi && !(p.on && self.filled) {
+            mix.0 = 1.0;
+        }
+        let t_ms = (echo_secs * 1000.0).clamp(1.0, 4000.0);
+        let mut revc = if rev_mode.is_some() { self.rv.take() } else { None };
+        if let (Some(f), Some(m)) = (revc.as_deref_mut(), rev_mode) {
+            if !self.fresh || f.mode != m || (f.rate() - r).abs() > 0.5 {
+                f.setup(m, r);
+            }
+        }
+        if gated {
+            self.bg.iter_mut().for_each(|g| g.set_rate(r));
+            let t = [if freeze_on { 0.0 } else { 1.0 }, if rev_on { 0.0 } else { 1.0 }, if rev_on { 1.0 } else { 0.0 }];
+            for (g, t) in self.bg.iter_mut().zip(t) {
+                if self.fresh {
+                    g.set_target(t);
+                } else {
+                    // (`onCalledMakeSelected`: the gates start where they are asked to be.)
+                    g.reset(t);
+                }
+            }
+        }
+        let made = !self.fresh;
+        self.fresh = true;
+        // Each side's time for the reverse core (`BeatFxEcho::updateAndSetParameter` 0x1029bf05c:
+        // at least 10 ms), its feedback, which sides run themselves (status not on; single REV
+        // DELAY: also the side with the longer time), and the restarts the beat quantizer
+        // gives this buffer.
+        let rv_ms = if kind == RevDelay { [t_ms * e.ml, t_ms * e.mr] } else { [(t_ms * e.ml).max(10.0), (t_ms * e.mr).max(10.0)] };
+        let rv_fb = if kind == RevDelay { [0.0; 2] } else { [e.fb; 2] };
+        let rs = !p.on;
+        let rv_self = if kind == RevDelay && !multi { [rs || lr_zone >= 5, rs || lr_zone <= 3] } else { [rs; 2] };
+        let rv_shift = e.ratio - 1.0;
+        let mut sync = EchoSync::new(kind == RevDelay);
+        if revc.is_some() || kind == Flanger {
+            let mut q = self.tq;
+            q.process(&mut sync, beat, bpm, rate, frames, if down { -beats } else { beats }, p.on, |s, at, len| s.seg(at, len));
+            self.tq = q;
+        }
+        let mut si = 0usize;
         let (dry, wet) = mix;
         // LOW CUT / HI CUT: the effect is not given those bands (LOW CUT ECHO never gets the
         // lows). The echoes simply do not repeat them; the others pass them through.
@@ -1874,16 +2091,32 @@ impl Slot {
         // right half.
         let fl_lo = 1000.0 / r;
         let fl_top = if multi { [2.6667f32; 2] } else { let t = through_value(k2) * 25.0 + 2.6667; if k2 < 0.48627 { [t, 2.6667] } else if k2 > 0.51373 { [2.6667, t] } else { [2.6667; 2] } };
-        let fl_mid = [(fl_top[0] + fl_lo) * 0.5, (fl_top[1] + fl_lo) * 0.5];
-        let fl_half = [(fl_top[0] - fl_lo) * 0.5, (fl_top[1] - fl_lo) * 0.5];
+        // (`BeatFxFlanger::updateAndSetParameter` 0x1029fe1e4: the heads stay at 0 in both modes,
+        // the range is one frame .. the top, PHASE turns the waves over.)
+        let fl_rev = !multi && b2;
         if kind == Flanger {
             self.fl.iter_mut().for_each(|f| f.set_rate(r));
-            if starting {
-                // (Made fresh: the LFO's range is where it is asked to be.)
-                for c in 0..2 {
-                    self.fl[3 + c].reset(fl_mid[c]);
-                    self.fl[5 + c].reset(fl_half[c]);
+            self.fgate.set_rate(r);
+            if made {
+                // The constructor (0x1029fde5c: triangles, 0 .. 2.6667 ms, 50 ms smoothing, a
+                // 10 ms period) and `onCalledMakeSelected` 0x1029fe7b8.
+                for l in self.flo.iter_mut() {
+                    *l = crate::fx_lfo::Lfo::new(r, crate::fx_lfo::Wave::TRI);
+                    l.set_amplitude_range(true, 0.0, 2.6667);
+                    l.set_smoothing_time(50.0);
+                    l.set_period_time(10.0, true);
+                    l.reset();
                 }
+                self.flanger_params([fl_lo; 2], fl_top, fl_rev);
+                if self.fpend {
+                    self.fpend = false;
+                    let ms = self.fpend_ms;
+                    self.flo.iter_mut().for_each(|l| l.set_period_time(ms, false));
+                }
+                self.flo.iter_mut().for_each(|l| l.reset());
+                self.fplay = false;
+                self.fclose = false;
+                self.fgate.reset(1.0);
             }
         }
         let ph_fb = if multi { mod_fb(level) } else { flanger_fb(k1, b1) };
@@ -2020,7 +2253,38 @@ impl Slot {
             let mixed = |wl: f32, wr: f32| (fdl * (1.0 + (dry - 1.0) * g) + wl * wet * g, fdr * (1.0 + (dry - 1.0) * g) + wr * wet * g);
             let (ol, or) = match kind {
                 Delay | RevDelay | Echo | PitchEcho | UpEcho | DownEcho | LowCutEcho | PingPong => {
-                    let (mut el, mut er) = self.echo(il, ir, &e, r);
+                    let (mut il, mut ir) = (il, ir);
+                    let (gf, gr) = if gated {
+                        let gi = self.bg[0].take();
+                        il *= gi;
+                        ir *= gi;
+                        (self.bg[1].take(), self.bg[2].take())
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    let (mut el, mut er) = if kind == RevDelay { (0.0, 0.0) } else { self.echo(il, ir, &e, r) };
+                    if let Some(f) = revc.as_deref_mut() {
+                        while si < sync.n && sync.at[si] as usize == n {
+                            if sync.both[si] {
+                                f.play_head_both();
+                            } else if sync.play[si] {
+                                f.play_head();
+                            }
+                            f.begin_call(sync.len[si] as usize, frames, rv_ms, rv_fb, rv_self, rv_shift);
+                            si += 1;
+                        }
+                        let (a, b) = f.next(il, ir);
+                        if kind == RevDelay {
+                            (el, er) = (a, b);
+                        } else {
+                            el = el * gf + a * gr;
+                            er = er * gf + b * gr;
+                        }
+                    } else {
+                        // (Without a reverse core made, REV is silent.)
+                        el *= gf;
+                        er *= gf;
+                    }
                     if let Some((ha, la)) = echo_filt {
                         let mut fr = [el, er];
                         self.ifl[0].process(&mut fr, ha, 0, rate);
@@ -2186,22 +2450,47 @@ impl Slot {
                     // (between frames), its input is the sound plus feedback x the read, and the
                     // output is the read at a gain that falls below 0.5 ms (0.3686 + 1.2628 x
                     // ms), the feedback and gain `SmoothFloat`s of 3.3333 ms.
-                    let wave = 2.0 * tri - 1.0;
+                    // The restarts (`BeatFxFlanger::processEffectConcrete` 0x1029fe634): the beat
+                    // quantizer's calls before this stretch, the parameters, then a restart shuts
+                    // the output gate; once it is shut the new period is taken, both LFOs jump to
+                    // their heads and the gate opens again.
+                    while si < sync.n && sync.at[si] as usize == n {
+                        self.flanger_calls(&sync, si);
+                        self.flanger_params([fl_lo; 2], fl_top, fl_rev);
+                        if self.fclose {
+                            self.fplay = false;
+                        } else if self.fplay {
+                            self.fplay = false;
+                            self.fclose = true;
+                            self.fgate.set_target(0.0);
+                        }
+                        si += 1;
+                    }
                     let (fbk, ..) = (self.fl[0].set_next(fl_fb), ());
+                    let gg = self.fgate.take();
                     let mut o = [0.0f32; 2];
                     for (c, x) in [dl, dr].into_iter().enumerate() {
-                        self.fl[3 + c].set(fl_mid[c]);
-                        self.fl[5 + c].set(fl_half[c]);
-                        let (mid, half) = (self.fl[3 + c].next(), self.fl[5 + c].next());
-                        let ms = mid + if !multi && b2 { -half } else { half } * wave;
+                        let mut v = [0.0f32; 1];
+                        self.flo[c].get_values(&mut v);
+                        let ms = v[0];
                         let d = (ms * 0.001 * r).max(1.0);
                         let y = self.tap(d, c);
                         o[c] = y;
                         let k = if ms <= 0.0 { 0.0 } else if ms >= 0.5 { 1.0 } else { ms * 1.2628 + 0.3686 };
-                        o[c] = y * self.fl[1 + c].set_next(k);
+                        o[c] = y * self.fl[1 + c].set_next(k) * gg;
                         self.fb[c] = x + y * fbk;
                     }
                     self.push(self.fb[0], self.fb[1]);
+                    if self.fclose && !self.fgate.on && self.fgate.cur.abs() < 1.1920929e-7 {
+                        self.fclose = false;
+                        self.fgate.set_target(1.0);
+                        if self.fpend {
+                            self.fpend = false;
+                            let ms = self.fpend_ms;
+                            self.flo.iter_mut().for_each(|l| l.set_period_time(ms, false));
+                        }
+                        self.flo.iter_mut().for_each(|l| l.jump_to_head(false));
+                    }
                     mixed(o[0], o[1])
                 }
                 Phaser => {
@@ -2409,24 +2698,32 @@ impl Slot {
                     }
                     let edge = (self.t.min(total - self.t) / (SMOOTH_SECS * r)).clamp(0.0, 1.0);
                     self.t += 1.0;
-                    // LOW / HI CUT and BPF (`SingleBeatFxStretch::updateParameter`): the three
-                    // bands' gains (`EffectFrequencyModule`, 284 Hz / 4.65 kHz): left of the
-                    // centre the lows fall to 1 - the distance, right the highs; BPF keeps the
-                    // middle band alone.
+                    // LOW / HI CUT and BPF (`SingleBeatFxStretch::updateParameter` 0x102a459c0,
+                    // `BeatFxStretch::updateAndSetParameter` / `processEffectConcrete`): the
+                    // `EffectFrequencyModule`'s low and high bands (284 Hz / 4.65 kHz; its band 2
+                    // and band 0) each get a gain into the stretch and a gain that passes the
+                    // live sound by it; the middle band is stretched whole. Left of the centre
+                    // the lows go in at 1 - the distance (BPF: none stretched, the highs live
+                    // at 1 and the lows live at 1 - the distance), right of it the highs.
+                    // (rekordbox splits the bands before the stretch; here the stretched sound
+                    // is split after it.)
+                    let mut thru = [0.0f32; 2];
                     if !multi && (b2 || (k1 - 0.5).abs() > 0.0137) {
-                        let t = through_value(k1);
-                        let (gl, gh) = if b2 { (0.0, 0.0) } else if k1 < 0.5 { (1.0 - t, 1.0) } else { (1.0, 1.0 - t) };
+                        let (fx_lo, th_lo, fx_hi, th_hi) = stretch_bands(k1, b2);
                         let mut o = [wl, wr];
-                        for c in 0..2 {
+                        for (c, live) in [dl, dr].into_iter().enumerate() {
                             let z = &mut self.bands[c];
                             let x = o[c];
                             let lo = { let a = biquad(&mut z[0..2], &lo_c, x); biquad(&mut z[2..4], &lo_c, a) };
                             let hi = { let a = biquad(&mut z[4..6], &hi_c, x); biquad(&mut z[6..8], &hi_c, a) };
-                            o[c] = (x - lo - hi) + lo * gl + hi * gh;
+                            let llo = { let a = biquad(&mut z[8..10], &lo_c, live); biquad(&mut z[10..12], &lo_c, a) };
+                            let lhi = { let a = biquad(&mut z[12..14], &hi_c, live); biquad(&mut z[14..16], &hi_c, a) };
+                            o[c] = (x - lo - hi) + lo * fx_lo + hi * fx_hi;
+                            thru[c] = llo * th_lo + lhi * th_hi;
                         }
                         (wl, wr) = (o[0], o[1]);
                     }
-                    (dl * (1.0 - g) + wl * edge * g, dr * (1.0 - g) + wr * edge * g)
+                    (dl * (1.0 - g) + (wl * edge + thru[0]) * g, dr * (1.0 - g) + (wr * edge + thru[1]) * g)
                 }
                 BpfEcho | HpfEcho | LpfEcho | CrushEcho => {
                     // rekordbox's FX+ echoes: the main knob (read in 8-bit steps) moves a
@@ -2501,6 +2798,19 @@ impl Slot {
             };
             buf[n * 2] = ol + tl;
             buf[n * 2 + 1] = or + tr;
+        }
+        if rev_mode.is_some() {
+            self.rv = revc;
+        }
+        if matches!(kind, Echo | LowCutEcho | PingPong | PitchEcho) {
+            // `BeatFxEcho::processEffectConcrete`: the line holds the longest delay (counted up
+            // to 4 s).
+            if self.fill_n >= (r * 4.0) as i32 {
+                self.filled = true;
+            } else {
+                self.fill_n += frames as i32;
+                self.filled = self.fill_n >= ((r * 0.001) * (t_ms * e.ml).max(t_ms * e.mr)) as i32;
+            }
         }
         if !p.on && self.gate <= 0.0 {
             // Off and faded out: the next ON starts clean.
@@ -2757,6 +3067,27 @@ impl Rack {
         Rack { units: [unit(), unit()], scratch: std::array::from_fn(|_| vec![0.0; 16384]), enabled: false, master_cfx: crate::cfx::Cfx::new(), master_cfx_set: (0, 0.5, 0.5), sampler_cfx: crate::cfx::Cfx::new(), sampler_cfx_set: (0, 0.5, 0.5), beat: [None; CHANNELS], pads: [None, None, None, None], pad_set: [PadSet::NONE; 4], pad_bpm: [120.0; 4], pad_quantize: [false; 4], merge: None, master_release: None, master_bpm: 120.0, master_rel: None }
     }
 
+    /// Make the reverse echo cores (about 4.7 MB a slot; `crate::fx_rev`) of the slots that can
+    /// run one: REV DELAY, and in single mode ECHO, LOW CUT ECHO, PING PONG and PITCH ECHO (their
+    /// REV button); a PAD FX unit set to REV DELAY. Called by the interface once the units'
+    /// params are in, never by the audio thread.
+    pub fn prepare_rev(&mut self) {
+        for u in self.units.iter_mut() {
+            let p = u.params;
+            for ch in u.channels.iter_mut().flatten() {
+                for (i, s) in ch.slots.iter_mut().enumerate() {
+                    let k = if i < 3 { p.slots[i].kind } else { p.one.kind };
+                    s.ensure_rev(k, i == 3);
+                }
+            }
+        }
+        for (pc, set) in self.pads.iter_mut().zip(self.pad_set.iter()) {
+            if let (Some(pc), Some(b)) = (pc.as_deref_mut(), set.beat) {
+                pc.ch.slots[0].ensure_rev(b.kind, false);
+            }
+        }
+    }
+
     /// Make deck `ch`'s PAD FX unit (about 8 MB; called by the interface, never the audio thread).
     pub fn prepare_pad(&mut self, ch: usize) {
         if ch < 4 && self.pads[ch].is_none() {
@@ -2976,6 +3307,79 @@ mod tests {
     }
 
     #[test]
+    fn rev_delay_plays_each_beat_backwards_from_the_restart() {
+        // REV DELAY (multi, 1 beat at 120 BPM = 24000 frames, LEVEL/DEPTH 1: the wet sound
+        // alone), no beat grid: the quantizer starts it at once and restarts it every 24000
+        // frames. After the restart at 24000 the gate shuts (159 frames), the read point goes
+        // to the frame written just before (23999) and the input plays backwards from there.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        rack.units[0].params = unit(Kind::RevDelay, 1.0, 1.0);
+        let a = rack.units[0].params.assign;
+        rack.units[0].prepare(&a);
+        rack.prepare_rev();
+        let x: Vec<f32> = (0..60000).flat_map(|t| { let v = (t % 20000) as f32 * 1e-4 - 1.0; [v, v] }).collect();
+        let mut y = x.clone();
+        for c in y.chunks_mut(960) {
+            rack.process(0, c, 48000);
+        }
+        let j = 24000 + 159;
+        for k in [200usize, 5000, 20000] {
+            assert!((y[(j + k) * 2] - x[(23999 - k) * 2]).abs() < 1e-5, "{k}: {} vs {}", y[(j + k) * 2], x[(23999 - k) * 2]);
+        }
+    }
+
+    #[test]
+    fn echo_rev_fades_to_the_reverse_core() {
+        // Single-mode ECHO with REV held: the forward echo's output gate is shut and the reverse
+        // core's open (`BeatFxEcho`); the click comes back reversed after the first restart and
+        // then repeats at the feedback (0.7 at the knob's centre) every beat.
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        let mut p = unit(Kind::Echo, 1.0, 1.0);
+        p.single = true;
+        p.one = SlotParams { on: true, level: 1.0, value: 1.0, knob: [0.5, 0.5], btn: [true, false], ..SlotParams::new(Kind::Echo) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        rack.prepare_rev();
+        let mut y: Vec<f32> = (0..96000).flat_map(|t| { let v = if t == 10000 { 1.0 } else { 0.0 }; [v, v] }).collect();
+        for c in y.chunks_mut(960) {
+            rack.process(0, c, 48000);
+        }
+        let peaks: Vec<(usize, f32)> = (0..96000).filter(|&t| y[t * 2].abs() > 0.05).map(|t| (t, y[t * 2])).collect();
+        // The click (dry gone at LEVEL/DEPTH 1 once the line is full) is read back after the
+        // restart at 24000: shut 159 frames, read from 23999 back to 10000 = frame 38158.
+        assert!(peaks.iter().any(|&(t, _)| t == 24159 + 13999), "{peaks:?}");
+        let first = peaks.iter().find(|&&(t, _)| t == 38158).unwrap().1;
+        let next = peaks.iter().find(|&&(t, _)| t == 38158 + 24000).map(|p| p.1).unwrap_or(0.0);
+        assert!((next / first - 0.7).abs() < 0.02, "{first} {next}");
+    }
+
+    #[test]
+    fn pitch_echo_rev_runs_the_pitch_reverse_core() {
+        // PITCH ECHO, REV held, PITCH at the centre (no shift): `PitchReverseEchoCore` gives the
+        // click back reversed after the restart at 24000 (read at frame 38158), through its
+        // shifter, then the repeats at the feedback (0.85 at the knob's centre).
+        let mut rack = Rack::new();
+        rack.enabled = true;
+        let mut p = unit(Kind::Echo, 1.0, 1.0);
+        p.single = true;
+        p.one = SlotParams { on: true, level: 0.5, value: 1.0, knob: [0.5, 0.5], btn: [true, false], ..SlotParams::new(Kind::PitchEcho) };
+        rack.units[0].params = p;
+        rack.units[0].prepare(&p.assign);
+        rack.prepare_rev();
+        let mut y: Vec<f32> = (0..96000).flat_map(|t| { let v = if t == 10000 { 1.0 } else { 0.0 }; [v, v] }).collect();
+        for c in y.chunks_mut(960) {
+            rack.process(0, c, 48000);
+        }
+        assert!(y.iter().all(|v| v.is_finite()));
+        let e = |a: usize| y[(a - 600) * 2..(a + 600) * 2].iter().map(|v| v * v).sum::<f32>().sqrt();
+        // (The shifter in the loop adds its 30 ms start-up delay, 1440 frames, to each pass.)
+        let (a, b) = (e(38158 + 1440), e(38158 + 24000 + 2 * 1440));
+        assert!(a > 0.2 && (b / a - 0.85).abs() < 0.05, "{a} {b}");
+    }
+
+    #[test]
     fn level_depth_law_of_the_echo_family() {
         // LEVEL/DEPTH at 0: no echo at all. Fully right: the echo only.
         let mut rack = Rack::new();
@@ -2993,9 +3397,15 @@ mod tests {
         let a = rack.units[0].params.assign;
         rack.units[0].prepare(&a);
         let mut y = x.clone();
-        rack.process(0, &mut y, 48000);
-        // Before the first repeat arrives there is only the (removed) dry signal.
-        assert!(rms(&y[2000..40000]) < 0.01);
+        for c in y.chunks_mut(1024) {
+            rack.process(0, c, 48000);
+        }
+        // Until the line holds the delay (a beat, 24000 frames) the dry sound stays whole
+        // (`MultiBeatFxEcho::updateParameter`); from the block after it, only the repeats.
+        assert!((rms(&y[2000..40000]) - rms(&x[2000..40000])).abs() < 0.01);
+        assert!(rms(&y[2 * 24600..2 * 25000]) > 0.1);
+        let d: Vec<f32> = y[2 * 24600..2 * 30000].iter().zip(&x[2 * (24600 - 24000)..2 * (30000 - 24000)]).map(|(a, b)| a - b).collect();
+        assert!(rms(&d) < 0.01, "only the repeat: {}", rms(&d));
     }
 
     #[test]
@@ -3179,7 +3589,9 @@ mod tests {
             rack.units[0].params = p;
             rack.units[0].prepare(&p.assign);
             let mut x = burst(48000 * 2);
-            rack.process(0, &mut x, 48000);
+            for c in x.chunks_mut(1024) {
+                rack.process(0, c, 48000);
+            }
             x
         };
         let at = |x: &[f32], f: usize| rms(&x[f * 2..(f + 480) * 2]);
@@ -3191,17 +3603,19 @@ mod tests {
         assert!(at(&x, 24000) > 0.4 && at(&x, 48000) < 0.01);
         let x = run([1.0, 0.5], [false, false], Kind::Echo);
         assert!((at(&x, 72000) / at(&x, 24000) - 1.0).abs() < 0.05);
-        // FREEZE: nothing new enters the echo.
+        // FREEZE takes hold once the line holds the delay (`SingleBeatFxEcho`: the burst is in by
+        // then); from there nothing new enters and the repeats keep their level (feedback 1).
         let x = run([0.5, 0.5], [false, true], Kind::Echo);
-        assert!(at(&x, 24000) < 0.01);
+        assert!(at(&x, 24000) > 0.4 && (at(&x, 72000) / at(&x, 24000) - 1.0).abs() < 0.02, "{} {}", at(&x, 24000), at(&x, 72000));
         // FILTER to the left: the repeat is duller (a 10 ms step keeps less of its edge).
         let dull = run([0.5, 0.0], [false, false], Kind::Echo);
         let bright = run([0.5, 0.5], [false, false], Kind::Echo);
         let edge = |x: &[f32]| (x[24001 * 2] - x[23999 * 2]).abs();
         assert!(edge(&dull) < edge(&bright) * 0.5, "{} vs {}", edge(&dull), edge(&bright));
-        // DELAY, LR RATIO at the left end (1:3): the left repeat comes at a third of the time.
+        // DELAY, LR RATIO at the left end (1:3): the left repeat at the beat value, the right one
+        // at three times it (`SingleBeatFxDelayBase::updateAndSetParameter` multiplies).
         let x = run([0.5, 0.0], [false, false], Kind::Delay);
-        assert!(x[8200 * 2] > 0.3 && x[8200 * 2 + 1].abs() < 0.01 && x[24200 * 2 + 1] > 0.3);
+        assert!(x[24200 * 2] > 0.3 && x[24200 * 2 + 1].abs() < 0.01 && x[72200 * 2 + 1] > 0.3);
         // At the centre (1:1) both come together.
         let x = run([0.5, 0.5], [false, false], Kind::Delay);
         assert!(x[24200 * 2] > 0.3 && x[24200 * 2 + 1] > 0.3 && x[8200 * 2].abs() < 0.01);
@@ -3508,6 +3922,7 @@ mod tests {
             set(&mut p);
             rack.units[0].params = p;
             rack.units[0].prepare(&p.assign);
+            rack.prepare_rev();
             let mut x = tone(48000 * 20, 330.0);
             let t = std::time::Instant::now();
             for chunk in x.chunks_mut(512 * 2) {
@@ -3521,6 +3936,14 @@ mod tests {
         for info in INFO.iter() {
             let label = format!("{} alone", info.name);
             run(&label, &|p| p.slots[0] = SlotParams { on: true, level: 0.7, ..SlotParams::new(info.kind) });
+        }
+        // Single mode with REV held: both cores run (`BeatFxEcho`).
+        for kind in [Kind::Echo, Kind::PingPong, Kind::LowCutEcho, Kind::PitchEcho] {
+            let label = format!("{} REV (single)", info_of(kind).name);
+            run(&label, &|p| {
+                p.single = true;
+                p.one = SlotParams { on: true, level: 0.7, knob: [0.5, 0.5], btn: [true, false], ..SlotParams::new(kind) };
+            });
         }
         run("REVERB + PHASER + PITCH ECHO-like", &|p| {
             p.slots = [SlotParams { on: true, ..SlotParams::new(Kind::Reverb) }, SlotParams { on: true, ..SlotParams::new(Kind::Phaser) }, SlotParams { on: true, ..SlotParams::new(Kind::UpEcho) }];
@@ -3841,10 +4264,10 @@ mod tests {
         let mut x = vec![0.0f32; 512 * 2];
         s.process(&p, 120.0, &mut x, 48000, &ring, None, false);
         let lo = 1000.0 / 48000.0;
-        assert!((s.fl[3].cur - (27.6667 + lo) / 2.0).abs() < 1e-3 && (s.fl[5].cur - (27.6667 - lo) / 2.0).abs() < 1e-3);
-        assert!((s.fl[4].cur - (2.6667 + lo) / 2.0).abs() < 1e-4);
-        // Multi mode: one frame .. 2.6667 ms on both sides; the output gain at a delay of one
-        // frame tends to 0.3686 + 1.2628 x 0.0208 ms.
+        // (The LFOs' ranges, `LFO::setAmplitudeRange`.)
+        assert!((s.flo[0].amax - 27.6667).abs() < 1e-3 && (s.flo[0].amin - lo).abs() < 1e-6);
+        assert!((s.flo[1].amax - 2.6667).abs() < 1e-4);
+        // Multi mode: one frame .. 2.6667 ms on both sides.
         let mut s = Slot::new();
         let mut p = SlotParams::new(Kind::Flanger);
         p.on = true;
@@ -3852,8 +4275,47 @@ mod tests {
         p.value = 16.0;
         let mut x = vec![0.0f32; 64 * 2];
         s.process(&p, 120.0, &mut x, 48000, &ring, Some(0.0), true);
-        assert!((s.fl[5].cur - (2.6667 - lo) / 2.0).abs() < 1e-4);
-        assert!(s.fl[1].cur < 0.9 && s.fl[1].cur > 0.39, "{}", s.fl[1].cur);
+        assert!((s.flo[1].amax - 2.6667).abs() < 1e-4 && (s.flo[1].amin - lo).abs() < 1e-6);
+        // Switched on, the first restart is shutting the gate; until it is shut the LFOs keep the
+        // constructor's 10 ms period (480 frames).
+        assert!(s.fclose && s.flo[0].wave.period() == 480);
+    }
+
+    #[test]
+    fn stretch_band_gains_are_rekordbox_s() {
+        // (low into the stretch, low live, high into it, high live).
+        assert_eq!(stretch_bands(0.5, false), (1.0, 0.0, 1.0, 0.0));
+        assert_eq!(stretch_bands(0.5, true), (0.0, 1.0, 0.0, 1.0));
+        assert_eq!(stretch_bands(0.0, false), (0.0, 0.0, 1.0, 0.0));
+        assert_eq!(stretch_bands(0.0, true), (0.0, 0.0, 0.0, 1.0));
+        assert_eq!(stretch_bands(1.0, false), (1.0, 0.0, 0.0, 0.0));
+        assert_eq!(stretch_bands(1.0, true), (0.0, 1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn flanger_restarts_through_its_gate() {
+        // FLANGER (multi, 1 beat at 120 BPM, no beat grid): switched on, the quantizer gives the
+        // beat time (500 ms) and a restart; the output gate shuts over 159 frames, then the
+        // period is taken and the LFOs jump to their heads (`BeatFxFlanger::processEffectConcrete`).
+        // The next restart comes a beat later: frames 24000 .. 24158 shut the gate, and from
+        // 24159 the LFOs run from 0 again.
+        let ring = Ring::new();
+        let mut s = Slot::new();
+        let mut p = SlotParams::new(Kind::Flanger);
+        p.on = true;
+        p.level = 1.0;
+        p.value = 1.0;
+        let mut x = vec![0.0f32; 480 * 2];
+        let mut done = 0;
+        while done + 480 <= 24000 {
+            s.process(&p, 120.0, &mut x, 48000, &ring, None, true);
+            done += 480;
+        }
+        assert_eq!(s.flo[0].wave.period(), 24000);
+        assert_eq!(s.flo[0].pos, 24000 - 159);
+        let mut y = vec![0.0f32; 170 * 2];
+        s.process(&p, 120.0, &mut y, 48000, &ring, None, true);
+        assert!(!s.fclose && s.flo[0].pos == 11 && s.flo[1].pos == 11, "{}", s.flo[0].pos);
     }
 
     #[test]

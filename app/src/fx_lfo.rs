@@ -337,6 +337,28 @@ impl Lfo {
         }
     }
 
+    pub fn reversed(&self) -> bool {
+        self.rev
+    }
+
+    /// `reverseAmplitude(on, smooth)` 0x102998824: the wave turned over (its half-range made
+    /// negative), over the smoothing time or at once.
+    pub fn reverse_amplitude(&mut self, on: bool, smooth: bool) {
+        if self.rev != on {
+            let was = self.rev;
+            self.rev = !was;
+            let half = (self.amax - self.amin) * 0.5;
+            let v = if was { half } else { -half };
+            if smooth {
+                let c = self.amp.cur;
+                self.amp.reset(c);
+                self.amp.set_target(v);
+            } else {
+                self.amp.reset(v);
+            }
+        }
+    }
+
     pub fn set_head(&mut self, h: f32) {
         if (h > 0.0 || h.abs() < EPS) && (h < 1.0 || (h - 1.0).abs() < EPS) {
             self.head = h;

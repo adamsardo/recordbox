@@ -400,6 +400,7 @@ pub fn sync(app: &mut App) {
             rack.pad_quantize[d] = quantize[d];
         }
         rack.pad_set = pad_sets;
+        rack.prepare_rev();
         if merge || rack.merge.is_some() {
             crate::mfx::sync(app, rack, &bpm)
         } else {
