@@ -125,12 +125,10 @@ fn icon_btn(app: &mut App, ui: &mut Ui, r: Rect, name: &str, asset: &str, enable
     let base = lit.unwrap_or(ICON);
     let col = if !enabled {
         base.gamma_multiply(0.4)
-    } else if resp.is_pointer_button_down_on() {
-        if lit.is_some() { base.gamma_multiply(0.8) } else { ICON_DOWN }
-    } else if resp.hovered() {
-        if lit.is_some() { Color32::from_rgb(base.r().saturating_add(40), base.g().saturating_add(40), base.b().saturating_add(40)) } else { ICON_OVER }
+    } else if lit.is_some() {
+        crate::ui_feel::face(&resp, base, Color32::from_rgb(base.r().saturating_add(40), base.g().saturating_add(40), base.b().saturating_add(40)), base.gamma_multiply(0.8))
     } else {
-        base
+        crate::ui_feel::face(&resp, base, ICON_OVER, ICON_DOWN)
     };
     let p = ui.painter().clone();
     match skin(app, asset) {
@@ -358,7 +356,7 @@ fn player_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     // Artwork; with a track loaded the pointer over it shows the eject button.
     let art = Rect::from_min_size(r.min + vec2(10.0, 10.0), vec2(58.0, 58.0));
     let art_path = app.edit.project.as_ref().map(|p| p.track.artwork.clone()).unwrap_or_default();
-    let own = crate::ui_browser::artwork_texture(app, &art_path);
+    let own = crate::ui_feel::list_artwork(app, &art_path);
     match own.or_else(|| skin(app, "p0510_artwork50_.png")) {
         Some(t) => paint_tex(&p, &t, art, WHITE.c()),
         None => {
@@ -369,14 +367,15 @@ fn player_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     if loaded {
         let resp = ui.interact(art, ui.id().with("edit_art"), Sense::click());
         app.edit.map.rects.insert("eject".into(), art);
-        if resp.hovered() {
-            p.rect_filled(art, 0.0, Color32::from_black_alpha(120));
+        let ha = crate::ui_feel::hover(&resp);
+        if ha > 0.0 {
+            p.rect_filled(art, 0.0, crate::motion::fade(Color32::from_black_alpha(120), ha));
             let er = Rect::from_center_size(art.center(), vec2(19.0, 19.0));
             match skin(app, "p10522_eject.png") {
-                Some(t) => paint_tex(&p, &t, er, WHITE.c()),
+                Some(t) => paint_tex(&p, &t, er, crate::motion::fade(WHITE.c(), ha)),
                 None => {
-                    p.add(egui::Shape::convex_polygon(vec![pos2(er.min.x, er.center().y + 2.0), pos2(er.center().x, er.min.y), pos2(er.max.x, er.center().y + 2.0)], WHITE, Stroke::NONE));
-                    p.rect_filled(Rect::from_min_max(pos2(er.min.x, er.max.y - 4.0), er.max), 0.0, WHITE);
+                    p.add(egui::Shape::convex_polygon(vec![pos2(er.min.x, er.center().y + 2.0), pos2(er.center().x, er.min.y), pos2(er.max.x, er.center().y + 2.0)], crate::motion::fade(WHITE.c(), ha), Stroke::NONE));
+                    p.rect_filled(Rect::from_min_max(pos2(er.min.x, er.max.y - 4.0), er.max), 0.0, crate::motion::fade(WHITE.c(), ha));
                 }
             }
         }
@@ -923,7 +922,7 @@ fn zoom_control(app: &mut App, ui: &mut Ui, r: Rect) {
         }
         let rst = Rect::from_min_size(r.min + vec2(35.0, 11.0), vec2(19.0, 8.0));
         let resp = ui.interact(rst.expand(4.0), ui.id().with("edit_rst"), Sense::click());
-        p.text(rst.center(), Align2::CENTER_CENTER, "RST", caps(em(10.0)), if resp.is_pointer_button_down_on() { ICON_DOWN } else { crate::ui_feel::hl(&resp, ICON, ICON_OVER) });
+        p.text(rst.center(), Align2::CENTER_CENTER, "RST", caps(em(10.0)), crate::ui_feel::face(&resp, ICON, ICON_OVER, ICON_DOWN));
         app.edit.map.rects.insert("zoom_rst".into(), rst);
         if resp.on_hover_text("Reset Zoom").clicked() {
             app.edit.queue.push(Cmd::ZoomReset);
@@ -964,9 +963,7 @@ fn pad(app: &mut App, ui: &mut Ui, r: Rect, name: &str, asset: &str, label: &str
             p.text(pos2(r.center().x, r.min.y + 52.5), Align2::CENTER_CENTER, label, rb(11.0), dim);
         }
     }
-    if enabled && resp.is_pointer_button_down_on() {
-        p.rect_filled(r, 0.0, Color32::from_black_alpha(140));
-    } else if let Some(c) = crate::ui_feel::hover_fill_if(&resp, enabled, Color32::from_white_alpha(26)) {
+    if let Some(c) = crate::ui_feel::overlay(&resp, enabled, Color32::from_white_alpha(26), Color32::from_black_alpha(140)) {
         p.rect_filled(r, 0.0, c);
     }
     app.edit.map.rects.insert(name.to_string(), r);
@@ -1104,7 +1101,7 @@ fn tool_panel(app: &mut App, ui: &mut Ui, r: Rect, glyph_y: f32) {
         let p = ui.painter().clone();
         p.rect_filled(add, 0.0, BAR);
         let can_add = can(app, &Cmd::AddToPalette);
-        let col = if !can_add { ICON.gamma_multiply(0.4) } else if resp.is_pointer_button_down_on() { ICON_DOWN } else { crate::ui_feel::hl(&resp, ICON, ICON_OVER) };
+        let col = if !can_add { ICON.gamma_multiply(0.4) } else { crate::ui_feel::face(&resp, ICON, ICON_OVER, ICON_DOWN) };
         let c = add.center();
         p.rect_filled(Rect::from_center_size(c, vec2(7.0, 1.0)), 0.0, col);
         p.rect_filled(Rect::from_center_size(c, vec2(1.0, 7.0)), 0.0, col);

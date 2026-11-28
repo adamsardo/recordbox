@@ -654,8 +654,9 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                     let rr = Rect::from_min_size(grid.min + vec2((k % 4) as f32 * 20.0, (k / 4) as f32 * 20.0), vec2(18.0, 18.0));
                     let r = ui.interact(rr, ui.id().with(("smp_col", idx, k)), Sense::click());
                     ui.painter().rect_filled(rr, 0.0, crate::sampler_ext::pad_color(*c));
-                    if *c == code || r.hovered() {
-                        ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0_f32, WHITE), egui::StrokeKind::Inside);
+                    let ca = if *c == code { 1.0 } else { crate::ui_feel::hover(&r) };
+                    if ca > 0.0 {
+                        ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0_f32, crate::motion::fade(WHITE.c(), ca)), egui::StrokeKind::Inside);
                     }
                     if r.clicked() {
                         app.sampler_set_color(idx, Some(*c));
@@ -696,9 +697,9 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 // Erase (30 x 14, `samplerSlot_btnErase`): the slot's notes leave the pattern.
                 let er = s_at(sw - 47.0, 23.0, 30.0, 14.0);
                 let eresp = ui.interact(er, ui.id().with(("smp_seq_erase", idx)), Sense::click());
-                let down = eresp.is_pointer_button_down_on();
-                p.rect_filled(er, 2.0, if down { hex(0x007DE1) } else { OFF.c() });
-                let (c, xc) = (er.center(), if down { WHITE } else { DIM });
+                let dn = crate::ui_feel::press(&eresp);
+                p.rect_filled(er, 2.0, crate::motion::mix(OFF.c(), hex(0x007DE1), dn));
+                let (c, xc) = (er.center(), crate::motion::mix(DIM.c(), WHITE.c(), dn));
                 p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], Stroke::new(1.4_f32, xc));
                 p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], Stroke::new(1.4_f32, xc));
                 if tip(eresp, app, "Erase button:\nErase Sampler sequence per Sampler Slot.").clicked() {
@@ -1130,15 +1131,19 @@ fn sequencer_strip(app: &mut App, ui: &mut Ui, so: Pos2, sv: &SeqView, sp: &mut 
     }
     let _ = tip(resp, app, "Sequence Slot:\nIndicates how sequence is saved:\n- Sequence name in white indicates the sequence is saved.\n- Gray out sequence name indicates the sequence is not saved.\n- Gray out sequence name with red circle indicates the sequence is temporarily recorded.\nUp to eight sequences can be saved.");
     // DELETE (`p13008_delete_1nrm.png`, 12 x 12) shows while the pointer is over the pattern.
-    if slot_hover && (saved_slot || sv.has_events || sv.dirty) && sv.reserved.is_none() {
+    let seq_del = slot_hover && (saved_slot || sv.has_events || sv.dirty) && sv.reserved.is_none();
+    let del_a = crate::ui_feel::appear(ui.id().with("feel_seqdel"), seq_del);
+    if del_a > 0.0 {
         let dr = q_at(185.0, 9.0, 12.0, 12.0);
-        let dresp = ui.interact(dr, ui.id().with("seq_delete"), Sense::click());
-        let col = crate::ui_feel::hl(&dresp, gy(0xA0A0A0), WHITE.c());
+        let dresp = seq_del.then(|| ui.interact(dr, ui.id().with("seq_delete"), Sense::click()));
+        let col = crate::motion::fade(dresp.as_ref().map_or(gy(0xA0A0A0), |d| crate::ui_feel::hl(d, gy(0xA0A0A0), WHITE.c())), del_a);
         let c = dr.center();
         p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], Stroke::new(1.3_f32, col));
         p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], Stroke::new(1.3_f32, col));
-        if tip(dresp, app, "Delete selected sequence").clicked() {
-            app.sampler_seq_delete(sv.cur);
+        if let Some(dresp) = dresp {
+            if tip(dresp, app, "Delete selected sequence").clicked() {
+                app.sampler_seq_delete(sv.cur);
+            }
         }
     }
 

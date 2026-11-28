@@ -354,7 +354,7 @@ fn button(ui: &mut egui::Ui, r: Rect, id: &str, label: &str, enabled: bool) -> b
     mark(id.to_string(), r);
     let p = ui.painter();
     p.rect_filled(r, 2.0, gy(0x141414));
-    p.rect_filled(r.shrink(1.0), 1.5, if enabled && resp.is_pointer_button_down_on() { gy(0x2E2E2E) } else if enabled && resp.hovered() { gy(0x4A4A4A) } else { gy(0x3C3C3C) });
+    p.rect_filled(r.shrink(1.0), 1.5, crate::ui_feel::face_if(&resp, enabled, gy(0x3C3C3C), gy(0x4A4A4A), gy(0x2E2E2E)));
     p.text(r.center(), Align2::CENTER_CENTER, label, rb(13.0), if enabled { gy(0xC8C8C8) } else { gy(0x787878) });
     resp.clicked()
 }

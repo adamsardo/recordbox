@@ -248,8 +248,9 @@ pub fn player_panel(app: &mut App, ui: &mut Ui) {
     let art = Rect::from_min_size(pos2(sx(main, 95.0), my + 11.0), vec2(48.0, 48.0));
     match &track {
         Some(t) => {
-            if let Some(tex) = crate::ui_browser::artwork_texture(app, &t.artwork) {
-                p.image(tex.id(), fit_rect(art, tex.size_vec2()), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            // (The cover is decoded off the frame and fades in: decoding it here took 6-7 ms.)
+            if let Some(tex) = crate::ui_feel::list_artwork(app, &t.artwork) {
+                p.image(tex.id(), fit_rect(art, tex.size_vec2()), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), crate::ui_feel::art_tint(&t.artwork));
             } else {
                 p.rect_filled(art, 0.0, gy(0x141414));
                 draw_note_icon(&p, art);
@@ -983,9 +984,10 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
                 // Clear: a small cross in the pad's corner while the pointer is over the pad.
                 let xr = Rect::from_center_size(pos2(r.max.x - 4.5, r.min.y + 4.5), vec2(10.0, 10.0));
                 let xresp = ui.interact(xr, ui.id().with(("padclr", slot)), Sense::click());
-                if ui.rect_contains_pointer(r.expand(2.0)) {
-                    p.rect_filled(xr, 2.0, crate::ui_feel::hl(&xresp, gy(0x323232), gy(0x505050)));
-                    close_cross(&p, xr.center(), 5.0, WHITE.c());
+                let xa = crate::ui_feel::hover_rect(ui, xresp.id, r.expand(2.0), true);
+                if xa > 0.0 {
+                    p.rect_filled(xr, 2.0, crate::motion::fade(crate::ui_feel::hl(&xresp, gy(0x323232), gy(0x505050)), xa));
+                    close_cross(&p, xr.center(), 5.0, crate::motion::fade(WHITE.c(), xa));
                 }
                 if tip(xresp, app, &format!("Clear Hot Cue(Loop) {letter}")).clicked() {
                     app.delete_cue(c.id);
@@ -1032,8 +1034,9 @@ fn control_strip(app: &mut App, ui: &mut Ui, s: Rect, main: Rect) {
             let dr = Rect::from_min_max(pos2(field.max.x - 14.0, field.min.y), field.max);
             let dresp = tip(ui.interact(dr, ui.id().with("lsize"), Sense::click()), app, "Beat Loop");
             // rekordbox shows no arrow in the field: ours appears only under the pointer.
-            if ui.rect_contains_pointer(field) {
-                crate::icons_player::chevron_down(&p, dr.center(), 0.9, crate::ui_feel::hl(&dresp, DIM.c(), WHITE.c()));
+            let fa = crate::ui_feel::hover_rect(ui, dresp.id, field, true);
+            if fa > 0.0 {
+                crate::icons_player::chevron_down(&p, dr.center(), 0.9, crate::motion::fade(crate::ui_feel::hl(&dresp, DIM.c(), WHITE.c()), fa));
             }
             crate::ui_browser::dropdown(ui, &dresp, "lsizepop", |ui: &mut Ui| crate::ui_player2::loop_size_menu(app, ui));
             if tip(icon_button(ui, at(1046.0, 20.0), "ldouble", Some(BTN.c()), |p, r, c| crate::icons_player::chevron_right(p, r.center(), 1.25, c)), app, "Auto Beat Loop:\nMake Loop length longer.").clicked() {
@@ -1452,6 +1455,7 @@ pub(crate) fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     }
     // Colour: the track's colour and its name; the choices appear under the pointer.
     let crow = Rect::from_min_max(pos2(x0, y0 + 32.0), pos2(sheet.max.x, y0 + 62.0));
+    crate::ui_feel::swap_veil(ui.id().with("feel_infocol"), ui.rect_contains_pointer(crow), crow, gy(0x0F0F0F));
     if ui.rect_contains_pointer(crow) {
         for i in 0..9u8 {
             let rr = Rect::from_min_size(pos2(x0 + 10.0 + i as f32 * 18.0, y0 + 40.0), vec2(14.0, 14.0));
@@ -1486,9 +1490,10 @@ pub(crate) fn info_panel(app: &mut App, ui: &mut Ui, r: Rect) {
     if !tags.is_empty() {
         p.with_clip_rect(sheet).text(pos2(x0 + 10.0, y0 + 126.0), Align2::LEFT_CENTER, tags, FontId::proportional(10.5), DIM2.c());
     }
-    if ui.rect_contains_pointer(sheet) {
+    let fmt_a = crate::ui_feel::hover_rect(ui, ui.id().with("feel_infofmt"), sheet, true);
+    if fmt_a > 0.0 {
         // The file's format, shown while the pointer is over the panel.
-        p.text(pos2(x0 + 10.0, r.max.y - 12.0), Align2::LEFT_CENTER, format!("{} · {} kbps · {} Hz", t.file_type.to_uppercase(), t.bitrate, t.sample_rate), FontId::proportional(10.0), OFF.c());
+        p.text(pos2(x0 + 10.0, r.max.y - 12.0), Align2::LEFT_CENTER, format!("{} · {} kbps · {} Hz", t.file_type.to_uppercase(), t.bitrate, t.sample_rate), FontId::proportional(10.0), crate::motion::fade(OFF.c(), fmt_a));
     }
 }
 

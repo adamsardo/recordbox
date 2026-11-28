@@ -518,10 +518,9 @@ fn sort_rows(w: &mut Win, col: usize) {
 fn text_button(ui: &mut Ui, r: Rect, id: &str, label: &str, on: bool, enabled: bool, join: (bool, bool)) -> egui::Response {
     let resp = ui.interact(r, ui.id().with(id), if enabled { Sense::click() } else { Sense::hover() });
     let mut bg = if on { BTN_ON.c() } else { BTN_BG.c() };
-    if enabled && resp.is_pointer_button_down_on() {
-        bg = mix(bg, 0.2);
-    } else if enabled && resp.hovered() {
-        bg = mix(bg, 0.05);
+    let (hv, dn) = (crate::ui_feel::hover_if(&resp, enabled), crate::ui_feel::press_if(&resp, enabled));
+    if hv > 0.0 || dn > 0.0 {
+        bg = mix(bg, 0.05 * hv + (0.2 - 0.05 * hv) * dn);
     }
     let a = if enabled { 1.0 } else { 0.5 };
     let cr = |sq: bool| if sq { 0 } else { 6 };
@@ -589,8 +588,8 @@ fn menu_style(ui: &mut Ui) {
 
 fn menu_item(ui: &mut Ui, label: &str, sub: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(140.0), 22.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(r, 0.0, MENU_HI);
+    if let Some(c) = crate::ui_feel::hover_fill(&resp, MENU_HI) {
+        ui.painter().rect_filled(r, 0.0, c);
     }
     ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, label, jf(15.0), TEXT.c());
     if sub {
@@ -634,10 +633,11 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
         let cb = Rect::from_center_size(pos2(title.min.x + 14.0, title.center().y), vec2(12.0, 12.0));
         let cresp = ui.interact(cb.expand(3.0), ui.id().with("close"), Sense::click());
         p.circle_filled(cb.center(), 6.0, hex(0xFF5F57));
-        if cresp.hovered() {
+        let ch = crate::ui_feel::hover(&cresp);
+        if ch > 0.0 {
             let c = cb.center();
-            p.line_segment([c + vec2(-2.5, -2.5), c + vec2(2.5, 2.5)], Stroke::new(1.2_f32, hex(0x4D0000)));
-            p.line_segment([c + vec2(-2.5, 2.5), c + vec2(2.5, -2.5)], Stroke::new(1.2_f32, hex(0x4D0000)));
+            p.line_segment([c + vec2(-2.5, -2.5), c + vec2(2.5, 2.5)], Stroke::new(1.2_f32, crate::motion::fade(hex(0x4D0000), ch)));
+            p.line_segment([c + vec2(-2.5, 2.5), c + vec2(2.5, -2.5)], Stroke::new(1.2_f32, crate::motion::fade(hex(0x4D0000), ch)));
         }
         app.midi.win.at.insert("close".into(), cb.center());
         if cresp.clicked() && !modal {
@@ -716,7 +716,7 @@ fn content(app: &mut App, ui: &mut Ui, o: Pos2, live: bool) {
             m.add_triangle(0, 2, 3);
             p.add(egui::Shape::mesh(m));
         }
-        p.text(r.center(), Align2::CENTER_CENTER, name, jf(15.0), WHITE.c().gamma_multiply(if resp.hovered() { 1.0 } else { 0.8 }));
+        p.text(r.center(), Align2::CENTER_CENTER, name, jf(15.0), WHITE.c().gamma_multiply(0.8 + 0.2 * crate::ui_feel::hover(&resp)));
         app.midi.win.at.insert(format!("tab:{name}"), r.center());
         if resp.clicked() {
             app.midi.win.tab = *ti;

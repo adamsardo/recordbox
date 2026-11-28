@@ -131,11 +131,12 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 fn pad_body(ui: &mut Ui, p: &Painter, r: Rect, clip: Rect, id: egui::Id, look: Look, enabled: bool) -> egui::Response {
     let hit = r.intersect(clip);
     let resp = ui.interact(if hit.is_positive() { hit } else { Rect::NOTHING }, id, Sense::click());
-    let down = resp.is_pointer_button_down_on() && enabled;
     let mut fill = look.fill;
     fill = crate::ui_feel::hl_if(&resp, enabled, fill, blend(fill, Color32::WHITE, 0.1));
-    if down {
-        fill = blend(BG2.c(), fill, 0.7);
+    // (recordbox: the press shows on its frame and lets go softly.)
+    let dn = crate::ui_feel::press_if(&resp, enabled);
+    if dn > 0.0 {
+        fill = crate::motion::mix(fill, blend(BG2.c(), fill, 0.7), dn);
     }
     p.rect_filled(r, look.radius, fill);
     if let Some(c) = look.outline {
@@ -512,16 +513,13 @@ fn jump_cell(app: &mut App, ui: &mut Ui, p: &Painter, r: Rect, clip: Rect, n: u8
         let id = (cell * 2) as u8 + dir;
         let br = Rect::from_min_size(pos2(r.min.x + dir as f32 * (half + 2.0), r.min.y), vec2(half, r.height()));
         let resp = pad_body(ui, p, br, clip, ui.id().with(("bjpad", id)), Look::pad(loaded, false), loaded);
-        let held = resp.is_pointer_button_down_on() && loaded;
         // (`beatjump_*_a.svg` red, `_b` orange while a loop runs, `_on` blue while pressed.)
         let col = if !loaded {
             PAD_OFF.c()
-        } else if held || down_now == Some(id) {
+        } else if down_now == Some(id) {
             hex(0x0178D7)
-        } else if looping {
-            hex(0xE0641B)
         } else {
-            hex(0xE62828)
+            crate::motion::mix(if looping { hex(0xE0641B) } else { hex(0xE62828) }, hex(0x0178D7), crate::ui_feel::press_if(&resp, loaded))
         };
         triangle(p, pos2(br.min.x + (r.width() / 4.0).floor(), br.center().y), 6.4, 7.2, dir == 0, col);
         if press_fired(ui, &resp) && loaded {

@@ -570,8 +570,8 @@ pub(crate) fn artwork(app: &mut App, ui: &mut Ui, art: Rect, track: &Option<Trac
     let p = ui.painter().clone();
     match track {
         Some(t) => {
-            if let Some(tex) = crate::ui_browser::artwork_texture(app, &t.artwork) {
-                p.image(tex.id(), crate::ui_player::fit_rect(art, tex.size_vec2()), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            if let Some(tex) = crate::ui_feel::list_artwork(app, &t.artwork) {
+                p.image(tex.id(), crate::ui_player::fit_rect(art, tex.size_vec2()), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), crate::ui_feel::art_tint(&t.artwork));
             } else {
                 p.rect_filled(art, 0.0, gy(0x141414));
                 draw_note_icon(&p.with_clip_rect(art), art);
@@ -695,7 +695,7 @@ pub fn two_players(app: &mut App, ui: &mut Ui) {
 /// A raised 17 pt tall button of the deck rows with a caps label; `lit`: blue (on).
 fn row_button(ui: &mut Ui, r: Rect, id: &str, label: &str, lit: bool, enabled: bool) -> egui::Response {
     let resp = ui.interact(r, ui.id().with(id), Sense::click());
-    let fill = if lit { BLUE.c() } else if resp.is_pointer_button_down_on() { BG2.c() } else { crate::ui_feel::hl(&resp, BTN.c(), lighten(BTN.c())) };
+    let fill = if lit { BLUE.c() } else { crate::ui_feel::face(&resp, BTN.c(), lighten(BTN.c()), BG2.c()) };
     ui.painter().rect_filled(r, 2.0, fill);
     ui.painter().text(r.center(), Align2::CENTER_CENTER, label, caps(8.8), if enabled { WHITE.c() } else { OFF.c() });
     resp
@@ -709,7 +709,7 @@ fn row_icon(ui: &mut Ui, r: Rect, id: &str, draw: impl FnOnce(&Painter, Pos2, Co
 /// `row_icon`; with `enabled` false the tile lies flat in the row (an empty deck).
 fn row_icon_on(ui: &mut Ui, r: Rect, id: &str, enabled: bool, draw: impl FnOnce(&Painter, Pos2, Color32, bool)) -> egui::Response {
     let resp = ui.interact(r, ui.id().with(id), Sense::click());
-    let fill = if !enabled { gy(0x212121) } else if resp.is_pointer_button_down_on() { BG2.c() } else { crate::ui_feel::hl(&resp, BTN.c(), lighten(BTN.c())) };
+    let fill = if !enabled { gy(0x212121) } else { crate::ui_feel::face(&resp, BTN.c(), lighten(BTN.c()), BG2.c()) };
     ui.painter().rect_filled(r, 2.0, fill);
     draw(ui.painter(), r.center(), WHITE.c(), resp.is_pointer_button_down_on());
     resp
@@ -953,8 +953,9 @@ fn deck_rows(app: &mut App, ui: &mut Ui, g: &TwoGeom, rows: &DeckRows, n: u8, is
         }
         let dr = Rect::from_min_max(pos2(field.max.x - 14.0, field.min.y), field.max);
         let dresp = tip(ui.interact(dr, ui.id().with("lsize"), Sense::click()), app, "Beat Loop");
-        if ui.rect_contains_pointer(field) {
-            crate::icons_player::chevron_down(&p, dr.center(), 0.9, crate::ui_feel::hl(&dresp, DIM.c(), WHITE.c()));
+        let fa = crate::ui_feel::hover_rect(ui, dresp.id, field, true);
+        if fa > 0.0 {
+            crate::icons_player::chevron_down(&p, dr.center(), 0.9, crate::motion::fade(crate::ui_feel::hl(&dresp, DIM.c(), WHITE.c()), fa));
         }
         crate::ui_browser::dropdown(ui, &dresp, "lsizepop", |ui: &mut Ui| loop_size_menu(app, ui));
         if tip(row_icon(ui, b(429.0, 20.0), "ldouble", |p, c, col, _| crate::icons_player::chevron_right(p, c, 1.25, col)), app, "Auto Beat Loop:\nMake Loop length longer.").clicked() {
@@ -1108,8 +1109,8 @@ fn shared_controls(app: &mut App, ui: &mut Ui, g: &TwoGeom) {
     if g.dual {
         let c = pos2(l + 35.0, t + 188.0);
         let resp = ui.interact(Rect::from_center_size(c, vec2(30.0, 26.0)), ui.id().with("dualctl"), Sense::click());
-        if resp.hovered() {
-            p.rect_filled(resp.rect, 2.0, gy(0x2A2A2A));
+        if let Some(c) = crate::ui_feel::hover_fill(&resp, gy(0x2A2A2A)) {
+            p.rect_filled(resp.rect, 2.0, c);
         }
         crate::icons_player::dual_control(&p, c, app.px.dual_control);
         if tip(resp, app, "Dual control:\nBeat jumps move both decks together.").clicked() {

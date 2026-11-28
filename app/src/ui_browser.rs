@@ -155,8 +155,8 @@ pub fn header_bar(app: &mut App, ui: &mut Ui) {
     // Layout selector: an 18 × 9 frame at x 136–154, y 9.5–18.5.
     let lay_r = Rect::from_min_max(pos2(r.min.x + 130.0, r.min.y + 3.0), pos2(r.min.x + 180.0, r.max.y - 3.0));
     let lay = ui.interact(lay_r, ui.id().with("layout"), Sense::click());
-    if lay.hovered() {
-        p.rect_filled(lay_r, 2.0, gy(0x1E1E1E));
+    if let Some(c) = crate::ui_feel::hover_fill(&lay, gy(0x1E1E1E)) {
+        p.rect_filled(lay_r, 2.0, c);
     }
     crate::icons_player::layout_mark(&p, pos2(r.min.x + 145.0, r.min.y + 14.0), app.player_layout(), WHITE.c());
     ip(&p, pos2(r.min.x + 170.75, r.min.y + 14.5), 1.0, WHITE.c());
@@ -342,7 +342,7 @@ pub fn footer(app: &mut App, ui: &mut Ui) {
     let (n, secs, bytes) = if let View::Device { .. } = app.view {
         (0usize, 0.0, 0u64)
     } else {
-        app.list.iter().filter_map(|id| app.track(*id)).fold((0, 0.0, 0u64), |(n, s, b), t| (n + 1, s + t.duration, b + t.file_size))
+        crate::ui_feel::list_totals(app)
     };
     let h = (secs / 3600.0).floor();
     let m = ((secs - h * 3600.0) / 60.0).floor();
@@ -675,7 +675,7 @@ fn icon_strip(app: &mut App, ui: &mut Ui, r: Rect) {
             p.rect_stroke(rr, 1.5, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
             hi.c()
         } else {
-            src::tile(p, rr, false, resp.hovered(), *tile != Tile::Off, BG2.c())
+            src::tile_t(p, rr, false, crate::ui_feel::hover(&resp), *tile != Tile::Off, BG2.c())
         };
         let col = if *tile == Tile::Off { gy(0x4A4A4A) } else { WHITE.c() };
         // iTunes is rekordbox's own colour logo (the 18 pt PNG of skins/MediaSelect, which the
@@ -806,11 +806,14 @@ pub(crate) fn tree_row(ui: &mut Ui, depth: usize, text: &str, count: Option<usiz
     use crate::icons_src as src;
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), pitch), Sense::click_and_drag());
     let p = ui.painter();
-    let bg = if selected { ROW_SEL.c() } else { crate::ui_feel::hl(&resp, BG2.c(), gy(0x262626)) };
+    let bg = crate::ui_feel::sel_col(resp.id, selected, crate::ui_feel::hl(&resp, crate::ui_feel::outside(BG2), gy(0x262626)), ROW_SEL.c());
     // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
     let _sel_dark = crate::theme::dark_scope(selected);
     if selected || bg != BG2.c() {
         p.rect_filled(rr, 0.0, bg);
+    }
+    if selected {
+        crate::ui_feel::focus_row(ui, rr, true);
     }
     let d = depth as f32 * 20.0;
     let cy = rr.center().y;
@@ -854,10 +857,13 @@ fn collection_row(ui: &mut Ui, text: &str, arrow: Option<bool>, indent: f32, cou
     let bar = Rect::from_min_max(pos2(rr.min.x + 1.0, rr.min.y), pos2(rr.max.x - 1.0, rr.max.y));
     // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
     let _sel_dark = crate::theme::dark_scope(selected);
+    let hov = crate::ui_feel::hover_fill_if(&resp, !selected, gy(0x262626)).unwrap_or(Color32::TRANSPARENT);
+    let fill = crate::ui_feel::sel_col(resp.id, selected, hov, ROW_SEL.c());
+    if fill.a() > 0 {
+        p.rect_filled(bar, 0.0, fill);
+    }
     if selected {
-        p.rect_filled(bar, 0.0, ROW_SEL);
-    } else if let Some(c) = crate::ui_feel::hover_fill(&resp, gy(0x262626)) {
-        p.rect_filled(bar, 0.0, c);
+        crate::ui_feel::focus_row(ui, bar, true);
     }
     if let Some(open) = arrow {
         crate::icons_src::tree_arrow(p, pos2(rr.min.x + 9.0 + indent, rr.center().y), open, WHITE.c());
@@ -1568,7 +1574,7 @@ fn device_list(app: &mut App, ui: &mut Ui, root: &str, node: Option<u32>, histor
             let selected = app.device_ui.sel.contains(&t.id);
             // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
             let _sel_dark = crate::theme::dark_scope(selected);
-            ui.painter().rect_filled(rr, 0.0, if selected { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 });
+            ui.painter().rect_filled(rr, 0.0, crate::ui_feel::sel_col(egui::Id::new(("feel_dsel", t.id)), selected, crate::ui_feel::outside(if i % 2 == 0 { BG1 } else { BG2 }), ROW_SEL.c()));
             let r3 = root.to_string();
             row.context_menu(|ui| {
                 let ids: Vec<u32> = app.device_ui.sel.iter().copied().collect();
@@ -1973,8 +1979,11 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                 // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
                 let _sel_dark = crate::theme::dark_scope(sel);
                 let loaded = app.deck.track == Some(id);
-                let bg = crate::ui_feel::row_bg(ui, egui::Id::new(("feel_row", id)), rr, sel, (if i % 2 == 0 { BG1 } else { BG2 }).c(), ROW_SEL.c());
+                let bg = crate::ui_feel::row_bg(ui, egui::Id::new(("feel_row", id)), rr, sel, crate::ui_feel::outside(if i % 2 == 0 { BG1 } else { BG2 }), ROW_SEL.c());
                 ui.painter().rect_filled(rr, 0.0, bg);
+                if app.anchor == Some(i) {
+                    crate::ui_feel::focus_row(ui, rr, false);
+                }
                 if loaded && !sel {
                     ui.painter().rect_stroke(rr, 0.0, Stroke::new(1.0, hex(0x27567A)), egui::StrokeKind::Inside);
                 }
@@ -2013,15 +2022,17 @@ pub(crate) fn track_list(app: &mut App, ui: &mut Ui) {
                 // Quick preview button in the Artwork cell ("Preview : Play/Stop"), shown while the
                 // pointer is over the cell or this track is previewing.
                 let previewing = app.preview_status().map(|s| s.0) == Some(id);
-                let art_btn = cell_of(app, Col::Artwork).filter(|cr| previewing || ui.rect_contains_pointer(*cr)).map(|cr| Rect::from_center_size(pos2(cr.min.x + 10.0, cr.center().y), vec2(13.0, 13.0)));
+                let art_a = cell_of(app, Col::Artwork).map_or(0.0, |cr| crate::ui_feel::appear(egui::Id::new(("feel_art_btn", id)), previewing || ui.rect_contains_pointer(cr)));
+                let art_btn = cell_of(app, Col::Artwork).filter(|_| art_a > 0.0).map(|cr| Rect::from_center_size(pos2(cr.min.x + 10.0, cr.center().y), vec2(13.0, 13.0)));
                 if let Some(b) = art_btn {
                     let pp = ui.painter();
-                    pp.circle_filled(b.center(), 6.5, Color32::from_black_alpha(190));
-                    pp.circle_stroke(b.center(), 5.8, Stroke::new(1.0, WHITE));
+                    let aw = crate::motion::fade(WHITE.c(), art_a);
+                    pp.circle_filled(b.center(), 6.5, crate::motion::fade(Color32::from_black_alpha(190), art_a));
+                    pp.circle_stroke(b.center(), 5.8, Stroke::new(1.0, aw));
                     if previewing {
-                        pp.rect_filled(Rect::from_center_size(b.center(), vec2(4.2, 4.2)), 0.0, WHITE);
+                        pp.rect_filled(Rect::from_center_size(b.center(), vec2(4.2, 4.2)), 0.0, aw);
                     } else {
-                        pp.add(egui::Shape::convex_polygon(vec![b.center() + vec2(-1.8, -3.0), b.center() + vec2(3.2, 0.0), b.center() + vec2(-1.8, 3.0)], WHITE, Stroke::NONE));
+                        pp.add(egui::Shape::convex_polygon(vec![b.center() + vec2(-1.8, -3.0), b.center() + vec2(3.2, 0.0), b.center() + vec2(-1.8, 3.0)], aw, Stroke::NONE));
                     }
                     if app.prefs.tooltips && ui.rect_contains_pointer(b) {
                         ui.interact(b, ui.id().with(("pv_tip", i)), Sense::hover()).on_hover_text("Preview : Play/Stop");

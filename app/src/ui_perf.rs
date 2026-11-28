@@ -835,8 +835,9 @@ pub(crate) fn platter_panel(app: &mut App, ui: &mut Ui, o: Pos2, n: u8, is_activ
             app.tempo_step(1);
         }
         let rs = ui.interact(reset, ui.id().with("treset"), Sense::click());
-        if rs.hovered() {
-            p.text(pos2(reset.center().x, reset.max.y + 6.0), Align2::CENTER_CENTER, "RESET", caps(7.0), WHITE.c());
+        let ra = crate::ui_feel::hover(&rs);
+        if ra > 0.0 {
+            p.text(pos2(reset.center().x, reset.max.y + 6.0), Align2::CENTER_CENTER, "RESET", caps(7.0), crate::motion::fade(WHITE.c(), ra));
         }
         if tip(rs, app, "Tempo Reset").clicked() {
             app.tempo_reset();

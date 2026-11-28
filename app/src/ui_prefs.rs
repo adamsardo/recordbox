@@ -415,6 +415,7 @@ pub fn prefs_window(app: &mut App, ctx: &Context) {
             let h = ui.available_height();
             prefs_body(app, ui, h)
         });
+        crate::ui_feel::viewport_end(vctx);
         if vctx.input(|i| i.viewport().close_requested()) {
             app.dialogs.prefs_open = false;
         }
@@ -519,12 +520,12 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
         }
         let sel = app.dialogs.prefs_tab == *i && app.dialogs.ext.prefs_search.trim().is_empty();
         let resp = ui.interact(r, ui.id().with(("prefs_page", *i)), egui::Sense::click());
-        let bg = if sel { PBLUE } else { crate::ui_feel::hl(&resp, BG2.c(), gy(0x2A2A2A)) };
+        let bg = crate::motion::mix(crate::ui_feel::hl(&resp, BG2.c(), gy(0x2A2A2A)), PBLUE.into(), crate::ui_feel::sel_amt(resp.id, sel));
         if bg != BG2 {
             ui.painter().rect_filled(r, 0.0, bg);
         }
         crate::ui_prefs_keys::side_icon(ui, r.min, *i, sel, false);
-        crate::prefs_font::draw(ui, Rect::from_min_size(pos2(r.min.x + 40.0, r.min.y), vec2(104.0, 30.0)), name, 15.0, false, if sel { ON_ACCENT.c() } else { PREF_CAT.c() }, kit::Just::Left);
+        crate::prefs_font::draw(ui, Rect::from_min_size(pos2(r.min.x + 40.0, r.min.y), vec2(104.0, 30.0)), name, 15.0, false, crate::ui_feel::sel_col(resp.id, sel, PREF_CAT.c(), ON_ACCENT.c()), kit::Just::Left);
         crate::ui_prefs_item::tab_seen(name, r);
         if resp.clicked() {
             app.dialogs.prefs_tab = *i;
@@ -553,8 +554,8 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
         }
         let r = Rect::from_min_size(at(x, 4.0), vec2(w, 30.0));
         let resp = ui.interact(r, ui.id().with(("prefs_tab", page, i)), egui::Sense::click());
-        ui.painter().rect_filled(r, 0.0, if sel { PBLUE } else { crate::ui_feel::hl_if(&resp, out.is_none(), BG2.c(), gy(0x2A2A2A)) });
-        crate::prefs_font::draw(ui, r, t, 14.0, false, if sel { ON_ACCENT.c() } else if out.is_some() { OFF.c() } else { PREF_CAT.c() }, kit::Just::Centre);
+        ui.painter().rect_filled(r, 0.0, crate::motion::mix(crate::ui_feel::hl_if(&resp, out.is_none(), BG2.c(), gy(0x2A2A2A)), PBLUE.into(), crate::ui_feel::sel_amt(resp.id, sel)));
+        crate::prefs_font::draw(ui, r, t, 14.0, false, crate::ui_feel::sel_col(resp.id, sel, if out.is_some() { OFF.c() } else { PREF_CAT.c() }, ON_ACCENT.c()), kit::Just::Centre);
         crate::ui_prefs_item::tab_seen(t, r);
         if let Some(why) = out {
             resp.on_hover_text(why);
@@ -609,6 +610,7 @@ fn prefs_body(app: &mut App, ui: &mut Ui, height: f32) {
             }
         }
     });
+    crate::ui_feel::page_veil(ui, egui::Id::new("prefs_page_veil"), (page as u64) << 16 | (sub_tab as u64) << 1 | searching as u64, area, BG.c());
     if format!("{:?}", app.prefs) != before {
         app.save_prefs();
     }

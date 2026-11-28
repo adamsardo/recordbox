@@ -38,6 +38,10 @@ struct Strip {
 struct Stats {
     last: Option<std::time::Instant>,
     intervals: Vec<f32>,
+    /// Per interval: the previous frame's CPU time (eframe's, without the swap).
+    cpu: Vec<f32>,
+    /// Per frame: the display refresh it started in and how far into it (s), the period.
+    refresh: Vec<(u64, f64, f64)>,
     /// Per frame while a deck plays: (drawn position step, real position step) in seconds.
     steps: Vec<(f64, f64)>,
     last_pos: Option<(f64, f64)>,
@@ -112,6 +116,10 @@ pub fn frame_start(app: &mut App, ctx: &egui::Context) {
         if let Some(l) = st.last {
             if inside {
                 st.intervals.push(now.duration_since(l).as_secs_f32() * 1000.0);
+                st.cpu.push(motion::last_cpu_ms());
+                if let Some(r) = motion::frame_refresh() {
+                    st.refresh.push(r);
+                }
             }
         }
         st.last = Some(now);
@@ -135,6 +143,13 @@ pub fn frame_end(app: &mut App, ctx: &egui::Context) {
                 }
             }
             st.last_pos = Some((shown, real));
+        }
+    }
+    if let Some(s) = scenario().filter(|s| matches!(*s, "wavedrag" | "wavescroll")) {
+        if (T0..T0 + span(s)).contains(&frame) {
+            let shown = crate::ui_feel::shown_pos(app);
+            let ask = WAVE.with(|w| w.get()).zip(WAVE_X.with(|w| w.get())).map(|((r, _, pps), x)| (x - r.center().x) as f64 / pps);
+            eprintln!("feeltest: {s} frame {} t {:.4} drawn {:.4} real {:.4} pointer-offset-s {}", frame - T0, ctx.input(|i| i.time), shown, app.pos(), ask.map_or("-".into(), |a| format!("{a:.4}")));
         }
     }
     let b = bench();
@@ -179,7 +194,38 @@ fn report_stats(app: &App) {
         }
         lo = *e;
     }
+    let pn = &crate::ui_feel::PASS_NS;
+    eprintln!("bench: egui widget frames eased {}; widget pass mean {:.1} us, longest {:.1} us over {} frames", crate::ui_feel::EASED_FRAMES.load(Relaxed), pn[0].load(Relaxed) as f64 / 1000.0 / pn[1].load(Relaxed).max(1) as f64, pn[2].load(Relaxed) as f64 / 1000.0, pn[1].load(Relaxed));
     eprintln!("bench: frame intervals {} frames, median {med:.2} ms, p95 {:.2}, max {:.2}, longer than 1.5x median {long}, motion {} (still moving last frame {});{hist}", v.len(), v[v.len() * 95 / 100], v[v.len() - 1], motion::level().name(), motion::last_active());
+    if !st.cpu.is_empty() {
+        let mut c = st.cpu.clone();
+        c.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let wait: Vec<f32> = st.intervals.iter().zip(&st.cpu).map(|(i, c)| (i - c).max(0.0)).collect();
+        let mut w = wait.clone();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |v: &Vec<f32>, q: usize| v[(v.len() * q / 100).min(v.len() - 1)];
+        eprintln!("bench: frame CPU (eframe, no swap) median {:.2} ms p95 {:.2} max {:.2}; outside it (swap + event loop) median {:.2} p5 {:.2} p95 {:.2}", pct(&c, 50), pct(&c, 95), c[c.len() - 1], pct(&w, 50), pct(&w, 5), pct(&w, 95));
+        // The intervals in order (first 40), to see the rhythm.
+        let seq: Vec<String> = st.intervals.iter().take(40).map(|x| format!("{x:.1}")).collect();
+        eprintln!("bench: interval sequence {}", seq.join(" "));
+    }
+    // Presented frames, estimated from the display link: frame i started in refresh t_i, phase
+    // p_i into it, and took c_i of CPU (eframe's, reported with the next frame); it is shown at
+    // the first refresh after it is done: t_i + 1 + floor((p_i + c_i) / period). Steps between
+    // shown frames: 1 = a new picture every refresh; 0 = two frames for one refresh (one never
+    // seen); 2+ = a refresh showed the old picture again.
+    if st.refresh.len() > 10 && st.cpu.len() >= st.refresh.len() {
+        let shown: Vec<u64> = st.refresh.iter().enumerate().filter_map(|(i, (t, p, per))| {
+            let c = *st.cpu.get(i + 1)? as f64 / 1000.0;
+            (*per > 0.0).then(|| t + 1 + ((p + c) / per).floor() as u64)
+        }).collect();
+        let mut h = [0usize; 4];
+        for w in shown.windows(2) {
+            h[(w[1].saturating_sub(w[0]) as usize).min(3)] += 1;
+        }
+        let per = st.refresh[0].2 * 1000.0;
+        eprintln!("bench: presented (estimated from the display link, period {per:.2} ms): steps between shown frames: 0 refreshes {} | 1 refresh {} | 2 refreshes {} | 3+ {}", h[0], h[1], h[2], h[3]);
+    }
     if st.steps.len() > 10 {
         let stat = |f: &dyn Fn(&(f64, f64)) -> f64| {
             let xs: Vec<f64> = st.steps.iter().map(f).collect();
@@ -292,6 +338,16 @@ fn list_offset(app: &App) -> f32 {
 
 thread_local! {
     static LIST_OFF: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// The enlarged waveform when a wave scenario starts: its rect, the position, pixels per s.
+    static WAVE: std::cell::Cell<Option<(egui::Rect, f64, f64)>> = const { std::cell::Cell::new(None) };
+    /// The pointer's x the wave drag asked for this frame.
+    static WAVE_X: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The x of the wave drag at scenario frame `f` (a press at the centre, then back and forth).
+fn wave_x(c: f32, f: u32) -> f32 {
+    let k = f.saturating_sub(10) as f32;
+    c + 160.0 * (k * std::f32::consts::TAU / 120.0).sin()
 }
 
 /// The track list reports its scroll offset (ui_browser.rs) for the scroll scenarios.
@@ -313,8 +369,13 @@ fn scenario_state(app: &mut App, s: &str, frame: u32) {
             // The histogram covers the interaction only.
             st.window = Some((T0, T0 + span(s)));
             st.intervals.clear();
+            st.cpu.clear();
+            st.refresh.clear();
             st.steps.clear();
         }
+    }
+    if frame == T0 && matches!(s, "wavedrag" | "wavescroll") {
+        WAVE.with(|w| w.set(app.deck.detail_map.map(|(r, _, pps)| (r, app.pos(), pps))));
     }
     if (T0..T0 + span(s)).contains(&frame) && matches!(s, "scroll" | "wheel" | "keys") {
         eprintln!("feeltest: {s} frame {} list offset {:.2} selected {:?}", frame - T0, list_offset(app), app.anchor);
@@ -326,7 +387,8 @@ fn span(s: &str) -> u32 {
         "scroll" | "wheel" => 120,
         "keys" => 140,
         "play" => 600,
-        "drag" | "refuse" => 80,
+        "drag" | "refuse" | "menu" => 80,
+        "wavedrag" | "wavescroll" => 240,
         _ => 60,
     }
 }
@@ -431,6 +493,74 @@ fn scenario_events(app: &mut App, s: &str, frame: u32, raw: &mut egui::RawInput)
                 50 => click(raw, b, false),
                 52 => eprintln!("feeltest: {s} released over {:?}: drag {:?}", b, app.drag.as_ref().map(|d| d.len())),
                 _ => {}
+            }
+        }
+        // Right-click at `PREPDECK_FEEL_AT` (a track row: its context menu), then the pointer
+        // goes down the menu one item at a time and leaves it.
+        "menu" => {
+            let p = at.unwrap_or(pos2(800.0, 500.0));
+            let sec = |raw: &mut egui::RawInput, down: bool| raw.events.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed: down, modifiers: Default::default() });
+            match f {
+                0 => mv(raw, p),
+                2 => sec(raw, true),
+                3 => sec(raw, false),
+                10..=58 if (f - 10) % 8 == 0 => mv(raw, p + egui::vec2(40.0, 12.0 + 22.0 * ((f - 10) / 8) as f32)),
+                66 => mv(raw, p + egui::vec2(-200.0, 0.0)),
+                _ => {}
+            }
+        }
+        // A dialog open (PREPDECK_SHOT_VIEW=...,confirmdelete): Tab three times (the focus ring
+        // goes from button to button), then PREPDECK_FEEL_KEY (Escape, Enter) and the answer.
+        "dialog" => {
+            let k = match env("PREPDECK_FEEL_KEY").as_deref() {
+                Some("Enter") => egui::Key::Enter,
+                _ => egui::Key::Escape,
+            };
+            match f {
+                4 | 16 | 28 => key(raw, egui::Key::Tab, true),
+                5 | 17 | 29 => key(raw, egui::Key::Tab, false),
+                44 => key(raw, k, true),
+                45 => key(raw, k, false),
+                10 | 22 | 34 => eprintln!("feeltest: dialog focus {:?} keyboard {}", app.ctx.memory(|m| m.focused()).map(|i| (i.short_debug_format(), app.ctx.read_response(i).map(|r| (r.layer_id, r.rect, r.sense)))), crate::ui_feel::keyboard()),
+                40 => eprintln!("feeltest: dialog before the key: open {}", app.dialogs.confirm_delete_node.is_some()),
+                50 => eprintln!("feeltest: dialog after {:?}: open {}, playlists view {:?}", k, app.dialogs.confirm_delete_node.is_some(), app.view),
+                _ => {}
+            }
+        }
+        // Drag a playing deck's enlarged waveform back and forth (Export: the centre of the
+        // waveform, then 160 pt each way over two seconds), and let go.
+        "wavedrag" => {
+            let Some((r, _, _)) = WAVE.with(|w| w.get()) else { return };
+            let y = r.center().y;
+            match f {
+                1 | 2 => mv(raw, pos2(r.center().x, y)),
+                8 => click(raw, pos2(r.center().x, y), true),
+                9..=209 => {
+                    let x = wave_x(r.center().x, f);
+                    WAVE_X.with(|w| w.set(Some(x)));
+                    mv(raw, pos2(x, y));
+                }
+                210 => {
+                    WAVE_X.with(|w| w.set(None));
+                    click(raw, pos2(wave_x(r.center().x, 209), y), false);
+                }
+                _ => {}
+            }
+        }
+        // A trackpad swipe over the playing waveform: point steps falling off, then back.
+        "wavescroll" => {
+            let Some((r, _, _)) = WAVE.with(|w| w.get()) else { return };
+            // (The waveform is known from the scenario's first frame on: move there on the next.)
+            if f <= 2 {
+                mv(raw, r.center());
+            }
+            if (4..64).contains(&f) {
+                let d = 24.0 * (-((f - 4) as f32) / 20.0).exp();
+                raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(d, 0.0), modifiers: Default::default() });
+            }
+            if (100..160).contains(&f) {
+                let d = -24.0 * (-((f - 100) as f32) / 20.0).exp();
+                raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(d, 0.0), modifiers: Default::default() });
             }
         }
         "panel" | "mode" => {

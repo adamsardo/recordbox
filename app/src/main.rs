@@ -331,7 +331,9 @@ impl eframe::App for Gui {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        motion::frame_cpu(_frame.info().cpu_usage);
         prefs_bridge::frame_limit(&mut self.app, ctx);
+        motion::pace_frame(ctx, self.app.screenshot.is_some());
         let bench_t0 = std::time::Instant::now();
         let app = &mut self.app;
         ui_feel::begin_frame(app, ctx);
@@ -741,6 +743,8 @@ fn main() -> eframe::Result<()> {
         }
     }
     let mut options = eframe::NativeOptions { viewport, ..Default::default() };
+    // (macOS: frames are paced by the display, not by the swap: motion.rs `pace_frame`.)
+    options.vsync = motion::swap_waits();
     if shot_mode {
         options.event_loop_builder = Some(Box::new(|b| {
             #[cfg(target_os = "macos")]

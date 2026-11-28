@@ -51,6 +51,7 @@ pub fn apply_style(ui: &mut Ui) {
     }
     s.visuals.selection.bg_fill = PBLUE;
     s.visuals.selection.stroke = Stroke::new(1.0, WHITE);
+    crate::ui_feel::text_look(&mut s.visuals);
     s.visuals.extreme_bg_color = gy(0x000000);
     let w = &mut s.visuals.widgets;
     for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
@@ -708,6 +709,7 @@ impl Btn {
 impl egui::Widget for Btn {
     fn ui(self, ui: &mut Ui) -> Response {
         let en = ui.is_enabled();
+        let role = crate::ui_feel::key_role(&self.text);
         let g = ui.painter().layout_no_wrap(self.text, inter(self.size), if en { WHITE.c() } else { OFF.c() });
         let size = self.exact.unwrap_or(vec2((g.size().x + 24.0).max(self.min.x), self.min.y));
         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -717,6 +719,7 @@ impl egui::Widget for Btn {
             paint_button(ui.painter(), r, en && resp.hovered(), en && resp.is_pointer_button_down_on());
         }
         ui.painter().galley(pos2(r.center().x - g.size().x / 2.0, r.center().y - g.size().y / 2.0), g, WHITE.c());
+        crate::ui_feel::dialog_key(&resp, role);
         resp
     }
 }
@@ -731,7 +734,11 @@ pub fn dialog_buttons(ui: &mut Ui, labels: &[&str]) -> Option<usize> {
         let w: f32 = labels.len() as f32 * 96.0 + (labels.len().saturating_sub(1)) as f32 * 8.0;
         ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
         for (i, l) in labels.iter().enumerate() {
-            if ui.add(btn(*l).min_size(vec2(96.0, 24.0))).clicked() {
+            let b = ui.add(btn(*l).min_size(vec2(96.0, 24.0)));
+            // (Return: the confirming button, first; Escape: the last; a lone one both.)
+            use crate::ui_feel::KeyRole;
+            crate::ui_feel::dialog_key(&b, if labels.len() == 1 { Some(KeyRole::Both) } else if i == 0 { Some(KeyRole::Return) } else if i + 1 == labels.len() { Some(KeyRole::Escape) } else { None });
+            if b.clicked() {
                 hit = Some(i);
             }
         }

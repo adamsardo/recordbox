@@ -818,7 +818,7 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
                     app.device_ui.confirm_delete = None;
                     app.delete_device_tracks(&root, &ids);
                 }
-                if ui.button("Cancel").clicked() {
+                if crate::ui_feel::key_button(ui, "Cancel").clicked() {
                     app.device_ui.confirm_delete = None;
                 }
             });
@@ -828,14 +828,14 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
         egui::Window::new("Delete My Settings").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("Do you want to delete My Settings file in the device?");
             ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
+                if crate::ui_feel::key_button(ui, "Yes").clicked() {
                     app.device_ui.confirm_delete_settings = None;
                     if !app.device_busy() {
                         let n = device_import::delete_my_settings(Path::new(&root));
                         app.toast(format!("{n} My Settings file(s) deleted from the device."));
                     }
                 }
-                if ui.button("No").clicked() {
+                if crate::ui_feel::key_button(ui, "No").clicked() {
                     app.device_ui.confirm_delete_settings = None;
                 }
             });
@@ -848,13 +848,13 @@ fn confirm_windows(app: &mut App, ctx: &Context) {
             ui.label("The selected lists are synchronized automatically \nat each connection.");
             ui.label("Do you want to synchronize the modifications now?");
             ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
+                if crate::ui_feel::key_button(ui, "Yes").clicked() {
                     app.device_ui.auto_prompt = None;
                     if let Some(cfg) = device_import::read_sync(Path::new(&root)) {
                         app.synchronize_device(&root, &cfg);
                     }
                 }
-                if ui.button("No").clicked() {
+                if crate::ui_feel::key_button(ui, "No").clicked() {
                     app.device_ui.auto_prompt = None;
                 }
             });
@@ -916,7 +916,7 @@ fn property_window(app: &mut App, ctx: &Context) {
             if ui.add_enabled(changed, egui::Button::new(RichText::new("Apply").strong())).on_disabled_hover_text("Nothing has been changed.").on_hover_text("Press to apply the customized setting to the DJ equipment").clicked() && app.apply_device_property(&st) {
                 st.opened = (st.name.clone(), st.settings.clone(), st.browse.clone(), st.colors.clone(), st.bg);
             }
-            if ui.button("Close").clicked() {
+            if crate::ui_feel::key_button(ui, "Close").clicked() {
                 close = true;
             }
         });
@@ -938,12 +938,12 @@ fn sync_window(app: &mut App, ctx: &Context) {
             ui.label("Are you sure you want to synchronize this with this computer?");
             ui.label(RichText::new("If you choose \"Yes\", the settings of the synchronization will be erased.").size(11.0).color(DIM));
             ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
+                if crate::ui_feel::key_button(ui, "Yes").clicked() {
                     st.cfg = SyncConfig::default();
                     st.saved = st.cfg.clone();
                     st.other_computer = false;
                 }
-                if ui.button("No").clicked() {
+                if crate::ui_feel::key_button(ui, "No").clicked() {
                     close = true;
                 }
             });
@@ -1027,7 +1027,7 @@ fn sync_window(app: &mut App, ctx: &Context) {
                     Err(e) => app.toast_err(format!("Could not save the synchronization settings on the device: {e}")),
                 }
             }
-            if ui.button("Close").clicked() {
+            if crate::ui_feel::key_button(ui, "Close").clicked() {
                 close = true;
             }
             if dirty {

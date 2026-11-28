@@ -1871,6 +1871,7 @@ impl App {
         self.index.get(&id).map(|i| &self.tracks[*i])
     }
     pub fn track_mut(&mut self, id: i64) -> Option<&mut Track> {
+        crate::ui_feel::tracks_touched();
         let i = *self.index.get(&id)?;
         Some(&mut self.tracks[i])
     }

@@ -143,13 +143,13 @@ fn fallback_icon(p: &Painter, name: &str, r: Rect, c: Color32) {
 }
 
 /// How a `CustomTextButton` shows hover, press and disabled: (opacity, hover highlight).
-fn feedback(resp: &egui::Response, enabled: bool) -> (f32, bool) {
+fn feedback(resp: &egui::Response, enabled: bool) -> (f32, f32) {
     if !enabled {
-        (0.3, false)
-    } else if resp.is_pointer_button_down_on() {
-        (0.7, false)
+        (0.3, 0.0)
     } else {
-        (1.0, resp.hovered())
+        // (recordbox: the press dims on its own frame and lets go softly, the hover fades.)
+        let down = resp.is_pointer_button_down_on();
+        (1.0 - 0.3 * crate::ui_feel::press(resp), crate::ui_feel::hover_if(resp, !down))
     }
 }
 
@@ -164,8 +164,8 @@ fn outline_button(ui: &mut Ui, r: Rect, id: impl std::hash::Hash, label: &str, o
     let p = ui.painter();
     p.rect_stroke(r, 2.0, Stroke::new(1.0_f32, fade(if on { BLUE.c() } else { OUTLINE.c() }, a)), egui::StrokeKind::Inside);
     p.text(r.center(), Align2::CENTER_CENTER, label, font, fade(WHITE.c(), a));
-    if hot {
-        p.rect_filled(r, 2.0, Color32::from_white_alpha(26));
+    if hot > 0.0 {
+        p.rect_filled(r, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
     }
     resp
 }
@@ -177,8 +177,8 @@ fn icon_button(app: &mut App, ui: &mut Ui, r: Rect, id: impl std::hash::Hash, na
     let p = ui.painter().clone();
     p.rect_filled(r, 2.0, fade(BTN_FILL.c(), a));
     icon(app, &p, name, at.translate(r.min.to_vec2()), fade(WHITE.c(), a));
-    if hot {
-        p.rect_filled(r, 2.0, Color32::from_white_alpha(26));
+    if hot > 0.0 {
+        p.rect_filled(r, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
     }
     resp
 }
@@ -303,11 +303,11 @@ fn panel(app: &mut App, ui: &mut Ui, r: Rect, deck: usize) {
     preset_menu(app, ui, lr, deck, true);
     preset_menu(app, ui, sv, deck, false);
     for (rr, name) in [(lr, "load"), (sv, "save")] {
-        let hovered = ui.rect_contains_pointer(rr);
+        let hovered = crate::ui_feel::hover_rect(ui, ui.id().with(("feel_gcls", name)), rr, true);
         p.rect_filled(rr, 2.0, BTN_FILL);
         icon(app, &p, name, icon_at.translate(rr.min.to_vec2()), WHITE.c());
-        if hovered {
-            p.rect_filled(rr, 2.0, Color32::from_white_alpha(26));
+        if hovered > 0.0 {
+            p.rect_filled(rr, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hovered));
         }
     }
 
@@ -327,15 +327,15 @@ fn panel(app: &mut App, ui: &mut Ui, r: Rect, deck: usize) {
         p.rect_stroke(name_r, round_l, Stroke::new(1.0_f32, BLUE), egui::StrokeKind::Inside);
     }
     p.with_clip_rect(name_r).text(name_r.center(), Align2::CENTER_CENTER, groove::RFX_NAMES[kind], caps(9.0), WHITE.c());
-    if nresp.hovered() && !lit {
-        p.rect_filled(name_r, round_l, Color32::from_white_alpha(26));
+    if let Some(c) = crate::ui_feel::hover_fill_if(&nresp, !lit, Color32::from_white_alpha(26)) {
+        p.rect_filled(name_r, round_l, c);
     }
     tip(nresp, app, "DRUM RELEASE FX On/Off button:\nEffects are applied on DRUMS Stem.");
     let aresp = ui.interact(arrow_r, ui.id().with("rfxsel"), Sense::click());
     p.rect_filled(arrow_r, round_r, BTN_FILL);
     icon(app, &p, "pulldown", Rect::from_min_size(arrow_r.min + vec2(4.0, 7.0), vec2(8.0, 4.0)), WHITE.c());
-    if aresp.hovered() {
-        p.rect_filled(arrow_r, round_r, Color32::from_white_alpha(26));
+    if let Some(c) = crate::ui_feel::hover_fill(&aresp, Color32::from_white_alpha(26)) {
+        p.rect_filled(arrow_r, round_r, c);
     }
     crate::ui_browser::dropdown(ui, &aresp, "rfxpop", |ui| {
         ui.set_min_width(110.0);
@@ -354,8 +354,8 @@ fn panel(app: &mut App, ui: &mut Ui, r: Rect, deck: usize) {
         let resp = ui.interact(rr, ui.id().with(("rfxbeat", dir)), Sense::click());
         let (a, hot) = feedback(&resp, true);
         icon(app, &p, name, chev.translate(rr.min.to_vec2()), fade(WHITE.c(), a));
-        if hot {
-            p.rect_filled(rr, 2.0, Color32::from_white_alpha(26));
+        if hot > 0.0 {
+            p.rect_filled(rr, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
         }
         if tip(resp, app, text).clicked() {
             app.groove_fx_beat_step(deck, dir);
@@ -384,8 +384,11 @@ fn slot(app: &mut App, ui: &mut Ui, r: Rect, deck: usize, idx: usize, st: groove
     p.rect_filled(r, 0.0, BG);
     let resp = ui.interact(r, ui.id().with(("slot", idx)), Sense::click());
     // The capture area dropped here: this slot captures it.
+    let cap_a = crate::ui_feel::appear(ui.id().with(("feel_gccap", idx)), app.gc.drag_capture.is_some() && ui.rect_contains_pointer(r));
+    if cap_a > 0.0 {
+        p.rect_stroke(r, 0.0, egui::Stroke::new(2.0_f32, crate::motion::fade(hex(0x8214EB), cap_a)), egui::StrokeKind::Inside);
+    }
     if app.gc.drag_capture.is_some() && ui.rect_contains_pointer(r) {
-        p.rect_stroke(r, 0.0, egui::Stroke::new(2.0, hex(0x8214EB)), egui::StrokeKind::Inside);
         if ui.input(|i| i.pointer.any_released()) {
             app.gc.drag_capture = None;
             app.groove_capture(deck, idx);
@@ -393,6 +396,7 @@ fn slot(app: &mut App, ui: &mut Ui, r: Rect, deck: usize, idx: usize, st: groove
     }
     let over = ui.rect_contains_pointer(r) && app.drag.is_none();
     let controls = over && !capture;
+    crate::ui_feel::swap_veil(ui.id().with(("feel_gcslot", idx)), controls, r, BG.c());
 
     // The level meter: the 2 pt at the right.
     let db = app.gc.meter[deck][row];
@@ -438,8 +442,8 @@ fn slot(app: &mut App, ui: &mut Ui, r: Rect, deck: usize, idx: usize, st: groove
         p.rect_filled(pr, 2.0, fade(BTN_FILL.c(), a));
         p.rect_stroke(pr.shrink(0.5), 2.0, Stroke::new(1.0_f32, fade(GREEN, a)), egui::StrokeKind::Middle);
         icon(app, &p, if playing || waiting { "stop" } else { "play" }, Rect::from_min_size(pr.min + vec2(8.0, 3.0), vec2(8.0, 8.0)), fade(WHITE.c(), a));
-        if hot {
-            p.rect_filled(pr, 2.0, Color32::from_white_alpha(26));
+        if hot > 0.0 {
+            p.rect_filled(pr, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
         }
         // (rekordbox's button acts on the press, not on the release.)
         if crate::ui_player::press_fired(ui, &presp) && loaded {
@@ -711,8 +715,8 @@ pub fn capture_buttons(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) {
         let resp = ui.interact(r, ui.id().with(("gccap", n)), Sense::click());
         let (a, hot) = feedback(&resp, true);
         icon(app, &p, "capture", Rect::from_min_size(r.min, vec2(14.0, 13.0)), fade(if on { BLUE.c() } else { WHITE.c() }, a));
-        if hot {
-            p.rect_filled(r, 2.0, Color32::from_white_alpha(26));
+        if hot > 0.0 {
+            p.rect_filled(r, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
         }
         if tip(resp, app, "DRUM CAPTURE:\nYou can extract DRUMS Stem.\nClicking DRUM SWAP SLOT while DRUM CAPTURE is ON loads the extracted DRUMS Stem.").clicked() {
             app.groove_capture_toggle(n as u8);
@@ -725,8 +729,8 @@ pub fn capture_buttons(app: &mut App, ui: &mut Ui, o: Pos2, waves_h: f32) {
     p.rect_stroke(lr, 2.0, Stroke::new(1.0_f32, fade(gy(0x646464), a)), egui::StrokeKind::Inside);
     p.text(lr.center() - vec2(0.5, 0.5), Align2::CENTER_CENTER, format!("{}", app.gc.capture_len), FontId::proportional(8.0), fade(WHITE.c(), a));
     icon(app, &p, "caplen", Rect::from_min_size(lr.min + vec2(10.0, 11.0), vec2(3.0, 2.0)), fade(WHITE.c(), a));
-    if hot {
-        p.rect_filled(lr, 2.0, Color32::from_white_alpha(26));
+    if hot > 0.0 {
+        p.rect_filled(lr, 2.0, crate::motion::fade(Color32::from_white_alpha(26), hot));
     }
     if tip(resp, app, "Change the DRUM CAPTURE length to 4, 8, 16, or 32 beats.").clicked() {
         app.groove_capture_length_next();

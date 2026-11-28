@@ -62,6 +62,8 @@ pub const HOVER_OUT: f32 = 0.16;
 pub const RELEASE: f32 = 0.14;
 /// Selection colour, drop-target highlights, read-outs.
 pub const FEEDBACK: f32 = 0.11;
+/// A row, page or tab becoming selected (going off: `HOVER_OUT`).
+pub const SELECT: f32 = 0.066;
 /// A control's drawn value travelling to a value set by a click or a reset.
 pub const GLIDE: f32 = 0.12;
 /// Panels, pages, modes and layouts appearing.
@@ -162,6 +164,8 @@ pub fn begin_frame(ctx: &egui::Context, db: &crate::db::Db, shot: Option<(u32, b
         let v = db.setting("recordbox_motion").and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(0);
         SETTING.store(v.min(2), Relaxed);
     }
+    // The time `pace_frame` waited for the display is part of this frame's time.
+    let now = now + PACED_US.load(Relaxed) as f64 / 1e6;
     let poll = STORE.with(|s| {
         let mut s = s.borrow_mut();
         step_clock(&mut s, now, dt);
@@ -192,6 +196,243 @@ pub fn begin_frame(ctx: &egui::Context, db: &crate::db::Db, shot: Option<(u32, b
         }
     }
     LEVEL.store(l as u8, Relaxed);
+}
+
+// ---- Frame pacing.
+//
+// A playing deck asks for the next frame at once, every frame. eframe then starts it as soon as
+// the last one has been handed to OpenGL, and on macOS that hand-over (`swap_buffers`) takes
+// a second frame without waiting and then waits almost two refreshes: measured on a playing
+// deck at 120 Hz, frames started 3 ms and 13.7 ms apart in turn (two per 16.7 ms), with a lone
+// 8.3 ms now and then. Here a frame starts at most once per refresh of the display, timed by
+// the display itself (CVDisplayLink): a frame that would start inside the refresh the last one
+// started in waits for the next refresh (never longer than one period and a bit). A frame
+// after a pause starts at once; nothing is drawn more often than before, only less bunched.
+
+static PACE_WAITS: AtomicU32 = AtomicU32::new(0);
+/// This frame's refresh number and how far into that refresh it started (tools read it).
+static FRAME_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static FRAME_PHASE_US: AtomicU32 = AtomicU32::new(0);
+
+/// The display refresh this frame started in, how far into it (seconds) and the refresh period;
+/// None without a display link.
+pub fn frame_refresh() -> Option<(u64, f64, f64)> {
+    let t = FRAME_TICK.load(Relaxed);
+    (t != u64::MAX).then(|| (t, FRAME_PHASE_US.load(Relaxed) as f64 / 1e6, link_period()))
+}
+
+#[cfg(target_os = "macos")]
+fn link_period() -> f64 {
+    vsync::period()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn link_period() -> f64 {
+    0.0
+}
+static PACED_US: AtomicU32 = AtomicU32::new(0);
+static PACED_PREV_US: AtomicU32 = AtomicU32::new(0);
+
+/// Whether OpenGL's swap waits for the display (eframe's `vsync`). On macOS it does not: that
+/// wait is what bunched the frames, and `pace_frame` gives one frame per refresh instead
+/// (`PREPDECK_VSYNC=on` brings the old swap back). Elsewhere it does, as before.
+pub fn swap_waits() -> bool {
+    !cfg!(target_os = "macos") || std::env::var("PREPDECK_VSYNC").as_deref() == Ok("on") || pace_off()
+}
+
+/// `PREPDECK_PACE=off` (measurements): the old way, the swap waits and frames are not paced;
+/// the display link only records which refresh each frame started in.
+fn pace_off() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("PREPDECK_PACE").as_deref() == Ok("off"))
+}
+
+/// main.rs, at the start of `update` (before its frame timer): one frame per display refresh.
+/// This is the frame scheduler, not interface motion: it runs at every motion level (with the
+/// swap no longer waiting, nothing else would hold frames to the display's rate).
+pub fn pace_frame(ctx: &egui::Context, _shot: bool) {
+    let w = pace(ctx);
+    PACED_PREV_US.store(PACED_US.load(Relaxed), Relaxed);
+    PACED_US.store((w * 1e6) as u32, Relaxed);
+}
+
+/// Frames that waited for the display so far (tools read it).
+pub fn pace_waits() -> u32 {
+    PACE_WAITS.load(Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+mod vsync {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::*};
+    use std::sync::{Condvar, Mutex};
+
+    type Link = *mut c_void;
+    type Callback = extern "C" fn(Link, *const c_void, *const c_void, u64, *mut u64, *mut c_void) -> i32;
+    #[link(name = "CoreVideo", kind = "framework")]
+    extern "C" {
+        fn CVDisplayLinkCreateWithActiveCGDisplays(out: *mut Link) -> i32;
+        fn CVDisplayLinkSetOutputCallback(link: Link, cb: Callback, user: *mut c_void) -> i32;
+        fn CVDisplayLinkSetCurrentCGDisplay(link: Link, display: u32) -> i32;
+        fn CVDisplayLinkStart(link: Link) -> i32;
+        fn CVDisplayLinkStop(link: Link) -> i32;
+        fn CVDisplayLinkGetActualOutputVideoRefreshPeriod(link: Link) -> f64;
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetDisplaysWithPoint(p: CGPoint, max: u32, out: *mut u32, count: *mut u32) -> i32;
+    }
+
+    static LINK: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static DISPLAY: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Refreshes seen, and when the link was last wanted (ms since `T0`).
+    static TICK: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+    /// When the last refresh callback came (ns since `T0`).
+    static TICK_AT_NS: AtomicU64 = AtomicU64::new(0);
+    static WANTED_MS: AtomicU64 = AtomicU64::new(0);
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    fn ms() -> u64 {
+        T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+
+    extern "C" fn on_refresh(_: Link, _: *const c_void, _: *const c_void, _: u64, _: *mut u64, _: *mut c_void) -> i32 {
+        TICK_AT_NS.store(T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64, Relaxed);
+        let (m, c) = &TICK;
+        if let Ok(mut t) = m.lock() {
+            *t += 1;
+        }
+        c.notify_all();
+        0
+    }
+
+    /// The link, running (made on first use; stopped by its watcher after a second unused).
+    fn ensure() -> Option<Link> {
+        WANTED_MS.store(ms(), Relaxed);
+        let mut l = LINK.load(Acquire);
+        if l.is_null() {
+            let mut out: Link = std::ptr::null_mut();
+            if unsafe { CVDisplayLinkCreateWithActiveCGDisplays(&mut out) } != 0 || out.is_null() {
+                return None;
+            }
+            unsafe { CVDisplayLinkSetOutputCallback(out, on_refresh, std::ptr::null_mut()) };
+            LINK.store(out, Release);
+            l = out;
+        }
+        if !RUNNING.swap(true, Relaxed) {
+            unsafe { CVDisplayLinkStart(l) };
+            // Stops the link once frames have not wanted it for a second, then ends.
+            let _ = std::thread::Builder::new().name("vsync-watch".into()).spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if ms().saturating_sub(WANTED_MS.load(Relaxed)) > 1000 {
+                    unsafe { CVDisplayLinkStop(LINK.load(Acquire)) };
+                    RUNNING.store(false, Relaxed);
+                    return;
+                }
+            });
+        }
+        Some(l)
+    }
+
+    /// Follow the display the window is on (`p`: a point of the window, global points).
+    pub fn follow(p: (f64, f64)) {
+        let Some(l) = ensure() else { return };
+        let (mut id, mut n) = (0u32, 0u32);
+        if unsafe { CGGetDisplaysWithPoint(CGPoint { x: p.0, y: p.1 }, 1, &mut id, &mut n) } == 0 && n == 1 && DISPLAY.swap(id as u64, Relaxed) != id as u64 {
+            unsafe { CVDisplayLinkSetCurrentCGDisplay(l, id) };
+        }
+    }
+
+    /// The refresh count now (starting the link if needed).
+    pub fn tick() -> Option<u64> {
+        ensure()?;
+        TICK.0.lock().ok().map(|t| *t)
+    }
+
+    /// Wait until the count passes `seen`, at most `max` seconds. Returns the seconds waited.
+    pub fn wait_past(seen: u64, max: f64) -> f64 {
+        let t = std::time::Instant::now();
+        let (m, c) = &TICK;
+        let Ok(g) = m.lock() else { return 0.0 };
+        let _ = c.wait_timeout_while(g, std::time::Duration::from_secs_f64(max), |n| *n <= seen);
+        t.elapsed().as_secs_f64()
+    }
+
+    /// Seconds since the last refresh callback (None before the first).
+    pub fn since_tick() -> Option<f64> {
+        let at = TICK_AT_NS.load(Relaxed);
+        (at > 0).then(|| (T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64).saturating_sub(at) as f64 / 1e9)
+    }
+
+    pub fn period() -> f64 {
+        let l = LINK.load(Acquire);
+        if l.is_null() { 0.0 } else { unsafe { CVDisplayLinkGetActualOutputVideoRefreshPeriod(l) } }
+    }
+}
+
+thread_local! {
+    static LAST_TICK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static LAST_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static FOLLOW_AT: std::cell::Cell<f64> = const { std::cell::Cell::new(-10.0) };
+}
+
+/// Start of a frame: wait for the next refresh if this frame would start inside the one the
+/// last frame started in. Returns the seconds waited.
+#[cfg(target_os = "macos")]
+fn pace(ctx: &egui::Context) -> f64 {
+    let t = ctx.input(|i| i.time);
+    if t - FOLLOW_AT.with(|f| f.get()) > 2.0 {
+        FOLLOW_AT.with(|f| f.set(t));
+        if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+            vsync::follow(((r.min.x + 40.0) as f64, (r.min.y + 40.0) as f64));
+        }
+    }
+    let Some(now) = vsync::tick() else { return cap_rate() };
+    let last = LAST_TICK.with(|l| l.get());
+    let p = vsync::period();
+    let p = if p > 0.002 && p < 0.05 { p } else { 1.0 / 60.0 };
+    // A frame after a pause (the link may have been stopped meanwhile) starts at once.
+    let recent = LAST_START.with(|l| l.get()).is_some_and(|t| t.elapsed().as_secs_f64() < 2.0 * p);
+    let mut waited = 0.0;
+    if last == Some(now) && recent && !pace_off() {
+        waited = vsync::wait_past(now, p * 1.25);
+        PACE_WAITS.fetch_add(1, Relaxed);
+    }
+    let t = vsync::tick();
+    LAST_TICK.with(|l| l.set(t));
+    LAST_START.with(|l| l.set(Some(std::time::Instant::now())));
+    FRAME_TICK.store(t.unwrap_or(u64::MAX), Relaxed);
+    FRAME_PHASE_US.store(vsync::since_tick().map_or(0, |s| (s * 1e6) as u32), Relaxed);
+    waited
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pace(_: &egui::Context) -> f64 {
+    0.0
+}
+
+/// No display link (it could not be made): frames at most 120 a second, by the clock.
+#[allow(dead_code)]
+fn cap_rate() -> f64 {
+    thread_local! { static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) }; }
+    let min = std::time::Duration::from_secs_f64(1.0 / 120.0);
+    let mut waited = 0.0;
+    if let Some(l) = LAST.with(|l| l.get()) {
+        let d = l.elapsed();
+        if d < min {
+            std::thread::sleep(min - d);
+            waited = (min - d).as_secs_f64();
+        }
+    }
+    LAST.with(|l| l.set(Some(std::time::Instant::now())));
+    waited
 }
 
 /// The frame clock: the measured interval since the last frame, or (after idling, when there
@@ -229,6 +470,19 @@ fn step_clock(s: &mut Store, now: f64, stable_dt: f32) {
         s.disp_step = 0.0;
         s.disp = now;
     }
+}
+
+static LAST_CPU_US: AtomicU32 = AtomicU32::new(0);
+
+/// main.rs, first thing in `update`: how long the last frame took on the CPU without waiting
+/// for the display (eframe's `cpu_usage`: our update, tessellation and painting).
+pub fn frame_cpu(secs: Option<f32>) {
+    LAST_CPU_US.store(secs.map_or(0, |s| (s * 1e6) as u32), Relaxed);
+}
+
+/// The last frame's CPU time in ms, without the time it waited for the display (tools read it).
+pub fn last_cpu_ms() -> f32 {
+    LAST_CPU_US.load(Relaxed).saturating_sub(PACED_PREV_US.load(Relaxed)) as f32 / 1000.0
 }
 
 /// The display clock (seconds, egui's time base): advances by whole refresh periods per frame.

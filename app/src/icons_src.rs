@@ -406,6 +406,11 @@ pub fn search_select(p: &Painter, r: Rect, col: Color32) {
 /// The tile itself: 18 pt, 1.5 pt corners, a 1 pt grey border; the selected one is blue with
 /// a white border. Returns the fill the glyph's cut-outs should use.
 pub fn tile(p: &Painter, r: Rect, on: bool, hovered: bool, enabled: bool, panel: Color32) -> Color32 {
+    tile_t(p, r, on, hovered as u8 as f32, enabled, panel)
+}
+
+/// `tile` with how much it is hovered (0..1; the edge lightens by that much).
+pub fn tile_t(p: &Painter, r: Rect, on: bool, hovered: f32, enabled: bool, panel: Color32) -> Color32 {
     let blue = crate::theme::BLUE;
     if on {
         p.rect_filled(r, 1.5, blue);
@@ -414,8 +419,8 @@ pub fn tile(p: &Painter, r: Rect, on: bool, hovered: bool, enabled: bool, panel:
     } else {
         let edge = if !enabled {
             Color32::from_rgb(0x3A, 0x3A, 0x3A)
-        } else if hovered {
-            Color32::from_rgb(0x8C, 0x8C, 0x8C)
+        } else if hovered > 0.0 {
+            crate::motion::mix(Color32::from_rgb(0x64, 0x64, 0x64), Color32::from_rgb(0x8C, 0x8C, 0x8C), hovered)
         } else {
             Color32::from_rgb(0x64, 0x64, 0x64)
         };

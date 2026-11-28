@@ -1607,7 +1607,7 @@ pub fn sync_rate_hook(app: &mut App, ui: &mut egui::Ui, n: u8, sync_btn: egui::R
     let r = Rect::from_min_size(pos2(sync_btn.min.x - 27.0, sync_btn.max.y - 10.0), vec2(25.0, 10.0));
     let resp = ui.interact(r, ui.id().with(("syncrate", n)), Sense::click());
     let out = app.deck.x.dk.out_of_range;
-    ui.painter().rect_filled(r, 1.0, if resp.hovered() { crate::theme::gy(0x323232) } else { crate::theme::gy(0x282828) });
+    ui.painter().rect_filled(r, 1.0, crate::ui_feel::hl(&resp, crate::theme::gy(0x282828), crate::theme::gy(0x323232)));
     ui.painter().text(r.center(), Align2::CENTER_CENTER, app.sync_rate_label(), crate::theme::caps(7.5), if out { crate::theme::gy(0x646464) } else { crate::theme::hex(0xFFFF64) });
     if resp.on_hover_text("Sync rate: follow the master at half, the same or double its tempo.").clicked() {
         app.sync_rate_toggle();

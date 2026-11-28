@@ -60,7 +60,7 @@ fn row(ui: &mut Ui, depth: usize, text: &str, count: Option<usize>, selected: bo
     use crate::icons_src as src;
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 15.0), Sense::click());
     let p = ui.painter();
-    let bg = if selected { ROW_SEL.c() } else { crate::ui_feel::hl(&resp, BG2.c(), gy(0x262626)) };
+    let bg = crate::ui_feel::sel_col(resp.id, selected, crate::ui_feel::hl(&resp, crate::ui_feel::outside(BG2), gy(0x262626)), ROW_SEL.c());
     // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
     let _sel_dark = crate::theme::dark_scope(selected);
     if selected || bg != BG2.c() {
@@ -390,7 +390,7 @@ pub fn list(app: &mut App, ui: &mut Ui, id: i64) {
             let sel = app.mixx.lib.selected.contains(&ri);
             // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
             let _sel_dark = crate::theme::dark_scope(sel);
-            ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
+            ui.painter().rect_filled(rr, 0.0, crate::ui_feel::sel_col(egui::Id::new(("feel_slsel", ri)), sel, crate::ui_feel::outside(if ri % 2 == 0 { BG1 } else { BG2 }), ROW_SEL.c()));
             let vals = [format!("{}", ri + 1), String::new(), s.name.clone(), if s.bpm100 > 0 { format!("{:.2}", s.bpm100 as f64 / 100.0) } else { String::new() }, if s.duration > 0.0 { fmt_time(s.duration, false) } else { String::new() }, s.path.clone()];
             let mut x = rr.min.x;
             for (ci, (v, (_, w, right))) in vals.iter().zip(cols.iter()).enumerate() {

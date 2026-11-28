@@ -520,7 +520,7 @@ fn fx_knob_r(ui: &mut Ui, c: egui::Pos2, rad: f32, id: impl std::hash::Hash, val
     let ang = |x: f32| (-225.0 + 270.0 * x).to_radians();
     let arc = |a: f32, b: f32| -> Vec<egui::Pos2> { (0..=32).map(|i| { let t = ang(a + (b - a) * i as f32 / 32.0); c + vec2(t.cos(), t.sin()) * rad }).collect() };
     let active = resp.hovered() || resp.dragged();
-    p.add(egui::Shape::line(arc(0.0, 1.0), Stroke::new(2.4_f32, if active { gy(0x464646) } else { gy(0x323232) })));
+    p.add(egui::Shape::line(arc(0.0, 1.0), Stroke::new(2.4_f32, crate::ui_feel::hot_col(&resp, gy(0x323232), gy(0x464646)))));
     let from = if bipolar { 0.5 } else { 0.0 };
     if (v - from).abs() > 0.012 {
         p.add(egui::Shape::line(arc(from, v), Stroke::new(2.4_f32, BLUE)));
@@ -771,8 +771,9 @@ pub fn panel(app: &mut App, ui: &mut Ui, r: Rect) {
             let rresp = ui.interact(rel_r, ui.id().with(("fxrel", u)), Sense::click_and_drag());
             let held = rresp.is_pointer_button_down_on();
             p.rect_filled(rel_r, 2.0, gy(0x1E1E1E));
-            p.rect_stroke(rel_r, 2.0, Stroke::new(1.0_f32, if held { BLUE.c() } else { OUTLINE }), egui::StrokeKind::Inside);
-            p.text(rel_r.center(), Align2::CENTER_CENTER, fx::RELEASE[rk].0, caps(8.75), if held { hex(0x3C8CFF) } else { WHITE.c() });
+            let pa = crate::ui_feel::press(&rresp);
+            p.rect_stroke(rel_r, 2.0, Stroke::new(1.0_f32, crate::motion::mix(OUTLINE.into(), BLUE.c(), pa)), egui::StrokeKind::Inside);
+            p.text(rel_r.center(), Align2::CENTER_CENTER, fx::RELEASE[rk].0, caps(8.75), crate::motion::mix(WHITE.c(), hex(0x3C8CFF), pa));
             let ridx = app.px.fx[u].release_idx[rk].min(fx::RELEASE_BEATS.len() - 1);
             app.px.fx[u].params.release = if held { Some((rk as u8, fx::RELEASE_BEATS[ridx])) } else { None };
             if held {

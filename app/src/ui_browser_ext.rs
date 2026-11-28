@@ -188,8 +188,8 @@ pub fn mytag_panel(app: &mut App, ui: &mut Ui, r: Rect) {
                 let partial = count > 0 && !on;
                 let filtering = app.filter_tags.contains(&tg.id);
                 let pt = ui.painter();
-                if resp.hovered() && !plus_clicked {
-                    pt.rect_filled(rr, 0.0, gy(0x141414));
+                if let Some(c) = crate::ui_feel::hover_fill_if(&resp, !plus_clicked, gy(0x141414)) {
+                    pt.rect_filled(rr, 0.0, c);
                 }
                 let bx = Rect::from_min_size(pos2(rr.min.x + 8.0, rr.center().y - 6.0), vec2(12.0, 12.0));
                 pt.rect_filled(bx, 0.0, gy(0x282828));
@@ -497,11 +497,11 @@ pub fn related_window(app: &mut App, ui: &mut Ui, r: Rect, which: usize) {
             // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
             let _sel_dark = crate::theme::dark_scope(sel);
             let pt = ui.painter().with_clip_rect(rr.intersect(ui.clip_rect()));
-            pt.rect_filled(rr, 0.0, if sel { ROW_SEL } else if i % 2 == 0 { BG1 } else { BG2 });
+            pt.rect_filled(rr, 0.0, crate::ui_feel::sel_col(resp.id, sel, crate::ui_feel::outside(if i % 2 == 0 { BG1 } else { BG2 }), ROW_SEL.c()));
             let ar = Rect::from_min_size(rr.min, vec2(30.0, 30.0));
-            match artwork_texture(app, &tr.artwork) {
+            match crate::ui_feel::list_artwork(app, &tr.artwork) {
                 Some(tex) => {
-                    pt.image(tex.id(), ar, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    pt.image(tex.id(), ar, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), crate::ui_feel::art_tint(&tr.artwork));
                 }
                 None => {
                     pt.rect_filled(ar, 0.0, gy(0x101010));
@@ -618,10 +618,10 @@ pub fn node_row_extras(app: &mut App, ui: &mut Ui, n: &PlaylistNode, rr: Rect, s
             let busy = app.ext.cue_wait;
             // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
             let _sel_dark = crate::theme::dark_scope(sel);
-            let col = if busy { BLUE } else if resp.hovered() { WHITE } else { DIM };
-            ui.painter().rect_filled(br, 0.0, if sel { ROW_SEL } else { BG2 });
+            let col = if busy { BLUE.c() } else { crate::ui_feel::hl(&resp, DIM.c(), WHITE.c()) };
+            ui.painter().rect_filled(br, 0.0, crate::ui_feel::sel_col(resp.id, sel, crate::ui_feel::outside(BG2), ROW_SEL.c()));
             ui.painter().rect_stroke(br, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
-            ui.painter().text(br.center(), Align2::CENTER_CENTER, "Start", rb(9.5), col.c());
+            ui.painter().text(br.center(), Align2::CENTER_CENTER, "Start", rb(9.5), col);
             let resp = if tips {
                 resp.on_hover_text("Analyzes CUE points of tracks registered to this playlist and generates personal CUE Tendency Information.\nThe more track CUE point tendencies are collected, the more you will be capable of achieving CUE points similar to your CUE points.\nTo add/remove tracks in a playlist, click the button again and update the personal CUE Tendency Information.\nYour personal CUE Tendency information can be reset by pressing the button when there are no tracks registered to the playlist.")
             } else {
@@ -797,7 +797,7 @@ fn cv_row(ui: &mut Ui, text: &str, icon: TreeIcon, count: Option<usize>, folder:
     use crate::icons_src as src;
     let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 15.0), Sense::click());
     let p = ui.painter().with_clip_rect(rr.intersect(ui.clip_rect()));
-    let bg = if selected { ROW_SEL.c() } else { crate::ui_feel::hl(&resp, BG2.c(), gy(0x262626)) };
+    let bg = crate::ui_feel::sel_col(resp.id, selected, crate::ui_feel::hl(&resp, crate::ui_feel::outside(BG2), gy(0x262626)), ROW_SEL.c());
     // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
     let _sel_dark = crate::theme::dark_scope(selected);
     if selected || bg != BG2.c() {
@@ -989,7 +989,7 @@ pub fn sub_browser(app: &mut App, ui: &mut Ui, r: Rect, drop: &mut Vec<(Rect, i6
             p.rect_stroke(rr, 1.5, Stroke::new(1.0, WHITE), egui::StrokeKind::Inside);
             ROW_SEL.c()
         } else {
-            src::tile(&p, rr, false, resp.hovered(), mode.is_some(), BG2.c())
+            src::tile_t(&p, rr, false, crate::ui_feel::hover(&resp), mode.is_some(), BG2.c())
         };
         draw(&p, rr, if mode.is_none() { gy(0x4A4A4A) } else { WHITE.c() }, bg);
         let resp = if app.prefs.tooltips { resp.on_hover_text(*name) } else { resp };

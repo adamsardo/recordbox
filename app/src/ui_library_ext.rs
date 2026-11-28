@@ -316,8 +316,8 @@ pub fn color_picker(app: &mut App, ctx: &egui::Context) {
             let cur = app.track(id).map(|t| t.color).unwrap_or(0);
             for i in (1..=8u8).chain([0u8]) {
                 let (rr, resp) = ui.allocate_exact_size(vec2(118.0, 17.0), Sense::click());
-                if resp.hovered() || cur == i {
-                    ui.painter().rect_filled(rr, 2.0, crate::ui_feel::hl(&resp, BTN, ROW_SEL));
+                if let Some(c) = if cur == i { Some(crate::ui_feel::hl(&resp, BTN, ROW_SEL)) } else { crate::ui_feel::hover_fill(&resp, ROW_SEL) } {
+                    ui.painter().rect_filled(rr, 2.0, c);
                 }
                 let chip = Rect::from_center_size(pos2(rr.min.x + 12.0, rr.center().y), vec2(14.0, 9.0));
                 if i == 0 {
@@ -1578,7 +1578,7 @@ pub fn source_list(app: &mut App, ui: &mut Ui, kind: u8, node: &str) {
             let sel = app.ext.sources[k].sel.contains(&ti);
             // (A selected row keeps rekordbox's fixed blue and white text in Light: `ListViewer::findTextColour`.)
             let _sel_dark = crate::theme::dark_scope(sel);
-            ui.painter().rect_filled(rr, 0.0, if sel { ROW_SEL } else if ri % 2 == 0 { BG1 } else { BG2 });
+            ui.painter().rect_filled(rr, 0.0, crate::ui_feel::sel_col(resp.id, sel, crate::ui_feel::outside(if ri % 2 == 0 { BG1 } else { BG2 }), ROW_SEL.c()));
             let have = present[ri];
             if have {
                 // "Track imported to the Collection": a tick.
@@ -2263,7 +2263,7 @@ fn missing_file_manager(app: &mut App, ctx: &egui::Context) {
             };
             let resp = ui.interact(br, ui.id().with(("mfm_btn", k)), if enabled { Sense::click() } else { Sense::hover() });
             p.rect_filled(br, 2.0, gy(0x000000));
-            let (top, foot) = if enabled && resp.is_pointer_button_down_on() { (gy(0x2E2E2E), gy(0x2E2E2E)) } else if enabled && resp.hovered() { (gy(0x525252), gy(0x484848)) } else { (gy(0x474747), gy(0x3D3D3D)) };
+            let (top, foot) = (crate::ui_feel::face_if(&resp, enabled, gy(0x474747), gy(0x525252), gy(0x2E2E2E)), crate::ui_feel::face_if(&resp, enabled, gy(0x3D3D3D), gy(0x484848), gy(0x2E2E2E)));
             kit::vgrad_rect(&p, br.shrink(0.5), top, foot);
             p.text(br.center(), Align2::CENTER_CENTER, label, font.clone(), if enabled { gy(0xC8C8C8) } else { gy(0x787878) });
             if resp.clicked() {

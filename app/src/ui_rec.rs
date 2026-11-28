@@ -407,7 +407,8 @@ impl App {
     /// the steps after a recording.
     pub fn poll_rec(&mut self) {
         let now = self.ctx.input(|i| i.time);
-        let prefs_open = now - self.rec.prefs_seen < 0.5;
+        // (`prefs_seen` is 0 until the page has been drawn: not "open" at launch.)
+        let prefs_open = self.rec.prefs_seen > 0.0 && now - self.rec.prefs_seen < 0.5;
         let wanted = self.rec_panel_shown() || self.rec.session.is_some() || self.rec.armed || prefs_open;
         if !wanted {
             self.rec_post();

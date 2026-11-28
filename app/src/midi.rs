@@ -1658,7 +1658,10 @@ impl Hub {
             .filter(|(_, n, id)| match (&only_ids, &only) {
                 (Some(ids), Some(names)) => ids.contains(id) || names.contains(n),
                 (Some(ids), None) => ids.contains(id),
-                _ => true,
+                // (A test run's stand-in ports, named "rbxtest-...", are that run's alone: a
+                // copy of the app that did not ask for them leaves them closed.)
+                (None, Some(_)) => true,
+                (None, None) => !n.starts_with("rbxtest-"),
             })
             .collect();
         // Gone: their threads end and their ports close. A device is its port (the unique

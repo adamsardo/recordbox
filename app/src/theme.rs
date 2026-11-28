@@ -420,6 +420,7 @@ fn visuals(v: &mut egui::Visuals) {
     v.widgets.active.bg_fill = BLUE.c();
     v.widgets.active.weak_bg_fill = BLUE.c();
     v.window_stroke = egui::Stroke::new(1.0, WIN_EDGE);
+    crate::ui_feel::text_look(v);
 }
 
 #[cfg(test)]
