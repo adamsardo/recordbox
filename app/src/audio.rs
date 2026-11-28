@@ -485,9 +485,12 @@ impl Player {
                 // besides the master's (an interface or controller with four outputs).
                 let hp = usize::try_from(HP_CHANNEL.load(std::sync::atomic::Ordering::Relaxed)).ok().filter(|h| h + 1 < channels && *h != first_ch && h + 1 != first_ch && *h != first_ch + 1);
                 HP_ACTIVE.store(hp.is_some(), std::sync::atomic::Ordering::Relaxed);
+                // `PREPDECK_MUTE_OUT=1` (scripted test runs): everything is rendered as usual and the
+                // device gets silence, so a test copy cannot be heard over the user's session.
+                let mute = mute_out();
                 dev.build_output_stream(
                 &config,
-                move |data: &mut [f32], _| match hp {
+                move |data: &mut [f32], _| { match hp {
                     Some(h) => {
                         let frames = data.len() / channels.max(1);
                         pair.clear();
@@ -505,7 +508,10 @@ impl Player {
                     }
                     None if first_ch == 0 => render(&st, data, channels, rate),
                     None => crate::prefs_ext::render_pair(data, channels, first_ch, &mut pair, |b| render(&st, b, 2, rate)),
-                },
+                }
+                if mute {
+                    data.fill(0.0);
+                } },
                 move |e| {
                     eprintln!("audio error: {e}");
                     if matches!(e, cpal::StreamError::DeviceNotAvailable) {
@@ -517,6 +523,7 @@ impl Player {
             }
             _ => {
                 let st2 = st.clone();
+                let mute = mute_out();
                 // Scratch buffer reused across callbacks (no allocation on the audio thread once
                 // it has reached the device's buffer size).
                 let mut tmp: Vec<f32> = Vec::with_capacity(8192);
@@ -527,6 +534,9 @@ impl Player {
                         render(&st2, &mut tmp, channels, rate);
                         for (d, s) in data.iter_mut().zip(tmp.iter().copied()) {
                             *d = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        }
+                        if mute {
+                            data.fill(0);
                         }
                     },
                     move |e| {
@@ -2528,4 +2538,9 @@ mod beat_pos_tests {
         assert!((860..=905).contains(&crossings), "zero crossings in a second: {crossings}");
     }
 
+}
+
+/// `PREPDECK_MUTE_OUT` set: the output device gets silence (test runs beside a live session).
+fn mute_out() -> bool {
+    std::env::var_os("PREPDECK_MUTE_OUT").is_some()
 }

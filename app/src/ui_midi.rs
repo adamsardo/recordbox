@@ -1156,7 +1156,7 @@ struct TestCtl {
     leds: std::sync::Arc<parking_lot::Mutex<Vec<[u8; 3]>>>,
 }
 
-pub const TEST_NAME: &str = "recordbox test controller";
+pub const TEST_NAME: &str = "rbxtest-midi4 controller";
 
 static TEST: parking_lot::Mutex<Option<TestCtl>> = parking_lot::Mutex::new(None);
 
@@ -1221,6 +1221,8 @@ impl App {
     /// controller. PREPDECK_SHOT_PLAYER=miditest (with PREPDECK_BENCH=<frames> to keep the
     /// window up): the scripted pointer run, which prints what each step did.
     pub fn shot_midi_events(&mut self, frame: u32, raw: &mut egui::RawInput) {
+        // `PREPDECK_SHOT_PLAYER=midirig`: the rehearsal of the owner's DDJ-S1 rig.
+        crate::midi_rig::frame(self, frame);
         // `PREPDECK_SHOT_PLAYER=midiprobe PREPDECK_MIDI_PROBE=<port>`: the read-only
         // hardware probe (midi.rs `probe`), started once (PREPDECK_MIDI_PROBE_SECS, default 8).
         if frame == 150 && std::env::var("PREPDECK_SHOT_PLAYER").map(|v| v.split(',').any(|x| x.trim() == "midiprobe")).unwrap_or(false) {
@@ -1304,7 +1306,7 @@ impl App {
         let steps: Vec<(&str, S)> = vec![
             ("the MIDI button opens the window", S::Click("MIDI")),
             ("the device list opens", S::Click("device")),
-            ("the test controller is picked", S::Click("item:recordbox test controller")),
+            ("the test controller is picked", S::Click("item:rbxtest-midi4 controller")),
             ("ADD opens its menu", S::Click("ADD")),
             ("PlayPause is added", S::Click("add:PlayPause")),
             ("LEARN is armed", S::Click("LEARN")),
@@ -1381,7 +1383,7 @@ impl App {
             vec![
                 ("the MIDI button opens the window", S::Click("MIDI")),
                 ("the device list opens", S::Click("device")),
-                ("the test controller (with the DDJ-S1 rows) is picked: DECK", S::Click("item:recordbox test controller")),
+                ("the test controller (with the DDJ-S1 rows) is picked: DECK", S::Click("item:rbxtest-midi4 controller")),
                 ("PAD tab", S::Click("tab:PAD")),
                 ("FX tab", S::Click("tab:FX")),
                 ("MIXER tab", S::Click("tab:MIXER")),

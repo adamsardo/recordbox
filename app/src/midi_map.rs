@@ -850,6 +850,8 @@ pub struct TempoTakeover {
     pub state: u8,
     /// Where the hardware slider stands (percent), for the on-screen ghost marker.
     pub slider: Option<f64>,
+    /// Set when the takeover starts waiting (`take_notice`).
+    pub notice: bool,
 }
 
 impl TempoTakeover {
@@ -878,6 +880,9 @@ impl TempoTakeover {
             } else {
                 3
             };
+            if matches!(self.state, 1 | 3) {
+                self.notice = true;
+            }
         }
         match self.state {
             1 | 2 if !follower && slider >= deck - NEAR => self.state = 5,
@@ -890,8 +895,18 @@ impl TempoTakeover {
     }
 
     /// The direction LEDs: (TempoDown, TempoUp) - which way to move the slider.
+    /// `UiPlayer::deviceUpdateTakeOverLed` 0x102032754: TempoUp (member 0x970) while the
+    /// slider stands below the deck's tempo (state 1), TempoDown (0x978) while above (3);
+    /// both dark on a deck that follows a sync master (states 2 and 4), matched or armed.
     pub fn leds(&self) -> (bool, bool) {
-        (matches!(self.state, 3 | 4), matches!(self.state, 1 | 2))
+        (self.state == 3, self.state == 1)
+    }
+
+    /// The takeover has just started waiting (state 0 to 1 or 3): rekordbox's status line
+    /// then says "Move Tempo Slider to the current BPM value." (`kBeatSyncOperateErrorTempoSlider2`
+    /// in `deviceUpdateTakeOverStatus` 0x102030ca8). Read once.
+    pub fn take_notice(&mut self) -> bool {
+        std::mem::take(&mut self.notice)
     }
 }
 
@@ -1071,12 +1086,14 @@ impl Jog {
                 if slow {
                     self.slow_releases += 1;
                 }
+                // (recordbox's deck has no spin-down: a spin is a release, so the platter
+                // goes back to idle either way; left in "spin", later counts would bend and
+                // the bend would never end.)
+                self.state = 0;
                 if slow || self.slow_releases >= self.spin_over {
                     self.slow_releases = 0;
-                    self.state = 0;
                     JogOut::Release
                 } else {
-                    self.state = 2;
                     JogOut::Spin(self.last_speed)
                 }
             }
@@ -1144,6 +1161,28 @@ impl Jog {
         }
         self.last_speed = 0.0;
         JogOut::Scratch(0.0)
+    }
+
+    /// The platter top is being touched.
+    pub fn touched(&self) -> bool {
+        self.touched
+    }
+
+    /// The device went away: whatever the platter was doing ends (a held record is let go,
+    /// a bend stops). `Nothing` when it was idle.
+    pub fn let_go(&mut self) -> JogOut {
+        let was = self.state;
+        self.state = 0;
+        self.touched = false;
+        self.window.clear();
+        self.carry = 0.0;
+        self.last_t = None;
+        self.last_speed = 0.0;
+        match was {
+            1 | 2 => JogOut::Release,
+            4 => JogOut::Bend(0.0),
+            _ => JogOut::Nothing,
+        }
     }
 
     /// Nothing came for a while (`now_ms`): a bend ends 60 ms after its last count, and a
@@ -1653,7 +1692,11 @@ mod tests {
         j.rotate(-40, 2000.0, true);
         j.rotate(-40, 2010.0, true);
         assert_eq!(j.touch(false, true), JogOut::Spin(-8.0));
-        assert_eq!(j.state, 2);
+        // (The deck has no spin-down: the platter is idle again, so later counts bend and
+        // the bend ends 60 ms after them.)
+        assert_eq!(j.state, 0);
+        assert!(matches!(j.rotate(10, 2100.0, false), JogOut::Bend(_)));
+        assert_eq!(j.idle(2200.0), JogOut::Bend(0.0));
         // Vinyl off on a playing deck: the platter top bends; on a stopped deck it scratches.
         let mut j = Jog::new(720.0);
         j.vinyl = false;
