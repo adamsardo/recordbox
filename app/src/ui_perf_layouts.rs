@@ -307,7 +307,7 @@ pub(crate) fn capture_pick(app: &mut App, ui: &mut Ui, lane: Rect, n: u8, vertic
     }
     let Some((r, pos, pps)) = (if vertical { None } else { app.deck.detail_map }) .or_else(|| {
         let span = span(app)?;
-        Some((lane, app.pos(), lane.height() as f64 / span))
+        Some((lane, app.pos(), lane.height() as f64 / (span * crate::wave_drag::tempo_scale(app))))
     }) else { return };
     let along = |t: f64| -> f32 {
         if vertical { lane.center().y + ((t - pos) * pps) as f32 } else { r.center().x + ((t - pos) * pps) as f32 }
@@ -1356,7 +1356,8 @@ pub(crate) fn beat_count_text(app: &App, pos: f64) -> String {
 pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: f64) {
     let p = ui.painter_at(lane);
     let span = crate::ui_feel::zoom_span(ui, lane, span(app).unwrap_or(2.0));
-    let pps = lane.height() as f64 / span;
+    // (The deck's tempo scales it: `wave_drag::tempo_scale`.)
+    let pps = lane.height() as f64 / (span * crate::wave_drag::tempo_scale(app));
     let cy = lane.center().y;
     // The beat marks' outer ends: 1 pt in from the left, 2.5 pt in from the right.
     let (xl, xr) = (lane.min.x + 1.0, lane.max.x - 2.5);
@@ -1601,6 +1602,7 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
             app.deck.cue_drag = Some((id, app.deck.cues.clone(), t_of(pp.y) - start));
         } else {
             app.deck.drag_origin = Some((pp.map(|p| p.y).unwrap_or(cy), pos));
+            crate::wave_drag::start(app);
         }
     }
     if let Some((id, _, grab)) = app.deck.cue_drag.clone() {
@@ -1628,12 +1630,14 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
     } else if resp.dragged() {
         if let (Some((y0, p0)), Some(pp)) = (app.deck.drag_origin, resp.interact_pointer_pos()) {
             let t = p0 - (pp.y - y0) as f64 / pps;
-            app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
-            app.seek(t);
+            let dt = ui.input(|i| i.unstable_dt) as f64;
+            app.deck.x.scrub += crate::wave_drag::to(app, t, dt);
+            ui.ctx().request_repaint();
         }
     }
-    if resp.drag_stopped() && app.deck.drag_origin.is_some() {
+    if (resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) && app.deck.drag_origin.is_some() {
         app.deck.drag_origin = None;
+        crate::wave_drag::end(app);
         if !app.playing() {
             let q = app.quantized(app.pos());
             app.deck.cue_point = q;
@@ -1649,6 +1653,7 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
             let t = pos - d as f64 / pps;
             app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
             app.seek(t);
+            crate::ui_feel::snap_pos(app);
         }
     }
 }

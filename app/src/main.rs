@@ -153,6 +153,7 @@ mod ui_perf_layouts;
 mod ui_player2;
 mod xmlexport;
 mod vocal_rb;
+mod wave_drag;
 mod vocal_rb_mp3;
 mod vocal_rb_net;
 
@@ -200,9 +201,54 @@ impl eframe::App for Gui {
         self.app.shot_key_events(frame, raw);
         crate::dupes::shot_events(&mut self.app, frame, raw);
         crate::stem_export_selftest::shot_events(&mut self.app, frame, raw);
+        // `PREPDECK_SHOT_TEMPO2=<percent>`: deck 2's tempo, to see the waveforms' tempo scale.
+        if frame == 60 {
+            if let Some(pct) = std::env::var("PREPDECK_SHOT_TEMPO2").ok().and_then(|v| v.parse::<f64>().ok()) {
+                self.app.with_deck(1, |a| {
+                    a.deck.x.tempo_adj = pct;
+                    a.push_deck_controls();
+                    eprintln!("tempo2: deck 2 speed {:.4}, BPM {:.2} -> {:.2}, waveform scale {:.4}", a.deck_speed(), a.current_bpm(), a.effective_bpm(), crate::wave_drag::tempo_scale(a));
+                });
+                self.app.with_deck(0, |a| eprintln!("tempo2: deck 1 speed {:.4}, BPM {:.2}, waveform scale {:.4}", a.deck_speed(), a.current_bpm(), crate::wave_drag::tempo_scale(a)));
+            }
+        }
+        // `PREPDECK_SHOT_WAVEDRAG=1`: a pointer drag on the playing active deck's waveform
+        // (3 pt a frame for 30 frames, held still for 10, let go): what is drawn against where
+        // the pointer has the track, and where the audio is.
+        if std::env::var("PREPDECK_SHOT_WAVEDRAG").is_ok() {
+            static AT: std::sync::OnceLock<(egui::Pos2, f64, f64)> = std::sync::OnceLock::new();
+            let ev = |x: f32, y: f32, down: Option<bool>| match down {
+                Some(d) => egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: d, modifiers: Default::default() },
+                None => egui::Event::PointerMoved(egui::pos2(x, y)),
+            };
+            match frame {
+                62 => self.app.set_playing(true),
+                69 => {
+                    if let Some((r, _, pps)) = self.app.deck.detail_map {
+                        let at = egui::pos2(r.center().x + 80.0, r.center().y);
+                        let _ = AT.set((at, self.app.pos(), pps));
+                        raw.events.push(ev(at.x, at.y, None));
+                    }
+                }
+                70 => if let Some((at, _, _)) = AT.get() { raw.events.push(ev(at.x, at.y, Some(true))) },
+                71..=100 => if let Some((at, _, _)) = AT.get() { raw.events.push(ev(at.x - 3.0 * (frame - 70) as f32, at.y, None)) },
+                111 => if let Some((at, _, _)) = AT.get() { raw.events.push(ev(at.x - 90.0, at.y, Some(false))) },
+                _ => {}
+            }
+            if (70..=116).contains(&frame) {
+                let held = crate::ui_feel::held_pos(&self.app);
+                let s = self.app.player.state.lock();
+                let (jog, playing) = (s.dk.jog, s.playing);
+                drop(s);
+                eprintln!("wavedrag: frame {frame}: pointer has it at {:?}, drawn {:.4}, audio {:.4}, {:?}, playing {playing}", held.map(|t| (t * 1e4).round() / 1e4), crate::ui_feel::shown_pos(&self.app), self.app.pos(), jog);
+            }
+        }
         // `PREPDECK_SHOT_DELKEY=1`: the Backspace key on a selected track of a playlist.
         if std::env::var("PREPDECK_SHOT_DELKEY").is_ok() {
             match frame {
+                80 if std::env::var("PREPDECK_SHOT_DELKEY").map(|v| v == "collection").unwrap_or(false) => {
+                    self.app.set_view(app::View::Collection);
+                }
                 80 => {
                     let pl = self.app.nodes.iter().filter(|n| n.kind == model::NodeKind::Playlist).map(|n| n.id).find(|id| self.app.node_counts.get(id).copied().unwrap_or(0) > 1);
                     if let Some(pl) = pl {
@@ -233,7 +279,7 @@ impl eframe::App for Gui {
                 }
                 86 => raw.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }),
                 87 => raw.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() }),
-                92 => eprintln!("delkey: after: {} tracks, {} selected", self.app.list.len(), self.app.selected.len()),
+                92 => eprintln!("delkey: after: {} tracks, {} selected, asking about {:?} track(s)", self.app.list.len(), self.app.selected.len(), self.app.dialogs.confirm_remove.as_ref().map(|v| v.len())),
                 _ => {}
             }
         }
@@ -649,10 +695,22 @@ fn shortcuts(app: &mut App, ctx: &egui::Context) {
     if cmd_a {
         app.selected = app.list.iter().copied().collect();
     }
-    if del && !app.selected.is_empty() {
+    if del && !app.selected.is_empty() && app.dialogs.confirm_remove.is_none() {
         if let Some(pl) = app.is_manual_playlist() {
             let s = app.selected.clone();
             app.remove_from_playlist(pl, &s);
+            // (The rows are gone: nothing of them stays selected.)
+            if !app.prefs.rb.library_protection {
+                app.selected.clear();
+            }
+        } else if matches!(app.view, app::View::Collection | app::View::Category { .. } | app::View::Playlist(_) | app::View::Related | app::View::Matching | app::View::Suggest(_)) {
+            // Anywhere else that lists collection tracks the key is the track menu's "Remove
+            // from Collection", which asks first (the Tag List and the histories have their
+            // own removal in ui_browser.rs).
+            let sel: Vec<i64> = app.list.iter().copied().filter(|t| app.selected.contains(t)).collect();
+            if !sel.is_empty() {
+                app.dialogs.confirm_remove = Some(sel);
+            }
         }
     }
 }

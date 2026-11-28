@@ -701,10 +701,15 @@ thread_local! {
 /// once; a paused deck is drawn at exactly its position.
 pub fn shown_pos(app: &App) -> f64 {
     let real = app.pos();
+    let key = std::sync::Arc::as_ptr(&app.player.state) as usize;
+    // A waveform being dragged is drawn where the pointer has it (`wave_drag.rs`).
+    if let Some(t) = held_pos(app) {
+        POS.with(|p| p.borrow_mut().retain(|(k, _)| *k != key));
+        return t;
+    }
     if !motion::on() {
         return real;
     }
-    let key = std::sync::Arc::as_ptr(&app.player.state) as usize;
     let frame = FRAME_NO.with(|f| f.get());
     let (now, step) = (motion::display_time(), motion::display_step());
     let fresh = |real: f64| PosTrack { shown: real, real, real_at: now, rate: 0.0, frame, anchor: (real, now) };
@@ -766,6 +771,46 @@ pub fn shown_pos(app: &App) -> f64 {
         motion::keep_alive();
         t.shown
     })
+}
+
+thread_local! {
+    /// Decks whose waveform is being dragged: (deck, the position under the pointer).
+    static HELD: RefCell<Vec<(usize, f64)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn deck_key(app: &App) -> usize {
+    std::sync::Arc::as_ptr(&app.player.state) as usize
+}
+
+/// The active deck's waveform is being dragged and the pointer has it at `t` seconds: it is
+/// drawn there until `release_pos`, whatever the audio does meanwhile.
+pub fn hold_pos(app: &App, t: f64) {
+    let key = deck_key(app);
+    HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => e.1 = t,
+            None => h.push((key, t)),
+        }
+    });
+}
+
+/// The position a dragged waveform is held at, if the active deck's is.
+pub fn held_pos(app: &App) -> Option<f64> {
+    let key = deck_key(app);
+    HELD.with(|h| h.borrow().iter().find(|(k, _)| *k == key).map(|e| e.1))
+}
+
+/// The deck was just moved by hand (a scroll over its waveform): the drawn position follows
+/// at once and does not glide there.
+pub fn snap_pos(app: &App) {
+    let key = deck_key(app);
+    POS.with(|p| p.borrow_mut().retain(|(k, _)| *k != key));
+}
+
+pub fn release_pos(app: &App) {
+    let key = deck_key(app);
+    HELD.with(|h| h.borrow_mut().retain(|(k, _)| *k != key));
 }
 
 // ------------------------------------------------------------------ track list artwork off the frame

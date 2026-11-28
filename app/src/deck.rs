@@ -718,6 +718,9 @@ pub struct DeckUi {
     /// The platter is held with the pointer: the angle and time of the last reading, and the
     /// speed in use.
     pub platter: Option<(f32, f64, f64)>,
+    /// The enlarged waveform of a playing deck is being dragged (`wave_drag.rs`): the deck is
+    /// held and follows the pointer as a scratch.
+    pub wave_held: bool,
     /// Bend from the jog ring (added to the bend buttons').
     pub jog_bend: f64,
     /// Loop edge adjust with the jog: what is left over under a whole millisecond.
