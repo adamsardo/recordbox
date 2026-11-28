@@ -852,6 +852,8 @@ pub struct TempoTakeover {
     pub slider: Option<f64>,
     /// Set when the takeover starts waiting (`take_notice`).
     pub notice: bool,
+    /// The slider's last raw position (0..16383), for judging it again under a new range.
+    pub raw: Option<i32>,
 }
 
 impl TempoTakeover {
@@ -859,6 +861,19 @@ impl TempoTakeover {
     /// on screen.
     pub fn arm(&mut self) {
         self.state = 0;
+    }
+
+    /// Armed again and judged at once from where the slider was last seen, as rekordbox's
+    /// `enableTakeOver` 0x102030c28 / `onSyncStateChangedTakeOver` 0x1020300c8 do (state 0,
+    /// then `deviceUpdateTakeOverStatus` with the stored `tempoSliderPosition`; nothing
+    /// before the slider has been moved once). So a slider message that came after the
+    /// change and one that comes later give the same state, whatever the order of the port
+    /// thread and the frame. The tempo is not set here.
+    pub fn rearm(&mut self, deck: f64, loaded: bool, follower: bool, range_pct: f64) {
+        self.state = 0;
+        if let Some(raw) = self.raw {
+            let _ = self.feed(tempo_slider_percent(raw, range_pct), deck, loaded, follower);
+        }
     }
 
     /// The slider moved to `slider` percent while the deck is at `deck` percent. Returns the
@@ -1601,6 +1616,34 @@ mod tests {
         }
         assert_eq!(cycles, [0, 6, 12, 15]);
         assert!(b.stop(2) && !b.stop(2) && b.is_blinking(1));
+    }
+
+    /// Armed again (the tempo changed on screen, sync changed): judged at once from the
+    /// slider's last place, so the order of a slider message and the re-arm does not matter.
+    #[test]
+    fn a_rearmed_takeover_is_judged_from_the_last_slider_place() {
+        // Never moved: nothing to judge.
+        let mut t = TempoTakeover::default();
+        t.rearm(3.0, true, false, 10.0);
+        assert_eq!(t.state, 0);
+        // The slider seen at its centre (raw 8191: -0.001 % at +-10 %), the deck at 0: taken.
+        t.raw = Some(8191);
+        let _ = t.feed(tempo_slider_percent(8191, 10.0), 0.0, true, false);
+        assert_eq!(t.state, 5);
+        // The tempo set to +3 % on screen, then re-armed: the slider stands below, TempoUp.
+        t.rearm(3.0, true, false, 10.0);
+        assert_eq!((t.state, t.leds()), (1, (false, true)));
+        assert!(t.take_notice());
+        // The other order: re-armed first, then the slider message: the same state.
+        let mut u = TempoTakeover::default();
+        u.rearm(3.0, true, false, 10.0);
+        u.raw = Some(8191);
+        let _ = u.feed(tempo_slider_percent(8191, 10.0), 3.0, true, false);
+        assert_eq!(u.state, t.state);
+        // A follower: states 2 / 4, both arrows dark, no message.
+        let mut f = TempoTakeover { raw: Some(8191), ..Default::default() };
+        f.rearm(3.0, true, true, 10.0);
+        assert_eq!((f.state, f.leds(), f.take_notice()), (2, (false, false), false));
     }
 
     #[test]

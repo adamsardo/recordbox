@@ -2074,7 +2074,9 @@ impl Hub {
         let d = self.snap.lock().decks[n];
         let deck_pct = (self.decks[n].lock().tempo - 1.0) * 100.0;
         let slider = tempo_slider_percent(raw, d.range * 100.0);
-        self.takeover.lock()[n].feed(slider, deck_pct, d.loaded, d.follower).map(|p| p / 100.0)
+        let mut t = self.takeover.lock();
+        t[n].raw = Some(raw);
+        t[n].feed(slider, deck_pct, d.loaded, d.follower).map(|p| p / 100.0)
     }
 
     pub fn takeover_state(&self, n: usize) -> TempoTakeover {
@@ -2090,6 +2092,18 @@ impl Hub {
     /// then, Needle Lock or not).
     pub fn jog_touched(&self, n: usize) -> bool {
         self.devices.lock().iter().any(|d| d.jog.lock()[n.min(3)].touched())
+    }
+
+    /// The record of deck `n` is held by the pointer (`App::jog_touch` / `jog_speed`: a hold
+    /// without a counted distance), not by a controller's platter.
+    pub fn pointer_holds(&self, n: usize) -> bool {
+        let s = self.decks[n.min(3)].lock();
+        s.dk.jog != crate::deck::Jog::None && s.dk.jog_left.is_nan()
+    }
+
+    /// Armed again and judged from the slider's last place (`TempoTakeover::rearm`).
+    pub fn rearm_takeover(&self, n: usize, deck_pct: f64, loaded: bool, follower: bool, range_pct: f64) {
+        self.takeover.lock()[n.min(3)].rearm(deck_pct, loaded, follower, range_pct);
     }
 
     pub fn arm_takeover(&self, n: usize) {
@@ -2220,6 +2234,11 @@ impl Hub {
                     j[n].rpm = if snap.rpm45 { 45.0 } else { 100.0 / 3.0 };
                     j[n].touch(on, playing)
                 };
+                // The pointer holds this deck's record (the on-screen platter, a waveform
+                // drag): the controller's touch and release leave it alone.
+                if self.pointer_holds(n) && matches!(out, JogOut::Scratch(_) | JogOut::Release | JogOut::Spin(_)) {
+                    return true;
+                }
                 // The hand has the record: from here it moves as far as the counts say.
                 if on && matches!(out, JogOut::Scratch(_)) {
                     self.decks[n].lock().dk.jog_left = 0.0;
@@ -2243,6 +2262,9 @@ impl Hub {
                 // A scratch: the record owes the distance these counts stand for (k ms of
                 // the track a count), so it stops where the platter stopped, however late
                 // the next message or the idle check comes.
+                if matches!(out, JogOut::Scratch(_)) && self.pointer_holds(n) {
+                    return true;
+                }
                 if matches!(out, JogOut::Scratch(_)) {
                     let mut s = self.decks[n].lock();
                     let sr = s.audio.as_ref().map(|a| a.sr as f64).unwrap_or(44100.0);
@@ -2443,6 +2465,11 @@ pub fn jog_scratch(hub: &Hub, n: usize, out: JogOut) {
     };
     hub.jog_bend[n].store(0f64.to_bits(), Relaxed);
     let mut s = hub.decks[n].lock();
+    // (The pointer holds the record: `Hub::pointer_holds`. A controller's late stop or
+    // release does not take it away.)
+    if s.dk.jog != crate::deck::Jog::None && s.dk.jog_left.is_nan() {
+        return;
+    }
     // The platter stood still long enough for the worker to say "stop", but the record has
     // not yet gone the distance the counts stand for (the audio thread starts each speed at
     // its next buffer): it goes on at its speed and stops there (`Engine::jog_left`).
@@ -2648,7 +2675,12 @@ pub fn poll(app: &mut App) {
         let d = app.deck_of(n as u8);
         let (tempo, iso, follow) = (d.x.tempo_adj, app.px.mix[n].stem_iso_on, d.x.beat_sync);
         if (tempo - app.midi.last_tempo[n]).abs() > 1e-9 || follow != app.midi.last_follow[n] {
-            hub.arm_takeover(n);
+            let follower = app.two_players() && follow && (n as u8 != app.px.master || app.sampler_is_master());
+            let range = if app.performance() { crate::player_ext::TEMPO_RANGES[(d.x.tempo_range as usize + 1) % 4] } else { crate::player_ext::TEMPO_RANGE * 100.0 };
+            hub.rearm_takeover(n, tempo * 100.0, d.audio.is_some(), follower, range);
+            if hub.takeover_notice(n) {
+                status(app, "Move Tempo Slider to the current BPM value.", false);
+            }
         }
         if iso != app.midi.last_iso[n] && app.prefs.midi.takeover_eq_iso {
             hub.start_pickup(n);
@@ -2719,7 +2751,9 @@ fn widen_tempo_range(app: &mut App, hub: &Arc<Hub>, n: u8) -> bool {
     }
     app.deck_of_mut(n).x.tempo_range = x;
     app.with_deck(n, |a| a.push_deck_controls());
-    hub.arm_takeover(ni);
+    // (Judged again from the slider under the new range; the message below says it.)
+    let tempo = app.deck_of(n).x.tempo_adj * 100.0;
+    hub.rearm_takeover(ni, tempo, true, false, want);
     let _ = hub.takeover_notice(ni);
     status(app, "Tempo Range has been changed. Move Tempo Slider to the current BPM value.", false);
     true
@@ -4629,6 +4663,55 @@ mod tests {
         assert!((hub.decks[1].lock().pos / 44100.0 - 10.666).abs() < 1e-6, "not again within 200 ms");
         feed(&hub, &dev, &[0xB1, 0x27, 0x3F], 1300.0);
         assert!((hub.decks[1].lock().pos / 44100.0 - 10.0).abs() < 1e-6);
+    }
+
+    /// A controller's platter and the pointer (the on-screen platter, a waveform drag, which
+    /// hold the record through `App::jog_touch`: `Jog::Touch` with no counted distance) do
+    /// not leave each other's state behind on one deck.
+    #[test]
+    fn a_controller_scratch_and_a_pointer_hold_do_not_take_each_others_record() {
+        let (hub, dev, _rx) = test_device("PIONEER DDJ-ERGO", "@file,1,PIONEER DDJ-ERGO\r\nJogScratch,,JogRotate,,B022,B122,,,,,,,,RO;,\r\nJogTouch,,JogTouch,,9036,9136,,,,,,,,RO;,\r\n");
+        let jog = |h: &Hub| {
+            let s = h.decks[0].lock();
+            (s.dk.jog, s.dk.jog_left)
+        };
+        // The controller has the record: a counted distance.
+        feed(&hub, &dev, &[0x90, 0x36, 0x7F], 0.0);
+        feed(&hub, &dev, &[0xB0, 0x22, 0x50], 10.0);
+        let (j, left) = jog(&hub);
+        assert!(matches!(j, crate::deck::Jog::Speed(_)) && left > 0.0, "{j:?} {left}");
+        // The pointer takes it (as `App::jog_touch(true)` does): the controller's further
+        // counts, its idle stop and its release leave the pointer's hold alone.
+        {
+            let mut s = hub.decks[0].lock();
+            s.dk.jog = crate::deck::Jog::Touch;
+            s.dk.jog_left = f64::NAN;
+        }
+        feed(&hub, &dev, &[0xB0, 0x22, 0x50], 20.0);
+        assert_eq!(jog(&hub).0, crate::deck::Jog::Touch);
+        assert!(jog(&hub).1.is_nan());
+        let out = dev.jog.lock()[0].idle(500.0);
+        hub.jog_out(0, out);
+        assert_eq!(jog(&hub).0, crate::deck::Jog::Touch);
+        feed(&hub, &dev, &[0x90, 0x36, 0x00], 600.0);
+        assert_eq!(jog(&hub).0, crate::deck::Jog::Touch);
+        // The pointer lets go; the controller touches again: its own hold, counted afresh.
+        hub.decks[0].lock().dk.jog = crate::deck::Jog::None;
+        feed(&hub, &dev, &[0x90, 0x36, 0x7F], 700.0);
+        assert_eq!(jog(&hub), (crate::deck::Jog::Speed(0.0), 0.0));
+        feed(&hub, &dev, &[0xB0, 0x22, 0x44], 710.0);
+        assert!(jog(&hub).1 > 0.0);
+        // A controller touch while the pointer holds: nothing taken.
+        feed(&hub, &dev, &[0x90, 0x36, 0x00], 800.0);
+        assert_eq!(jog(&hub).0, crate::deck::Jog::None);
+        {
+            let mut s = hub.decks[0].lock();
+            s.dk.jog = crate::deck::Jog::Touch;
+            s.dk.jog_left = f64::NAN;
+        }
+        feed(&hub, &dev, &[0x90, 0x36, 0x7F], 900.0);
+        assert_eq!(jog(&hub).0, crate::deck::Jog::Touch);
+        assert!(jog(&hub).1.is_nan());
     }
 
     #[test]

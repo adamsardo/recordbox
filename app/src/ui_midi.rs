@@ -1289,12 +1289,24 @@ impl App {
         }
         // ---- the scripted run: a step every 8 frames from frame 150 (the test controller
         // is found by the port scan within a second or two of the start).
+        // (On a clock, not on frames: a tick of 16 ms, at most one a frame, so that the steps
+        // take the same time whatever the frame rate; the app's frames are paced to the
+        // display. A step is 8 ticks; it starts 150 ticks, 2.4 s, after the first frame.)
         const START: u32 = 150;
-        if frame < START {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let due = (T0.get_or_init(std::time::Instant::now).elapsed().as_millis() / 16) as u32;
+        let tick = TICK.load(Relaxed);
+        if tick > due {
             return;
         }
-        let step = ((frame - START) / 8) as usize;
-        let phase = (frame - START) % 8;
+        TICK.store(tick + 1, Relaxed);
+        let _ = frame;
+        if tick < START {
+            return;
+        }
+        let step = ((tick - START) / 8) as usize;
+        let phase = (tick - START) % 8;
         let file = std::env::var("PREPDECK_MIDI_FILE").unwrap_or_default();
         enum S {
             Click(&'static str),
@@ -1485,6 +1497,10 @@ impl App {
         let Some((name, s)) = steps.get(step) else {
             if step == steps.len() && phase == 0 {
                 eprintln!("miditest: done; {} mapped messages handled, {} codes learned", self.midi.handled, self.midi.win.learned);
+            }
+            // (The run is on a clock now, not a number of frames: it ends itself.)
+            if step == steps.len() + 1 && phase == 0 {
+                std::process::exit(0);
             }
             return;
         };

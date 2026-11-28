@@ -947,7 +947,7 @@ pub fn frame(app: &mut App, frame: u32) {
             }
             let loaded = (0..2u8).all(|n| app.deck_of(n).audio.is_some() && app.deck_of(n).loading.is_none());
             if open.len() == 3 && loaded && since > 30 {
-                say(&format!("connected after {since} frames: {open:?}; decks loaded: {:?}", (0..2u8).map(|n| app.deck_of(n).track).collect::<Vec<_>>()));
+                say(&format!("connected after {since} ticks of 16 ms: {open:?}; decks loaded: {:?}", (0..2u8).map(|n| app.deck_of(n).track).collect::<Vec<_>>()));
                 for name in PORTS {
                     if let Some(d) = hub.as_ref().and_then(|h| h.device(name)) {
                         say(&format!("{name}: {}", hub.as_ref().unwrap().mapping_summary(&d)));
@@ -1355,6 +1355,14 @@ fn outputs(app: &mut App, r: &mut Rig, frame: u32) {
             if app.deck_of(0).audio.is_some() && o.state != "deck 1 paused on the cue point" {
                 app.with_deck(0, |a| a.seek(20.0));
             }
+            if o.state == "deck 1 takeover: slider below the tempo" {
+                // (The fader at its centre with the deck at 0: it has the deck.)
+                app.with_deck(0, |a| {
+                    a.deck.x.tempo_adj = 0.0;
+                    a.push_deck_controls();
+                });
+                send(r, S1, &[msg(0xB0, 0x00, 0x3F), msg(0xB0, 0x20, 0x7F)]);
+            }
         }
         // Then the state under test.
         20 => {
@@ -1385,13 +1393,14 @@ fn outputs(app: &mut App, r: &mut Rig, frame: u32) {
                     }
                 }),
                 "deck 1 takeover: slider below the tempo" => {
+                    // The deck set to +3 % on screen, the fader last seen at its centre (sent in
+                    // the plain state): judged again at once, the fader stands below the deck
+                    // (rekordbox's `enableTakeOver`), whatever comes first, the frame or the
+                    // port's thread.
                     app.with_deck(0, |a| {
                         a.deck.x.tempo_adj = 0.03;
                         a.push_deck_controls();
                     });
-                    hub.arm_takeover(0);
-                    // The fader at its centre: 3 % below the deck.
-                    send(r, S1, &[msg(0xB0, 0x00, 0x3F), msg(0xB0, 0x20, 0x7F)]);
                 }
                 "deck 1 headphone CUE on" => app.px.mix[0].cue = true,
                 "FX1 effect on" => {
