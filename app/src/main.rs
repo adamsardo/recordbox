@@ -200,6 +200,43 @@ impl eframe::App for Gui {
         self.app.shot_key_events(frame, raw);
         crate::dupes::shot_events(&mut self.app, frame, raw);
         crate::stem_export_selftest::shot_events(&mut self.app, frame, raw);
+        // `PREPDECK_SHOT_DELKEY=1`: the Backspace key on a selected track of a playlist.
+        if std::env::var("PREPDECK_SHOT_DELKEY").is_ok() {
+            match frame {
+                80 => {
+                    let pl = self.app.nodes.iter().filter(|n| n.kind == model::NodeKind::Playlist).map(|n| n.id).find(|id| self.app.node_counts.get(id).copied().unwrap_or(0) > 1);
+                    if let Some(pl) = pl {
+                        self.app.side = app::SideMode::Playlists;
+                        self.app.set_view(app::View::Playlist(pl));
+                    }
+                }
+                81..=83 if std::env::var("PREPDECK_SHOT_DELKEY").map(|v| v.contains(',')).unwrap_or(false) => {
+                    // "x,y": a real click on a row instead of a selection set from here.
+                    let v = std::env::var("PREPDECK_SHOT_DELKEY").unwrap_or_default();
+                    let mut it = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+                    let at = egui::pos2(it.next().unwrap_or(0.0), it.next().unwrap_or(0.0));
+                    match frame {
+                        81 => raw.events.push(egui::Event::PointerMoved(at)),
+                        82 => raw.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }),
+                        _ => raw.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }),
+                    }
+                }
+                84 => {
+                    if self.app.selected.is_empty() {
+                    if let Some(t) = self.app.list.first().copied() {
+                        self.app.selected = [t].into_iter().collect();
+                        self.app.anchor_id = Some(t);
+                    }
+                    }
+                    eprintln!("delkey: focused widget {:?}", _ctx.memory(|m| m.focused()));
+                    eprintln!("delkey: before: view {:?}, {} tracks, {} selected, typing {}", self.app.view, self.app.list.len(), self.app.selected.len(), _ctx.wants_keyboard_input());
+                }
+                86 => raw.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }),
+                87 => raw.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() }),
+                92 => eprintln!("delkey: after: {} tracks, {} selected", self.app.list.len(), self.app.selected.len()),
+                _ => {}
+            }
+        }
         if std::env::var("PREPDECK_SHOT_DRAG").is_err() {
             return;
         }
