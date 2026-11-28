@@ -114,11 +114,15 @@ pub struct Engine {
     pub eqsw: EqSwitch,
     /// DJM-900NXS EQ: the filter steps in use per band (rekordbox's `Equalizer`).
     pub nxs: NxsSteps,
+    /// A controller's platter: how far (source frames, signed) the counts received so far
+    /// still move the record under `Jog::Speed`; it stops there whatever the speed says, so
+    /// the record travels exactly the distance turned. NaN: no limit (the on-screen platter).
+    pub jog_left: f64,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Engine { reverse: false, slip_reverse: false, slip_return: false, jog: Jog::None, start_ms: 1.0, stop_ms: 1.0, bend_slope: 0.0, bend_acc: 0.0, warp: None, scan_grain: 0.0, sync_rate: 1.0, route: 255, xf: [1.0; 2], vel: 0.0, arm_loop: None, eqsw: EqSwitch::default(), nxs: NxsSteps::default() }
+        Engine { reverse: false, slip_reverse: false, slip_return: false, jog: Jog::None, start_ms: 1.0, stop_ms: 1.0, bend_slope: 0.0, bend_acc: 0.0, warp: None, scan_grain: 0.0, sync_rate: 1.0, route: 255, xf: [1.0; 2], vel: 0.0, arm_loop: None, eqsw: EqSwitch::default(), nxs: NxsSteps::default(), jog_left: f64::NAN }
     }
 }
 
@@ -845,7 +849,14 @@ impl App {
         if on {
             self.sync_lost();
         }
-        self.player.state.lock().dk.jog = self.deck.x.dk.jog;
+        {
+            let mut s = self.player.state.lock();
+            s.dk.jog = self.deck.x.dk.jog;
+            // (A hold with the pointer has no counted distance: a controller's is cleared.)
+            if on {
+                s.dk.jog_left = f64::NAN;
+            }
+        }
         // (Controller > Deck > JOG: "After turning on the cue button and spinning the jog, the
         // track returns to the cue point and pause." Off, the deck plays on from the jog.)
         if !on && self.deck.cue_preview && self.prefs.rb.jog_sampler_mode {

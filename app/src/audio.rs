@@ -1499,6 +1499,8 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
     // Groove Circuit: this deck's DRUM SWAP slots (and its drums under DRUM RELEASE FX).
     let gc = crate::groove::deck_block(s, &audio, speed, &mut stem_target, out.len() / channels.max(1), rate);
     for (fi, f) in out.chunks_mut(channels).enumerate() {
+        // (A controller's platter has turned no further: the record stands.)
+        let target = if matches!(jog, Jog::Speed(_)) && s.dk.jog_left.is_finite() && s.dk.jog_left * target <= 0.0 { 0.0 } else { target };
         let d = &mut s.dsp;
         // ---- speed
         match d.ramp {
@@ -1751,7 +1753,22 @@ pub fn render_deck_cue(s: &mut PlayState, out: &mut [f32], cue: &mut [f32], chan
             f[0] += 0.5 * (l + r) * vol + click;
         }
         // ---- move on
-        d.snd += step * d.vel;
+        let mut adv = step * d.vel;
+        if matches!(jog, Jog::Speed(_)) && s.dk.jog_left.is_finite() {
+            let left = s.dk.jog_left;
+            if left * adv <= 0.0 {
+                adv = 0.0;
+            } else if adv.abs() > left.abs() {
+                adv = left;
+            }
+            s.dk.jog_left = left - adv;
+            // (Gone the whole way: the platter is standing still.)
+            if s.dk.jog_left.abs() < 1e-9 {
+                s.dk.jog = Jog::Speed(0.0);
+            }
+        }
+        let d = &mut s.dsp;
+        d.snd += adv;
         if jog != Jog::None {
             d.snd = d.snd.clamp(0.0, last);
         }

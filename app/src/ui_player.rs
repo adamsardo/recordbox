@@ -901,8 +901,9 @@ pub(crate) fn draw_detail_at(app: &mut App, ui: &mut Ui, r: Rect, pos: f64, cx_o
                 let d = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
                 let t = pos - d as f64 / px_per_s;
                 app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
+                let was = app.pos();
                 app.seek(t);
-                crate::ui_feel::snap_pos(app);
+                crate::ui_feel::shift_pos(app, app.pos() - was);
             }
         }
     }

@@ -1177,11 +1177,20 @@ pub fn held_pos(app: &App) -> Option<f64> {
     HELD.with(|h| h.borrow().iter().find(|(k, _)| *k == key).map(|e| e.1))
 }
 
-/// The deck was just moved by hand (a scroll over its waveform): the drawn position follows
-/// at once and does not glide there.
-pub fn snap_pos(app: &App) {
+/// The deck was just moved by `by` seconds by hand (a scroll over its waveform): the drawn
+/// position moves by as much on this frame and keeps its own clock, so each frame of a scroll
+/// over a playing deck moves by the scroll plus one refresh of play (restarting from the
+/// audio's position instead, which only moves once per audio buffer, left one frame in three
+/// about 10 ms short).
+pub fn shift_pos(app: &App, by: f64) {
     let key = deck_key(app);
-    POS.with(|p| p.borrow_mut().retain(|(k, _)| *k != key));
+    POS.with(|p| {
+        if let Some((_, t)) = p.borrow_mut().iter_mut().find(|(k, _)| *k == key) {
+            t.shown += by;
+            t.real += by;
+            t.anchor.0 += by;
+        }
+    });
 }
 
 pub fn release_pos(app: &App) {

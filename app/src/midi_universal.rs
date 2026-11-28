@@ -319,6 +319,41 @@ mod tests {
         eprintln!("UNIVERSAL two devices at once: the same code plays deck 1 from one and deck 2 from the other");
     }
 
+    /// The record under a controller's platter travels exactly the distance the counts stand
+    /// for (`Engine::jog_left`): however long the speed stays set (the worker's idle check
+    /// late under load), it stops there. On-screen scratching (no limit) is unchanged.
+    #[test]
+    fn a_scratch_moves_the_record_exactly_as_far_as_the_counts() {
+        let n = 44100 * 10;
+        let audio = Arc::new(crate::audio::Decoded { sr: 44100, samples: vec![0.1; n * 2], raw_frames: n, damaged: 0, truncated: false });
+        let mut s = PlayState::default();
+        s.audio = Some(audio);
+        s.playing = false;
+        s.volume = 1.0;
+        s.gain = 1.0;
+        s.pos = 44100.0;
+        s.dk.jog = crate::deck::Jog::Speed(3.6);
+        // 1150 counts of the ERGO's 2300 a turn: 900 ms of the track.
+        let k = Jog::new(2300.0).k();
+        s.dk.jog_left = -(k * 1150.0) * 44100.0 / 1000.0;
+        s.dk.jog = crate::deck::Jog::Speed(-3.6);
+        let mut out = vec![0.0f32; 1024];
+        for _ in 0..40 {
+            out.iter_mut().for_each(|x| *x = 0.0);
+            crate::audio::render_deck(&mut s, &mut out, 2, 44100);
+        }
+        let moved = (s.pos - 44100.0) / 44100.0;
+        assert!((moved + 0.9).abs() < 1e-6, "{moved}");
+        assert!(s.dk.jog_left.abs() < 1e-6);
+        // Without a limit the speed goes on.
+        s.dk.jog_left = f64::NAN;
+        s.dk.jog = crate::deck::Jog::Speed(1.0);
+        let before = s.pos;
+        crate::audio::render_deck(&mut s, &mut out, 2, 44100);
+        assert!(s.pos > before + 400.0);
+        eprintln!("UNIVERSAL scratch distance: 1150 counts at the ERGO's 2300 a turn moved the record {moved:+.6} s (wants -0.900000), speed left set for 40 blocks");
+    }
+
     #[test]
     fn a_header_only_file_is_none_and_the_rekordbox_mapping_is_used() {
         let base = std::env::temp_dir().join(format!("rbxtest-hdr-{}", std::process::id()));

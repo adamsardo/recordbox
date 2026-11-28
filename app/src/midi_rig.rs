@@ -349,6 +349,24 @@ fn plan(c: &Case) -> Vec<Msg> {
 /// The deck put in a known state before a case: loaded, paused at 20 s, no loop, no reverse,
 /// no sync. Returns frames to wait.
 fn base(app: &mut App, n: u8) {
+    // (Vinyl Speed Adjust back to none: the S1's TOUCH/RELEASE and BRAKE rows set it, and a
+    // long brake keeps a paused deck moving for seconds.)
+    // (`PREPDECK_MIDI_RIG_NO_RESET=1` leaves it, to show what it does to the cases after.)
+    if (app.prefs.rb.brake != [0; 2] || app.prefs.rb.start != [0; 2]) && std::env::var_os("PREPDECK_MIDI_RIG_NO_RESET").is_none() {
+        app.prefs.rb.brake = [0; 2];
+        app.prefs.rb.start = [0; 2];
+        app.prefs.deck.vinyl_brake = [0; 2];
+        app.prefs.deck.vinyl_start = [0; 2];
+        app.push_deck_controls();
+    }
+    // (Q as it was when the run began: the "q" cases switch it on.)
+    let q = Q_START.load(Relaxed);
+    if q < 4 {
+        for d in 0..2u8 {
+            app.with_deck(d, |a| a.prefs.quantize = q & 1 == 1);
+        }
+        app.prefs.rb.q_reverse.on = q & 2 == 2;
+    }
     // (The other deck stands too: a playing deck takes MASTER over from a standing one.)
     play(app, 1 - n.min(1), false);
     app.with_deck(n, |a| {
@@ -450,6 +468,16 @@ fn prep(app: &mut App, c: &Case) {
             }
         }
         "SlipReverse" | "Reverse" | "PitchBendUp" | "PitchBendDown" | "WheelPitchBend" | "JogPitchBend" | "JogScratch" | "JogTouch" => {
+            if c.variant == "q" {
+                app.with_deck(n, |a| a.prefs.quantize = true);
+                app.prefs.rb.q_reverse.on = true;
+                // (Just past a beat: the turn waits for nearly a whole beat.)
+                app.with_deck(n, |a| {
+                    if let Some(t) = a.deck.beats.iter().map(|b| b.time).find(|t| *t >= 20.0) {
+                        a.seek(t + 0.03);
+                    }
+                });
+            }
             play(app, n, true);
             if let Some(h) = app.midi.hub.clone() {
                 h.vinyl[n as usize].store(true, Relaxed);
@@ -577,7 +605,7 @@ fn check(app: &App, c: &Case, b: &St, m: &St, a: &St) -> (Option<bool>, String) 
         "Vinyl" => yes(db.vinyl != da.vinyl, format!("VINYL (jog mode) {} -> {}", db.vinyl, da.vinyl)),
         "Slip" => yes(db.slip != da.slip, format!("SLIP {} -> {}", db.slip, da.slip)),
         "SlipReverse" => yes(!db.reverse && dm.reverse && !da.reverse, format!("reverse while held: {} -> {} -> released {}", db.reverse, dm.reverse, da.reverse)),
-        "Reverse" => yes(!db.reverse && da.reverse, format!("REVERSE {} -> {}", db.reverse, da.reverse)),
+        "Reverse" => yes(!db.reverse && da.reverse, format!("REVERSE {} -> {} (64 ms after the press: {}){}", db.reverse, da.reverse, dm.reverse, if c.variant == "q" { format!(" (Q on, REVERSE quantize {}: on the next REVERSE beat; deck at {:.3} s, its beat {:.3} s)", crate::prefs_rb::Q_BEATS.get(app.prefs.rb.q_reverse.beat.saturating_sub(1) as usize).copied().unwrap_or("?"), dm.pos, { let d = app.deck_of(n as u8); let b = crate::player_ext::bpm_at(&d.beats, d.cue_point); if b > 0.0 { 60.0 / b } else { 0.0 } }) } else { String::new() })),
         "Load" => {
             let want = app.anchor.and_then(|i| app.list.get(i).copied());
             yes(da.track.is_some() && da.track != db.track && da.track == want && da.loaded, format!("deck {} track {:?} -> {:?} (selected row {:?}), loaded {}", n + 1, db.track, da.track, want, da.loaded))
@@ -755,6 +783,7 @@ struct Rig {
     restarted: bool,
     t_mark: Option<Instant>,
     child: Option<std::process::Child>,
+    wait: u32,
 }
 
 /// The stage (or the next case) begins now.
@@ -828,6 +857,9 @@ fn cases(app: &App) -> Vec<Case> {
             }
             if func.ends_with("TapBeatWithLongPress") {
                 v.push(Case { port: pi, func, kind, code, deck, variant: "long" });
+            } else if func == "Reverse" {
+                // (With Q on, rekordbox turns on the next REVERSE beat.)
+                v.push(Case { port: pi, func, kind, code, deck, variant: "q" });
             }
         }
     }
@@ -862,7 +894,7 @@ pub fn frame(app: &mut App, frame: u32) {
         for p in &ports {
             say(&format!("virtual port \"{}\": source id {}, destination id {} (real ports of that name: sources {:?}, destinations {:?})", p.name, p.src_id, p.dst_id, source_ids(&p.name).into_iter().filter(|i| *i != p.src_id).collect::<Vec<_>>(), dest_ids(&p.name).into_iter().filter(|i| *i != p.dst_id).collect::<Vec<_>>()));
         }
-        *g = Some(Rig { ports, got, t0, stage: Stage::Setup, cases: vec![], i: 0, at: frame, sub: 0, snaps: vec![], results: vec![], outs: vec![], hw: vec![], jog: vec![], sending: None, mark: 0, report: String::new(), frame_ms: vec![], last_frame: None, note: String::new(), t_stage: Instant::now(), vt: 0, restarted: false, t_mark: None, child: None });
+        *g = Some(Rig { ports, got, t0, stage: Stage::Setup, cases: vec![], i: 0, at: frame, sub: 0, snaps: vec![], results: vec![], outs: vec![], hw: vec![], jog: vec![], sending: None, mark: 0, report: String::new(), frame_ms: vec![], last_frame: None, note: String::new(), t_stage: Instant::now(), vt: 0, restarted: false, t_mark: None, child: None, wait: 0 });
         return;
     }
     let r = g.as_mut().unwrap();
@@ -894,6 +926,7 @@ pub fn frame(app: &mut App, frame: u32) {
             if !app.performance() {
                 return;
             }
+            Q_START.store(app.prefs.quantize as u8 | (app.prefs.rb.q_reverse.on as u8) << 1, Relaxed);
             // (A known start: no panels, not the Browse layout; earlier runs saved theirs.)
             app.prefs.perf_lay.browse = false;
             app.prefs.perf_fx = false;
@@ -997,13 +1030,20 @@ pub fn frame(app: &mut App, frame: u32) {
                 16 if jog => {
                     r.snaps[1] = snap(app);
                 }
-                s if s == settle => {
-                    if long {
+                s if s >= settle => {
+                    if long && s == settle {
                         send(r, c.port, &[msg(c.st(), c.d1(), 0)]);
                     }
                     let a = snap(app);
                     let (b, m) = (r.snaps[0].clone(), r.snaps.get(1).cloned().unwrap_or_default());
                     let (pass, changed) = check(app, &c, &b, &m, &a);
+                    // Judged on the state, not at a fixed time: a change that comes later (a
+                    // quantized REVERSE waits for its beat, a busy machine draws fewer frames)
+                    // is waited for, up to 2.4 s more; one that never comes fails then.
+                    if pass == Some(false) && s < settle + 150 {
+                        return;
+                    }
+                    let changed = if s > settle { format!("{changed} (after {} ms more)", (s - settle) * 16) } else { changed };
                     let sent = plan_v.iter().map(|m| format!("{:02X} {:02X} {:02X}", m.m[0], m.m[1], m.m[2])).collect::<Vec<_>>();
                     let sent = if sent.len() > 4 { format!("{} x{}", sent[0], sent.len()) } else { sent.join(", ") };
                     let lights: Vec<String> = r.got.lock()[r.mark..].iter().filter(|g| g.0 == c.port).map(|g| format!("{:02X}{:02X}={:02X}", g.2[0], g.2[1], g.2[2])).collect();
@@ -1047,6 +1087,17 @@ pub fn frame(app: &mut App, frame: u32) {
     }
 }
 
+/// Wait at this tick until `ready` (at most 150 ticks, 2.4 s): true while waiting.
+fn hold(r: &mut Rig, ready: bool) -> bool {
+    if !ready && r.wait < 150 {
+        r.wait += 1;
+        r.vt -= 1;
+        return true;
+    }
+    r.wait = 0;
+    false
+}
+
 // ---------------------------------------------------------------------- the platter
 
 /// The jog as the helper sends it in platter mode, measured: scratch distance, bend, touch
@@ -1078,11 +1129,22 @@ fn jogs(app: &mut App, r: &mut Rig, frame: u32) {
             send_timed(r, ERGO, v);
         }
         (0, 39) => {
+            // (Judged once the burst is sent and the record stands, up to 2.4 s more: a busy
+            // machine sends the 100 messages more slowly than 5 ms apart.)
+            let standing = {
+                let d = app.player.decks[0].lock();
+                d.dk.jog == crate::deck::Jog::Speed(0.0) || d.dk.jog_left.abs() < 0.5
+            };
+            if hold(r, r.sending.as_ref().map(|h| h.is_finished()).unwrap_or(true) && standing) {
+                return;
+            }
             let b = r.snaps[0].clone();
             let p = pos(app, 0);
             let moved = p - b.d[0].pos;
             let jog = snap(app).d[0].jog.clone();
-            push(r, "9036 + B022", "JogTouch + JogScratch (one turn)", "90 36 7F, B0 22 57 x100 every 5 ms".into(), format!("deck 1 moved {moved:+.3} s while held (wants +1.800: 2300 counts = one turn at 33 1/3 rpm); jog {jog}"), near(moved, 1.8, 0.12), "the platter stops: the record stops");
+            // (Distance = counts x 60000 / (counts a turn x rpm) ms: 2300 x 60000 / (2300 x 33 1/3)
+            // = 1800 ms; within 2 ms, the engine's frame rounding.)
+            push(r, "9036 + B022", "JogTouch + JogScratch (one turn)", "90 36 7F, B0 22 57 x100 every 5 ms".into(), format!("deck 1 moved {moved:+.4} s while held (wants +1.8000: 2300 counts = one turn at 33 1/3 rpm); jog {jog}"), near(moved, 1.8, 0.002), "the platter stops: the record stops");
             send(r, ERGO, &[msg(0x90, 0x36, 0x00)]);
         }
         // 2. Scratch backwards, half a turn.
@@ -1090,13 +1152,21 @@ fn jogs(app: &mut App, r: &mut Rig, frame: u32) {
             r.snaps = vec![snap(app)];
             let mut v = vec![Msg { m: [0x90, 0x36, 0x7F], gap_ms: 5 }];
             v.extend((0..50).map(|_| Msg { m: [0xB0, 0x22, 0x40 - 23], gap_ms: 5 }));
+            // (The hand stops, then lifts: 100 ms later.)
+            if let Some(l) = v.last_mut() {
+                l.gap_ms = 100;
+            }
             v.push(Msg { m: [0x90, 0x36, 0x00], gap_ms: 0 });
             send_timed(r, ERGO, v);
         }
         (1, 39) => {
+            let let_go = app.player.decks[0].lock().dk.jog == crate::deck::Jog::None;
+            if hold(r, r.sending.as_ref().map(|h| h.is_finished()).unwrap_or(true) && let_go) {
+                return;
+            }
             let moved = pos(app, 0) - r.snaps[0].d[0].pos;
             let d = snap(app).d[0].clone();
-            push(r, "9036 + B022", "JogScratch backwards, let go", "B0 22 29 x50, 90 36 00".into(), format!("moved {moved:+.3} s (wants -0.900); after letting go: playing {} jog {}", d.playing, d.jog), near(moved, -0.9, 0.08) && d.jog == "None", "");
+            push(r, "9036 + B022", "JogScratch backwards, let go", "B0 22 29 x50, 100 ms still, 90 36 00".into(), format!("moved {moved:+.4} s (wants -0.9000: 1150 counts); after letting go: playing {} (it was paused) jog {}", d.playing, d.jog), near(moved, -0.9, 0.002) && d.jog == "None" && !d.playing, "");
         }
         // 3. Bend: deck 1 playing, the rim (B021) and the untouched top (B023) bend.
         (2, 0) => {
@@ -1176,7 +1246,32 @@ fn jogs(app: &mut App, r: &mut Rig, frame: u32) {
             let after = app.player.decks[0].lock().bend;
             push(r, "9071", "nudge mode: PitchBendUp held / let go", "90 71 7F, 90 71 00".into(), format!("bend held {during:+.4}, released {after:+.4}"), during > 0.0 && after == 0.0, "");
         }
+        // 7. Tempo range widening: deck 1 at +12 % with the range at 10 %, the fader not
+        // taken over; moving it widens the range to 16 % (rekordbox's AsyncTempoUpdater).
         (7, 0) => {
+            base(app, 0);
+            app.with_deck(0, |a| {
+                a.deck.x.tempo_range = 0;
+                a.deck.x.tempo_adj = 0.12;
+                a.push_deck_controls();
+            });
+            hub.arm_takeover(0);
+        }
+        (7, 8) => {
+            send(r, S1, &[msg(0xB0, 0x00, 0x3F), msg(0xB0, 0x20, 0x7F)]);
+        }
+        (7, 30) => {
+            let d = app.deck_of(0);
+            let range = crate::player_ext::TEMPO_RANGES[(d.x.tempo_range as usize + 1) % 4];
+            let toast = app.toasts.last().map(|t| t.text.clone());
+            let ok = range == 16.0 && (d.x.tempo_adj - 0.12).abs() < 1e-9 && toast.as_deref() == Some("Tempo Range has been changed. Move Tempo Slider to the current BPM value.");
+            push(r, "B000", "TempoSlider: range widening (deck +12 %, range 10 %)", "B0 00 3F, B0 20 7F".into(), format!("range {range} %, tempo {:+.2} %, status line {toast:?}", d.x.tempo_adj * 100.0), ok, "");
+            app.with_deck(0, |a| {
+                a.deck.x.tempo_adj = 0.0;
+                a.push_deck_controls();
+            });
+        }
+        (8, 0) => {
             r.stage = Stage::Outputs;
             restart(r);
         }
@@ -1603,6 +1698,7 @@ fn hardware(app: &mut App, r: &mut Rig, frame: u32) {
 }
 
 static FLOOD: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+static Q_START: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(9);
 static MIN_PLAY_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-10);
 static MIN_FRAMES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 static MIN_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

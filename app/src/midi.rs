@@ -1457,6 +1457,12 @@ pub fn probe_learn(port: &str, msgs: &[Vec<u8>], rb: Option<&MidiMap>) -> Vec<(u
         .collect()
 }
 
+/// The line printed when a port is opened: rekordbox's "### MIDI:open success [%s]"
+/// (`DeviceManager::connectMidiDevice` 0x100e5d5bc) and where the mapping came from.
+pub fn open_line(name: &str, summary: &str) -> String {
+    format!("### MIDI:open success [{name}] {summary}")
+}
+
 /// The models whose MIDI side rekordbox authenticates (`getDeviceAuth` overrides).
 pub fn needs_auth(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
@@ -1775,7 +1781,7 @@ impl Hub {
         let d = dev.clone();
         let _ = std::thread::Builder::new().name(format!("midi-out {name}")).spawn(move || d.run_output());
         let summary = self.mapping_summary(&dev);
-        eprintln!("### MIDI:open success [{name}] {summary}");
+        eprintln!("{}", open_line(name, &summary));
         crate::midi_log::port(name, "connected", &format!("{summary}; output {}", if dev.has_output { "open" } else if no_out { "closed (PREPDECK_MIDI_NO_OUT=1)" } else { "none" }));
         self.devices.lock().push(dev.clone());
         let _ = self.tx.send(UiEvent::Connected { device: name.to_string(), summary });
@@ -2214,6 +2220,10 @@ impl Hub {
                     j[n].rpm = if snap.rpm45 { 45.0 } else { 100.0 / 3.0 };
                     j[n].touch(on, playing)
                 };
+                // The hand has the record: from here it moves as far as the counts say.
+                if on && matches!(out, JogOut::Scratch(_)) {
+                    self.decks[n].lock().dk.jog_left = 0.0;
+                }
                 self.jog_out(n, out);
                 true
             }
@@ -2226,7 +2236,19 @@ impl Hub {
                     self.grid_acc.lock()[n] += delta as f64 * k;
                     return true;
                 }
-                let out = dev.jog.lock()[n].rotate(delta, t_ms, scratch_row);
+                let (out, k) = {
+                    let mut j = dev.jog.lock();
+                    (j[n].rotate(delta, t_ms, scratch_row), j[n].k())
+                };
+                // A scratch: the record owes the distance these counts stand for (k ms of
+                // the track a count), so it stops where the platter stopped, however late
+                // the next message or the idle check comes.
+                if matches!(out, JogOut::Scratch(_)) {
+                    let mut s = self.decks[n].lock();
+                    let sr = s.audio.as_ref().map(|a| a.sr as f64).unwrap_or(44100.0);
+                    let left = if s.dk.jog_left.is_finite() { s.dk.jog_left } else { 0.0 };
+                    s.dk.jog_left = left + k * delta as f64 * sr / 1000.0;
+                }
                 self.jog_out(n, out);
                 true
             }
@@ -2420,7 +2442,17 @@ pub fn jog_scratch(hub: &Hub, n: usize, out: JogOut) {
         _ => crate::deck::Jog::None,
     };
     hub.jog_bend[n].store(0f64.to_bits(), Relaxed);
-    hub.decks[n].lock().dk.jog = jog;
+    let mut s = hub.decks[n].lock();
+    // The platter stood still long enough for the worker to say "stop", but the record has
+    // not yet gone the distance the counts stand for (the audio thread starts each speed at
+    // its next buffer): it goes on at its speed and stops there (`Engine::jog_left`).
+    let owed = s.dk.jog_left.is_finite() && s.dk.jog_left.abs() >= 0.5 && matches!(s.dk.jog, crate::deck::Jog::Speed(v) if v * s.dk.jog_left > 0.0);
+    if !(owed && jog == crate::deck::Jog::Speed(0.0)) {
+        s.dk.jog = jog;
+    }
+    if jog == crate::deck::Jog::None {
+        s.dk.jog_left = f64::NAN;
+    }
 }
 
 // ---------------------------------------------------------------------- the app's side
@@ -2662,6 +2694,35 @@ pub fn poll(app: &mut App) {
         leds(app, &hub);
         hub.engine_outputs();
     }
+}
+
+/// The tempo slider has not taken the deck over and the deck's tempo lies beyond the range:
+/// the range widens to the first of 10 %, 16 % and WIDE that holds it, the takeover starts
+/// again, and the status line says so (`UiPlayer::AsyncTempoUpdater::handleAsyncUpdate`
+/// 0x102036ac0, `kBeatSyncOperateErrorTempoSlider3`). The tempo itself stays.
+fn widen_tempo_range(app: &mut App, hub: &Arc<Hub>, n: u8) -> bool {
+    let ni = n as usize;
+    if hub.takeover_state(ni).state == 5 || app.deck_of(n).audio.is_none() || !app.performance() {
+        return false;
+    }
+    let d = app.deck_of(n);
+    let range = crate::player_ext::TEMPO_RANGES[(d.x.tempo_range as usize + 1) % 4];
+    let t = (d.x.tempo_adj * 100.0).abs() * 0.99999;
+    if t <= range {
+        return false;
+    }
+    let want = if t <= 10.0 { 10.0 } else if t <= 16.0 { 16.0 } else { 100.0 };
+    let Some(i) = crate::player_ext::TEMPO_RANGES.iter().position(|r| *r == want) else { return false };
+    let x = ((i + 3) % 4) as u8;
+    if x == d.x.tempo_range {
+        return false;
+    }
+    app.deck_of_mut(n).x.tempo_range = x;
+    app.with_deck(n, |a| a.push_deck_controls());
+    hub.arm_takeover(ni);
+    let _ = hub.takeover_notice(ni);
+    status(app, "Tempo Range has been changed. Move Tempo Slider to the current BPM value.", false);
+    true
 }
 
 /// rekordbox's status line when a controller comes or goes (`MainComponent::initializeDevice`
@@ -3053,7 +3114,7 @@ pub fn apply(app: &mut App, hub: &Arc<Hub>, device: &str, f: &Func, deck: u8, va
             // (`eventAbsoluteValueChanged` 0x102029150), or the takeover started waiting.
             if app.with_deck(n, |a| a.sync_follower()) && app.deck_of(n).audio.is_some() {
                 status(app, "Invalid operation. In Sync mode, Tempo Slider is only available for Master Deck.", true);
-            } else if hub.takeover_notice(ni) {
+            } else if !widen_tempo_range(app, hub, n) && hub.takeover_notice(ni) {
                 status(app, "Move Tempo Slider to the current BPM value.", false);
             }
             settle(app);
@@ -4456,6 +4517,47 @@ mod tests {
         for o in dev.map.lock().outputs.iter() {
             assert!(output_source(&o.name), "{} has no source", o.name);
         }
+    }
+
+    /// The open line of the owner's three ports, named as the system names them (no alias):
+    /// the S1 and the helper's port from rekordbox's folder (stand-in copies here), the
+    /// ERGO port from the installed rekordbox's factory file under a header-only own file.
+    #[test]
+    fn the_open_line_names_the_mapping_file_and_its_rows() {
+        let base = std::env::temp_dir().join(format!("rbxtest-openline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (rb, own) = (base.join("rekordbox6/MidiMappings"), base.join("Recordbox/MidiMappings"));
+        std::fs::create_dir_all(&rb).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(rb.join("PIONEER DDJ-S1.midi.csv"), S1).unwrap();
+        std::fs::write(rb.join("DDJ-S1 Jog Helper.midi.csv"), HELPER).unwrap();
+        for n in ["PIONEER DDJ-S1", "DDJ-S1 Jog Helper", "PIONEER DDJ-ERGO"] {
+            std::fs::write(own.join(format!("{n}.midi.csv")), crate::midi_csv::empty_user_file(n)).unwrap();
+        }
+        let decks: [Arc<Mutex<PlayState>>; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(PlayState::default())));
+        let (hub, _rx) = Hub::new(decks, own.clone());
+        *hub.rb_dir.lock() = Some(rb.clone());
+        let line = |name: &str| {
+            let (map, factory) = hub.load_map(name);
+            let (h2, d, _) = test_device(name, &crate::midi_csv::empty_user_file(name));
+            let _ = (h2, factory);
+            *d.map.lock() = map;
+            open_line(name, &hub.mapping_summary(&d))
+        };
+        let s1 = line("PIONEER DDJ-S1");
+        assert!(s1.starts_with("### MIDI:open success [PIONEER DDJ-S1] mapping from rekordbox "), "{s1}");
+        assert!(s1.contains("PIONEER DDJ-S1.midi.csv (21 rows)") && s1.contains("0 rows rejected"), "{s1}");
+        let h = line("DDJ-S1 Jog Helper");
+        assert!(h.contains("[DDJ-S1 Jog Helper] mapping from rekordbox ") && h.contains("DDJ-S1 Jog Helper.midi.csv (13 rows)"), "{h}");
+        assert!(!h.contains("MIDI Learn only"), "{h}");
+        let e = line("PIONEER DDJ-ERGO");
+        if crate::midi_csv::factory_file(&crate::midi_csv::factory_dir(), "PIONEER DDJ-ERGO").is_some() {
+            assert!(e.contains("[PIONEER DDJ-ERGO] factory mapping PIONEER DDJ-ERGO.midi.csv ("), "{e}");
+        } else {
+            assert!(e.contains("no mapping (MIDI Learn only)"), "{e}");
+        }
+        eprintln!("OPENLINE {s1}\nOPENLINE {h}\nOPENLINE {e}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

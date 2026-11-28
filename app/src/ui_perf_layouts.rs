@@ -1652,8 +1652,9 @@ pub(crate) fn draw_detail_vertical(app: &mut App, ui: &mut Ui, lane: Rect, pos: 
             let d = if scroll.y.abs() >= scroll.x.abs() { scroll.y } else { scroll.x };
             let t = pos - d as f64 / pps;
             app.deck.x.scrub += t.clamp(0.0, dur.max(0.0)) - app.pos();
+            let was = app.pos();
             app.seek(t);
-            crate::ui_feel::snap_pos(app);
+            crate::ui_feel::shift_pos(app, app.pos() - was);
         }
     }
 }
