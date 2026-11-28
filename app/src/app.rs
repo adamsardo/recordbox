@@ -4032,7 +4032,7 @@ impl App {
         } else {
             // Whole track: one tempo, keeping the beat nearest the playhead in place.
             let bpm = f(g.anchors[self.anchor_at(b.time)].bpm).clamp(40.0, 499.0);
-            g = BeatGrid { anchors: vec![GridAnchor { time: b.time, bpm, beat: b.beat }] };
+            g = BeatGrid { anchors: vec![GridAnchor { time: b.time, bpm, beat: b.beat }], ..Default::default() };
         }
         self.push_grid(g);
     }

@@ -35,6 +35,8 @@ pub mod legacy;
 pub mod tempo;
 #[path = "rb_hp_focus2.rs"]
 pub mod focus2;
+#[path = "rb_hp_class.rs"]
+pub mod class;
 
 use crate::model::BeatGrid;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -341,7 +343,7 @@ pub const NO_NET_BEATS: &str = "the network found no beats";
 
 /// The reasons the tempo-change path gives up in a branch that is not built yet.
 pub fn is_tempo_fallback(why: &str) -> bool {
-    why == focus2::UNPORTED_CLASS || why == focus2::UNPORTED_HALFBEAT || why == focus2::UNPORTED_SHORT
+    why == focus2::UNPORTED_SHORT
 }
 
 /// rekordbox's high precision analysis of decoded audio. `legacy` is the standard analysis'
@@ -476,7 +478,7 @@ pub fn grid_from_list(beats: &[(i32, i32, i32)], sr: u32) -> BeatGrid {
         // the next one: with the tempo changing per beat (the tempo-change path) a gap to the
         // next listed beat of 1.5 periods or more would add a beat, one of half a period or
         // less would drop this one. Such a beat gets its own anchor at the nearest tempo that
-        // keeps the list (its written tempo then differs from rekordbox's).
+        // keeps the list (and the list itself is kept beside the grid, below).
         let gap = beats.get(j + 1).map(|b| beat_us(b.0, sr) as f64 / 1e6 - t);
         let p = 60.0 / bpm.max(1.0);
         let bad = match gap {
@@ -496,7 +498,21 @@ pub fn grid_from_list(beats: &[(i32, i32, i32)], sr: u32) -> BeatGrid {
             force = bad;
         }
     }
-    BeatGrid { anchors }
+    // the beats the export would write from the anchors against the list (beat number, tempo
+    // x 100, whole ms); where they differ (a tempo per beat, beats laid before the first listed
+    // one, uneven gaps) the list is kept beside the grid and `beats` gives it as it is
+    let entries: Vec<(u8, i32, i64)> = beats.iter().map(|&(pos, num, bpm100)| (num.clamp(1, 4) as u8, bpm100, beat_us(pos, sr) / 1000)).collect();
+    let mut g = BeatGrid { anchors, ..Default::default() };
+    if let Some(&(last, _, _)) = beats.last() {
+        let dur = beat_us(last, sr) as f64 / 1e6 + 1e-6;
+        let laid: Vec<(u8, i32, i64)> = g.beats(dur).iter().map(|b| (b.beat, (b.bpm * 100.0).round() as i32, ((b.time.max(0.0) * 1e6).round() as i64) / 1000)).collect();
+        if laid != entries {
+            let fallback = g.anchors.first().map(|a| a.bpm).unwrap_or(120.0);
+            let listed = beats.iter().map(|&(pos, num, bpm100)| (beat_us(pos, sr) as f64 / 1e6, if bpm100 > 0 { bpm100 as f64 / 100.0 } else { fallback }, num.clamp(1, 4) as u8)).collect();
+            g = BeatGrid::with_listed(g.anchors, listed);
+        }
+    }
+    g
 }
 
 /// The analysis mode the next analyses use: 0 = high precision off, 2 / 3 / 4 = Auto / Normal /
@@ -1212,6 +1228,33 @@ mod grid_tests {
         assert_eq!(&got[..want.len()], &want[..]);
         assert!(g.anchors.len() < 60, "{} anchors", g.anchors.len());
         assert!(g.anchors.iter().all(|a| (a.bpm - 129.97).abs() < 1e-9));
+    }
+
+    #[test]
+    fn grid_from_list_keeps_a_list_its_anchors_cannot_lay() {
+        // 120 BPM with one gap of 1.6 beats whose listed tempo stays 120: anchors at that tempo
+        // would add a beat in the gap, so rekordbox's list is kept and given as it is
+        let sr = 44100u32;
+        let per = sr as f64 * 0.5;
+        let mut pos: Vec<f64> = (0..40).map(|k| 1000.0 + k as f64 * per).collect();
+        let last = *pos.last().unwrap();
+        pos.extend((0..40).map(|k| last + 1.6 * per + k as f64 * per));
+        let beats: Vec<(i32, i32, i32)> = pos.iter().enumerate().map(|(k, &p)| (p as i32, (k % 4 + 1) as i32, 12000)).collect();
+        let g = super::grid_from_list(&beats, sr);
+        assert!(!g.listed.is_empty());
+        let dur = (pos.last().unwrap() + per) / sr as f64;
+        let got: Vec<(u8, u16, u32)> = g.beats(dur).iter().map(|b| (b.beat, (b.bpm * 100.0).round() as u16, (((b.time * 1e6).round() as u64) / 1000) as u32)).collect();
+        let want: Vec<(u8, u16, u32)> = beats.iter().map(|b| (b.1 as u8, 12000, (super::beat_us(b.0, sr) / 1000) as u32)).collect();
+        assert_eq!(got, want);
+        // an edit of the anchors makes the grid lay its beats from them again
+        let mut e = g.clone();
+        e.anchors[0].time += 0.01;
+        assert_ne!(e.beats(dur).len(), 0);
+        assert!((e.beats(dur)[0].time - g.beats(dur)[0].time).abs() > 1e-3 || e.beats(dur).len() != got.len());
+        // a shift moves the list with the anchors
+        let s2 = crate::analysis::shift_grid(&g, 0.25);
+        assert_eq!(s2.beats(dur + 1.0).len(), got.len());
+        assert!((s2.beats(dur + 1.0)[0].time - (g.beats(dur)[0].time + 0.25)).abs() < 1e-9);
     }
 
     #[test]

@@ -297,6 +297,19 @@ impl Cue {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BeatGrid {
     pub anchors: Vec<GridAnchor>,
+    /// rekordbox's own beat list (time, tempo, beat number) when the grid came from the high
+    /// precision analysis and the anchors cannot lay it exactly (a tempo per beat, uneven
+    /// gaps): `beats` then gives this list as it is, so the export writes rekordbox's beats.
+    /// It holds only while the anchors are the ones it was made with (`listed_for`, their
+    /// fingerprint): an edit of the grid makes `beats` go back to the anchors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listed: Vec<(f64, f64, u8)>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub listed_for: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -319,8 +332,26 @@ impl BeatGrid {
     pub fn is_empty(&self) -> bool {
         self.anchors.is_empty()
     }
+    /// A grid with rekordbox's own beat list kept beside its anchors (see `listed`).
+    pub fn with_listed(anchors: Vec<GridAnchor>, listed: Vec<(f64, f64, u8)>) -> BeatGrid {
+        let mut g = BeatGrid { anchors, listed, listed_for: 0 };
+        if !g.listed.is_empty() {
+            g.listed_for = g.anchors_key();
+        }
+        g
+    }
+    /// Fingerprint of the anchors (FNV-1a over their bits; never 0).
+    pub fn anchors_key(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for a in &self.anchors {
+            for v in [a.time.to_bits(), a.bpm.to_bits(), a.beat as u64] {
+                h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h.max(1)
+    }
     pub fn constant(first_beat: f64, bpm: f64, beat: u8) -> BeatGrid {
-        BeatGrid { anchors: vec![GridAnchor { time: first_beat, bpm, beat }] }
+        BeatGrid { anchors: vec![GridAnchor { time: first_beat, bpm, beat }], ..Default::default() }
     }
     pub fn first_bpm(&self) -> f64 {
         self.anchors.first().map(|a| a.bpm).unwrap_or(0.0)
@@ -328,6 +359,9 @@ impl BeatGrid {
     /// Every beat from the start of the track to `duration`.
     pub fn beats(&self, duration: f64) -> Vec<Beat> {
         let mut out = vec![];
+        if !self.listed.is_empty() && self.listed_for == self.anchors_key() {
+            return self.listed.iter().take_while(|l| l.0 <= duration).enumerate().map(|(index, &(time, bpm, beat))| Beat { time, bpm, beat, index }).collect();
+        }
         if self.anchors.is_empty() {
             return out;
         }
@@ -389,7 +423,7 @@ impl BeatGrid {
                 out.push(GridAnchor { time: last.time + gap / 2.0, bpm: a.bpm * 2.0, beat: map(last.beat) % 4 + 1 });
             }
         }
-        BeatGrid { anchors: out }
+        BeatGrid { anchors: out, ..Default::default() }
     }
     /// The grid at half tempo, following rekordbox's traced `bpmToHalf`: beats 0, 2, 4… counted
     /// from the first beat of the track stay where they are, and the first beat's number picks
@@ -409,7 +443,7 @@ impl BeatGrid {
                 out.push(GridAnchor { time: b.time, bpm: a.bpm / 2.0, beat: ((start - 1 + b.index / 2) % 4 + 1) as u8 });
             }
         }
-        BeatGrid { anchors: out }
+        BeatGrid { anchors: out, ..Default::default() }
     }
 }
 
@@ -541,7 +575,7 @@ mod tests {
     #[test]
     fn loops_follow_the_grid_through_a_tempo_change() {
         // 120 BPM until 2.0 s, then 100 BPM.
-        let g = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.0, bpm: 100.0, beat: 1 }] };
+        let g = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.0, bpm: 100.0, beat: 1 }], ..Default::default() };
         let b = g.beats(10.0);
         let end = |s: f64, n: f64| (crate::app::loop_end_on_grid(&b, s, n).unwrap() * 1e6).round() as i64;
         // Four beats from 1.0 s: two at 0.5 s and two at 0.6 s, not 4 x 0.5.
@@ -568,7 +602,7 @@ mod tests {
         assert_eq!(back, orig);
         // Two tempos with an uneven interval (0.7 s, not 0.5) across the change: every original
         // beat is kept and the added one sits at the midpoint of that interval.
-        let g2 = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.2, bpm: 100.0, beat: 1 }] };
+        let g2 = BeatGrid { anchors: vec![GridAnchor { time: 0.0, bpm: 120.0, beat: 1 }, GridAnchor { time: 2.2, bpm: 100.0, beat: 1 }], ..Default::default() };
         let d2: Vec<i64> = times(&g2.doubled(5.0), 5.0).iter().map(|x| x.0).collect();
         for t in times(&g2, 5.0) {
             assert!(d2.contains(&t.0), "beat at {} lost", t.0);

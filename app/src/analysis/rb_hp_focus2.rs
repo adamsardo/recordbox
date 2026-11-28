@@ -13,15 +13,14 @@
 //! 3. each irregular stretch, last first: a short one (under 8 intervals) that stands out from
 //!    its neighbours is widened over the off intervals next to it and, when it spans a whole
 //!    number of reference beats, re-filled with even beats; a long one is tested for halved,
-//!    two-thirds, 1.5x and doubled tempo over the whole stretch or a part of it.
+//!    two-thirds, 1.5x and doubled tempo over the whole stretch or a part of it, and the first
+//!    test that holds re-spaces it (`rb_hp_class.rs`).
 //! Then (twice) single long intervals are split, every beat gets its bar number from the
 //! reference beat, the tempo the median of the per-beat tempi, and each beat the mean
 //! interval of its bar (from 8 beats on each side).
 
 use super::uba::BeatInfo;
 
-pub const UNPORTED_CLASS: &str = "the tempo-change analysis found a stretch at half, two thirds, 1.5 or twice the tempo (a branch of rekordbox's analyzeFocus not built yet)";
-pub const UNPORTED_HALFBEAT: &str = "the tempo-change analysis found beats half a beat off (a branch of rekordbox's analyzeFocus not built yet)";
 pub const UNPORTED_SHORT: &str = "the tempo-change analysis got too few beats (a branch of rekordbox's analyzeFocus not built yet)";
 
 /// What the two passes saw (for checks against the oracle).
@@ -118,11 +117,19 @@ fn halve_back(list: &mut [BeatInfo], hi: usize, lo: usize) {
     }
 }
 
-/// The half-beat correction (decompile ~19505-19915): for each pair of candidates the beats
-/// from the first bar to the second are moved back half a beat and one beat is added after
-/// the second; a last single candidate moves every beat after it and adds one at the end.
-/// Only the 4.5-beat bars are built (a 3.5-beat bar: not seen on the corpus).
-fn half_beat_fix(list: &mut Vec<BeatInfo>, cand: &mut Vec<(i32, i32)>, total: i32) -> Result<(), &'static str> {
+/// Beats `lo ..= hi - 1` each moved to the middle of itself and the beat after (from the bottom).
+fn halve_forward(list: &mut [BeatInfo], lo: usize, hi: usize) {
+    for j in lo..hi {
+        list[j].pos = ((list[j].pos + list[j + 1].pos) as f64).mul_add(0.5, 0.5) as i32;
+    }
+}
+
+/// The half-beat correction (listing 19500-19982): each candidate bar is re-spaced at
+/// 1 / (k + 0.5) of its length (k = 4: a bar 4.5 beats long, 3: 3.5). For each pair, the beats
+/// between the two bars move half a beat (back after a long bar, forward after a short one)
+/// and a beat is added (4.5 then 4.5) or removed (3.5 then 3.5); a last single candidate moves
+/// every beat after it and adds a beat at the end (4.5) or moves the last one (3.5).
+fn half_beat_fix(list: &mut Vec<BeatInfo>, cand: &mut Vec<(i32, i32)>, total: i32) {
     let cnt = cand.len();
     for i in 0..cnt / 2 {
         let (a, k1) = cand[2 * i];
@@ -138,11 +145,34 @@ fn half_beat_fix(list: &mut Vec<BeatInfo>, cand: &mut Vec<(i32, i32)>, total: i3
         list[b + 2].pos = ((span2 * -2.0).mul_add(inv2, 0.5) + te) as i32;
         list[b + 1].pos = ((span2 * -3.0).mul_add(inv2, 0.5) + te) as i32;
         if k1 == 3 {
-            return Err(UNPORTED_HALFBEAT);
+            if k2 == 4 {
+                // 19785: forward half a beat up to the second bar, its start a third on
+                if a + 4 < b {
+                    halve_forward(list, a + 4, b);
+                }
+                let d = (list[b + 1].pos - list[b].pos) as f64;
+                list[b].pos += d.mul_add(THIRD, 0.5) as i32;
+            } else if k2 == 3 {
+                // 19681: forward half a beat, the second bar's first beat removed
+                if a + 4 < b - 1 {
+                    halve_forward(list, a + 4, b - 1);
+                }
+                list.remove(b);
+                let d = (list[b].pos - list[b - 1].pos) as f64;
+                list[b - 1].pos += d.mul_add(THIRD, 0.5) as i32;
+                if cnt as i64 - (2 * i) as i64 >= 3 && 2 * i + 2 < cnt {
+                    for c in cand.iter_mut().skip(2 * i + 2) {
+                        c.0 -= 1;
+                    }
+                }
+            }
         }
         if k1 == 4 {
             if k2 == 3 {
-                return Err(UNPORTED_HALFBEAT);
+                // 19551: back half a beat, no beat added
+                halve_back(list, b, a + 4);
+                let d = (list[a + 4].pos - list[a + 3].pos) as f64;
+                list[a + 4].pos -= d.mul_add(THIRD, 0.5) as i32;
             }
             if k2 == 4 {
                 halve_back(list, b, a + 4);
@@ -176,187 +206,20 @@ fn half_beat_fix(list: &mut Vec<BeatInfo>, cand: &mut Vec<(i32, i32)>, total: i3
                 }
             }
         } else if k == 3 {
-            return Err(UNPORTED_HALFBEAT);
-        }
-    }
-    Ok(())
-}
-
-/// The doubled-tempo test's body (whole stretch at about 2x the reference interval: the network
-/// missed every other beat; coverage listing 18001-18576): the stretch is widened over ratios
-/// that are not 1 or 2, a beat is put in the middle of each interval, a beat added before the
-/// first one when there is room. Returns the list's new length (the original's `v296` from here
-/// on). Branches never seen on the corpus (removals, re-fills, the end extension) are not built.
-fn class2_whole(list: &mut Vec<BeatInfo>, q: &[f64], start: &mut [i32; 128], end: &mut [i32; 128], k: usize, v416: i32, total: i32) -> Result<i32, &'static str> {
-    let fits = |x: f64| (x >= 1.8 || x <= 1.07) && x <= 2.2;
-    let off = |x: f64| !fits(x);
-    let qi = |i: i32| q[i as usize];
-    let mut v301 = start[k];
-    let mut v300 = end[k];
-    let mut v530 = false;
-    // the start side (LABEL_2308 / 2309 / 2310)
-    let v527: i32 = 'st: {
-        if v301 == 0 {
-            break 'st 0;
-        }
-        if fits(qi(v301 - 1)) {
-            break 'st v301;
-        }
-        if v301 < 2 {
-            break 'st 0;
-        }
-        if fits(qi(v301 - 2)) {
-            break 'st v301 - 1;
-        }
-        if v301 < 3 {
-            break 'st 0;
-        }
-        if fits(qi(v301 - 3)) {
-            break 'st v301 - 2;
-        }
-        if v301 < 4 {
-            break 'st 0;
-        }
-        if off(qi(v301 - 4)) {
-            if v301 >= 5 {
-                v530 = off(qi(v301 - 5));
-                break 'st if v530 { v301 - 5 } else { v301 - 4 };
+            // 19917: forward half a beat, the last beat one interval on (or dropped past the end)
+            if a + 4 < n - 1 {
+                halve_forward(list, a + 4, n - 1);
             }
-            break 'st 0;
-        }
-        v301 - 3
-    };
-    // LABEL_2310: the start moves forward over off ratios after it
-    if v301 <= v416 - 2 && off(qi(v301 + 1)) {
-        if v301 > v416 - 3 || fits(qi(v301 + 2)) {
-            v301 += 1;
-        } else if v301 > v416 - 4 || fits(qi(v301 + 3)) {
-            v301 += 2;
-        } else if v301 > v416 - 5 || fits(qi(v301 + 4)) {
-            v301 += 3;
-        } else if v301 <= v416 - 6 {
-            let o = off(qi(v301 + 5));
-            v301 += if o { 5 } else { 4 };
-            v530 |= o;
-        } else {
-            v301 += 4;
-        }
-    }
-    // the end side
-    let v1749: i32 = if v300 < 1 {
-        end[k]
-    } else {
-        let x = qi(v300 - 1);
-        let mut deep = false;
-        let mut r = 0;
-        if x <= 1.07 || x >= 1.8 {
-            r = if x > 2.2 { 0 } else { end[k] };
-            if x > 2.2 && v300 >= 2 {
-                deep = true;
-            }
-        } else if v300 < 2 {
-            r = 0;
-        } else {
-            deep = true;
-        }
-        if deep {
-            // LABEL_2336
-            r = v300 - 2;
-            if fits(qi(v300 - 2)) {
-                r = v300 - 1;
-            } else if v300 < 3 {
-                r = 0;
-            } else if off(qi(v300 - 3)) {
-                if v300 < 4 {
-                    r = 0;
-                } else if fits(qi(v300 - 4)) {
-                    r = v300 - 3;
-                } else if v300 < 5 {
-                    r = 0;
+            if n > 1 {
+                let p = list[n - 1].pos - list[n - 2].pos + list[n - 1].pos;
+                if p <= total {
+                    list[n - 1].pos = p;
                 } else {
-                    r = v300 - 4;
-                    let o = off(qi(v300 - 5));
-                    if o {
-                        r = v300 - 5;
-                    }
-                    v530 |= o;
+                    list.pop();
                 }
             }
         }
-        r
-    };
-    // LABEL_2362: the end moves forward over off ratios after it
-    if v300 <= v416 - 2 && off(qi(v300 + 1)) {
-        if v300 > v416 - 3 || fits(qi(v300 + 2)) {
-            v300 += 1;
-        } else if v300 > v416 - 4 || fits(qi(v300 + 3)) {
-            v300 += 2;
-        } else if v300 > v416 - 5 || fits(qi(v300 + 4)) {
-            v300 += 3;
-        } else if v300 > v416 - 6 {
-            v300 += 4;
-        } else {
-            let o = off(qi(v300 + 5));
-            v300 += if o { 5 } else { 4 };
-            v530 |= o;
-        }
     }
-    let v1762 = v1749.max(0);
-    let len = list.len() as i32;
-    let v1768 = v300.min(len - 1);
-    if v1768 > v1762 {
-        // the original removes the beats between (never seen)
-        return Err(UNPORTED_CLASS);
-    }
-    let mut v1771 = v1768;
-    end[k] = v1771;
-    let v1772 = v527.max(0);
-    let v1773 = if len - 1 >= v301 { v301 } else { len - 1 };
-    if v1773 > v1772 {
-        return Err(UNPORTED_CLASS);
-    }
-    let v1783 = v1768 > v1762 || v1771 == len - 1;
-    let mut v1784 = v1771 - v1783 as i32;
-    if v1784 >= len - 2 {
-        v1784 = len - 2;
-    }
-    start[k] = v1772;
-    let v1785 = if v1773 <= v1772 { v1772 } else { v1772 + 1 };
-    if v1784 >= v1785 {
-        // a beat in the middle of each interval, from the end
-        let mut j = v1784;
-        loop {
-            let a = list[j as usize].pos;
-            let b = list[(j + 1) as usize].pos;
-            let p = ((b - a) as f64).mul_add(0.5, a as f64 + 0.5) as i32;
-            list.insert((j + 1) as usize, blank(p));
-            end[k] += 1;
-            v1771 = end[k];
-            if j <= v1785 {
-                break;
-            }
-            j -= 1;
-        }
-    }
-    // a beat before the first one when it fits
-    let v1812 = list[0].pos;
-    let v1814 = v1812 - (list[1].pos - v1812);
-    if v1814 > 0 {
-        list.insert(0, blank(v1814));
-        end[k] = v1771 + 1;
-    }
-    let n = list.len();
-    if n >= 2 {
-        let last = list[n - 1].pos;
-        let prev = list[n - 2].pos;
-        if last != prev && ((total - last) as f32) / ((last - prev) as f32) > 1.0 {
-            return Err(UNPORTED_CLASS);
-        }
-    }
-    if v530 {
-        return Err(UNPORTED_CLASS);
-    }
-    Ok(n as i32)
 }
 
 /// The tempo-change half of analyzeFocus on `list` (built by the caller as the constant half
@@ -846,32 +709,42 @@ pub fn analyze(mut list: Vec<BeatInfo>, sr: i32, a7: i32, bpm72: f32, total: i32
                     let v103 = t_hi[k] - t_lo[k];
                     let v394 = p_hi[k] - p_lo[k];
                     let v419 = w_hi[k] - w_lo[k];
-                    // the eight tests, in order (each body is a branch not ported yet)
-                    if v308 < 0.515 && v308 > 0.485 && v437 < 0.008 && v301 >= 0 && v436 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                    // the eight tests, in order; the first that holds runs its body
+                    // (`rb_hp_class.rs`), whose new list length counts for the stretches before
+                    use super::class::{body, Kind};
+                    let pass = super::class::Pass { q: &q, sr, total, v223 };
+                    let whole = v437 < 0.008 && v301 >= 0 && v436 < 0.015;
+                    if v308 < 0.515 && v308 > 0.485 && whole {
+                        v296 = body(&mut list, &pass, &mut start[k], &mut end[k], v296, Kind::Half);
+                        break 'seg;
                     }
                     if (v369 + v353 + v370) * THIRD < 0.008 && h_lo[k] >= 0 && v355 >= 8 && v354 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                        v296 = body(&mut list, &pass, &mut h_lo[k], &mut h_hi[k], v296, Kind::Half);
+                        break 'seg;
                     }
-                    if v308 < 0.6866666666666666 && v308 > 0.6466666666666666 && v437 < 0.008 && v301 >= 0 && v436 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                    if v308 < 0.6866666666666666 && v308 > 0.6466666666666666 && whole {
+                        v296 = body(&mut list, &pass, &mut start[k], &mut end[k], v296, Kind::TwoThirds);
+                        break 'seg;
                     }
                     if (v385 + v386 + v388) * THIRD < 0.008 && t_lo[k] >= 0 && v103 >= 8 && v368 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                        v296 = body(&mut list, &pass, &mut t_lo[k], &mut t_hi[k], v296, Kind::TwoThirds);
+                        break 'seg;
                     }
-                    if v308 < 1.545 && v308 > 1.455 && v437 < 0.008 && v301 >= 0 && v436 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                    if v308 < 1.545 && v308 > 1.455 && whole {
+                        v296 = body(&mut list, &pass, &mut start[k], &mut end[k], v296, Kind::ThreeHalves);
+                        break 'seg;
                     }
                     if (v413 + v392 + v414) * THIRD < 0.008 && p_lo[k] >= 0 && v394 >= 8 && v393 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                        v296 = body(&mut list, &pass, &mut p_lo[k], &mut p_hi[k], v296, Kind::ThreeHalves);
+                        break 'seg;
                     }
-                    if v308 < 2.06 && v308 > 1.94 && v437 < 0.008 && v301 >= 0 && v436 < 0.015 {
-                        // LABEL_2670: the list's new length counts for the stretches before
-                        v296 = class2_whole(&mut list, &q, &mut start, &mut end, k, v296, total)?;
+                    if v308 < 2.06 && v308 > 1.94 && whole {
+                        v296 = body(&mut list, &pass, &mut start[k], &mut end[k], v296, Kind::Double);
                         break 'seg;
                     }
                     if !((v431 + v432 + v434) * THIRD >= 0.008 || w_lo[k] < 0 || v419 < 8) && v412 < 0.015 {
-                        return Err(UNPORTED_CLASS);
+                        v296 = body(&mut list, &pass, &mut w_lo[k], &mut w_hi[k], v296, Kind::Double);
+                        break 'seg;
                     }
                     let _ = v412;
                 }
@@ -971,10 +844,11 @@ pub fn analyze(mut list: Vec<BeatInfo>, sr: i32, a7: i32, bpm72: f32, total: i32
                     if v2041 || v2024 {
                         v2024 = !v2041;
                     } else {
-                        if cand.len() > 126 {
-                            return Err(UNPORTED_HALFBEAT);
-                        }
                         cand.push((m, v2032 as i32));
+                        if cand.len() >= 128 {
+                            // 19505: the 128th candidate ends the scan
+                            break;
+                        }
                         v2025 = 0;
                         v2024 = true;
                     }
@@ -988,7 +862,7 @@ pub fn analyze(mut list: Vec<BeatInfo>, sr: i32, a7: i32, bpm72: f32, total: i32
                 }
             }
             if !cand.is_empty() {
-                half_beat_fix(&mut list, &mut cand, total)?;
+                half_beat_fix(&mut list, &mut cand, total);
             }
         }
         again = false;

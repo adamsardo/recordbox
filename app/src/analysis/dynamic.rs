@@ -113,7 +113,7 @@ pub fn tempo_and_grid_dynamic(mono: &[f32], sr: f64, bpm_min: f64, bpm_max: f64)
     // The first anchor's bar position must hold when beats are extended back to time zero,
     // which `BeatGrid::beats` does by itself.
     let bpm = anchors[0].bpm;
-    (bpm, Some(BeatGrid { anchors }))
+    (bpm, Some(BeatGrid { anchors, ..Default::default() }))
 }
 
 /// Beat period in frames for each envelope frame: the best autocorrelation lag per window,

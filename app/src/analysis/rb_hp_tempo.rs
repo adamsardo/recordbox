@@ -364,7 +364,7 @@ mod oracle_tests {
             return;
         }
         let env = super::super::uba::Uba::new(44100, &[0i16; 4096]);
-        let (mut n, mut same, mut unported) = (0, 0, 0);
+        let (mut n, mut same, mut unported, mut grid_same) = (0, 0, 0, 0);
         let mut why: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
         for (name, d) in &all {
             let ml: Vec<(i32, i32, i32)> = d.j.iter().map(|b| (b.0 as i32, b.1, b.2)).collect();
@@ -377,12 +377,28 @@ mod oracle_tests {
                     let fm: Vec<(i64, i32, i32)> = o.beats.iter().map(|b| (b.0 as i64, b.1, b.2)).collect();
                     let ok = fm == d.f && o.bpm100 == d.f_bpm;
                     same += ok as usize;
+                    // what the export writes (PQTZ) from the grid made of the port's list, against
+                    // convertToMicrosec of the oracle's list
+                    let sr = d.sr as u32;
+                    let want: Vec<(u16, u16, u32)> = d.f.iter().map(|b| (b.1.clamp(1, 4) as u16, b.2 as u16, (super::super::beat_us(b.0 as i32, sr) / 1000) as u32)).collect();
+                    let g = super::super::grid_from_list(&o.beats, sr);
+                    let mine: Vec<(u16, u16, u32)> = g.beats(total as f64 / sr as f64).iter().map(|b| (b.beat as u16, (b.bpm * 100.0).round() as u16, (((b.time.max(0.0) * 1e6).round() as u64) / 1000) as u32)).collect();
+                    let g_ok = mine.len() >= want.len() && mine[..want.len()] == want[..];
+                    grid_same += g_ok as usize;
+                    if !g_ok {
+                        let gfirst = mine.iter().zip(&want).position(|(a, b)| a != b);
+                        eprintln!("  {name}: exported beats {} vs {} first {:?}", mine.len(), want.len(), gfirst.map(|i| (i, mine[i], want[i])));
+                    }
                     if !ok {
                         let first = fm.iter().zip(&d.f).position(|(a, b)| a != b);
                         eprintln!("  {name}: {} vs {} beats, bpm {} vs {}, first diff {:?}", fm.len(), d.f.len(), o.bpm100, d.f_bpm, first.map(|i| (i, fm[i], d.f[i])));
                     }
                 }
-                Err(e) if e == super::super::focus::NO_INPUT && d.f.is_empty() => same += 1,
+                Err(e) if e == super::super::focus::NO_INPUT && d.f.is_empty() => {
+                    // no list on either side: nothing exported
+                    same += 1;
+                    grid_same += 1;
+                }
                 Err(e) => {
                     unported += 1;
                     why.entry(e).or_default().push(name.clone());
@@ -392,7 +408,7 @@ mod oracle_tests {
         for (e, v) in &why {
             eprintln!("  not built: {e}: {}", v.join(" "));
         }
-        eprintln!("tempo focus stage: cases {n}, final list identical {same}, not built {unported}");
+        eprintln!("tempo focus stage: cases {n}, final list identical {same}, exported beats identical {grid_same}, not built {unported}");
     }
 
     /// The whole high precision analysis of each corpus case in its mode (`rb_hp::analyze`:

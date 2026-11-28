@@ -153,7 +153,37 @@ mod oracle {
             if !only.is_empty() && !only.contains(&k) {
                 continue;
             }
-            let dec = if let Some(k) = p.strip_prefix("synth:") {
+            let dec = if let Some(spec) = p.strip_prefix("synthj:") {
+                // a click track at one tempo with single beats shortened (phase jumps):
+                // synthj:<secs>:<bpm>:<seed>:<beat>/<fraction cut>,...[:<silent from>-<to> s]
+                let w: Vec<&str> = spec.split(':').collect();
+                // <bpm> may be a step program: 120.4@100=121.4@160=120.4 (tempo from that time on)
+                let mut prog: Vec<(f64, f64)> = vec![];
+                let mut it = w[1].split('=');
+                let first = it.next().unwrap();
+                let (b0, t0) = first.split_once('@').map(|(b, t)| (b.parse::<f64>().unwrap(), t.parse::<f64>().unwrap())).unwrap_or_else(|| (first.parse().unwrap(), f64::INFINITY));
+                prog.push((0.0, b0));
+                let mut at = t0;
+                for x in it {
+                    let (b, t) = x.split_once('@').map(|(b, t)| (b.parse::<f64>().unwrap(), t.parse::<f64>().unwrap())).unwrap_or_else(|| (x.parse().unwrap(), f64::INFINITY));
+                    prog.push((at, b));
+                    at = t;
+                }
+                let (secs, seed): (f64, u64) = (w[0].parse().unwrap(), w[2].parse().unwrap());
+                let bpm_at = |t: f64| prog.iter().rev().find(|p| t >= p.0).map(|p| p.1).unwrap_or(b0);
+                let cuts: Vec<(usize, f64)> = w.get(3).filter(|c| !c.is_empty()).map(|c| c.split(',').filter_map(|x| x.split_once('/')).map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).collect()).unwrap_or_default();
+                let beat = std::cell::Cell::new(0usize);
+                let tempo = |t: f64| {
+                    let k = beat.get();
+                    beat.set(k + 1);
+                    let bpm = bpm_at(t);
+                    cuts.iter().find(|c| c.0 == k).map(|c| bpm / (1.0 - c.1)).unwrap_or(bpm)
+                };
+                let gap = w.get(4).and_then(|g| g.split_once('-')).map(|(a, b)| (a.parse::<f64>().unwrap(), b.parse::<f64>().unwrap()));
+                let samples = super::super::super::rb_beat1::oracle::synth(secs, &tempo, seed, gap);
+                let frames = samples.len() / 2;
+                crate::audio::Decoded { sr: 44100, samples, raw_frames: frames, damaged: 0, truncated: false }
+            } else if let Some(k) = p.strip_prefix("synth:") {
                 let (secs, f, seed, gap) = super::super::super::rb_beat1::oracle::SYNTH[k.parse::<usize>().unwrap()];
                 let samples = super::super::super::rb_beat1::oracle::synth(secs, &f, seed, gap);
                 let frames = samples.len() / 2;

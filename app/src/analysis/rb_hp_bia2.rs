@@ -129,6 +129,16 @@ pub fn analyze(sr: i32, sensor: &[BeatInfo], total: i32, low: Option<&[i16]>) ->
 mod post {
     use super::BeatInfo;
 
+    /// Which return of the check was taken (PREPDECK_HP_BIA_TRACE, test builds only).
+    macro_rules! why {
+        ($($t:tt)*) => {
+            #[cfg(test)]
+            if std::env::var_os("PREPDECK_HP_BIA_TRACE").is_some() {
+                eprintln!("  2_0 check: {}", format!($($t)*));
+            }
+        };
+    }
+
     pub struct Verdict {
         pub hendou: bool,
         pub cbpm: f32,
@@ -436,6 +446,7 @@ mod post {
         } else if tb >= 140.0 {
             tb *= 0.5;
         }
+        why!("n {n} refv {refv:.2} dev {dev:.3} steady {steady} dev_hendou {dev_hendou} judge {judge} seg_hendou {seg_hendou}");
         if dev_hendou || judge || seg_hendou {
             return Verdict { hendou: true, cbpm, vbpm, halved, unported };
         }
@@ -478,6 +489,7 @@ mod post {
         let lo = (nf * 0.05 + 0.5) as i32;
         let hi = (nf * 0.8 + 0.5) as i32;
         let verdict = |h: bool, cbpm: f32, vbpm: f32, unported: bool| Verdict { hendou: h, cbpm, vbpm, halved, unported };
+        why!("stretches10 {:?} total_exp {total_exp} lo {lo} hi {hi}", s10.iter().zip(&e10).collect::<Vec<_>>());
         if hi - lo < 65 {
             return verdict(true, cbpm, vbpm, unported);
         }
@@ -642,6 +654,7 @@ mod post {
             *y -= mn;
         }
         let jumps: Vec<i32> = (0..nd as i32).filter(|&i| iv * 0.0625 < dd[i as usize] as f64).collect();
+        why!("windows {:?} total {total} iv {iv:.1} jumps {jumps:?} max dd {:?}", q1.iter().zip(&q2).collect::<Vec<_>>(), dd.iter().max());
         if !jumps.is_empty() {
             // phase jumps: the original drops short stretches between them (more than one jump)
             // and measures the deviations per stretch (any jump; 0x1011a3.. "v1843 != 0"), not

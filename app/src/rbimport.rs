@@ -350,7 +350,7 @@ pub fn read_pqtz_grid(dat: &Path) -> Option<BeatGrid> {
                     last_tempo = tempo;
                 }
             }
-            return (!anchors.is_empty()).then_some(BeatGrid { anchors });
+            return (!anchors.is_empty()).then_some(BeatGrid { anchors, ..Default::default() });
         }
         i += total;
     }

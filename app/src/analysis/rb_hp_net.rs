@@ -353,12 +353,13 @@ impl Net {
                     *m = c.re.hypot(c.im);
                 }
                 let row = &mut spec[f * bands..(f + 1) * bands];
-                for (r, band) in row.iter_mut().zip(bank) {
+                for (b, (r, band)) in row.iter_mut().zip(bank).enumerate() {
                     let mut s = 0f32;
                     for (w, m) in band.w.iter().zip(&mag[band.first..]) {
                         s += m * w;
                     }
-                    *r = (s * 1.0 + 1.0).ln() / std::f32::consts::LN_10;
+                    // the graph's Log runs over the whole frames x bands tensor at once
+                    *r = tf_elementwise(f * bands + b, n * bands, s * 1.0 + 1.0, tf_log_packet, f32::ln) / std::f32::consts::LN_10;
                 }
             }
             let d = DIFF_FRAMES[k];
@@ -410,55 +411,238 @@ impl Net {
 }
 
 /// tf.signal.hann_window(size, periodic=True) as the graph computes it in single precision.
+/// (The graph's `Cos` is TensorFlow's kernel; the sizes are multiples of four, so every value
+/// takes its packet path.)
 pub fn hann_periodic(size: usize) -> Vec<f32> {
-    (0..size).map(|i| 0.5f32 - 0.5f32 * (6.283_185_5f32 * i as f32 / size as f32).cos()).collect()
+    (0..size).map(|i| 0.5f32 - 0.5f32 * tf_elementwise(i, size, 6.283_185_5f32 * i as f32 / size as f32, tf_cos_packet, f32::cos)).collect()
 }
 
+// TensorFlow 2.16's CPU kernels as rekordbox's bundled libtensorflow_cc runs them on arm64
+// (read from its disassembly: `EvalRange<... scalar_tanh_op<float> ...>::run` 0x8d21850,
+// `generic_fast_tanh_float<float>` 0x66a51c4, `EvalRange<... scalar_logistic_op<float> ...>::run`
+// 0x8c8bc58). An element-wise op runs on NEON packets of four and on the elements left over one
+// at a time, and the two paths round differently: in a 25-unit gate, units 0-23 take the packet
+// path and unit 24 the scalar one.
+
+/// Eigen's rational tanh on a packet (fused multiply-adds; the clamp is the non-FMA one).
 #[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+pub(crate) fn tf_tanh_packet(a: f32) -> f32 {
+    let c = f32::from_bits(0x40fcf84f);
+    let x = a.min(c).max(-c);
+    let x2 = x * x;
+    let mut p = x2.mul_add(f32::from_bits(0xa59f25c0), f32::from_bits(0x2a61337e));
+    for k in [0xaebd37ffu32, 0x335c0041, 0x3779434a, 0x3a270ded, 0x3ba059dc] {
+        p = x2.mul_add(p, f32::from_bits(k));
+    }
+    let p = x * p;
+    let mut q = x2.mul_add(f32::from_bits(0x35a0d3d8), f32::from_bits(0x38f895d6));
+    q = q.mul_add(x2, f32::from_bits(0x3b14aa05));
+    q = q.mul_add(x2, f32::from_bits(0x3ba059dd));
+    if a.abs() < f32::from_bits(0x39d1b717) {
+        x
+    } else {
+        p / q
+    }
+}
+
+/// The same rational on a single element (separate multiplies and adds).
+#[inline]
+pub(crate) fn tf_tanh_scalar(a: f32) -> f32 {
+    let c = f32::from_bits(0x40fcf84f);
+    let x = a.min(c).max(-c);
+    let x2 = x * x;
+    let mut p = x2 * f32::from_bits(0xa59f25c0) + f32::from_bits(0x2a61337e);
+    for k in [0xaebd37ffu32, 0x335c0041, 0x3779434a, 0x3a270ded, 0x3ba059dc] {
+        p = x2 * p + f32::from_bits(k);
+    }
+    let mut q = f32::from_bits(0x35a0d3d8) * x2 + f32::from_bits(0x38f895d6);
+    q = q * x2 + f32::from_bits(0x3b14aa05);
+    let p = x * p;
+    let q = x2 * q + f32::from_bits(0x3ba059dd);
+    if a.abs() < f32::from_bits(0x39d1b717) {
+        x
+    } else {
+        p / q
+    }
+}
+
+/// Eigen's `pexp` on a packet: Cody-Waite reduction, a degree-5 polynomial, 2^m in three steps.
+#[inline]
+pub(crate) fn tf_exp_packet(x0: f32) -> f32 {
+    let x = x0.min(f32::from_bits(0x42b1722d));
+    let m = f32::from_bits(0x3fb8aa3b).mul_add(x, 0.5).floor();
+    let r = f32::from_bits(0xbf318000).mul_add(m, x);
+    let r = f32::from_bits(0x395e8083).mul_add(m, r);
+    let r2 = r * r;
+    let a = f32::from_bits(0x3ab42872).mul_add(r2, f32::from_bits(0x3d2aadcc));
+    let b = f32::from_bits(0x3c091de6).mul_add(r2, f32::from_bits(0x3e2aaa47));
+    let c = a.mul_add(r2, f32::from_bits(0x3efffffc));
+    let c = b.mul_add(r, c);
+    let y = c.mul_add(r2, r + 1.0);
+    let mi = m.max(-278.0).min(278.0) as i32;
+    let b = mi >> 2;
+    let f = f32::from_bits(((b << 23) + 0x3f80_0000) as u32);
+    let y = y * f * f * f;
+    let g = f32::from_bits((((mi - b - 2 * b) << 23) + 0x3f80_0000) as u32);
+    let e = (y * g).max(x0);
+    if x0 < -104.0 {
+        0.0
+    } else {
+        e
+    }
+}
+
+/// Eigen's logistic on a packet: e / (1 + e) with e = exp(x), 1 where e overflows.
+#[inline]
+pub(crate) fn tf_sigmoid_packet(x: f32) -> f32 {
+    let e = tf_exp_packet(x);
+    if e == f32::INFINITY {
+        1.0
+    } else {
+        e / (e + 1.0)
+    }
+}
+
+/// The same on a single element, with the C library's expf.
+#[inline]
+pub(crate) fn tf_sigmoid_scalar(x: f32) -> f32 {
+    let e = x.exp();
+    if e == f32::INFINITY {
+        1.0
+    } else {
+        e / (e + 1.0)
+    }
+}
+
+/// Eigen's cosine on a packet (`psincos_float`, `EvalRange<... scalar_cos_op<float> ...>::run`
+/// 0x86e5030): reduction by pi/2 in three parts, then the cosine or sine polynomial by quadrant.
+/// Arguments of 71476 and more (a slower reduction in the original) do not occur here.
+#[inline]
+pub(crate) fn tf_cos_packet(a: f32) -> f32 {
+    let x = a.abs();
+    let y = x * f32::from_bits(0x3f22f983) + 12_582_912.0;
+    let yr = y + -12_582_912.0;
+    let r = f32::from_bits(0xbfc90fd8).mul_add(yr, x);
+    let r = f32::from_bits(0xb4a8885a).mul_add(yr, r);
+    let r = f32::from_bits(0xa7c234c4).mul_add(yr, r);
+    let n = y.to_bits();
+    let sign = (n << 30).wrapping_add(0x4000_0000) & 0x8000_0000;
+    let x2 = r * r;
+    let c = f32::from_bits(0x37cc730b).mul_add(x2, f32::from_bits(0xbab6036e));
+    let c = x2.mul_add(c, f32::from_bits(0x3d2aaa9e));
+    let c = x2.mul_add(c, -0.5);
+    let c = x2.mul_add(c, 1.0);
+    let sn = f32::from_bits(0xb94d70ca).mul_add(x2, f32::from_bits(0x3c0885d3));
+    let sn = x2.mul_add(sn, f32::from_bits(0xbe2aaaa8));
+    let sn = r.mul_add(x2 * sn, r);
+    let v = if n & 1 == 0 { c } else { sn };
+    f32::from_bits(v.to_bits() ^ sign)
+}
+
+/// Eigen's natural log on a packet (`plog_float`, `EvalRange<... scalar_log_op<float> ...>::run`
+/// 0x89fc968): frexp (denormals scaled by 2^24), the mantissa moved to [sqrt(1/2), sqrt(2)) - 1, a
+/// [2/3] rational, plus e * ln 2.
+#[inline]
+pub(crate) fn tf_log_packet(a: f32) -> f32 {
+    // (TensorFlow runs with denormals flushed to zero: their log is -inf)
+    if a != 0.0 && a.abs() < f32::MIN_POSITIVE {
+        return f32::NEG_INFINITY;
+    }
+    let den = a.abs() < f32::from_bits(0x0080_0000);
+    let xs = if den { a * f32::from_bits(0x4b80_0000) } else { a };
+    let bias = if den { -150.0f32 } else { -126.0 };
+    let expo = (xs.abs().to_bits() >> 23) as f32;
+    let zero = a == 0.0;
+    let special = expo == 255.0 || zero;
+    let (m, e) = if special { (a, 0.0f32) } else { (f32::from_bits((xs.to_bits() & 0x807f_ffff) | 0x3f00_0000), bias + expo) };
+    let lt = m < f32::from_bits(0x3f3504f3);
+    let tmp = if lt { m } else { 0.0 };
+    let x = m + -1.0;
+    let e = e - if lt { 1.0 } else { 0.0 };
+    let x = x + tmp;
+    let p = f32::from_bits(0x3e3af1c9).mul_add(x, 1.0);
+    let p = p.mul_add(x, 1.0);
+    let p = x * p;
+    let q = f32::from_bits(0x3d4b3a68).mul_add(x, f32::from_bits(0x3f19674d));
+    let q = q.mul_add(x, 1.5);
+    let q = q.mul_add(x, 1.0);
+    let r = f32::from_bits(0x3f317218).mul_add(e, p / q);
+    if a == f32::INFINITY {
+        f32::INFINITY
+    } else if !(a >= 0.0) {
+        f32::NAN
+    } else if zero {
+        f32::NEG_INFINITY
+    } else {
+        r
+    }
+}
+
+/// An element-wise kernel over `n` values as TensorFlow runs it on one block: packets of four,
+/// the rest one at a time.
+#[inline]
+fn tf_elementwise(i: usize, n: usize, x: f32, packet: fn(f32) -> f32, scalar: fn(f32) -> f32) -> f32 {
+    if i < n & !3 {
+        packet(x)
+    } else {
+        scalar(x)
+    }
 }
 
 /// One direction of a peephole LSTM layer over `n` frames of `x` (n x l.input); writes the 25
 /// outputs per frame into `y` (n x 50) at column `off`.
-fn run_lstm(l: &Lstm, x: &[f32], n: usize, reverse: bool, y: &mut [f32], off: usize) {
-    // Input projection for every frame at once: zx = x * W.
-    let mut zx = vec![0f32; n * GATES];
-    for t in 0..n {
-        let xr = &x[t * l.input..(t + 1) * l.input];
-        let zr = &mut zx[t * GATES..(t + 1) * GATES];
-        for (k, &xv) in xr.iter().enumerate() {
-            if xv == 0.0 {
-                continue;
-            }
-            let wr = &l.w[k * GATES..(k + 1) * GATES];
-            for (z, w) in zr.iter_mut().zip(wr) {
-                *z += xv * w;
+/// One row times a matrix (`MatMul` of [1 x k] by [k x 100]) as Eigen's matrix-vector product
+/// does it: per output, a fused multiply-add chain over a block of columns (all of them when
+/// there are fewer than 128, else 16 at a time), each block's sum added to the result.
+#[inline]
+fn tf_gemv(x: &[f32], w: &[f32], out: &mut [f32; GATES]) {
+    let k = x.len();
+    let block = if k < 128 { k.max(1) } else { 16 };
+    *out = [0f32; GATES];
+    let mut j2 = 0;
+    while j2 < k {
+        let jend = (j2 + block).min(k);
+        let mut acc = [0f32; GATES];
+        for j in j2..jend {
+            let xv = x[j];
+            let wr = &w[j * GATES..(j + 1) * GATES];
+            for (a, &wv) in acc.iter_mut().zip(wr) {
+                *a = wv.mul_add(xv, *a);
             }
         }
+        for (o, a) in out.iter_mut().zip(&acc) {
+            *o += a;
+        }
+        j2 = jend;
+    }
+}
+
+fn run_lstm(l: &Lstm, x: &[f32], n: usize, reverse: bool, y: &mut [f32], off: usize) {
+    // Input projection for every frame (the graph does it inside the loop, one frame at a time).
+    let mut zx = vec![0f32; n * GATES];
+    let mut row = [0f32; GATES];
+    for t in 0..n {
+        tf_gemv(&x[t * l.input..(t + 1) * l.input], &l.w, &mut row);
+        zx[t * GATES..(t + 1) * GATES].copy_from_slice(&row);
     }
     let mut h = [0f32; UNITS];
     let mut c = [0f32; UNITS];
     let mut z = [0f32; GATES];
+    let mut zh = [0f32; GATES];
+    let (sp, ss, tp, ts) = (tf_sigmoid_packet as fn(f32) -> f32, tf_sigmoid_scalar as fn(f32) -> f32, tf_tanh_packet as fn(f32) -> f32, tf_tanh_scalar as fn(f32) -> f32);
     for step in 0..n {
         let t = if reverse { n - 1 - step } else { step };
-        let mut zh = [0f32; GATES];
-        for (k, &hv) in h.iter().enumerate() {
-            let ur = &l.u[k * GATES..(k + 1) * GATES];
-            for (a, u) in zh.iter_mut().zip(ur) {
-                *a += hv * u;
-            }
-        }
+        tf_gemv(&h, &l.u, &mut zh);
         for j in 0..GATES {
             z[j] = (zx[t * GATES + j] + zh[j]) + l.b[j];
         }
         for j in 0..UNITS {
-            let i_g = sigmoid(z[j] + l.pi[j] * c[j]);
-            let f_g = sigmoid(z[UNITS + j] + l.pf[j] * c[j]);
-            let c_new = f_g * c[j] + i_g * z[2 * UNITS + j].tanh();
-            let o_g = sigmoid(z[3 * UNITS + j] + l.po[j] * c_new);
+            let i_g = tf_elementwise(j, UNITS, z[j] + l.pi[j] * c[j], sp, ss);
+            let f_g = tf_elementwise(j, UNITS, z[UNITS + j] + l.pf[j] * c[j], sp, ss);
+            let c_new = f_g * c[j] + i_g * tf_elementwise(j, UNITS, z[2 * UNITS + j], tp, ts);
+            let o_g = tf_elementwise(j, UNITS, z[3 * UNITS + j] + l.po[j] * c_new, sp, ss);
             c[j] = c_new;
-            h[j] = o_g * c_new.tanh();
+            h[j] = o_g * tf_elementwise(j, UNITS, c_new, tp, ts);
         }
         y[t * 2 * UNITS + off..t * 2 * UNITS + off + UNITS].copy_from_slice(&h);
     }
@@ -533,5 +717,62 @@ mod tests {
         let w71 = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * 71.0 / 1024.0).cos();
         let v = ((2.0 * w71 + 1.0).log10()) as f32;
         assert!((f[NUM_FEATURES] - v).abs() < 1e-5, "{} vs {v}", f[NUM_FEATURES]);
+    }
+}
+
+#[cfg(test)]
+mod eigen_probe {
+    fn read_f32(p: &str) -> Vec<f32> {
+        std::fs::read(p).unwrap().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    /// TensorFlow's Tanh / Sigmoid kernels (scratch/harness/rbops on rekordbox's own
+    /// libtensorflow_cc) against `tf_tanh_*` / `tf_sigmoid_*`, bit for bit. PREPDECK_HP_OPS = the
+    /// folder with ops_x.f32 (inputs), ops_tanh.f32, ops_sig.f32 (TensorFlow's outputs).
+    #[test]
+    #[ignore]
+    fn eigen_kernels_against_tensorflow() {
+        let Ok(dir) = std::env::var("PREPDECK_HP_OPS") else { return };
+        let x = read_f32(&format!("{dir}/ops_x.f32"));
+        let n = x.len();
+        let report = |name: &str, want: &[f32], packet: fn(f32) -> f32, scalar: fn(f32) -> f32| {
+            let bad = x.iter().zip(want).enumerate().filter(|(i, (&a, &w))| (if *i < n & !3 { packet(a) } else { scalar(a) }).to_bits() != w.to_bits()).count();
+            eprintln!("  {name}: {bad} of {n} differ");
+        };
+        report("tanh", &read_f32(&format!("{dir}/ops_tanh.f32")), super::tf_tanh_packet, super::tf_tanh_scalar);
+        report("sigmoid", &read_f32(&format!("{dir}/ops_sig.f32")), super::tf_sigmoid_packet, super::tf_sigmoid_scalar);
+        // RFFT / ComplexAbs on windowed frames (fr<n>.f32: 600 frames; rfft<n>.f32 complex,
+        // rfa<n>.f32 magnitudes, from rbops RFFT / RFFTAbs)
+        for size in [1024usize, 2048, 4096] {
+            let Ok(_) = std::fs::metadata(format!("{dir}/fr{size}.f32")) else { continue };
+            let fr = read_f32(&format!("{dir}/fr{size}.f32"));
+            let tc = read_f32(&format!("{dir}/rfft{size}.f32"));
+            let ta = read_f32(&format!("{dir}/rfa{size}.f32"));
+            let bins = size / 2 + 1;
+            let mut planner = rustfft::FftPlanner::<f32>::new();
+            let fft = planner.plan_fft_forward(size);
+            let (mut re_bad, mut abs_bad, mut hyp_bad, mut worst) = (0usize, 0usize, 0usize, 0f32);
+            for f in 0..fr.len() / size {
+                let mut buf: Vec<rustfft::num_complex::Complex<f32>> = fr[f * size..(f + 1) * size].iter().map(|&v| rustfft::num_complex::Complex::new(v, 0.0)).collect();
+                fft.process(&mut buf);
+                for b in 0..bins {
+                    let (r, i) = (tc[2 * (f * bins + b)], tc[2 * (f * bins + b) + 1]);
+                    re_bad += (buf[b].re.to_bits() != r.to_bits() || buf[b].im.to_bits() != i.to_bits()) as usize;
+                    let m = buf[b].re.hypot(buf[b].im);
+                    let w = ta[f * bins + b];
+                    abs_bad += (m.to_bits() != w.to_bits()) as usize;
+                    hyp_bad += (r.hypot(i).to_bits() != w.to_bits()) as usize;
+                    worst = worst.max((m - w).abs() / w.max(1e-12));
+                }
+            }
+            let tot = fr.len() / size * bins;
+            eprintln!("  rfft {size}: {tot} bins, complex differs {re_bad}, magnitude differs {abs_bad} (worst rel {worst:.2e}); hypotf of TF's complex vs TF's ComplexAbs differs {hyp_bad}");
+        }
+        for (name, xs, ys, f) in [("cos", "ops_cosx", "ops_cos", super::tf_cos_packet as fn(f32) -> f32), ("log", "ops_logx", "ops_log", super::tf_log_packet)] {
+            let x = read_f32(&format!("{dir}/{xs}.f32"));
+            let want = read_f32(&format!("{dir}/{ys}.f32"));
+            let bad = want.iter().zip(&x).filter(|(w, a)| f(**a).to_bits() != w.to_bits()).count();
+            eprintln!("  {name}: {bad} of {} differ", want.len());
+        }
     }
 }

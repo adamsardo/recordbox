@@ -679,7 +679,7 @@ fn chroma_novelty(mono: &[f32], sr: f64, times: &[f64]) -> Vec<f64> {
 /// Recompute a grid's BPM by tapping intervals etc. is UI work; this helper fits a constant
 /// tempo for "Analyze from current position" style edits.
 pub fn shift_grid(g: &BeatGrid, seconds: f64) -> BeatGrid {
-    BeatGrid { anchors: g.anchors.iter().map(|a| crate::model::GridAnchor { time: a.time + seconds, ..*a }).collect() }
+    BeatGrid::with_listed(g.anchors.iter().map(|a| crate::model::GridAnchor { time: a.time + seconds, ..*a }).collect(), if g.listed_for == g.anchors_key() { g.listed.iter().map(|&(t, b, n)| (t + seconds, b, n)).collect() } else { vec![] })
 }
 
 // ------------------------------------------------------------------------------------------
